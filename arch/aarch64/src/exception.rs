@@ -217,6 +217,7 @@ extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
     c.write_str("\n  spsr ");
     write_hex(c, spsr);
     c.write_str("\n");
+    crate::backtrace::print(c, Some(elr as usize), crate::backtrace::EXCEPTION_FRAMES);
 
     <crate::Aarch64 as hal::Arch>::halt()
 }

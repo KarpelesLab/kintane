@@ -38,6 +38,7 @@
 #![feature(abi_x86_interrupt)]
 #![no_std]
 
+pub mod backtrace;
 mod boot;
 pub mod context;
 mod exception;

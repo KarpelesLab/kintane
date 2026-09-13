@@ -18,7 +18,9 @@
 //!
 //! Handlers allocate nothing, take no lock, and call only into the polled UART, in
 //! line with the rule that the interrupt path contains nothing that can fault or
-//! deadlock against itself.
+//! deadlock against itself. The fatal report also walks the frame-pointer chain for a
+//! backtrace, and that walk reads only memory it has bounds-checked against the image's
+//! data (`lib/unwind`), so a corrupt stack ends the backtrace instead of faulting.
 //!
 //! ## What the frame does *not* contain
 //!
@@ -164,7 +166,9 @@ fn fatal(vector: Option<u8>, code: Option<u32>, frame: &InterruptFrame) -> ! {
     write_hex(c, frame.cs, 4);
     c.write_str("\n    eflags ");
     write_hex(c, frame.eflags, 8);
-    c.write_str("\n\nhalted.\n");
+    c.write_str("\n");
+    crate::backtrace::print(c, Some(frame.eip as usize), crate::backtrace::EXCEPTION_FRAMES);
+    c.write_str("\nhalted.\n");
 
     crate::I686::halt()
 }

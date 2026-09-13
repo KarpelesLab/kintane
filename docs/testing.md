@@ -352,6 +352,27 @@ is hard-capped by the 440 bytes the MBR allows.
 - `kbuild run --replay <trace>` re-executes a recorded failure deterministically, with
   or without GDB attached.
 - Panics print a symbolized backtrace resolved against the separately shipped symbols,
-  so stripped production images stay debuggable.
+  so stripped production images stay debuggable. **This part exists.** A panic or a
+  fatal CPU exception prints raw return addresses from a bounded frame-pointer walk
+  (`lib/unwind`), and `kbuild run`, `kbuild test --target` and `kbuild symbolize`
+  resolve them against `build/<target>/out/kintane.debug`. See
+  [build-system.md](build-system.md#what-a-build-produces-today) for the format and the
+  limits.
+
+  The unwinder follows frame pointers on a stack that may be corrupt. It reads only
+  inside the image's data, less the guard page. It stops on a null, misaligned,
+  out-of-bounds or non-increasing frame pointer, and at 32 frames. Host tests drive it
+  over synthetic stacks that are well formed, corrupt or looping. The live chain is
+  checked on every boot (`backtrace  3 frames to null frame ok`): it must end at the null
+  frame `_start` plants, with every return address inside `.text`.
+
+  The `CRASH_TEST` configuration choice panics or takes an undefined instruction two
+  calls deep. CI does both on all three architectures and requires the decoded report
+  to name those functions. An exception report skips its own frames and prints the
+  faulting instruction as `pc`. A fatal `#DF` on x86_64's IST stack has not been
+  exercised. By construction its walk should stop right after `pc`, because the
+  interrupted frames are on the boot stack, below the IST stack, and the walk refuses a
+  frame pointer that decreases. A fault report halts rather than exiting the emulator,
+  so under `kbuild run` it ends in a timeout, and the decoded backtrace is still printed.
 - A crash-dump format and an offline decoder, so a report from a device in the field is
   readable with only the `.config` and the symbol bundle.

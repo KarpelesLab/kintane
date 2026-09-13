@@ -10,6 +10,7 @@
 // docs/coding-standards.md; this is the replacement it names.
 #![feature(sync_unsafe_cell)]
 
+mod crash;
 mod space;
 
 use core::cell::SyncUnsafeCell;
@@ -48,6 +49,8 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     if selftest::PRESENT {
         c.write_str("\n");
     }
+
+    crash::if_configured();
 
     // Both halves gate the exit status. Until this line existed, only the in-kernel
     // suite did: the banner computed verdicts for paging, interrupts, memory and the
@@ -143,11 +146,39 @@ fn banner(boot_arg: u64) -> Check {
     // which is precisely the kind of check that cannot change an outcome.
     let switch_ok = arch::context_switch_selftest(c);
 
+    c.write_str("\n  backtrace  ");
+    let backtrace_ok = backtrace_check(c);
+
     c.write_str("\n\nreached kmain\n");
     Check::from_ok(paging_ok)
         .and(mem)
         .and(Check::from_ok(irq_ok))
         .and(Check::from_ok(switch_ok))
+        .and(Check::from_ok(backtrace_ok))
+}
+
+/// Walk the frame-pointer chain from here and check it is the one boot built.
+///
+/// A crash report is read only after something has gone wrong, so an unwinder that
+/// quietly stopped working would be found at the worst possible moment. This walks the
+/// live chain on every boot and requires what a working one must show: it reaches the
+/// null frame `_start` planted, through at least the frames between here and `kmain`,
+/// and every return address it read is inside `.text`.
+fn backtrace_check(c: &dyn EarlyConsole) -> bool {
+    let chain = arch::backtrace::chain();
+    write_usize(c, chain.frames);
+    c.write_str(" frames to ");
+    c.write_str(chain.stop.describe());
+    // `chain`, `backtrace_check`, `banner` and `kmain`, less whatever the optimiser
+    // was allowed to fold together. Two is the floor that still proves a walk
+    // happened past the frame that started it.
+    let ok = chain.stop == unwind::Stop::NullFrame && chain.frames >= 2 && chain.stray.is_none();
+    if let Some(ra) = chain.stray {
+        c.write_str(", return address outside .text: ");
+        write_hex(c, ra as u64);
+    }
+    c.write_str(if ok { " ok" } else { " FAILED" });
+    ok
 }
 
 /// Room for the loader's memory map. QEMU reports a handful of regions; real
@@ -381,7 +412,11 @@ fn write_hex(c: &dyn EarlyConsole, v: u64) {
 }
 
 /// Panics in the core are fatal. There is no pretending otherwise: print what we can
-/// and stop. A symbolized backtrace against the separate symbol bundle is Phase 2.
+/// and stop.
+///
+/// The backtrace is raw return addresses. `kbuild run` and `kbuild test --target`
+/// symbolize it against the separate symbol bundle when the guest stops, and
+/// `kbuild symbolize` does the same for a saved log.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     let c = &arch::EARLY;
@@ -394,5 +429,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         c.write_str("<no location>");
     }
     c.write_str("\n");
+    // Skip nothing: the handler's own return address is into `core::panicking`, and
+    // the frames after that are the ones that panicked.
+    arch::backtrace::print(c, None, 0);
     finish(false)
 }

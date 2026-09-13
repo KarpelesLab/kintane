@@ -6,6 +6,7 @@
 mod build;
 mod cache;
 mod codegen;
+mod dwarf;
 mod graph;
 mod hosttest;
 mod kcfg;
@@ -13,6 +14,7 @@ mod lint;
 mod portable;
 mod qemu;
 mod sha256;
+mod symbolize;
 mod toml;
 mod toolchain;
 
@@ -39,6 +41,8 @@ COMMANDS:
     portability          compile the hardware-independent units for machines
                          without a port yet (no atomics, no 64-bit atomics, no MMU)
     run                  build, then boot under QEMU
+    symbolize [log]      decode the backtrace in a guest console log against the
+                         symbol bundle (default: the last `run` or `test --target`)
     clean                remove build outputs (the cache is kept)
 
 OPTIONS:
@@ -73,6 +77,8 @@ struct Opts {
     sets: Vec<(String, String)>,
     verbose: bool,
     timeout: u64,
+    /// Arguments that are not options. Only `symbolize` takes one.
+    positional: Vec<String>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -83,6 +89,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         sets: Vec::new(),
         verbose: false,
         timeout: 30,
+        positional: Vec::new(),
     };
     let mut i = 0;
     while i < args.len() {
@@ -112,6 +119,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--host" => o.in_kernel = false,
             "--target" => o.in_kernel = true,
             "-v" | "--verbose" => o.verbose = true,
+            other if !other.starts_with('-') => o.positional.push(other.to_string()),
             other => return Err(format!("unknown option `{other}`")),
         }
         i += 1;
@@ -122,6 +130,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
 fn dispatch(args: &[String]) -> Result<(), String> {
     let cmd = args[0].as_str();
     let opts = parse_opts(&args[1..])?;
+    if cmd != "symbolize" {
+        if let Some(p) = opts.positional.first() {
+            return Err(format!("unexpected argument `{p}`"));
+        }
+    }
     let root = find_root()?;
 
     match cmd {
@@ -159,7 +172,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             let (image, res) = do_build(&root, &topts)?;
             let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
             let m = qemu::machine_for(&res, &image, &log)?;
-            let outcome = qemu::run(&m, opts.timeout)?;
+            let outcome = boot(&root, &res, &m, opts.timeout)?;
             match outcome.code {
                 Some(c) if outcome.passed => {
                     println!("\n\x1b[32min-kernel tests passed\x1b[0m (qemu exit {c})");
@@ -204,7 +217,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
             let m = qemu::machine_for(&res, &image, &log)?;
             println!("\n\x1b[36mbooting\x1b[0m {} {}\n", m.binary, m.args.join(" "));
-            let outcome = qemu::run(&m, opts.timeout)
+            let outcome = boot(&root, &res, &m, opts.timeout)
                 .map_err(|e| format!("{e}\n  exception trace: {}", log.display()))?;
             println!();
             match outcome.code {
@@ -220,6 +233,24 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                 )),
                 None => Err("QEMU was terminated by a signal".into()),
             }
+        }
+        "symbolize" => {
+            let (_, res) = resolve_config(&root, &opts)?;
+            let dir = root.join("build").join(res.str("TARGET"));
+            let log = match opts.positional.as_slice() {
+                [] => dir.join("console.log"),
+                [one] => PathBuf::from(one),
+                _ => return Err("symbolize takes one log file".into()),
+            };
+            let text = std::fs::read(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+            let bundle = find_symbol_bundle(&dir.join("out"))?;
+            let tc = toolchain::verify(&root)?;
+            let n =
+                symbolize::report(&String::from_utf8_lossy(&text), &bundle, &tc.tool("llvm-nm")?)?;
+            if n == 0 {
+                return Err(format!("no backtrace lines (`bt ...`) in {}", log.display()));
+            }
+            Ok(())
         }
         "lint" => {
             let violations = lint::check_tree(&root)?;
@@ -359,6 +390,55 @@ fn list_presets(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Boot under QEMU, keep the console, and decode any backtrace the guest printed.
+///
+/// The console goes to `build/<target>/console.log`, which is what `kbuild symbolize`
+/// reads by default. Decoding is a convenience for whoever reads the failure: if it
+/// cannot be done, that is said and the verdict is unchanged.
+fn boot(
+    root: &Path,
+    res: &kcfg::Resolution,
+    m: &qemu::Machine,
+    timeout: u64,
+) -> Result<qemu::Outcome, String> {
+    let dir = root.join("build").join(res.str("TARGET"));
+    let outcome = qemu::run(m, timeout)?;
+    let console = dir.join("console.log");
+    std::fs::write(&console, &outcome.console)
+        .map_err(|e| format!("{}: {e}", console.display()))?;
+
+    let text = String::from_utf8_lossy(&outcome.console);
+    if !symbolize::entries(&text).is_empty() {
+        let decoded = toolchain::verify(root).and_then(|tc| {
+            let bundle = find_symbol_bundle(&dir.join("out"))?;
+            symbolize::report(&text, &bundle, &tc.tool("llvm-nm")?)
+        });
+        if let Err(e) = decoded {
+            eprintln!("\n\x1b[33mbacktrace not decoded\x1b[0m: {e}");
+        }
+    }
+
+    if outcome.timed_out {
+        return Err(format!("timed out after {timeout}s with no exit signal from the guest"));
+    }
+    Ok(outcome)
+}
+
+/// The one symbol bundle a build directory holds.
+fn find_symbol_bundle(out: &Path) -> Result<PathBuf, String> {
+    let found: Vec<PathBuf> = std::fs::read_dir(out)
+        .map_err(|e| format!("{}: {e} (has this configuration been built?)", out.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "debug"))
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("no symbol bundle (*.debug) in {}", out.display())),
+        _ => Err(format!("more than one symbol bundle in {}", out.display())),
+    }
+}
+
 fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), String> {
     let tc = toolchain::verify(root)?;
     let (table, res) = configure(root, opts)?;
@@ -448,11 +528,11 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     );
 
     let linked = image.ok_or("no unit of kind `bin` was built; nothing to boot")?;
+    let symbols = b.split_symbols(&linked)?;
     let image = b.package(res.str("IMAGE_FORMAT"), &linked)?;
     let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
-    if image != linked {
-        println!("  linked {}", linked.display());
-    }
-    println!("  image  {} ({} bytes)", image.display(), size);
+    println!("  linked  {}", linked.display());
+    println!("  symbols {}", symbols.display());
+    println!("  image   {} ({} bytes)", image.display(), size);
     Ok((image, res))
 }

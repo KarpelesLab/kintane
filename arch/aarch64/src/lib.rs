@@ -6,6 +6,7 @@
 
 #![no_std]
 
+pub mod backtrace;
 mod boot;
 pub mod context;
 pub mod exception;
