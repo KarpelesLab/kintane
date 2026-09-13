@@ -1,0 +1,138 @@
+// The device model's hand-written test tree. Compiled with
+//   dtc -I dts -O dtb -o model.dtb model.dts
+// and both files are checked in, so the tests do not need dtc. Each node exists for
+// one rule the model must get right; the tests name the node they use.
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&gic>;
+	compatible = "test,model";
+
+	aliases {
+		serial0 = "/soc/uart@1000";
+		bogus = "not-a-path";
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	gic: intc@8000000 {
+		compatible = "vendor,new-gic", "arm,gic-v3";
+		reg = <0 0x08000000 0 0x10000>, <0 0x080a0000 0 0xf60000>;
+		interrupt-controller;
+		#interrupt-cells = <3>;
+	};
+
+	// A bus with one-cell addresses mapped to 0x2_0000_0000 in the root's space.
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x2 0x00000000 0x10000000>;
+
+		uart@1000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0x1000 0x1000>;
+			interrupts = <0 1 4>;
+			clocks = <&clk2 7>, <&clk>;
+		};
+
+		// Declares no cell counts of its own: its children get the defaults (2 and 1),
+		// not soc's (1 and 1). The spec says cell counts are not inherited.
+		inner {
+			ranges;
+
+			dev@0 {
+				reg = <0x0 0x3000 0x100>;
+				interrupts = <0 2 4>;
+			};
+		};
+
+		disabled@5000 {
+			compatible = "arm,pl011";
+			reg = <0x5000 0x1000>;
+			status = "disabled";
+		};
+
+		// Overlaps the UART's window: a second driver must not get it.
+		twin@1800 {
+			compatible = "test,twin";
+			reg = <0x1800 0x100>;
+		};
+
+		outside@20000000 {
+			reg = <0x20000000 0x1000>;
+		};
+	};
+
+	// A bus with no `ranges`: its children's addresses are not CPU addresses.
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			reg = <0>;
+		};
+	};
+
+	clk: clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
+	clk2: clock-mux {
+		compatible = "test,mux";
+		#clock-cells = <1>;
+	};
+
+	nexus: pci-ish {
+		interrupt-map = <0 0 0 1 &gic 0 3 4>;
+		#interrupt-cells = <1>;
+
+		child {
+			interrupt-parent = <&nexus>;
+			interrupts = <1>;
+		};
+	};
+
+	not-a-controller {
+		phandle = <0x77>;
+
+		orphan {
+			interrupt-parent = <0x77>;
+			interrupts = <0 4 4>;
+		};
+	};
+
+	dangling {
+		interrupt-parent = <0x9999>;
+		interrupts = <0 5 4>;
+	};
+
+	bad-cells {
+		#address-cells = <1 2>;
+		#size-cells = <1>;
+		#interrupt-cells = [00 03];
+
+		dev@0 {
+			reg = <0 0 0>;
+		};
+	};
+
+	wide {
+		#address-cells = <5>;
+		#size-cells = <1>;
+
+		dev@0 {
+			reg = <0 0 0 0 0 1>;
+		};
+	};
+
+	multi-compat {
+		compatible = "test,specific", "test,generic";
+	};
+};

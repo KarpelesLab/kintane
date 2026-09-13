@@ -302,8 +302,15 @@ Phase 1 put both halves of the split under test rather than leaving them as argu
 rather than by looking at it — boots and takes timer interrupts under `gic-version=2`
 and `gic-version=3`, and also under the machine default, `gic-version=max`,
 `gic-version=4` with virtualization enabled, and on `cortex-a53` and `cortex-a57`.
-The GIC driver is chosen at runtime from the hardware's own ID register, behind
-`dyn IrqChip`. This is the case the type system genuinely cannot handle, and it works.
+The GIC driver is chosen at runtime behind `dyn IrqChip`. This is the case the type
+system genuinely cannot handle, and it works.
+
+It was first chosen from the hardware's own ID register, `GICD_PIDR2`, which reports
+the IP revision rather than the programming model in force. Since the device model
+landed it is chosen by the device tree's `compatible` string, as the drivers in
+`drivers/irqchip/` are bound. The same image was re-run on every variant above, plus
+Cortex-A53 on GICv2 and Cortex-A57 on GICv3, and passed all of them. It also fails
+visibly, rather than hanging, when booted with a tree that names the wrong controller.
 
 **The static half.** x86_64, i686 and aarch64 boot from one unmodified `kernel/main`,
 with paging depth (4, 3 and 4 levels), page size and physical address width all read

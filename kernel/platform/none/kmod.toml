@@ -1,0 +1,17 @@
+# The `platform` provider for ports with nothing to enumerate yet: the PC ports, whose
+# console, timer and interrupt controller sit at fixed I/O ports the architecture
+# drives directly. The device windows are still the architecture's, passed through, so
+# kmain asks `platform` on every port and never learns which kind it has.
+#
+# The condition must exclude every architecture another provider claims.
+[unit]
+name = "platform"
+kind = "lib"
+root = "src/lib.rs"
+layer = "kernel"
+
+[deps]
+units = ["hal", "arch"]
+
+[config]
+requires = "!ARCH_AARCH64"

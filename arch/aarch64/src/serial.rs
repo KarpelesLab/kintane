@@ -19,6 +19,15 @@ use hal::EarlyConsole;
 /// PL011 #0 on QEMU `virt`. Fixed by the machine model, not discovered.
 pub(crate) const UART0: usize = 0x0900_0000;
 
+/// Where the early console writes.
+///
+/// The device tree is read after this console has already printed, so the two can
+/// disagree; `kernel/platform/fdt` compares this with the tree's `stdout-path` and refuses
+/// to build the kernel's address space from a tree that puts the console elsewhere.
+pub fn early_console_base() -> u64 {
+    UART0 as u64
+}
+
 // Byte offsets from the PL011 programmer's model. Only the handful the early console
 // touches are named; the rest belong to the real driver.
 const DR: usize = 0x00; // data

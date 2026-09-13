@@ -1,0 +1,17 @@
+# The device model: the one node representation every enumerator fills in, driver
+# binding, typed resource claims, and the probe phases a driver moves through.
+#
+# Layer `device`, below `drivers/` in spirit though not in rank: drivers are also
+# layer `device` and depend on this. It reads the flattened device tree through
+# `boot/fdt` and nothing else — ACPI and PCIe will enumerate into the same nodes from
+# their own units. No `config.requires`: a device tree describes aarch64, RISC-V and
+# most ARM boards, and the model is pure enough to be host-tested under any preset.
+[unit]
+name = "device"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = ["hal", "fdt"]

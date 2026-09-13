@@ -1,0 +1,15 @@
+# Arm Generic Interrupt Controller, v2 and v3, bound from the device tree.
+#
+# Moved out of arch/aarch64, where it could only live while nothing could bind it.
+# Not gated on ARCH_AARCH64: the specifier translation and the GICv2 driver are plain
+# register arithmetic and are host-tested under every preset. The GICv3 CPU interface
+# is system registers, so that one module is selected by target architecture.
+[unit]
+name = "gic"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = ["hal", "device"]

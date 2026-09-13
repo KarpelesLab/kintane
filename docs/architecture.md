@@ -106,10 +106,13 @@ inputs, verifies them, installs them, and checks them again through the live roo
 - **The image**, from `image_sections()`: `.text` read-execute, `.rodata` read-only,
   data and stacks read-write and never executable. A one-page hole below the boot stack
   is left unmapped. That hole is the stack guard.
-- **Device windows**, from `arch::kspace::device_windows()`. Neither of the other two
+- **Device windows**, from `platform::device_windows()`. Neither of the other two
   inputs describes a device. A device left out of the map is a fault on its first
   register access after the switch, and on aarch64, where the console is MMIO, that
-  fault has nowhere to print. x86 needs none today, because its devices are I/O ports.
+  fault has nowhere to print. On aarch64 the windows are exactly what the drivers bound
+  from the device tree claimed (see [`device`](#device--the-device-framework)); x86 needs
+  none today, because its devices are I/O ports, and passes the architecture's empty list
+  through.
 
 Nothing is installed unless every mapping reads back with the intended permissions, the
 guard page reads back unmapped, and the loader's boot data is reachable. After the switch
@@ -234,6 +237,70 @@ more than a wide margin, or if the counter steps backwards.
   dereferences itself. This is what makes the isolation domains possible.
 - **Power and lifecycle** — suspend, resume, and driver removal are part of the
   interface from the start, not retrofitted.
+
+#### What exists today
+
+The model is `kernel/device`. It is host-tested against QEMU `virt`'s own device trees
+(GICv2 and GICv3, dumped with `-machine virt,dumpdtb=`) and against a hand-written tree
+that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
+
+- **Nodes.** `DeviceTree` is built from a validated `boot/fdt` blob into caller-provided
+  storage, with no allocation.
+  - A `reg` entry is translated to a CPU address through every ancestor's `ranges`: empty
+    means identity, and a missing `ranges` means the bus is not memory-mapped. `/cpus` is
+    the case where that matters.
+  - `#address-cells` and `#size-cells` are **not inherited**, per the specification.
+    Linux inherits them, as a legacy behaviour.
+  - `interrupt-parent` **is** inherited. Interrupts resolve to their controller node and
+    raw specifier cells; turning cells into a line number is the controller driver's job.
+  - `stdout-path` resolves through `/aliases`, and `clocks` walks each provider's
+    `#clock-cells`.
+  - Not yet: `interrupt-map` nexuses (reported as an error), `interrupts-extended`, and
+    ACPI and PCIe enumeration.
+- **Binding.** The node's own `compatible` list decides specificity: its first entry that
+  any driver knows wins. A disabled node binds nothing.
+- **Resources.** An MMIO window or an interrupt is claimed through the probe token and
+  comes back as a handle that is not `Copy`. Overlapping windows are refused, naming the
+  holder. A failed probe releases exactly its own claims: claims are tagged per probe,
+  not per node, so re-probing a bound node cannot strip the existing binding.
+  `Registers` checks every access against the window.
+- **Phases as types.**
+  - Only a probe produces `Bound`, and only a successful start produces `Started`.
+  - Registering an interrupt handler requires `Bound`, plus an `IrqLine` claimed by that
+    same binding. Enabling the handler requires `Started`.
+  - Suspend, resume, stop and remove move between the tokens. Their default
+    implementations are trivial, but they are in the interface.
+  - The handler table is not yet what the architectures dispatch through; aarch64's
+    interrupt path still knows only its timer.
+- **Drivers.** `drivers/irqchip/gic` holds GICv2 and GICv3, moved out of `arch/aarch64`.
+  `drivers/serial/pl011` takes its window and its baud divisors from the tree.
+- **Platform.** `kernel/platform/fdt` is the one unit that sees both the drivers and the
+  architecture. It is layer `kernel`, because only the image may name `arch`. The PC ports
+  get `kernel/platform/none`.
+
+Boot on aarch64 departs from the diagram below in one place: devices are enumerated
+**before** the kernel address space is built, because that space maps exactly the windows
+the bound drivers claimed. Discovery runs on the boot identity map, which covers every
+device, and ends by installing the GIC as the interrupt path's controller.
+
+It refuses to go further, printing why, when the tree and the running kernel disagree:
+
+- the tree's console is not where the early console writes;
+- the timer interrupt the tree names is not the one the architecture arms;
+- no interrupt controller bound.
+
+In each case the kernel address space is not installed, because it would unmap the only
+console that can report the failure.
+
+Checked by booting the unmodified image on edited trees. It exits with a failure,
+without hanging, when:
+
+- the UART's `reg` is moved;
+- the timer's PPI is changed;
+- the GIC's `compatible` is unknown, or names the wrong version for the machine.
+
+A mutation that claims the GICv3 redistributor but leaves it out of the mapped windows
+faults on the redistributor's first register after the switch.
 
 ### `sched` — scheduling
 
@@ -363,6 +430,7 @@ kintane/
 │   ├── sched/
 │   ├── time/
 │   ├── ipc/
+│   ├── platform/        per-firmware glue: binds drivers, hands the arch its devices
 │   └── main/            the linked kernel image
 ├── drivers/
 │   ├── irqchip/

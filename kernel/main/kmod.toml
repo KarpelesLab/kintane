@@ -4,8 +4,8 @@ kind = "bin"
 root = "src/main.rs"
 layer = "kernel"
 
-# `arch` and `bootinfo` are both provider names: several units declare each, and the
-# configuration selects one. The image names the role, never the machine or the
-# loader.
+# `arch`, `bootinfo` and `platform` are provider names: several units declare each,
+# and the configuration selects one. The image names the role, never the machine or
+# the loader.
 [deps]
-units = ["hal", "arch", "boot_protocol", "bootinfo", "mm", "kalloc", "selftest", "time", "sched", "thread", "unwind"]
+units = ["hal", "arch", "boot_protocol", "bootinfo", "mm", "kalloc", "selftest", "time", "sched", "thread", "unwind", "platform"]

@@ -185,6 +185,17 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     let paging_ok = arch::paging_selftest(c);
     c.write_str(if paging_ok { " ok" } else { "" });
 
+    // Before `memory`, because the kernel's address space maps the device windows the
+    // drivers found here claim, and before interrupts, because this is where the
+    // interrupt controller is bound.
+    c.write_str("\n  devices    ");
+    // SAFETY: once, with interrupts masked, on the boot identity map, with `boot_arg` as
+    // the boot code passed it — `discover`'s contract on every provider.
+    let devices = match unsafe { platform::discover(c, boot_arg) } {
+        None => Check::Skipped,
+        Some(ok) => Check::from_ok(ok),
+    };
+
     let (mem, live) = memory(c, boot_arg);
 
     c.write_str("\n  interrupts ");
@@ -219,6 +230,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
 
     c.write_str("\n\nreached kmain\n");
     let verdict = Check::from_ok(paging_ok)
+        .and(devices)
         .and(mem)
         .and(Check::from_ok(irq_ok))
         .and(Check::from_ok(switch_ok))
@@ -464,7 +476,12 @@ fn kernel_space(
     let boot_data = [boot_arg];
     let must_reach: &[u64] = if boot_arg == 0 { &[] } else { &boot_data };
     let sections = arch::image_sections();
-    let devices = arch::kspace::device_windows();
+    let Some(devices) = platform::device_windows() else {
+        // Without them the switch would unmap the console on a port whose console is a
+        // device, and nothing could report what happened next.
+        c.write_str("no device windows (device discovery failed), not installed");
+        return (Check::Failed, Live::NONE);
+    };
     let Some(built) =
         space::build_and_verify::<Cpu>(c, frames, direct, sections, devices, must_reach)
     else {

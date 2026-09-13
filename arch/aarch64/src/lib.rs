@@ -11,7 +11,6 @@ mod boot;
 pub mod clock;
 pub mod context;
 pub mod exception;
-pub mod gic;
 pub mod irq;
 pub mod kspace;
 pub mod paging;
@@ -227,22 +226,16 @@ pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
     unsafe { exception::install_vectors() };
 
     // The one genuinely dynamic decision in the image: which interrupt controller this
-    // machine has. Everything after this point talks to it through `dyn IrqChip`.
-    //
-    // SAFETY: on this machine 0x08000000 is the GIC distributor, and PIDR2 is a
-    // read-only identification register — the probe cannot disturb a device that turns
-    // out to be something else, and on `virt` there is nothing else it could be.
-    let Some(chip) = (unsafe { gic::detect(gic::GICD_BASE) }) else {
-        c.write_str("no GIC at 0x08000000");
+    // machine has. It is not made here. `kernel/platform/fdt` reads the device tree, binds
+    // the GIC driver the tree's `compatible` names, starts it, and installs it through
+    // `irq::set_chip` before this runs; the architecture only talks to it through
+    // `dyn IrqChip`, and cannot name the driver even if it wanted to, because `arch` may
+    // not depend on the device layer.
+    let Some(chip) = irq::chip() else {
+        c.write_str("no interrupt controller was bound from the device tree");
         return false;
     };
     c.write_str(chip.name());
-
-    // SAFETY: first and only initialisation of this controller, with interrupts still
-    // masked, which is exactly the contract `IrqChip::init` states.
-    unsafe { chip.init() };
-    // SAFETY: called once, before any source is enabled, on an initialised controller.
-    unsafe { irq::set_chip(chip) };
 
     let freq = timer::frequency();
     if freq == 0 {
@@ -266,11 +259,12 @@ pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
     // than the timer needs; reaching the deadline means the interrupt never came, which
     // is a result to report rather than a reason to hang.
     let deadline = timer::counter().wrapping_add(freq);
+    // Spun, not `wfi`. A wait-for-interrupt returns only when an interrupt arrives, so the
+    // deadline was never checked in the one case it exists for: booted on a device tree
+    // that names the wrong controller — a GICv2 on GICv3 hardware — this hung instead of
+    // reporting. The spin costs nothing when the interrupt comes, ten milliseconds in.
     while irq::timer_ticks() == 0 && timer::counter() < deadline {
-        // SAFETY: `wfi` is a hint. With IRQs unmasked the timer wakes it, and the
-        // architecture permits it to return for no reason at all, which the loop
-        // tolerates.
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+        core::hint::spin_loop();
     }
 
     // SAFETY: restores the mask this function cleared, leaving DAIF as `kmain` had it.
