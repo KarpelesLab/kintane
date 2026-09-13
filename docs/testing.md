@@ -159,8 +159,10 @@ hand:
 | Target | Emulator | Machine | Firmware | Result channel |
 |---|---|---|---|---|
 | x86_64 (UEFI) | `qemu-system-x86_64` | `q35` | OVMF | `isa-debug-exit` |
-| x86_64 (BIOS) | `qemu-system-x86_64` | `pc` | SeaBIOS | `isa-debug-exit` |
-| i686 | `qemu-system-i386` | `pc` (i440FX) | SeaBIOS | `isa-debug-exit` |
+| x86_64 (`x86_64-qemu`) | `qemu-system-x86_64` | `q35` | `-kernel` | `isa-debug-exit` |
+| x86_64 (`x86_64-bios`) | `qemu-system-x86_64` | `q35`, raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
+| i686 (`i686-qemu`) | `qemu-system-i386` | `pc` (i440FX) | `-kernel` | `isa-debug-exit` |
+| i686 (`i686-bios`) | `qemu-system-i386` | `pc` (i440FX), raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
 | armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
 | riscv32 | `qemu-system-riscv32` | `virt` | `-bios none` | `sifive_test` |
@@ -182,6 +184,12 @@ terminate with a status, and we use it:
   giving exit code 33, and the harness maps it back. Anything else — including a real
   0 — is a failure, which conveniently means "QEMU exited for reasons of its own" is
   never mistaken for a pass.
+
+  A disk boot relies on that. The `*-bios` presets add `-boot reboot-timeout=0`, so when
+  the BIOS finds nothing bootable, or `kinboot-bios` gives up through INT 18h, SeaBIOS
+  reboots at once and `-no-reboot` turns the reboot into exit code 0. A corrupted boot
+  signature or a kernel with a bad checksum fails in seconds, with the loader's reason
+  on the console, instead of waiting out the timeout.
 - **ARM / AArch64:** semihosting, `-semihosting-config enable=on,target=native`, with
   `SYS_EXIT` and `ADP_Stopped_ApplicationExit`. Works identically on `armv7m`, where
   there is no other channel at all.
@@ -295,6 +303,17 @@ least well.** The i686 BIOS boot path exists precisely because real old machines
 behave in ways modern ones do not, and SeaBIOS under QEMU is a clean, modern,
 well-behaved BIOS. `kinboot-bios` will pass CI long before anyone knows whether it
 boots a Pentium III.
+
+What has been done about that under QEMU is to take, by force, every path SeaBIOS never
+chooses:
+
+- CHS reads in stage 1 and stage 2, including past cylinder 1;
+- the E801 memory map instead of E820;
+- A20 masked, recovered by each of the BIOS, the keyboard controller and port `0x92`
+  in turn, and a masked A20 that nothing recovers, which must fail.
+
+Each was a temporary mutation, not a test that runs in CI, and none of it substitutes
+for the machine. The loader stays **unvalidated** until one boots it.
 
 The consequence is a rule rather than a worry: code in these categories is marked
 **unvalidated** in its module documentation until hardware has run it, and "CI is

@@ -1,0 +1,11 @@
+# x86_64 on BIOS (or UEFI CSM) firmware: MBR, kinboot-bios, then the kernel.
+#
+# The x86_64 image is packaged as a Multiboot ELF32 whose entry is 32-bit code, so
+# the same loader that boots i686 boots it unchanged. That is the whole reason the
+# loader is built for i486 rather than for either kernel's target.
+ARCH_X86_64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+KINBOOT_BIOS=y

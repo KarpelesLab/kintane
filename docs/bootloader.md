@@ -106,32 +106,90 @@ modern UEFI systems expect.
 
 The legacy PC path, required because tier-1 [`i686`](targets.md#i686) boots this way.
 
+It exists, in `boot/kinboot-bios/`, and boots both x86 kernels under QEMU. The
+`i686-bios` and `x86_64-bios` presets boot from a raw disk through SeaBIOS with no
+`-kernel`, so every boot, in-kernel and stack guard test on them also tests the loader.
+
+```text
+LBA 0                MBR: stage 1 code (at most 424 bytes), stage 1 table, disk
+                     signature, one partition entry, 0x55AA
+LBA 1 ..             stage 2 (at most 32 KiB), with a header naming the kernel's LBA,
+                     length and CRC-32
+LBA 1 + stage 2      the packaged kernel image, byte for byte
+```
+
 **Stage 1** occupies the 440 bytes of MBR boot code (bytes 440–445 are the disk
 signature, 446–509 the partition table, 510–511 the `0x55AA` signature — the budget is
 not negotiable). It runs in 16-bit real mode and does exactly one thing: check for
-INT 13h extensions, then load stage 2. It must cope with the BIOS handing it the boot
-drive in `DL`, and with LBA being unavailable on genuinely old machines.
+INT 13h extensions, then load stage 2. It copes with the BIOS handing it the boot drive
+in `DL` and entering at `07C0:0000` instead of `0000:7C00`. Without LBA it reads stage 2
+one sector at a time through CHS, with the geometry `AH=08h` reports. Its last 16 bytes
+of code space are a table `kbuild` fills in with stage 2's location, and the table's
+position is asserted with `.org`, so code that grows into it fails to assemble.
 
 Rust has no 16-bit x86 target, so this is assembly — but it needs **no external
 assembler**. `global_asm!` with `.code16` goes through LLVM's integrated assembler in
 our pinned toolchain and emits correct real-mode encodings, which keeps
 [D8](decisions.md#d8--rust-198-baseline-on-a-pinned-nightly-engine-no-third-party-crates)'s
-"no non-Rust build dependencies" intact. Verified.
+"no non-Rust build dependencies" intact. Verified: stage 1 is about 280 bytes.
 
-**Stage 2** lives in the MBR gap (LBA 1 to the first partition) or, on GPT disks, in a
-BIOS Boot Partition. Its structure is dictated by one constraint that shapes the whole
-design:
+**Stage 2** lives in the MBR gap, at LBA 1. A BIOS Boot Partition on GPT disks is not
+supported yet. It is built for its own target, `targets/i686-kinboot.json`: an i486
+with no SSE and no x87 use. The kernel's i686 target assumes a Pentium 4, and a loader
+cannot fault before it has printed why.
 
-> Everything the BIOS can tell us must be collected **in real mode, before** the switch
-> to protected mode. After the switch there is no BIOS.
+This section first said stage 2 must collect everything in real mode, *because after
+the switch there is no BIOS*. That turned out to be wrong in the way that matters.
+INT 13h reads into a `segment:offset` buffer below 1 MiB, and the kernel loads at
+1 MiB, so a loader cannot avoid going back to the BIOS after it has started loading.
+Once it can do that, collecting the memory map in assembly first only moves logic out
+of reach of tests. So stage 2 does the minimum in real mode, which is load a GDT and
+enter protected mode. Everything after that is Rust, calling BIOS services through a
+real-mode **thunk** (`loader/stage2.rs`). The thunk drops to real mode, performs one
+`int` with the registers the caller set, and comes back. In order, stage 2:
 
-So stage 2 runs in this order: real-mode assembly collects the E820 memory map, INT
-13h/EDD disk geometry, and VBE video modes into a scratch buffer → enable A20 →
-switch to protected mode → **Rust takes over** (as a normal `i686` no-std program) with
-that data already in hand → parse the boot configuration, load the kernel, build
-`BootInfo`, jump.
+1. **A20**: tests the line, then tries INT 15h `2401h`, the keyboard controller and
+   port `0x92` in that order, testing after each.
+2. **Memory map**: E820, handling 20- and 24-byte entries, the ACPI 3.0 "enabled" bit
+   and the continuation value. On a BIOS without E820 it builds the map E801 implies.
+3. **Kernel**: checks the header, then streams the kernel off the disk in 32 KiB chunks
+   through a bounce buffer at `0x20000`. The ELF is validated from its first chunk, and
+   each segment's destination is checked against the memory map before any byte is
+   copied. The CRC-32 of the whole file must match the header before the jump.
+4. **Handover**: jumps to the ELF entry point as a Multiboot 1 loader, with
+   `EAX = 0x2BADB002` and `EBX` pointing to an information structure carrying the memory
+   map, `mem_lower`/`mem_upper`, the boot drive, a command line and the loader's name.
 
-The real-mode portion is small and fixed. Everything with logic in it is Rust.
+**The handover is interim.** Both x86 kernels already accept Multiboot 1 through
+`boot/info-multiboot`, because QEMU's `-kernel` uses it, so no kernel change was needed.
+Switching this loader to the native `BootInfo` protocol comes once a kernel-side
+`BootInfo` consumer exists; `kinboot-efi` is the first loader to produce one.
+
+Every decision stage 2 makes is in the `kinboot-bios` crate (`boot/kinboot-bios/src/`),
+which is byte-slice code with no `unsafe` and has host tests. That covers the disk
+layout, E820/E801 decoding, ELF validation, the streaming copy plan and the Multiboot
+structure's offsets. The disk layout file is also compiled into `kbuild`, so the writer
+and the reader cannot disagree. `loader/` only does I/O.
+
+On any failure the loader prints `kinboot-bios:` and a reason to the screen and COM1,
+then calls INT 18h, the BIOS's "this device did not boot" entry. A real machine moves
+on to its next boot device. Under QEMU, the harness passes `-boot reboot-timeout=0
+-no-reboot`, so a failed boot ends the run within seconds instead of timing out.
+
+**Not in the minimal loader yet:** the entry list and its `normal`/`safe`/`recovery`
+modes (below), the boot counter, chainloading, EDD and VBE queries, and GPT. The
+command line field in the disk header is written empty today.
+
+**Unvalidated on hardware.** Every path above, including the ones SeaBIOS never takes,
+was exercised under QEMU by forcing it:
+
+- CHS reads in both stages, including a kernel placed past cylinder 1;
+- E801 instead of E820;
+- A20 masked and each enable method in turn;
+- A20 that cannot be enabled, which must fail.
+
+That is not the same as a 1998 BIOS. See
+[testing.md](testing.md#what-qemu-will-not-catch).
 
 ### No bootloader — `armv7m`, `riscv32`, and friends
 
@@ -226,7 +284,10 @@ The scoping rule, stated positively, since "small" erodes without a definition:
 
 Size budgets, tracked in CI exactly like the kernel's
 ([testing.md](testing.md#size-budgets)): stage 1 is hard-capped at 440 bytes, stage 2
-at 32 KiB, and `kinboot-efi` at 128 KiB.
+at 32 KiB, and `kinboot-efi` at 128 KiB. The first two are enforced by the build, not a
+report: stage 1's table is placed with `.org`, which fails to assemble if the code
+reaches it, and the loader's link script asserts stage 2's size. Both were checked by
+growing each past its limit.
 
 ## Security
 
@@ -252,6 +313,21 @@ reproducibility rules as the kernel ([build-system.md](build-system.md#reproduci
 and ship as part of the same release. `kbuild image --format` produces the bootable
 artifact per platform: a GPT/ESP disk image, an MBR disk image, a raw XIP binary, or a
 FIT image.
+
+Today the MBR image is the one that exists. With `KINBOOT_BIOS=y`, `kbuild build` also
+writes `build/<target>/out/kinboot-bios.img` (`kbuild/src/bios.rs`), in these steps:
+
+1. **Build the loader.** `core` is built for the loader's own target, then the
+   `kinboot-bios` crate and the loader binary.
+2. **Flatten it** with `llvm-objcopy -O binary`.
+3. **Check its layout.** The signature, table and header must be where the disk format
+   says, and the partition table must be untouched.
+4. **Write the disk.** Stage 2's header is filled in, and the image is padded to whole
+   16×63 cylinders. SeaBIOS on q35 refuses to read a disk smaller than one cylinder,
+   which the first `x86_64-bios` boot found.
+
+The disk is byte-identical across cold builds; its signature is derived from its
+contents, not the clock.
 
 ## Support matrix
 

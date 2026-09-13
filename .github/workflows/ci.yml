@@ -270,6 +270,8 @@ jobs:
             build/*/console.log
             build/*/out/*.elf
             build/*/out/*.debug
+            build/*/out/*.img
+            build/*/kinboot-bios/*.elf
             build/*/gen/config.rs
             .config
           if-no-files-found: ignore

@@ -44,8 +44,6 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 cpu,
                 s("-m"),
                 mem,
-                s("-kernel"),
-                image.display().to_string(),
                 s("-device"),
                 s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
                 s("-serial"),
@@ -66,7 +64,10 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 s("int,guest_errors"),
                 s("-D"),
                 log.display().to_string(),
-            ],
+            ]
+            .into_iter()
+            .chain(x86_boot_media(res, image))
+            .collect(),
             success_code: (0x10 << 1) | 1,
         });
     }
@@ -83,8 +84,6 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 cpu,
                 s("-m"),
                 mem,
-                s("-kernel"),
-                image.display().to_string(),
                 s("-device"),
                 s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
                 s("-serial"),
@@ -96,7 +95,10 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 s("int,guest_errors"),
                 s("-D"),
                 log.display().to_string(),
-            ],
+            ]
+            .into_iter()
+            .chain(x86_boot_media(res, image))
+            .collect(),
             success_code: (0x10 << 1) | 1,
         });
     }
@@ -130,6 +132,27 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
 
     Err("no QEMU machine is defined for this configuration".into())
+}
+
+/// How an x86 guest gets its kernel: straight from QEMU's multiboot loader, or from a
+/// raw disk through the BIOS and `kinboot-bios`, with no `-kernel` at all.
+///
+/// The disk boot adds `-boot reboot-timeout=0`. When the BIOS finds nothing bootable, or
+/// the loader gives up through INT 18h, SeaBIOS then reboots at once instead of after 60
+/// seconds, and `-no-reboot` turns that reboot into an exit with status 0, which is never
+/// the success code. So a broken disk is a failure the harness sees within a second,
+/// not a timeout.
+fn x86_boot_media(res: &Resolution, image: &Path) -> Vec<String> {
+    if res.is_on(crate::bios::SYMBOL) {
+        vec![
+            "-drive".into(),
+            format!("format=raw,file={}", image.display()),
+            "-boot".into(),
+            "reboot-timeout=0".into(),
+        ]
+    } else {
+        vec!["-kernel".into(), image.display().to_string()]
+    }
 }
 
 pub struct Outcome {
