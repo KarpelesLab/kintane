@@ -299,3 +299,12 @@ pub fn image_range() -> (u64, u64) {
     let end = (&raw const __kernel_end) as usize as u64;
     (start, end)
 }
+
+/// Bring up kernel-managed page tables and prove they work, reporting what happened.
+///
+/// Exists so `kmain` can exercise the paging path without naming an architecture.
+/// Returns `true` only when a mapping was demonstrably installed and used.
+pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
+    c.write_str("not implemented on this port");
+    false
+}
