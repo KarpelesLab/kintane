@@ -106,6 +106,11 @@ impl HasMpu for MockTiny {
     const REGIONS: usize = 8;
 }
 
+// SAFETY: `MockTiny` models an ARMv6-M-class part: one CPU, no `HasSmp` below, and
+// an interrupt flag with no second processor behind it. Masking interrupts on it is
+// therefore genuine mutual exclusion.
+unsafe impl UniProcessor for MockTiny {}
+
 // Note what MockTiny does NOT implement: HasMmu, HasSmp, HasCas, HasCoherentDma,
 // HasFpu. Any subsystem generic over those simply cannot be instantiated with it,
 // which is the compile-time half of the portability claim.

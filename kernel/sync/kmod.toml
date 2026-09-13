@@ -1,0 +1,13 @@
+[unit]
+name = "sync"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+# `hal` and nothing else. A lock does not need to know which machine it is on; it
+# needs to know what that machine can do, and that arrives as a trait bound on the
+# type parameter `A`. Nothing here names `arch_*`, and nothing here depends on a
+# subsystem — a lock is below everything that locks.
+[deps]
+units = ["hal"]

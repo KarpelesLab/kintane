@@ -146,6 +146,73 @@ pub trait IrqChip: Sync {
     fn name(&self) -> &'static str;
 }
 
+
+/// An architecture with exactly one hardware thread, where masking interrupts is
+/// mutual exclusion.
+///
+/// This is the bound on `sync::IrqLock`, and it exists because `IrqLock` on a
+/// multiprocessor is silent corruption rather than a slow lock.
+///
+/// # Why this is not simply `A: !HasSmp`
+///
+/// Because Rust has no negative bounds, and the ways to fake one are all worse:
+///
+/// - `feature(negative_bounds)` exists on nightly, and this is a nightly kernel. It is
+///   also marked incomplete, it does not propagate reliably through generic code, and
+///   it is not on the permitted-features list in `toolchain.toml`. Adding it there
+///   would rest a soundness argument on a feature that may behave differently after
+///   the next toolchain bump, and a guarantee that can quietly stop holding is worse
+///   than one that is honest about being an assertion.
+/// - Two overlapping blanket impls (one over [`HasSmp`], one over this trait) are
+///   rejected by coherence outright — E0119 is raised because the impls *could*
+///   overlap, not because any type actually satisfies both, so this expresses nothing.
+/// - Autoref specialisation can ask "does `A` implement `HasSmp`?" at run time. A
+///   run-time answer to a question the whole unit exists to settle at compile time is
+///   a step backwards, and the only thing it could do with the answer is halt.
+///
+/// # The trade this makes
+///
+/// What the bound does buy, and it is not nothing: the default is closed. An
+/// architecture that implements only `Arch` — which is every architecture in the tree
+/// today — cannot instantiate an `IrqLock` at all. Reaching one requires writing
+/// `unsafe impl UniProcessor for …`, which is an explicit, `unsafe`, greppable,
+/// reviewable act carrying the contract below, rather than a `#define` that nobody
+/// reads. The remaining hole is an architecture that asserts this *and* implements
+/// `HasSmp`; the compiler will not catch that, and no construction available to us
+/// would.
+///
+/// # Where the impls live
+///
+/// Here, in `hal`, and that placement is load-bearing rather than tidy. The trait was
+/// first written in `kernel/sync` beside its only user, and that turned out to make it
+/// unimplementable by any real architecture: the orphan rule requires an impl for
+/// `arch_armv7m`'s type to live in either that crate or the trait's, and kbuild's
+/// `layer_violation` rule forbids an `arch` unit from depending on a `core` unit. The
+/// only impl that could exist was for a mock. A capability claim has to live where the
+/// capability traits live.
+///
+/// # Safety
+///
+/// Implementing this is a claim that **no code compiled against `Self` will ever run
+/// on more than one hardware thread**, so that masking interrupts on the running CPU
+/// leaves no other agent able to touch memory. Specifically:
+///
+/// - The architecture has one CPU, or the kernel never releases the others from reset.
+/// - `Self` does not implement [`HasSmp`], and never will. Adding `HasSmp` to a
+///   type that implements this trait must be accompanied by removing this impl; the
+///   compiler will not remind you.
+/// - No DMA-capable device writes memory that an `IrqLock` protects. Masking
+///   interrupts does not stop a bus master, which is the same argument one level down.
+///
+/// Breaking any of these makes every `sync::IrqLock` in the image a no-op that still
+/// type-checks.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` has not asserted that it is a uniprocessor",
+    label = "masking interrupts is only mutual exclusion on a machine with one CPU",
+    note = "use sync::SpinLock (requires hal::HasCas) on anything that might be SMP"
+)]
+pub unsafe trait UniProcessor: Arch {}
+
 /// A console usable before the device framework exists.
 ///
 /// Object-safe on purpose: which console a machine has is a runtime question even
