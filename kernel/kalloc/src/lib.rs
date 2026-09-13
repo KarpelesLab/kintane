@@ -113,7 +113,7 @@ use core::alloc::Layout;
 
 pub mod bump;
 pub mod context;
-pub mod directmap;
+
 pub mod frames;
 pub mod heap;
 pub mod poison;
@@ -121,7 +121,7 @@ pub mod slab;
 
 pub use bump::{Bump, BumpStats};
 pub use context::{AllocContext, AllocFlags, NumaNode};
-pub use directmap::DirectMap;
+pub use mm::directmap::DirectMap;
 pub use frames::{FrameSource, NoFrames};
 pub use heap::{Heap, HeapStats};
 pub use mm::AllocError;

@@ -12,6 +12,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod addr;
+pub mod paging;
 
 // Mock architectures for host-side testing. Gated at the module boundary, which is
 // the only place cfg is allowed, and off in every kernel image.
@@ -19,6 +20,7 @@ pub mod addr;
 pub mod mock;
 
 pub use addr::{AddrOverflow, KernAddr, PhysAddr, UserAddr};
+pub use paging::{HasPageTables, MapError, PageFlags, PageTableEntry};
 
 /// Byte order of the target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

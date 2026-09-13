@@ -74,7 +74,7 @@ use hal::{KernAddr, PhysAddr};
 use mm::AllocError;
 
 use crate::context::AllocContext;
-use crate::directmap::DirectMap;
+use mm::directmap::DirectMap;
 use crate::poison;
 
 /// The size classes, ascending. Each is also the alignment that class guarantees.

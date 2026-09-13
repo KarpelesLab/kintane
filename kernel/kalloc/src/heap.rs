@@ -49,7 +49,7 @@ use mm::AllocError;
 
 use crate::bump::{Bump, BumpStats};
 use crate::context::AllocContext;
-use crate::directmap::DirectMap;
+use mm::directmap::DirectMap;
 use crate::frames::{FrameSource, NoFrames};
 use crate::slab::{self, Slab, SlabStats};
 
@@ -107,7 +107,7 @@ impl<A: Arch> Heap<A> {
     /// [`Self::try_alloc_in`] with a frame source that has frames.
     ///
     /// `map` is the assumption this whole unit is built on; see
-    /// [`crate::directmap`]. Today the bootstrap passes
+    /// [`mm::directmap`]. Today the bootstrap passes
     /// [`DirectMap::identity`](crate::DirectMap::identity).
     pub fn new(map: DirectMap) -> Self {
         Heap {

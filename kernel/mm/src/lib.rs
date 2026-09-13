@@ -46,8 +46,11 @@
 // say) overrides this with written justification, per docs/coding-standards.md.
 #![deny(unsafe_code)]
 
+pub mod directmap;
 pub mod frame;
 pub mod phys;
+
+pub use directmap::DirectMap;
 
 pub use frame::{Frame, FrameIter, FrameRange};
 pub use phys::{FrameAllocator, FrameStats, bitmap_bytes};

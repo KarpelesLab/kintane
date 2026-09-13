@@ -53,7 +53,7 @@ use hal::{Arch, KernAddr, PhysAddr};
 use mm::{AllocError, Frame, FrameRange};
 
 use crate::context::AllocContext;
-use crate::directmap::DirectMap;
+use mm::directmap::DirectMap;
 use crate::frames::FrameSource;
 use crate::{check_layout, narrow, poison, widen};
 

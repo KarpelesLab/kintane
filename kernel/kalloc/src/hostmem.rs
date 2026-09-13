@@ -20,7 +20,7 @@ use core::marker::PhantomData;
 use hal::{Arch, KernAddr, PhysAddr};
 use mm::{AllocError, Frame, FrameRange};
 
-use crate::directmap::DirectMap;
+use mm::directmap::DirectMap;
 use crate::frames::FrameSource;
 use crate::widen;
 
