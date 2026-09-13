@@ -16,6 +16,10 @@ use crate::toml;
 /// Layer ranks. A unit may depend only on units of equal or lower rank.
 const LAYERS: &[&str] = &[
     "builtins",
+    // Userspace: programs that run unprivileged, and the ABI definitions they share with
+    // the kernel. Ranked just above `builtins` so layering alone keeps every kernel crate
+    // out of a user program, while the kernel may still link the shared ABI crate.
+    "user",
     "hal",
     // Bootloaders: images of their own, built for a firmware target, that may link the
     // boot protocol and nothing of the kernel's. Ranked just above `hal` so layering
@@ -38,6 +42,10 @@ pub enum Kind {
     Lib,
     /// The final linked kernel image.
     Bin,
+    /// A userspace program, linked for the kernel's target at user addresses by its own
+    /// linker script. Not linked into anything: a unit that depends on one embeds the
+    /// linked ELF, whose path it reads as `env!("KINTANE_USER_<NAME>")`.
+    User,
 }
 
 #[derive(Debug, Clone)]
@@ -123,13 +131,14 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
     {
         "lib" => Kind::Lib,
         "bin" => Kind::Bin,
+        "user" => Kind::User,
         other => return Err(at(&format!("unknown unit kind `{other}`"))),
     };
 
     let root = v
         .get_path("unit.root")
         .and_then(|x| x.as_str())
-        .unwrap_or(if kind == Kind::Bin {
+        .unwrap_or(if kind != Kind::Lib {
             "src/main.rs"
         } else {
             "src/lib.rs"
@@ -228,6 +237,25 @@ pub fn plan(units: Vec<Unit>, res: &Resolution) -> Result<Vec<Unit>, String> {
                     u.layer,
                     dep.name,
                     dep.layer,
+                    u.manifest.display()
+                ));
+            }
+            // A kernel image is the end of the graph: nothing embeds or links it.
+            if dep.kind == Kind::Bin && dep.target.is_none() {
+                return Err(format!(
+                    "`{}` depends on `{}`, which is a kernel image\n  declared at {}",
+                    u.name,
+                    dep.name,
+                    u.manifest.display()
+                ));
+            }
+            // A user program links only what userspace may: the ABI it shares with the
+            // kernel, never another image.
+            if u.kind == Kind::User && dep.kind != Kind::Lib {
+                return Err(format!(
+                    "user program `{}` depends on `{}`, which is not a library\n  declared at {}",
+                    u.name,
+                    dep.name,
                     u.manifest.display()
                 ));
             }
@@ -432,6 +460,33 @@ mod tests {
         let units = vec![loader, unit("kernel", "kernel", &["kinboot"])];
         let e = plan(units, &Resolution::default()).unwrap_err();
         assert!(e.contains("image of its own"), "{e}");
+    }
+
+    #[test]
+    fn a_user_program_links_only_user_layer_libraries() {
+        let mut prog = unit("init", "user", &["abi"]);
+        prog.kind = Kind::User;
+        let ok = vec![
+            prog.clone(),
+            unit("abi", "user", &[]),
+            unit("kernel", "kernel", &["init", "abi"]),
+        ];
+        assert!(plan(ok, &Resolution::default()).is_ok());
+
+        let mut greedy = prog;
+        greedy.deps.push("mm".into());
+        let bad = vec![greedy, unit("abi", "user", &[]), unit("mm", "core", &[])];
+        let e = plan(bad, &Resolution::default()).unwrap_err();
+        assert!(e.contains("layering violation"), "{e}");
+    }
+
+    #[test]
+    fn nothing_depends_on_the_kernel_image() {
+        let mut image = unit("kintane", "kernel", &[]);
+        image.kind = Kind::Bin;
+        let units = vec![image, unit("other", "kernel", &["kintane"])];
+        let e = plan(units, &Resolution::default()).unwrap_err();
+        assert!(e.contains("is a kernel image"), "{e}");
     }
 
     #[test]

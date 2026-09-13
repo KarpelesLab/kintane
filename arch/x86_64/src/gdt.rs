@@ -101,12 +101,38 @@ use core::mem::size_of;
 /// long mode the CPU ignores both and this segment covers everything.
 const CODE64: u64 = (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53);
 
-/// Index of the code segment. Must match `boot.rs`, whose far jump put `0x08` in `CS`.
-const CODE_INDEX: usize = 1;
-/// Index of the TSS descriptor, which occupies this slot and the next.
-const TSS_INDEX: usize = 2;
+/// A writable data segment: present, this ring, system-off, writable. In long mode only
+/// present, DPL and the type nibble mean anything; base and limit are ignored.
+const fn data(dpl: u64) -> u64 {
+    (1 << 47) | (dpl << 45) | (1 << 44) | (1 << 41)
+}
 
-/// The selector `ltr` is given: index 2, table GDT, RPL 0.
+/// The GDT layout. The order past the null and kernel-code descriptors is dictated by
+/// `SYSCALL`/`SYSRET`, not chosen: `STAR` names one base selector for each, and the CPU
+/// derives the stack and the return selectors by *adding* to it. With `STAR` syscall base
+/// = kernel code (index 1) and sysret base = kernel data (index 2), `SYSCALL` loads
+/// `SS = kdata`, and `SYSRET` loads `SS = udata` (base + 8, index 3) and `CS = ucode`
+/// (base + 16, index 4). So the four must sit in exactly this order. See
+/// [`super::user::init_syscall`], which programs `STAR` to match.
+const CODE_INDEX: usize = 1;
+const KDATA_INDEX: usize = 2;
+const UDATA_INDEX: usize = 3;
+const UCODE_INDEX: usize = 4;
+/// The TSS descriptor occupies this slot and the next.
+const TSS_INDEX: usize = 5;
+
+const KDATA: u64 = data(0);
+const UDATA: u64 = data(3);
+const UCODE: u64 = CODE64 | (3 << 45);
+
+/// Ring-3 selectors, RPL 3, as `SYSRET` forms them and an `iretq` to user needs them.
+pub const USER_CODE_SELECTOR: u16 = ((UCODE_INDEX as u16) << 3) | 3;
+pub const USER_DATA_SELECTOR: u16 = ((UDATA_INDEX as u16) << 3) | 3;
+/// The kernel selectors, for programming `STAR`.
+pub const KERNEL_CODE_SELECTOR: u16 = (CODE_INDEX as u16) << 3;
+pub const KERNEL_DATA_SELECTOR: u16 = (KDATA_INDEX as u16) << 3;
+
+/// The selector `ltr` is given.
 pub const TSS_SELECTOR: u16 = (TSS_INDEX as u16) << 3;
 
 /// The IST slot the #DF gate selects, as an index into [`Tss::ist`].
@@ -212,9 +238,10 @@ const _: () = assert!(
      offsets no longer match what the CPU reads"
 );
 
-/// The table. Four `u64` slots: null, code, and the two halves of the TSS descriptor.
+/// The table: null, kernel code, kernel data, user data, user code, and the two halves
+/// of the TSS descriptor.
 #[repr(C, align(16))]
-struct Gdt([u64; 4]);
+struct Gdt([u64; 7]);
 
 /// The GDT as a static with interior mutability, on the same invariant as the TSS.
 struct GdtCell(UnsafeCell<Gdt>);
@@ -223,7 +250,7 @@ struct GdtCell(UnsafeCell<Gdt>);
 // afterwards, and no concurrency exists at that point in boot.
 unsafe impl Sync for GdtCell {}
 
-static GDT: GdtCell = GdtCell(UnsafeCell::new(Gdt([0; 4])));
+static GDT: GdtCell = GdtCell(UnsafeCell::new(Gdt([0; 7])));
 
 /// The operand of `lgdt`: a 16-bit limit followed by a 64-bit base, unpadded.
 #[repr(C, packed(2))]
@@ -291,8 +318,11 @@ pub unsafe fn init() {
     // SAFETY: upholds the GdtCell invariant, for the same reasons as the TSS above —
     // written before the `lgdt` that makes the CPU care.
     let gdt = unsafe { &mut *GDT.0.get() };
-    let mut table = [0u64; 4];
+    let mut table = [0u64; 7];
     table[CODE_INDEX] = CODE64;
+    table[KDATA_INDEX] = KDATA;
+    table[UDATA_INDEX] = UDATA;
+    table[UCODE_INDEX] = UCODE;
     table[TSS_INDEX] = tss_low;
     table[TSS_INDEX + 1] = tss_high;
     gdt.0 = table;
@@ -332,6 +362,30 @@ pub fn task_register() -> u16 {
         core::arch::asm!("str {0:x}", out(reg) tr, options(nomem, nostack, preserves_flags));
     }
     tr
+}
+
+/// Set the stack the CPU loads on a privilege change into ring 0 — a trap taken while
+/// user code runs. Written into `TSS.rsp[0]` before a thread enters user mode, and again
+/// on every switch to a user thread, so a fault from ring 3 lands on that thread's kernel
+/// stack rather than the last one set.
+///
+/// # Safety
+/// The TSS is loaded and the caller is the boot CPU with interrupts masked, so no trap
+/// can read `rsp0` mid-write. `top` must be the top of a valid, mapped kernel stack.
+pub unsafe fn set_kernel_stack(top: u64) {
+    // SAFETY: a single aligned 8-byte write into the loaded TSS; see the TssCell invariant
+    // and the caller's obligation above.
+    let tss = unsafe { &mut *TSS.0.get() };
+    tss.rsp[0] = top;
+}
+
+/// The value of `TSS.rsp[0]`, for the selftest to observe.
+#[allow(dead_code)] // read by the userspace selftest
+pub fn kernel_stack() -> u64 {
+    // SAFETY: a shared read of a `packed` field, copied out whole.
+    let tss = unsafe { &*TSS.0.get() };
+    let rsp = tss.rsp;
+    rsp[0]
 }
 
 /// The address the CPU will load into RSP when it delivers #DF.

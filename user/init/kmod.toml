@@ -1,0 +1,25 @@
+# The first native userspace program. Built for the kernel's own target, linked at user
+# addresses, and embedded in the kernel image, which loads it into processes at boot.
+#
+# `userinit` is a provider name: with USERSPACE off, `user/init-none` provides it as an
+# empty library, so the kernel image depends on the name in every configuration.
+[unit]
+name = "userinit"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+# Position-independent code at a static link address. The kernel targets use the small
+# code model with static relocation, whose absolute 32-bit relocations cannot reach the
+# user half at 512 GiB; PIC reaches it through RIP-relative references and 64-bit
+# absolute ones. aarch64's ADRP is PC-relative either way.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-T$ROOT/user/init/link.ld",
+    "-C", "link-arg=--no-warnings",
+]
+
+[deps]
+units = ["abi"]
+
+[config]
+requires = "USERSPACE"

@@ -1,0 +1,12 @@
+[unit]
+name = "abi"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+# `user`, the one layer both a user program and the kernel may link: this crate is the
+# contract between them, and it must be impossible for it to pull kernel code into an
+# unprivileged image.
+layer = "user"
+
+[deps]
+units = []

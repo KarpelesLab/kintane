@@ -1,0 +1,244 @@
+//! EL0 on aarch64: the `svc` entry, the return to user, and the user-memory copies.
+//!
+//! Far less machinery than x86 asks for. There are no segments and no fast-path MSRs:
+//! `svc #0` is always a valid instruction, and the CPU's exception mechanism does the
+//! privilege change. A trap from EL0 lands in the "lower EL, AArch64" quarter of the
+//! vector table already installed, on `SP_EL1`, which is the user thread's kernel stack —
+//! so no separate `rsp0` to program. What this file adds is the four pieces the abstract
+//! contract names:
+//!
+//! 1. **A drop to EL0.** [`X86_64::enter_user`]'s counterpart sets `SP_EL0`, `ELR_EL1` and a
+//!    `SPSR_EL1` selecting EL0t, then `eret`.
+//! 2. **A system-call decode.** [`exception`](crate::exception) hands a `svc` from EL0 here as a
+//!    [`SyscallFrame`] over the saved registers: `x8` the number, `x0`–`x5` the arguments,
+//!    `x0`/`x1` the two return registers.
+//! 3. **Fault routing.** A data or instruction abort from EL0 goes to the process's address space
+//!    or kills the process; the kernel is never halted for a program's fault.
+//! 4. **User copies.** [`X86_64::copy_from_user`]'s counterpart validates and faults in every page
+//!    before touching it, so the copy cannot fault the kernel. See that port for why this is chosen
+//!    over an exception-fixup table.
+
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use hal::user::{CopyFault, SyscallFrame as SyscallFrameTrait, UserHooks, UserTrap};
+use hal::{Arch, KernAddr, PhysAddr, UserAddr};
+
+use crate::exception::TrapFrame;
+use crate::{Aarch64, paging};
+
+/// The user half: the second 512 GiB, one top-level `TTBR0` entry above the kernel's.
+pub const USER_START: usize = 1 << 39;
+pub const USER_END: usize = 2 << 39;
+
+/// A system call's saved registers, borrowed from the exception frame.
+pub struct SyscallFrame {
+    frame: *mut TrapFrame,
+}
+
+impl SyscallFrameTrait for SyscallFrame {
+    fn number(&self) -> u64 {
+        // SAFETY: `frame` is the live exception frame for this call; `x8` is the number.
+        unsafe { (*self.frame).x[8] }
+    }
+    fn args(&self) -> [u64; 6] {
+        // SAFETY: as above; `x0`–`x5` are the argument registers.
+        let x = unsafe { &(*self.frame).x };
+        [x[0], x[1], x[2], x[3], x[4], x[5]]
+    }
+    fn set_result(&mut self, status: u64, value: u64) {
+        // SAFETY: as above; the epilogue restores `x0`/`x1` from the frame on `eret`.
+        unsafe {
+            (*self.frame).x[0] = status;
+            (*self.frame).x[1] = value;
+        }
+    }
+}
+
+/// The installed hooks.
+struct Hooks(UnsafeCell<Option<UserHooks<SyscallFrame>>>);
+// SAFETY: written once by `install` before any user thread runs, read-only afterwards.
+unsafe impl Sync for Hooks {}
+static HOOKS: Hooks = Hooks(UnsafeCell::new(None));
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
+
+fn hooks() -> Option<&'static UserHooks<SyscallFrame>> {
+    // SAFETY: see `Hooks`.
+    unsafe { (*HOOKS.0.get()).as_ref() }
+}
+
+/// A `svc` or a fault from EL0, routed from the exception handler. Returns to resume the
+/// process (a resolved fault, or a system call whose result is now in the frame); does not
+/// return when it kills the process.
+///
+/// # Safety
+/// `frame` is the live exception frame for a trap taken from EL0.
+pub(crate) unsafe fn on_lower_sync(esr: u64, far: u64, frame: *mut TrapFrame) {
+    let ec = (esr >> 26) & 0x3f;
+    match ec {
+        // SVC from AArch64: a system call.
+        0x15 => {
+            if let Some(h) = hooks() {
+                let mut sf = SyscallFrame { frame };
+                (h.syscall)(&mut sf);
+            }
+        }
+        // Data abort (0x24) or instruction abort (0x20) from a lower EL: a user page fault.
+        0x24 | 0x20 => {
+            let access = if ec == 0x20 {
+                hal::fault::Access::Execute
+            } else if esr & (1 << 6) != 0 {
+                hal::fault::Access::Write
+            } else {
+                hal::fault::Access::Read
+            };
+            #[allow(clippy::as_conversions)]
+            let fault = hal::fault::PageFault {
+                addr: far as usize,
+                access,
+            };
+            if hooks().is_some_and(|h| (h.fault)(fault)) {
+                return;
+            }
+            // SAFETY: `elr` is the faulting instruction; the frame is live.
+            let pc = unsafe { (*frame).elr } as usize;
+            kill(UserTrap::Page { fault, pc });
+        }
+        // Any other exception from EL0 is the process's problem.
+        _ => {
+            // SAFETY: the frame is live.
+            let pc = unsafe { (*frame).elr } as usize;
+            kill(UserTrap::Exception { code: ec, pc });
+        }
+    }
+}
+
+/// Route a user page fault taken while the kernel copies on the process's behalf.
+pub(crate) fn user_fault(fault: hal::fault::PageFault) -> bool {
+    hooks().is_some_and(|h| (h.fault)(fault))
+}
+
+/// End the running user thread. Never returns.
+fn kill(trap: UserTrap) -> ! {
+    match hooks() {
+        Some(h) => (h.kill)(trap),
+        None => Aarch64::halt(),
+    }
+}
+
+impl hal::HasUserMode for Aarch64 {
+    const USER_START: usize = USER_START;
+    const USER_END: usize = USER_END;
+    const ELF_MACHINE: u16 = 183; // EM_AARCH64
+
+    type SyscallFrame = SyscallFrame;
+
+    unsafe fn install(hooks: UserHooks<Self::SyscallFrame>, kernel_root: PhysAddr) {
+        // SAFETY: see `Hooks`; caller guarantees once, before any user thread.
+        unsafe { *HOOKS.0.get() = Some(hooks) };
+        KERNEL_ROOT.store(kernel_root.raw(), Ordering::Relaxed);
+    }
+
+    fn bind(ctx: &mut Self::Context, kernel_stack_top: KernAddr, root: PhysAddr) {
+        // On aarch64 the trap from EL0 uses SP_EL1, which is the thread's current kernel
+        // SP, so nothing extra need be programmed; the fields are recorded for a future
+        // switch that changes address spaces.
+        ctx.user_kernel_stack = kernel_stack_top.raw() as u64;
+        ctx.user_root = root.raw();
+    }
+
+    unsafe fn enter_user(
+        entry: usize,
+        stack: usize,
+        args: [usize; 4],
+        _kernel_stack_top: KernAddr,
+    ) -> ! {
+        // SAFETY: `eret` to EL0t. `SPSR_EL1 = 0` selects EL0t with DAIF clear, so the
+        // process runs with interrupts enabled; `SP_EL0` and `ELR_EL1` are the process's
+        // mapped user stack and entry. Every register not carrying an argument is cleared.
+        unsafe {
+            core::arch::asm!(
+                "msr sp_el0, {stack}",
+                "msr elr_el1, {entry}",
+                "msr spsr_el1, xzr",
+                "mov x0, {a0}",
+                "mov x1, {a1}",
+                "mov x2, {a2}",
+                "mov x3, {a3}",
+                "mov x4, xzr",
+                "mov x5, xzr",
+                "mov x6, xzr",
+                "mov x7, xzr",
+                "mov x8, xzr",
+                "mov x29, xzr",
+                "mov x30, xzr",
+                "isb",
+                "eret",
+                stack = in(reg) stack as u64,
+                entry = in(reg) entry as u64,
+                a0 = in(reg) args[0] as u64,
+                a1 = in(reg) args[1] as u64,
+                a2 = in(reg) args[2] as u64,
+                a3 = in(reg) args[3] as u64,
+                options(noreturn, nostack),
+            )
+        }
+    }
+
+    unsafe fn copy_from_user(dst: &mut [u8], src: UserAddr) -> Result<(), CopyFault> {
+        prepare(src.raw(), dst.len(), false)?;
+        // SAFETY: `prepare` proved every page present and user-readable; the process space
+        // is loaded.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.raw() as *const u8, dst.as_mut_ptr(), dst.len())
+        };
+        Ok(())
+    }
+
+    unsafe fn copy_to_user(dst: UserAddr, src: &[u8]) -> Result<(), CopyFault> {
+        prepare(dst.raw(), src.len(), true)?;
+        // SAFETY: `prepare` proved every page present and user-writable; the process space
+        // is loaded.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.raw() as *mut u8, src.len()) };
+        Ok(())
+    }
+}
+
+/// Prove `[addr, addr+len)` is user memory, present and (for a write) writable, faulting
+/// each page in first. See the x86 port for why this replaces exception fixups.
+fn prepare(addr: usize, len: usize, write: bool) -> Result<(), CopyFault> {
+    if len == 0 {
+        return Ok(());
+    }
+    if !hal::user::user_range::<Aarch64>(addr, len) {
+        return Err(CopyFault);
+    }
+    let page = <Aarch64 as Arch>::PAGE_SIZE;
+    let last = addr.checked_add(len - 1).ok_or(CopyFault)?;
+    let mut p = addr & !(page - 1);
+    loop {
+        if !page_ready(p, write) {
+            let access = if write {
+                hal::fault::Access::Write
+            } else {
+                hal::fault::Access::Read
+            };
+            if !user_fault(hal::fault::PageFault { addr: p, access }) || !page_ready(p, write) {
+                return Err(CopyFault);
+            }
+        }
+        if p >= (last & !(page - 1)) {
+            return Ok(());
+        }
+        p += page;
+    }
+}
+
+fn page_ready(va: usize, write: bool) -> bool {
+    match paging::user_leaf_flags(va) {
+        Some(f) => {
+            f.contains(hal::PageFlags::USER) && (!write || f.contains(hal::PageFlags::WRITE))
+        }
+        None => false,
+    }
+}

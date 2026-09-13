@@ -28,6 +28,8 @@ pub mod pic;
 pub mod pit;
 pub mod serial;
 pub mod tick;
+#[cfg(CONFIG_USERSPACE)]
+pub mod user;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};

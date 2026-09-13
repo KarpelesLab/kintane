@@ -83,7 +83,8 @@ const PRESENT: u64 = 1 << 0;
 /// Bit 1, R/W: writes are permitted through this entry and everything below it.
 pub(crate) const WRITABLE: u64 = 1 << 1;
 /// Bit 2, U/S: unprivileged code may use this entry and everything below it.
-const USER: u64 = 1 << 2;
+pub(crate) const USER_BIT: u64 = 1 << 2;
+const USER: u64 = USER_BIT;
 /// Bit 3, PWT: write-through rather than write-back caching.
 const WRITE_THROUGH: u64 = 1 << 3;
 /// Bit 4, PCD: caching disabled.
@@ -479,7 +480,7 @@ pub(crate) unsafe fn read_msr(msr: u32) -> u64 {
 /// `msr` must be implemented by this CPU and `value` must be a legal value for it: a
 /// reserved bit set in an MSR is #GP, and some MSRs change the meaning of code that is
 /// already executing. The caller owns what the register does.
-unsafe fn write_msr(msr: u32, value: u64) {
+pub(crate) unsafe fn write_msr(msr: u32, value: u64) {
     let lo = value & 0xffff_ffff;
     let hi = value >> 32;
     // SAFETY: `wrmsr` writes EDX:EAX to the register named by ECX; the caller
@@ -684,6 +685,14 @@ fn leaf_of(root: PhysAddr, va: usize) -> Option<(Table, usize)> {
         table = Table::from_phys(entry.address());
         level = level.saturating_sub(1);
     }
+}
+
+/// The leaf entry bits translating `va` in the current address space (CR3), or `None` if
+/// no leaf maps it. For the user-copy pre-check.
+pub(crate) fn user_leaf_bits(va: usize) -> Option<u64> {
+    let root = <X86_64 as HasPageTables>::root();
+    let (table, index) = leaf_of(root, va)?;
+    Some(table.get(index).bits())
 }
 
 // ---------------------------------------------------------------------------

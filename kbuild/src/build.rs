@@ -77,6 +77,25 @@ impl Target {
 pub struct Built {
     pub path: PathBuf,
     pub key: String,
+    /// For a user program: the environment variable its dependents read the linked ELF's
+    /// path from. `None` for everything linked with `--extern`.
+    pub embed: Option<String>,
+}
+
+impl Built {
+    fn linked(path: PathBuf, key: String) -> Built {
+        Built {
+            path,
+            key,
+            embed: None,
+        }
+    }
+}
+
+/// The variable a dependent reads a user program's path from: `KINTANE_USER_INIT` for
+/// the unit `init`.
+pub fn embed_var(unit: &str) -> String {
+    format!("KINTANE_USER_{}", unit.replace('-', "_").to_ascii_uppercase())
 }
 
 impl Build {
@@ -161,14 +180,14 @@ impl Build {
         let key = kb.finish();
 
         if self.cache.restore(&key, "libcore.rlib", &dest) {
-            return Ok(Built { path: dest, key });
+            return Ok(Built::linked(dest, key));
         }
 
         args.push("-o".into());
         args.push(dest.display().to_string());
         self.run(&args, "core")?;
         self.cache.store(&key, "libcore.rlib", &dest)?;
-        Ok(Built { path: dest, key })
+        Ok(Built::linked(dest, key))
     }
 
     /// Build one unit against already-built dependencies.
@@ -177,6 +196,7 @@ impl Build {
         let filename = match unit.kind {
             Kind::Lib => format!("lib{crate_name}.rlib"),
             Kind::Bin => format!("{crate_name}.{}", self.target.image_extension()),
+            Kind::User => format!("{crate_name}.user.elf"),
         };
         let dest = self.out.join(&filename);
 
@@ -185,7 +205,7 @@ impl Build {
             "--crate-type".into(),
             match unit.kind {
                 Kind::Lib => "rlib".into(),
-                Kind::Bin => "bin".into(),
+                Kind::Bin | Kind::User => "bin".into(),
             },
             "--crate-name".into(),
             crate_name.clone(),
@@ -203,9 +223,23 @@ impl Build {
 
         // Every dependency named explicitly; nothing transitive is visible.
         for name in dep_order(unit, deps) {
-            if let Some(b) = deps.get(&name) {
-                args.push("--extern".into());
-                args.push(format!("{}={}", name.replace('-', "_"), b.path.display()));
+            match deps.get(&name) {
+                // A user program is embedded, not linked: its dependent includes the bytes.
+                // The dependency's cache key is part of this unit's key below, so a changed
+                // program rebuilds everything that embeds it.
+                Some(Built {
+                    path,
+                    embed: Some(var),
+                    ..
+                }) => {
+                    args.push("--env-set".into());
+                    args.push(format!("{var}={}", path.display()));
+                }
+                Some(b) => {
+                    args.push("--extern".into());
+                    args.push(format!("{}={}", name.replace('-', "_"), b.path.display()));
+                }
+                None => {}
             }
         }
         args.push("-L".into());
@@ -267,18 +301,25 @@ impl Build {
         }
         let key = kb.finish();
 
+        let embed = (unit.kind == Kind::User).then(|| embed_var(&unit.name));
         if self.cache.restore(&key, &filename, &dest) {
             if self.verbose {
                 eprintln!("  {} (cached)", unit.name);
             }
-            return Ok(Built { path: dest, key });
+            return Ok(Built {
+                embed,
+                ..Built::linked(dest, key)
+            });
         }
 
         args.push("-o".into());
         args.push(dest.display().to_string());
         self.run(&args, &unit.name)?;
         self.cache.store(&key, &filename, &dest)?;
-        Ok(Built { path: dest, key })
+        Ok(Built {
+            embed,
+            ..Built::linked(dest, key)
+        })
     }
 
     /// Compile the generated `config.rs` into a crate every unit can depend on.
@@ -307,13 +348,13 @@ impl Build {
         let key = kb.finish();
 
         if self.cache.restore(&key, "libkconfig.rlib", &dest) {
-            return Ok(Built { path: dest, key });
+            return Ok(Built::linked(dest, key));
         }
         args.push("-o".into());
         args.push(dest.display().to_string());
         self.run(&args, "kconfig")?;
         self.cache.store(&key, "libkconfig.rlib", &dest)?;
-        Ok(Built { path: dest, key })
+        Ok(Built::linked(dest, key))
     }
 
     /// `$ROOT` and `$OUT` in a unit's rustflags, so manifests stay path-independent.

@@ -1,0 +1,14 @@
+# `userinit` on a configuration without userspace: nothing to embed. The kernel image
+# depends on the name in every configuration; only this provider is selected when
+# USERSPACE is off, and the kernel's userspace module is not compiled then either.
+[unit]
+name = "userinit"
+kind = "lib"
+root = "src/lib.rs"
+layer = "user"
+
+[deps]
+units = []
+
+[config]
+requires = "!USERSPACE"

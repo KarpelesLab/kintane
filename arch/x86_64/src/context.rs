@@ -85,6 +85,12 @@ pub struct Context {
     r13: u64,
     r14: u64,
     r15: u64,
+    /// For a thread that runs user code: the kernel stack its traps and system calls land
+    /// on, and the physical root of its address space. Both zero for a kernel-only thread,
+    /// and past the seven registers `switch` saves, so the assembly's offsets are unchanged.
+    /// See `hal::HasUserMode::bind` and `super::user`.
+    pub(crate) user_kernel_stack: u64,
+    pub(crate) user_root: u64,
 }
 
 /// Size of the return address a `call` pushes, and of the slot `init` fabricates for
@@ -132,6 +138,8 @@ impl HasContextSwitch for X86_64 {
             r13: 0,
             r14: 0,
             r15: 0,
+            user_kernel_stack: 0,
+            user_root: 0,
         };
     }
 
@@ -275,6 +283,8 @@ static BOOT_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     r13: 0,
     r14: 0,
     r15: 0,
+    user_kernel_stack: 0,
+    user_root: 0,
 }));
 static THREAD_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     rsp: 0,
@@ -284,6 +294,8 @@ static THREAD_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     r13: 0,
     r14: 0,
     r15: 0,
+    user_kernel_stack: 0,
+    user_root: 0,
 }));
 
 /// Set by the first selftest run. A second would re-`init` a stack a suspended thread

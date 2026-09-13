@@ -16,6 +16,7 @@ pub mod clock;
 pub mod context;
 pub mod fault;
 pub mod paging;
+pub mod user;
 
 // Mock architectures for host-side testing. Gated at the module boundary, which is
 // the only place cfg is allowed, and off in every kernel image.
@@ -27,6 +28,7 @@ pub use clock::ClockSource;
 pub use context::{HasContextSwitch, ThreadEntry};
 pub use fault::{Access, PageFault, PageFaultHook};
 pub use paging::{HasPageTables, ImageSections, MapError, PageFlags, PageTableEntry, StackArray};
+pub use user::{CopyFault, HasUserMode, SyscallFrame, UserHooks, UserTrap};
 
 /// Byte order of the target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

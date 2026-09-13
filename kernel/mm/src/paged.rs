@@ -143,6 +143,24 @@ impl<A: HasPageTables> AddressSpace<A> {
         self.root
     }
 
+    /// Copy every top-level entry from `other`'s root into this one's, so the two address
+    /// spaces share every table `other` reaches from its root. For a process root that
+    /// must share the kernel's mappings: the kernel lives under the low top-level entries
+    /// and a process adds its own under a higher one, which `map` fills in on top of the
+    /// zero this leaves there.
+    ///
+    /// # Safety
+    /// `other` must be a live root reachable through this space's direct map, and the
+    /// tables it names must outlive every use of this space.
+    pub unsafe fn mirror_top_level(&mut self, other: PhysAddr) -> Result<(), MapError> {
+        let n = level_entries::<A>(A::LEVELS - 1);
+        for i in 0..n {
+            let e = self.read(other, i)?;
+            self.write(self.root, i, e)?;
+        }
+        Ok(())
+    }
+
     /// The direct map these tables are reached through.
     pub fn direct(&self) -> DirectMap {
         self.direct

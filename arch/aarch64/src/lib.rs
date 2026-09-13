@@ -19,6 +19,8 @@ pub mod serial;
 pub mod smp;
 pub mod tick;
 pub mod timer;
+#[cfg(CONFIG_USERSPACE)]
+pub mod user;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};
 use hal::{Arch, Endian, HasCas, HasFpu, HasMmu, HasSmp, IrqNumber};

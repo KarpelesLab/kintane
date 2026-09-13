@@ -1,7 +1,61 @@
 # Userspace ABI
 
-Status: **design sketch.** Nothing here is implemented, and the details will move.
-The principles are the commitment; the syscall numbers are not.
+Status: **the native slice is built; the Linux personality is still a sketch.** The
+principles below are the commitment; the syscall numbers are not.
+
+## As built — the native vertical slice
+
+x86_64 and aarch64 now run unprivileged processes. Every boot on those ports (the
+`USERSPACE` config symbol, on by default where the machine allows it) builds three
+processes from one embedded program (`user/init`), enters ring 3 / EL0, and grades each
+by the exit code it returns — so a kernel that answers a system call wrong is caught by
+the program that got the wrong answer, not by the kernel checking its own work. What
+exists:
+
+- **`lib/abi`** — the ABI as one table (`lib/abi/src/table.rs`), in a `syscalls!` macro
+  that generates the numbering, the kernel's `Handler` trait, the argument-decoding
+  dispatcher, and the userspace bindings from a single source. There is no `#[syscall]`
+  proc-macro (kbuild has no way to build one); the macro is chosen because the table is
+  Rust, so a signature is type-checked identically on both sides. Errors are values: a
+  status register (0 or an `Error`) and a value register, no `errno`.
+- **`kernel/elf`** — a static-ELF loader that refuses a non-executable, a
+  writable-and-executable segment, a segment outside the user half, two segments in one
+  page, or an entry point outside code. Fuzz-tested.
+- **`hal::HasUserMode`** — the per-port contract: enter user mode, take a system call
+  and a fault from it, and copy across the boundary without trusting the pointer.
+  Implemented for x86_64 (`arch/x86_64/src/user.rs`: the `syscall`/`sysret` fast path,
+  ring-3 GDT segments, `TSS.rsp0` per thread, the `SYSRET` canonical hazard handled) and
+  aarch64 (`arch/aarch64/src/user.rs`: `eret` to EL0t, the `svc` decode in the lower-EL
+  vector, `SP_EL0` per thread).
+- **The syscalls** for the slice: `process_exit`, `thread_exit`, `thread_yield`,
+  `debug_write` (rights-checked), `vm_map` of anonymous memory (demand-paged),
+  `channel_create`/`channel_write`/`channel_read`, and `handle_close`. Each process has
+  its own address space (a `mm::vm::Vm` over its own page tables, sharing the kernel
+  half) and its own handle table.
+
+**User-pointer safety, and the choice made.** The design asks for fault-safe copies.
+Rather than an exception-fixup table, `copy_from_user`/`copy_to_user` validate the range
+against the user half and fault every page in through the process's own fault hook
+*before* touching it, so the copy itself only ever reads present memory and cannot fault
+the kernel. A page the hook maps and a recheck still finds absent, or an address the
+hook will not map, is refused as `Fault`. This is sound because all user memory is
+backed by the process `Vm`; a fixup table becomes worthwhile only when a copy may touch
+memory no `Vm` owns.
+
+**What the check proves, each falsified:** a program maps memory and uses it, writes to
+the console, is refused a write through a console handle without `WRITE`, is refused a
+copy from a bad pointer *without the kernel faulting*, and loops a message through its
+own channel. A second process is given only the raw handle *values* of another's handles
+and every use is refused — "a process with no handles can do nothing." A third writes to
+kernel memory and is killed at the fault, the kernel continuing. Removing the rights
+check, the `rsp0` switch, or the copy validation each makes the check fail.
+
+**Not yet:** one process runs at a time, driven by a direct context switch rather than
+the scheduler, so `init`'s channel-to-a-kernel-thread step waits for the process to run
+scheduled; there is no `Process` object in the handle namespace, no explicit
+process-construction syscalls, no completion queues, no ELF loading from a filesystem,
+and no per-process teardown of shared page tables (the slice frees what it took but
+leaves the object store to own that). i686 and riscv32 have no userspace port.
 
 ## Two ABIs, one kernel
 
