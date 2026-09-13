@@ -33,11 +33,13 @@ architecture also forced `kernel/main` to stop naming a specific one, and forced
 kbuild to allow several units to *provide* a name so the configuration could pick.
 Both were one-time costs, and the third architecture did land within the rule.
 
+Landed since, as Phase 2 opened: an in-kernel test suite, `kbuild test --target`,
+which boots a test image and takes the guest's exit status as the verdict — 17 checks
+on x86_64 and i686, 10 on aarch64, which correctly *skips* rather than claims the
+memory checks it cannot run.
+
 Not done, and deliberately named rather than quietly folded into "done":
 
-- **No in-kernel test suite.** `kbuild test` runs host tests only; `--target` reports
-  that in-kernel tests are unimplemented. They belong with Phase 2, when there is a
-  kernel worth testing from inside.
 - **No page table manipulation or kernel address space.** The frame allocator exists;
   building mappings on top of it does not. Phase 2.
 - **No i686 interrupt support.** That port boots and reports memory but has no IDT.

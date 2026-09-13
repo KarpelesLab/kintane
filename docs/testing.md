@@ -44,20 +44,35 @@ structures, and the boot protocol's tag encoding.
 
 ### 2. In-kernel tests
 
-Tests that must run on the real architecture — page tables, context switch, atomics,
-cache maintenance, exception entry — compile into a test kernel that boots under QEMU,
-runs, reports over a structured channel, and exits with a status code.
+Tests that must run on the real architecture compile into a test image that boots
+under QEMU, reports, and exits with a status code. The verdict is the exit status, so
+no harness has to parse console output:
 
 ```
-$ kbuild test --target aarch64-virt
-  running 218 tests in-kernel
-  ...
-  test mm::paged::huge_page_split ... ok
-  218 passed; 0 failed; 3 skipped (require HasSmp)
+$ kbuild test --target --preset aarch64-virt
+  selftest
+    ok   irq_save/irq_restore nest and return
+    ok   atomic compare_exchange fails on mismatch
+    skip frame allocator over the real map (no memory map on this port)
+    ...
+    10 passed, 0 failed
+  in-kernel tests passed (qemu exit 0)
 ```
 
-Skipping is by trait bound, not runtime check: a test requiring `HasSmp` is generic
-over it and is not registered in a build that lacks it.
+**Skipped is reported distinctly from passed**, because they are different claims and
+conflating them is how coverage rots silently. The aarch64 line above is an honest
+statement that those checks did not run, not a green tick.
+
+The test image is selected by a *provider pair* rather than a `cfg` in `kmain`:
+`kernel/selftest` is linked when `INKERNEL_TESTS` is set and `kernel/selftest-none`
+otherwise, so a production image does not contain the test code at all rather than
+merely not reaching it.
+
+What belongs here is only what a mock architecture cannot make good on — that this
+machine's atomics really are atomic, that masking interrupts really masks them, that
+memory the loader described can be read and written. Anything that does not need real
+hardware belongs in level 1, which is faster and far easier to debug. Page table
+manipulation and context switching join this level when they exist.
 
 ### 3. Boot and integration tests
 
