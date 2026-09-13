@@ -1,0 +1,14 @@
+# i686 booted the way a legacy PC boots it: firmware, MBR, kinboot-bios, kernel.
+#
+# The same kernel configuration as i686-qemu. The difference is how the image
+# reaches memory: QEMU boots a raw disk through SeaBIOS rather than loading the
+# kernel itself, so every boot, in-kernel and stack guard test on this preset
+# also tests the loader. See docs/bootloader.md#kinboot-bios--mbr--bios.
+ARCH_I686=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+KINBOOT_BIOS=y
+# QEMU's default 32-bit core, not `max`: this target exists for legacy machines.
+QEMU_CPU="qemu32"

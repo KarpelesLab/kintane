@@ -3,6 +3,7 @@
 //! Owns configuration resolution, the crate graph, rustc invocation, caching, and
 //! running the result. Cargo builds this tool and nothing else in the tree.
 
+mod bios;
 mod build;
 mod cache;
 mod codegen;
@@ -530,6 +531,13 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     let linked = image.ok_or("no unit of kind `bin` was built; nothing to boot")?;
     let symbols = b.split_symbols(&linked)?;
     let image = b.package(res.str("IMAGE_FORMAT"), &linked)?;
+    // A BIOS disk wraps the packaged image rather than replacing it: the kernel on the
+    // disk is byte for byte the one `-kernel` boots.
+    let image = if res.is_on(bios::SYMBOL) {
+        bios::disk_image(root, b.tc.clone(), &res, &image, opts.verbose)?
+    } else {
+        image
+    };
     let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
     println!("  linked  {}", linked.display());
     println!("  symbols {}", symbols.display());

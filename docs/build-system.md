@@ -321,6 +321,12 @@ The release packaging above is ahead of the code. What `kbuild build` writes to
   `kbuild symbolize` reads.
 - `kintane.mb32.elf` (x86_64) or `kintane.img.elf` (everything else) — the bootable
   image, `--strip-all`. It has no symbol table, and CI checks that.
+- `kinboot-bios.img` (x86 with `KINBOOT_BIOS=y`) — a raw MBR disk: `kinboot-bios`
+  stage 1 and stage 2, then the bootable image above, byte for byte. `kbuild run` and
+  `kbuild test --target` boot this instead of passing `-kernel`. The loader itself is
+  built beside it in `build/<target>/kinboot-bios/`, for its own target
+  (`targets/i686-kinboot.json`) with its own `core`; see
+  [bootloader.md](bootloader.md#build-integration).
 
 The kernel never reads its own symbols. A panic or fatal exception prints raw return
 addresses (`lib/unwind`), and decoding happens off the machine:

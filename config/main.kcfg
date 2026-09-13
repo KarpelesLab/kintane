@@ -125,6 +125,20 @@ config IMAGE_FORMAT
         image is rewritten to ELF32 after linking. The 64-bit code is untouched
         and the ELF64 is kept as the debug artifact.
 
+config KINBOOT_BIOS
+    bool "Boot from a BIOS disk through kinboot-bios"
+    depends on ARCH_X86_64 || ARCH_I686
+    default n
+    help
+        Also build the BIOS loader and write build/<target>/out/kinboot-bios.img:
+        an MBR, stage 2 and the packaged kernel image. `kbuild run` and
+        `kbuild test --target` then boot that disk through the machine's
+        firmware, with no -kernel, so every boot test exercises the loader.
+
+        The loader hands over as a Multiboot 1 loader, which both x86 kernels
+        already accept. See docs/bootloader.md. The BIOS path has no root of
+        trust, and this option offers no security guarantee.
+
 config MOCK_ARCH
     bool "Mock architectures for host testing"
     default n
