@@ -122,3 +122,33 @@ config INKERNEL_TESTS
 
         Requires a result channel, since the verdict is the guest's exit
         status rather than console output a harness would have to scrape.
+
+config FRAME_BITMAP_KIB
+    int "Boot-time frame bitmap reserve (KiB)"
+    range 4 4096
+    default 32
+    help
+        Static reserve the boot path builds its frame allocator bitmap in.
+        Two bits per frame of usable span, so 32 KiB covers about 512 MiB at
+        a 4 KiB page. A machine with more memory than this reports the
+        shortfall and skips the report rather than truncating the pool.
+
+        This is a bootstrap shortcut. The bitmap should be carved out of the
+        memory it describes and this symbol should disappear; until then a
+        preset that boots a large machine must raise it.
+
+config QEMU_MEMORY_MB
+    int "Guest memory under QEMU (MiB)"
+    depends on QEMU_EXIT
+    range 8 65536
+    default 128
+
+config QEMU_CPU
+    string "CPU model under QEMU"
+    depends on QEMU_EXIT
+    default "max"
+    help
+        The i686 target deliberately runs on QEMU's default 32-bit CPU in
+        its main preset, because it exists to serve legacy machines and
+        testing it only on a modern core would defeat that. A second preset
+        raises it, so both are covered.

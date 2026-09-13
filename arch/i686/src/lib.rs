@@ -10,6 +10,12 @@
 //! genuinely fails on this target and nowhere else in tier 1. See
 //! `docs/targets.md#i686` and `hal/src/addr.rs`.
 //!
+//! `paging` is where that claim is cashed: it implements the `hal::paging` contract in
+//! the 32-bit PAE format, whose entries are 64 bits wide behind 32-bit pointers and
+//! whose three levels are indexed by 2, 9 and 9 bits rather than uniformly. Its
+//! selftest maps a frame 4 GiB above itself and proves bit 32 survives the trip to the
+//! MMU, which is the most direct statement of this port's purpose that exists.
+//!
 //! Interrupt support lives in `idt`, `exception`, `pic`, `pit` and `interrupt`, and is
 //! the same shape as `arch/x86_64`'s without being the same code: the descriptor
 //! format and the pushed frame are genuinely different, and the two devices are
@@ -30,6 +36,7 @@ mod boot;
 mod exception;
 mod idt;
 pub mod interrupt;
+pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod serial;
@@ -193,6 +200,5 @@ pub fn image_range() -> (u64, u64) {
 /// Exists so `kmain` can exercise the paging path without naming an architecture.
 /// Returns `true` only when a mapping was demonstrably installed and used.
 pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    paging::selftest(c)
 }

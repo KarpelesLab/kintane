@@ -279,7 +279,7 @@ fn memory<A: Arch>(r: &mut Report, boot_arg: u64, reserved: &[(u64, u64)]) {
     );
 }
 
-const STORE_BYTES: usize = 32 * 1024;
+const STORE_BYTES: usize = kconfig::FRAME_BITMAP_KIB * 1024;
 
 /// SAFETY INVARIANT: used only by `memory`, which runs once on the boot CPU before
 /// any other execution context exists.

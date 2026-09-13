@@ -108,7 +108,7 @@ const MAX_REGIONS: usize = 64;
 /// Backing store for the frame allocator's bitmaps. 32 KiB covers a 512 MiB usable
 /// span at a 4 KiB page (two bits per frame, two arrays). Too small is an error the
 /// caller prints, never a truncated pool.
-const STORE_BYTES: usize = 32 * 1024;
+const STORE_BYTES: usize = kconfig::FRAME_BITMAP_KIB * 1024;
 
 /// Memory below this is never handed out on a PC: real-mode interrupt vectors, the
 /// BIOS data area, and whatever firmware left behind. Reserving it where it is not

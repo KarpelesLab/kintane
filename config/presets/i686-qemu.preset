@@ -8,3 +8,5 @@ SMP=n
 EARLY_CONSOLE=y
 DEBUG_BUILD=y
 QEMU_EXIT=y
+# QEMU's default 32-bit core, not `max`: this target exists for legacy machines.
+QEMU_CPU="qemu32"

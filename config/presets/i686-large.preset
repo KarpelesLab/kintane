@@ -1,0 +1,14 @@
+# i686 on a large, modern machine: 5 GiB of RAM and a CPU that advertises NX.
+#
+# The companion to i686-qemu, which runs on QEMU's default 32-bit core. Both are
+# needed: the legacy preset is what the target exists for, and this one is the only
+# configuration where PAE's whole purpose can actually be exercised — a physical
+# address above 4 GiB, written through and read back, and NX actually enabled.
+ARCH_I686=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+QEMU_MEMORY_MB=5120
+QEMU_CPU="max"
+FRAME_BITMAP_KIB=512

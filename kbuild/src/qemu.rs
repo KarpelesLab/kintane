@@ -17,6 +17,14 @@ pub struct Machine {
 
 pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine, String> {
     let s = |x: &str| x.to_string();
+    let mem = format!("{}M", {
+        let m = res.int("QEMU_MEMORY_MB");
+        if m > 0 { m } else { 128 }
+    });
+    let cpu = {
+        let c = res.str("QEMU_CPU");
+        if c.is_empty() { "max".to_string() } else { c.to_string() }
+    };
 
     if res.is_on("ARCH_X86_64") {
         // isa-debug-exit reports (value << 1) | 1, so the guest can never produce 0
@@ -25,8 +33,8 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             binary: "qemu-system-x86_64",
             args: vec![
                 s("-machine"), s("q35"),
-                s("-cpu"), s("max"),
-                s("-m"), s("128M"),
+                s("-cpu"), cpu,
+                s("-m"), mem,
                 s("-kernel"), image.display().to_string(),
                 s("-device"), s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
                 s("-serial"), s("stdio"),
@@ -55,7 +63,8 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 // i440FX rather than q35: this target exists for legacy PCs, and
                 // testing it on a modern chipset would defeat the point.
                 s("-machine"), s("pc"),
-                s("-m"), s("128M"),
+                s("-cpu"), cpu,
+                s("-m"), mem,
                 s("-kernel"), image.display().to_string(),
                 s("-device"), s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
                 s("-serial"), s("stdio"),
@@ -73,8 +82,8 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             binary: "qemu-system-aarch64",
             args: vec![
                 s("-machine"), s("virt,gic-version=3"),
-                s("-cpu"), s("max"),
-                s("-m"), s("128M"),
+                s("-cpu"), cpu,
+                s("-m"), mem,
                 s("-kernel"), image.display().to_string(),
                 s("-semihosting-config"), s("enable=on,target=native"),
                 s("-serial"), s("stdio"),
