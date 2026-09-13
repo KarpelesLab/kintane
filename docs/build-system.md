@@ -292,6 +292,10 @@ names.
 A release produces:
 
 - `kintane-<version>-<target>-<configname>.img` — the bootable image.
+- `boot/` — the loader for that platform: a signed `kinboot-efi` PE/COFF binary, the
+  `kinboot-bios` stages, or nothing at all where the kernel is its own boot image.
+  Built from the same pinned toolchain under the same reproducibility rules; see
+  [bootloader.md](bootloader.md).
 - `modules/` — loadable modules for that exact configuration.
 - `kintane-<...>.symbols.tar.zst` — DWARF and a symbol table, stripped from the
   image and shipped separately.

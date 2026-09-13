@@ -164,6 +164,9 @@ Per-CPU data is a `HasSmp`-gated abstraction; a uniprocessor build resolves
 ## Boot flow
 
 ```
+bootloader: kinboot-efi / kinboot-bios / none / a foreign loader
+  └─ hands over one BootInfo, then ceases to exist  [bootloader.md]
+      ↓
 platform entry (arch/<name>/boot)
   └─ minimal machine setup: stack, exception vectors, early console
      └─ hal init: report memory map, CPU features, CPU count
@@ -202,6 +205,11 @@ kintane/
 │   ├── *.kcfg
 │   └── presets/
 ├── targets/             rustc JSON target specifications
+├── boot/                the boot protocol and the loaders
+│   ├── protocol/        BootInfo and its tags — a genuinely stable ABI
+│   ├── efi/             kinboot-efi (PE/COFF, built-in uefi targets)
+│   ├── bios/            kinboot-bios (16-bit stage 1 + i686 stage 2)
+│   └── shims/           translation from U-Boot, GRUB, OpenSBI, QEMU -kernel
 ├── hal/                 architecture traits
 ├── arch/
 │   ├── x86_64/

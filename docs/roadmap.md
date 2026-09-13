@@ -27,8 +27,13 @@ out.
 - Reproducibility from the start — path remapping, `SOURCE_DATE_EPOCH`, deterministic
   link order — because retrofitting byte-identical builds is far harder than never
   losing them.
-- `x86_64` target spec, UEFI entry, early serial console, panic handler, `kbuild run`
-  under QEMU.
+- `x86_64` target spec, early serial console, panic handler, `kbuild run` under QEMU.
+- **Boot protocol v1** — `BootInfo`, its tag encoding, and the forward/backward
+  compatibility rules. Defined early because every loader and the kernel entry path
+  both depend on it ([bootloader.md](bootloader.md#the-boot-protocol)).
+- **Minimal `kinboot-efi`**: load the kernel from the ESP, collect the memory map,
+  `ExitBootServices`, hand over `BootInfo`. Built on the built-in
+  `x86_64-unknown-uefi` target, so it emits PE/COFF with no custom target spec.
 - Skeleton `hal` traits — `Arch` only, no capability traits yet.
 
 **Exit:** `kbuild run --preset x86_64-qemu` prints a banner and a panic backtrace over
@@ -44,6 +49,10 @@ serial, and a second invocation is a cache hit.
   `HasCoherentDma`, `HasFpu`.
 - `aarch64` port: QEMU `virt`, device tree, exception vectors, MMU bring-up.
 - `i686` port: BIOS boot, PAE, 36-bit physical addresses behind 32-bit pointers.
+- **`kinboot-bios`** — stage 1 in 440 bytes of real-mode assembly via `global_asm!`
+  with `.code16`, stage 2 collecting E820/EDD/VBE in real mode before switching to
+  protected mode and handing off to Rust. Early work, not Phase 7 polish: tier-1 i686
+  has no other way to boot.
 - Physical frame allocator, early page tables, kernel address space — written once,
   generic over `A: Arch + HasMmu`.
 - `PhysAddr` / `KernAddr` / `UserAddr` as distinct types, tree-wide.
@@ -109,6 +118,9 @@ on aarch64 and from ACPI/PCIe on x86_64 using the same binding code.
 - `riscv32` port (`rv32imac`, and an `rv32i` variant without atomics to exercise
   `HasCas` being absent).
 - `mm::flat`: region allocator, optional MPU programming, no translation.
+- **Build-time `BootInfo`** for targets with no bootloader: `kbuild` emits it as a
+  `const` from the board description, so the kernel entry path is identical to the
+  UEFI one at no runtime cost.
 - Single-provider mode: config-pinned subsystems resolving to static type aliases,
   removing virtual dispatch from the interrupt path.
 - Loadable modules: ELF loader, per-arch relocations, build identity and interface
@@ -199,8 +211,14 @@ forcing function works.
 - USB host.
 - Framebuffer and input.
 - Bring-up on real machines for every tier-1 target; the nightly hardware rack.
-- Boot integration: UEFI stub, secure boot, module signing, `uImage` and XIP
-  packaging for embedded targets.
+- Boot integration: the EFI stub (kernel as its own PE/COFF application), Secure Boot
+  and signature verification, measured boot with PCR extension and an event log,
+  module signing, `uImage`/FIT and XIP packaging.
+- Last-known-good escalation: boot counter in an EFI variable or reserved sector,
+  automatic fallback `normal` → `safe` → previous kernel.
+- Chainloading: VBR chainload on BIOS; `LoadImage`/`StartImage` on UEFI and nothing
+  more, since the firmware's boot manager already does it better.
+- Foreign-loader shims: U-Boot FIT, OpenSBI, GRUB/systemd-boot.
 - Crash-dump format and offline decoder.
 - First tagged release, with images, modules, symbol bundles, and SDK.
 

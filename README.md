@@ -67,6 +67,7 @@ made.
 | [portability.md](docs/portability.md) | How we avoid `#ifdef`; the `Arch` trait family |
 | [build-system.md](docs/build-system.md) | `kbuild`, the config language, the crate graph |
 | [targets.md](docs/targets.md) | Supported platforms and support tiers |
+| [bootloader.md](docs/bootloader.md) | The boot protocol, and one loader per boot mechanism |
 | [modules.md](docs/modules.md) | Loadable modules and the module ABI problem |
 | [userspace-abi.md](docs/userspace-abi.md) | Syscall and object model principles |
 | [testing.md](docs/testing.md) | Host tests, QEMU harness, CI gates |

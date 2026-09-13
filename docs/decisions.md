@@ -228,9 +228,59 @@ project is worth contributing to, not because a license compels it.
 
 *Consequences:* module signing ([D7](#d7--no-stable-module-abi-compatibility-by-hash))
 is a security mechanism only, never a licensing one. Any vendored third-party code
-must carry a compatible permissive license — [D8](#d8--pinned-nightly-toolchain-no-third-party-crates-in-the-kernel)
+must carry a compatible permissive license — [D8](#d8--rust-198-baseline-on-a-pinned-nightly-engine-no-third-party-crates)
 keeps that list near-empty, and each entry records its license alongside its
 justification.
+
+---
+
+### D11 — Own the boot path: one loader per mechanism, one stable protocol
+**Accepted.** 2026-09-13.
+
+Purpose-built loaders per boot mechanism — `kinboot-efi`, `kinboot-bios`, nothing at
+all on microcontrollers — rather than one generic GRUB-like loader. All of them
+produce a single versioned `BootInfo` handoff.
+
+*Why not GRUB:* it is an operating system in its own right — scripting, filesystem
+drivers, module loading — nearly all of it there to boot kernels that are not ours. It
+also has nothing to say about a Cortex-M part, which is half of what this project is
+for. Owning the path puts it inside our build, our reproducibility, and our signing
+chain.
+
+*Why per-mechanism rather than generic:* UEFI and a 440-byte MBR sector have almost
+nothing in common. A single loader spanning both is mostly conditional code — the
+thing [D1](#d1--portability-through-traits-not-the-preprocessor) exists to avoid.
+Separate loaders with a shared protocol is the same static-vs-dynamic split the kernel
+uses.
+
+*Why the boot protocol is a stable ABI* — unlike modules under
+[D7](#d7--no-stable-module-abi-compatibility-by-hash), which are hash-locked: the
+loader lives on the ESP or in the MBR gap and is updated independently of the kernel.
+An installed loader must boot a newer kernel, and a newer loader must boot an older one
+so rollback works. Hence tag-based with explicit sizes, forward and backward
+compatible. The surface is one `#[repr(C)]` struct handed over by something that then
+ceases to exist — not a shared address space full of monomorphized Rust types.
+
+*Cost:* we reimplement things GRUB already knows, especially BIOS-era quirks, and we
+own the security of the path. Bounded by a hard scope — no scripting, no filesystem
+writes, no network boot, FAT and our own format only — and by size budgets in CI
+(stage 1 at 440 bytes, stage 2 at 32 KiB, EFI loader at 128 KiB).
+
+*Deliberately kept:* being loaded *by* U-Boot, OpenSBI, GRUB, systemd-boot, or QEMU
+`-kernel` through thin shims that produce the same `BootInfo`. Cheap, and refusing it
+would cost reach for nothing. Replacing vendor firmware on an SoC is a fight not worth
+having.
+
+*Verified while deciding:* the three UEFI targets are built in, so `kinboot-efi` needs
+no hand-written target spec and emits PE/COFF directly. 16-bit real-mode code
+assembles through `global_asm!` with `.code16` on the pinned toolchain, so the MBR
+stage needs no external assembler and
+[D8](#d8--rust-198-baseline-on-a-pinned-nightly-engine-no-third-party-crates) holds.
+
+*Scheduling consequence:* `kinboot-bios` is Phase 1 work, not Phase 7 polish, because
+tier-1 i686 cannot boot without it.
+
+See [bootloader.md](bootloader.md).
 
 ---
 
