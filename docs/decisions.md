@@ -154,15 +154,31 @@ loop, and committing to it before those exist would be premature.
 
 ---
 
-## Open questions
+### D10 — MIT license
+**Accepted.** 2026-09-13.
 
-### License
-**Open.** The choice interacts with the module story (a permissive license makes
-proprietary modules straightforward; a copyleft one deliberately does not) and with
-whether contributions can be accepted from people whose employers restrict copyleft.
-Candidates: MPL-2.0 (file-level copyleft, module-friendly), GPL-2.0 (Linux-aligned,
-maximises contribution reuse), Apache-2.0 (permissive, patent grant), or dual
-licensing. Must be resolved before the first external contribution.
+The whole tree is MIT. See [LICENSE](../LICENSE).
+
+*Why:* permissive licensing keeps the module story simple — loadable modules, derived
+kernels, and vendor board-support packages may be proprietary without a derived-work
+argument, which matters for a kernel aimed at embedded and industrial deployments. It
+also excludes nobody: contributors whose employers restrict copyleft can participate.
+MIT specifically, over Apache-2.0, for brevity and near-universal acceptance.
+
+*Cost:* no explicit patent grant, which Apache-2.0 would provide — a real difference
+if a contributor's employer holds patents reading on their contribution. No copyleft,
+so improvements made downstream need not come back; we get contributions because the
+project is worth contributing to, not because a license compels it.
+
+*Consequences:* module signing ([D7](#d7--no-stable-module-abi-compatibility-by-hash))
+is a security mechanism only, never a licensing one. Any vendored third-party code
+must carry a compatible permissive license — [D8](#d8--pinned-nightly-toolchain-no-third-party-crates-in-the-kernel)
+keeps that list near-empty, and each entry records its license alongside its
+justification.
+
+---
+
+## Open questions
 
 ### Project governance
 **Open.** Deferrable until there is more than one contributor, but the tier-1

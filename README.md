@@ -73,4 +73,8 @@ the many kinds of machine.
 
 ## License
 
-Not yet chosen. See [docs/decisions.md](docs/decisions.md#open-questions).
+MIT. See [LICENSE](LICENSE).
+
+Permissive by choice: loadable modules and derived kernels may be proprietary, and
+contributors whose employers restrict copyleft are not excluded. See
+[D10](docs/decisions.md#d10--mit-license).
