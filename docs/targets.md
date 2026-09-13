@@ -3,8 +3,10 @@
 ## Tier definitions
 
 **Tier 1 — gated.** Builds and boots on every merge. A change that breaks a tier-1
-target does not land. Every tier-1 target has a QEMU machine in CI and at least one
-piece of real hardware someone can reach.
+target does not land. Every tier-1 target has a QEMU machine in CI from the start, and
+real hardware someone can reach from Phase 7 — see
+[testing.md](testing.md#the-hardware-debt) for what that ordering defers and when the
+debt comes due.
 
 **Tier 2 — built.** Compiled on every merge; booted nightly. Breakage is a bug with
 an owner, not a merge blocker.
@@ -75,7 +77,9 @@ late.
 
 Thumb-2, MPU instead of MMU, no privilege model worth speaking of, single core,
 kilobytes rather than megabytes of RAM, execute-in-place from flash. Implements
-`Arch` and `HasMpu` and nothing else. QEMU `mps2-an385` in CI, plus a real board.
+`Arch` and `HasMpu` and nothing else. QEMU `mps2-an385` (Cortex-M3) in CI; a real board
+from Phase 7. Semihosting is the only result channel this target has, which is why the
+test protocol standardizes on it rather than on console scraping.
 
 *Stresses:* every assumption that virtual memory exists, the entire size budget, the
 lower bound of the configuration system. If the config system cannot produce a kernel

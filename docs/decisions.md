@@ -284,6 +284,47 @@ See [bootloader.md](bootloader.md).
 
 ---
 
+### D12 — QEMU-first testing, with the gaps named
+**Accepted.** 2026-09-13.
+
+All automated testing runs under QEMU until Phase 7. Every tier-1 target has a
+canonical machine, a real result channel, and gated CI from the start; physical
+hardware is deferred.
+
+*Why:* QEMU gives every tier-1 target on every laptop and in CI immediately, which is
+what makes gating on all of them affordable. It also offers three things hardware
+cannot: `gic-version=2|3` on the same image, which is the direct test of the
+static-architecture/dynamic-devices split; `-smp 1..64` and varied `-cpu` models, so
+feature detection is tested rather than assumed; and **record/replay**, which makes a
+one-in-five-hundred scheduler race exactly reproducible under GDB.
+
+*Result channels, not console scraping:* `isa-debug-exit` on x86 (note that
+`(value << 1) | 1` means the guest can never return 0, so a stray success is
+impossible), semihosting on ARM/AArch64 — the only channel `armv7m` has at all — and
+the `sifive_test` finisher on RISC-V.
+
+*Cost, accepted explicitly:* QEMU structurally cannot find weak-memory-ordering bugs,
+cache/DMA coherency bugs, timing and latency problems, device errata, or firmware
+variation. The sharp edge is that **our most exotic target is the one QEMU validates
+least well** — SeaBIOS is a clean modern BIOS, so `kinboot-bios` will pass CI long
+before anyone knows whether it boots a Pentium III.
+
+*Mitigations, so the cost is managed rather than ignored:* code in those categories is
+marked unvalidated in its module documentation until hardware runs it, and green CI is
+never cited as evidence for it; the memory model gets written down before the SMP work
+rather than after; lock-free code is model-checked on the host, which is the one
+substitute that genuinely works; and no test may depend on emulator-specific behaviour,
+so a hardware runner drops in behind the same interface.
+
+*Also:* QEMU ships system emulators for every architecture in the tier-3 long tail —
+m68k, SPARC, MIPS, SH4, Alpha, PA-RISC, PowerPC — so a contributed port can have CI
+from its first commit. That is what makes "possible without a fork" a testable claim
+rather than a slogan.
+
+See [testing.md](testing.md).
+
+---
+
 ## Open questions
 
 ### Project governance

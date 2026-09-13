@@ -70,7 +70,7 @@ made.
 | [bootloader.md](docs/bootloader.md) | The boot protocol, and one loader per boot mechanism |
 | [modules.md](docs/modules.md) | Loadable modules and the module ABI problem |
 | [userspace-abi.md](docs/userspace-abi.md) | Syscall and object model principles |
-| [testing.md](docs/testing.md) | Host tests, QEMU harness, CI gates |
+| [testing.md](docs/testing.md) | The QEMU-first test protocol, merge gates, and what QEMU cannot catch |
 | [coding-standards.md](docs/coding-standards.md) | `unsafe` policy, lints, conventions |
 | [roadmap.md](docs/roadmap.md) | Phases, exit criteria, sequencing |
 | [decisions.md](docs/decisions.md) | Foundational decisions and their rationale |

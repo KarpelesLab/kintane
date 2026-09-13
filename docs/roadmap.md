@@ -35,6 +35,11 @@ out.
   `ExitBootServices`, hand over `BootInfo`. Built on the built-in
   `x86_64-unknown-uefi` target, so it emits PE/COFF with no custom target spec.
 - Skeleton `hal` traits — `Arch` only, no capability traits yet.
+- **The QEMU test harness** ([testing.md](testing.md#the-qemu-protocol)): canonical
+  machine per target, real result channels (`isa-debug-exit` / semihosting /
+  `sifive_test`) rather than console scraping, two serial channels separating the human
+  log from the machine one, timeouts that dump state instead of dying silently, and
+  `-no-reboot` so a triple fault is a visible failure rather than a boot loop.
 
 **Exit:** `kbuild run --preset x86_64-qemu` prints a banner and a panic backtrace over
 serial, and a second invocation is a cache hit.
@@ -210,7 +215,11 @@ forcing function works.
   demonstration of Phase 5's value.
 - USB host.
 - Framebuffer and input.
-- Bring-up on real machines for every tier-1 target; the nightly hardware rack.
+- **Bring-up on real machines for every tier-1 target**; the nightly hardware rack.
+  This is where the [hardware debt](testing.md#the-hardware-debt) comes due — weak
+  memory ordering, cache/DMA coherency, device errata, and real firmware all arrive at
+  once. Scheduled as substantial work, not a formality: a port that boots under QEMU is
+  perhaps two thirds of the way to booting the machine QEMU was modelling.
 - Boot integration: the EFI stub (kernel as its own PE/COFF application), Secure Boot
   and signature verification, measured boot with PCR extension and an event log,
   module signing, `uImage`/FIT and XIP packaging.
@@ -252,6 +261,7 @@ of writing an `arch/` crate and nothing else.
 | Driver isolation is too slow to ever enable | Phase 5 | Measure early with a prototype in Phase 3; `InKernel` is always available, so the fallback is the status quo |
 | `kbuild` becomes a second project competing for attention | continuous | Keep it minimal; it resolves config and calls `rustc`. Any feature that is not needed for a shipping kernel is out |
 | Nightly toolchain churn breaks builds | continuous | Pinned toolchain with hashes; upgrades are deliberate, separate commits with a full-matrix build |
+| QEMU-only validation hides weak-memory, cache/DMA and firmware bugs until Phase 7, when they all land at once | Phase 0–7 | Named and tracked rather than assumed away ([D12](decisions.md#d12--qemu-first-testing-with-the-gaps-named)): affected code is marked unvalidated until hardware runs it, the memory model is written before the SMP work, lock-free code is model-checked on the host, and no test may depend on emulator-specific behaviour |
 | The Linux personality is a large, permanently incomplete surface; signals alone are substantial | Phase 6b | Compatibility is defined by a published corpus CI runs, never a percentage claim. Gaps are loud: `-ENOSYS` plus a named log line, fatal under CI. Scope grows corpus tier by corpus tier, starting at static musl |
 | The compat path becomes the de-facto ABI and the native one gets no users | Phase 6b onward | The personality is a client of native interfaces, so it cannot outgrow them; native-first sequencing in 6a; the native runtime library and our own userland stay the primary target. Accepted as a live risk, not a solved one |
 | Linux semantics leak into kernel design through the compat layer | Phase 6b onward | Each place the layer reaches past the native interfaces for performance is documented at the site with the measurement that justified it, so the exceptions stay countable |

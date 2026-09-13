@@ -1,17 +1,24 @@
-# Testing and CI
+# Testing Protocol
 
-A kernel that claims to support twelve platforms and a thousand configurations is
-making a claim about things nobody runs daily. The only defence is automation, and
-the only automation that works is the kind that blocks merges.
+A kernel that claims to support a dozen platforms and a thousand configurations is
+making a claim about things nobody runs daily. The only defence is automation, and the
+only automation that works is the kind that blocks merges.
 
-## Four levels
+**We rely fully on QEMU to begin with.** Physical hardware comes later. That is a
+deliberate trade — QEMU gives us every tier-1 target on every developer's laptop and in
+CI from day one, at the cost of a set of bug classes it structurally cannot find.
+Those are enumerated in [What QEMU will not catch](#what-qemu-will-not-catch), and
+pretending they do not exist is the one way this strategy fails.
+
+Validated against QEMU 11.0.3; every mechanism described below was checked to exist
+rather than assumed.
+
+## Levels
 
 ### 1. Host tests
 
-Any code that does not touch hardware is compiled for the **host** target and tested
-with ordinary Rust test tooling. This is possible because the kernel's upper layers
-are generic over `hal` traits rather than calling into `arch` directly — so we can
-supply a `MockArch`:
+Code that does not touch hardware is compiled for the **host** target and tested with
+ordinary Rust test tooling, against a mock architecture:
 
 ```rust
 pub struct MockArch;
@@ -23,24 +30,23 @@ impl HasMmu for MockArch {
 }
 ```
 
-Several mock architectures exist, each with a different capability set, so that the
-same subsystem test runs against "has MMU + SMP + CAS" and "no MMU, no CAS" and the
-differences are caught on a laptop in a second rather than on a board in an hour.
+Several mock architectures exist, each with a different capability set, so the same
+subsystem test runs against "MMU + SMP + CAS" and against "no MMU, no CAS" and the
+differences are caught on a laptop in a second rather than in an emulator in a minute.
 
-This is the single largest payoff of the trait-based portability design and it is
-worth protecting: **a subsystem that cannot be tested against `MockArch` has a design
-problem.** New subsystems are expected to justify it if they cannot.
+This is the largest payoff of the trait-based portability design and it is worth
+protecting: **a subsystem that cannot be tested against `MockArch` has a design
+problem.** New subsystems justify it or get restructured.
 
-Covered this way: allocators, schedulers (with a mock time source), the VFS, the
-object model, device tree parsing, the module loader's relocation logic, config
-resolution, data structures.
+Covered here: allocators, schedulers (with a mock time source), the VFS, the object
+model, device tree parsing, module relocation logic, config resolution, data
+structures, and the boot protocol's tag encoding.
 
 ### 2. In-kernel tests
 
-Tests that must run on the real architecture — page table manipulation, context
-switch, atomics, cache maintenance, exception entry — are compiled into a test kernel
-that boots under QEMU, runs, reports results over the console, and exits with a
-status code.
+Tests that must run on the real architecture — page tables, context switch, atomics,
+cache maintenance, exception entry — compile into a test kernel that boots under QEMU,
+runs, reports over a structured channel, and exits with a status code.
 
 ```
 $ kbuild test --target aarch64-virt
@@ -50,50 +56,206 @@ $ kbuild test --target aarch64-virt
   218 passed; 0 failed; 3 skipped (require HasSmp)
 ```
 
-Skipping is by trait bound, not by runtime check: a test requiring `HasSmp` is
-generic over it and simply is not registered in a build that lacks it.
+Skipping is by trait bound, not runtime check: a test requiring `HasSmp` is generic
+over it and is not registered in a build that lacks it.
 
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once
-there is one), run a scripted workload, check output and exit cleanly. Includes
-deliberate fault injection — kill an isolated driver and confirm it restarts, exhaust
-memory and confirm the fallible allocation paths are actually exercised rather than
-merely present.
+there is one), run a scripted workload, check output, exit cleanly. Includes deliberate
+fault injection — kill an isolated driver and confirm it restarts, exhaust memory and
+confirm the fallible allocation paths are exercised rather than merely present.
 
-From Phase 6b, this level gains its most valuable input: **unmodified Linux binaries**.
-The compatibility corpus — static musl programs first, busybox, later a real userland —
-is run under the Linux personality on every merge. Software written without any
-knowledge of this kernel is the only test workload that does not share our
-assumptions, and it finds things our own tests structurally cannot. The corpus is also
-the compatibility claim itself; see
+From Phase 6b this level gains its most valuable input: **unmodified Linux binaries**.
+The compatibility corpus — static musl first, busybox, later a real userland — runs
+under the Linux personality on every merge. Software written without any knowledge of
+this kernel is the only workload that does not share our assumptions. The corpus is
+also the compatibility claim itself; see
 [userspace-abi.md](userspace-abi.md#scoping-and-the-partial-compatibility-problem).
 
-Gaps are made loud rather than silent: an unimplemented syscall returns `-ENOSYS` and
-logs its name, and CI builds enable the config option that makes it fatal, so a
-missing syscall is a named test failure instead of a program that misbehaves.
+Gaps are loud rather than silent: an unimplemented syscall returns `-ENOSYS` and logs
+its name, and CI enables the option making that fatal, so a missing syscall is a named
+failure instead of a program behaving oddly.
 
-### 4. Hardware
+### 4. Hardware — deferred
 
-A small rack of real machines for tier-1 targets, driven nightly: an x86_64 server,
-an aarch64 board, a genuinely old 32-bit PC, and Cortex-M and RISC-V development
-boards. QEMU is a model of hardware, and the places where the model is wrong are
-exactly the places kernels break.
+Not "cancelled". See [The hardware debt](#the-hardware-debt) for what deferring it
+actually costs and when it comes due.
+
+## The QEMU protocol
+
+### Machines
+
+One canonical invocation per target, defined in `config/presets/` and never typed by
+hand:
+
+| Target | Emulator | Machine | Firmware | Result channel |
+|---|---|---|---|---|
+| x86_64 (UEFI) | `qemu-system-x86_64` | `q35` | OVMF | `isa-debug-exit` |
+| x86_64 (BIOS) | `qemu-system-x86_64` | `pc` | SeaBIOS | `isa-debug-exit` |
+| i686 | `qemu-system-i386` | `pc` (i440FX) | SeaBIOS | `isa-debug-exit` |
+| aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
+| armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
+| riscv32 | `qemu-system-riscv32` | `virt` | `-bios none` | `sifive_test` |
+
+QEMU also ships system emulators for `m68k`, `sparc`, `sh4`, `mips`, `alpha`, `hppa`,
+and `ppc` — every architecture in the
+[tier-3 long tail](targets.md#tier-3-and-the-long-tail). A contributed port can have CI
+from its first commit, which is what makes the "possible without a fork" promise
+credible rather than rhetorical.
+
+### How a test reports its result
+
+Console scraping is not a protocol. Each platform has a real mechanism for a guest to
+terminate with a status, and we use it:
+
+- **x86:** `-device isa-debug-exit,iobase=0xf4,iosize=0x04`. The kernel writes a byte
+  to port `0xf4` and QEMU exits with `(value << 1) | 1`. Note the consequence: **the
+  guest can never produce exit code 0.** Convention is to write `0x10` for success,
+  giving exit code 33, and the harness maps it back. Anything else — including a real
+  0 — is a failure, which conveniently means "QEMU exited for reasons of its own" is
+  never mistaken for a pass.
+- **ARM / AArch64:** semihosting, `-semihosting-config enable=on,target=native`, with
+  `SYS_EXIT` and `ADP_Stopped_ApplicationExit`. Works identically on `armv7m`, where
+  there is no other channel at all.
+- **RISC-V:** the `sifive_test` MMIO finisher built into the `virt` machine (it is part
+  of the machine, not a `-device`). Write `0x5555` to pass, `0x3333 | (code << 16)` to
+  fail.
+
+### Structured output
+
+Two channels, never one:
+
+- **Serial 0** — the human log. Whatever the kernel prints.
+- **Serial 1** — the machine channel. A line protocol with a fixed prefix carrying test
+  start/end, result, timing, and structured failure data.
+
+Separating them means a test's verdict is never lost inside a burst of kernel logging,
+and a kernel log line can never accidentally parse as a result. Level 1 and level 2
+tests share the same line protocol, so one reporter renders both.
+
+### Timeouts and hangs
+
+Every test carries a wall-clock budget. On expiry the harness does not simply kill
+QEMU — it first requests a state dump through the monitor, so a hang produces evidence
+rather than silence:
+
+```
+-no-reboot -no-shutdown -d int,mmu,guest_errors -D qemu.log
+```
+
+`-no-reboot` matters more than it looks: without it a triple fault reboots and the
+kernel starts again, turning a crash into an infinite loop that reads as a timeout.
+With it, the crash is the failure, with the fault visible in `qemu.log`.
+
+### Determinism and replay
+
+QEMU's instruction counting and record/replay make kernel races tractable, which is the
+strongest single reason to be QEMU-first:
+
+```
+-icount shift=7,rr=record,rrfile=run.rr        # record
+-icount shift=7,rr=replay,rrfile=run.rr        # replay, exactly
+```
+
+`-icount` decouples guest time from host time, so a test's timing does not depend on CI
+load. Record/replay then makes a failing run **exactly reproducible**, including under
+GDB — a scheduler race that appears once in five hundred runs can be captured and then
+single-stepped as many times as needed. On real hardware that same bug is a week of
+guessing.
+
+Caveats, since this is not free: record/replay constrains which devices may be used,
+does not compose with KVM, and slows execution. It is therefore on for nightly stress
+runs and switched on for any test that has ever failed intermittently, not for the
+whole matrix.
+
+### Deliberate variation
+
+QEMU lets us test configurations nobody owns hardware for, and we use that
+aggressively rather than running one canonical machine:
+
+- **`-machine virt,gic-version=2` and `gic-version=3`** on aarch64. The *same kernel
+  image* must boot under both. This is the direct test of the runtime interrupt
+  controller selection in [portability.md](portability.md#static-architecture-dynamic-devices) —
+  the claim that architecture is static and devices are dynamic is validated here or
+  nowhere.
+- **`-smp 1, 2, 8, 64`** — the uniprocessor path is a real configuration, not a
+  degenerate case, and 64 CPUs finds lock contention that 2 never will.
+- **`-m`** from the target's minimum to generous — the frame allocator under pressure.
+- **`-cpu`** varied deliberately, including old models on i686, so feature detection is
+  tested rather than assumed. `-cpu max` alone would let "assume the feature exists"
+  pass forever.
+- **Missing devices and unusual memory maps**, to exercise the device framework's
+  failure paths.
+
+### Artifacts
+
+Every failing run keeps: both serial logs, `qemu.log`, the exact QEMU argument vector,
+the `.config`, the kernel image and its symbol bundle, a monitor state dump, and the
+replay trace where one exists. A failure that cannot be investigated from CI output
+alone is itself a harness bug.
+
+### No automatic retries
+
+A test that fails intermittently is **a bug, most likely a real race**. It is not
+retried until green. It is recorded with `rr=record`, filed, and quarantined with an
+owner. Auto-retry in a kernel test suite is a mechanism for converting genuine
+concurrency bugs into invisible ones.
+
+## What QEMU will not catch
+
+The honest half of a QEMU-first strategy. These bug classes pass CI and fail on
+silicon:
+
+| Class | Why QEMU misses it | What we do instead |
+|---|---|---|
+| **Weak memory ordering** | TCG does not faithfully model aarch64's memory model; a missing barrier usually passes | Write the memory model down *before* the SMP work (an open question in [decisions.md](decisions.md#open-questions)); host-side model checking for lock-free code; explicit review for any barrier change |
+| **Cache/DMA coherency** | QEMU's memory is coherent, so missing cache maintenance passes silently | Make cache operations explicit and typed, so omission is a compile error where possible; `HasCoherentDma` is a capability, never an assumption; debug-mode buffer poisoning |
+| **Interrupt latency and timing** | `-icount` is deterministic, not realistic | The real-time guarantee question stays open until hardware exists; no latency claims are made from QEMU numbers |
+| **Device errata and quirks** | QEMU models the specification; hardware deviates from it | Drivers cite the manual and revision they were written against, so the gap is at least locatable |
+| **Firmware variation** | OVMF is one clean UEFI implementation; real firmware is neither | Keep `kinboot-efi` minimal and defensive; assume nothing the spec does not require |
+| **Legacy BIOS reality** | SeaBIOS is not a 1998 BIOS | Acknowledged as the weakest coverage we have — see below |
+| **Power management, suspend/resume** | Barely modelled | Deferred with the hardware |
+
+Note the sharp edge in that table: **our most exotic target is the one QEMU validates
+least well.** The i686 BIOS boot path exists precisely because real old machines
+behave in ways modern ones do not, and SeaBIOS under QEMU is a clean, modern,
+well-behaved BIOS. `kinboot-bios` will pass CI long before anyone knows whether it
+boots a Pentium III.
+
+The consequence is a rule rather than a worry: code in these categories is marked
+**unvalidated** in its module documentation until hardware has run it, and "CI is
+green" is never cited as evidence of correctness for them.
+
+## The hardware debt
+
+Deferring hardware is a debt with a due date, and the roadmap names it: Phase 7 brings
+up real machines for every tier-1 target. Until then we accumulate exactly the bug
+classes above, and the longer we wait the more of them land at once.
+
+Two things keep the debt serviceable:
+
+- **Nothing in the design assumes QEMU.** No test may depend on an emulator-specific
+  behaviour, and the harness abstracts "run this image and collect a result" so that a
+  hardware runner drops in behind the same interface.
+- **The first hardware bring-up is expected to be unpleasant**, and is scheduled as
+  real work rather than a formality. A port that boots under QEMU is perhaps two thirds
+  of the way to booting on the machine it models.
 
 ## Configuration coverage
 
-The configuration space is too large to enumerate. We sample it deliberately:
+The configuration space is too large to enumerate, so we sample it deliberately:
 
 - **All presets, every merge.** The configurations we actually ship.
-- **Boundary configurations**: everything off that can be off, everything on that can
-  be on. These catch the majority of "this config does not compile" bugs.
+- **Boundary configurations** — everything off that can be off, everything on that can
+  be on. Catches most "this config does not compile" bugs.
 - **Randomized configurations, nightly.** `kbuild config --random --seed N` produces a
-  valid configuration; build it. A failure is reported with its seed, so it is
+  valid configuration; build it. Failures are reported with their seed and so are
   reproducible. This is where the unbuildable-configuration bugs that plague
-  `#ifdef`-based kernels would show up — and where we find out whether the trait
+  `#ifdef`-based kernels would surface — and where we find out whether the trait
   approach really removed them.
-- **Pairwise coverage** over config symbols known to interact (SMP × MM model ×
-  isolation × module support), once the symbol count makes exhaustive impractical.
+- **Pairwise coverage** over symbols known to interact (SMP × memory model × isolation
+  × modules × `ABI_LINUX`), once exhaustive becomes impractical.
 
 ## Merge gates
 
@@ -102,16 +264,18 @@ A change may not land unless:
 1. Every tier-1 target builds, every preset.
 2. Host tests pass.
 3. In-kernel tests pass under QEMU for every tier-1 target.
-4. No new `unsafe` block lacks a `// SAFETY:` comment.
-5. No `cfg` appears inside a function body or struct definition
+4. Boot tests pass for every preset, including `gic-version` 2 and 3 on aarch64 and
+   both `-smp 1` and multi-CPU where supported.
+5. No new `unsafe` block lacks a `// SAFETY:` comment.
+6. No `cfg` appears inside a function body or struct definition
    ([the rule](portability.md#where-cfg-is-still-allowed)).
-6. Layering is not violated.
-7. The size report does not regress beyond the configured budget.
-8. From Phase 6b: the Linux compatibility corpus passes. Programs leave the corpus
-   only by explicit decision, never by being quietly removed when they break.
+7. Layering is not violated.
+8. The size report does not regress beyond the configured budget.
+9. From Phase 6b: the Linux compatibility corpus passes. Programs leave the corpus only
+   by explicit decision, never by being quietly dropped when they break.
 
-Gates 1 and 3 are what make the portability claim real, and they are affordable only
-because of `kbuild`'s content-addressed cache.
+Gates 1, 3, and 4 are what make the portability claim real, and they are affordable
+only because of `kbuild`'s content-addressed cache.
 
 ## Size budgets
 
@@ -129,25 +293,31 @@ $ kbuild size --compare origin/main
 ```
 
 A 300-byte regression on a Cortex-M matters and is invisible on x86_64. Tracking it
-per-commit is the only way the small targets stay viable, and it is the mechanism
-that keeps "supports microcontrollers" from quietly becoming false.
+per-commit is the only way small targets stay viable, and it is what keeps "supports
+microcontrollers" from quietly becoming false. The bootloader stages carry their own
+budgets ([bootloader.md](bootloader.md#what-the-bootloader-must-not-do)), where stage 1
+is hard-capped by the 440 bytes the MBR allows.
 
 ## Sanitizers and analysis
 
 - **Debug builds** enable overflow checks, poison freed memory, add lock-order
-  checking, and validate that sleeping functions are not called in atomic context —
-  all as config options so the checks can be enabled selectively in production too.
-- **Address arithmetic is always checked**, in every build, because the failure mode
-  is corruption rather than a wrong number.
-- **Miri** on host tests for the portions that involve `unsafe` and can run under it.
-- **Fuzzing**, from Phase 6, on every parser that touches untrusted input: device
-  tree, ELF loading, module loading, filesystem metadata, network packets. Syscall
-  argument fuzzing from the point the ABI exists.
+  checking, and validate that sleeping functions are not called in atomic context — all
+  as config options, so the checks can be enabled selectively in production too.
+- **Address arithmetic is always checked**, in every build, because the failure mode is
+  corruption rather than a wrong number.
+- **Miri** on host tests for the `unsafe` portions that can run under it.
+- **Model checking** for lock-free data structures on the host, since this is the one
+  mitigation that genuinely substitutes for the weak-memory testing QEMU cannot do.
+- **Fuzzing** from Phase 6 on every parser touching untrusted input: device tree, ELF,
+  module loading, filesystem metadata, network packets, and the boot protocol's tags.
+  Syscall argument fuzzing from the point an ABI exists.
 
 ## Debugging
 
 - `kbuild run --gdb` starts QEMU stopped with a GDB stub and loads the symbol bundle.
-- Panics print a symbolized backtrace, resolved against the separately shipped
-  symbols so that stripped production images remain debuggable.
-- A crash-dump format and an offline decoder, so a report from a device in the field
-  can be read with only the `.config` and the symbol bundle.
+- `kbuild run --replay <trace>` re-executes a recorded failure deterministically, with
+  or without GDB attached.
+- Panics print a symbolized backtrace resolved against the separately shipped symbols,
+  so stripped production images stay debuggable.
+- A crash-dump format and an offline decoder, so a report from a device in the field is
+  readable with only the `.config` and the symbol bundle.
