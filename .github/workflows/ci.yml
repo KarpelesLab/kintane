@@ -59,6 +59,10 @@ jobs:
         run: cargo build --release --manifest-path kbuild/Cargo.toml
       - name: Kernel host tests
         run: ./kbuild/target/release/kbuild test --preset x86_64-qemu
+      # A provider the default preset does not select is not built by the step above.
+      # `bootinfo` from boot/info-kinboot exists only in the UEFI configuration.
+      - name: Host tests of the kinboot handover
+        run: ./kbuild/target/release/kbuild test --preset x86_64-efi --only bootinfo
 
   # "No discussion; the time is better spent elsewhere" — docs/coding-standards.md.
   # A formatting rule nobody enforces is a rule every author negotiates privately, which
@@ -131,7 +135,9 @@ jobs:
       - name: Install QEMU
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-system-arm qemu-system-misc
+          # ovmf: UEFI firmware for the x86_64-efi preset, which boots through
+          # kinboot-efi instead of QEMU's -kernel loader.
+          sudo apt-get install -y -qq qemu-system-x86 qemu-system-arm qemu-system-misc ovmf
           qemu-system-x86_64 --version | head -1
       - name: Build kbuild
         run: cargo build --release --manifest-path kbuild/Cargo.toml
@@ -347,5 +353,22 @@ jobs:
           echo "second: $b"
           if [ "$a" != "$b" ]; then
             echo "::error title=not reproducible::the same source produced different bytes"
+            exit 1
+          fi
+      # The loader and the disk image have reproducibility hazards of their own: lld-link
+      # stamps PE files with the time, and a FAT image records timestamps and a serial.
+      - name: Build the UEFI disk image twice from scratch and compare
+        run: |
+          set -euo pipefail
+          rm -rf build
+          ./kbuild/target/release/kbuild build --preset x86_64-efi
+          a=$(sha256sum build/x86_64-kintane/out/kintane.esp.img | cut -d' ' -f1)
+          rm -rf build
+          ./kbuild/target/release/kbuild build --preset x86_64-efi
+          b=$(sha256sum build/x86_64-kintane/out/kintane.esp.img | cut -d' ' -f1)
+          echo "first:  $a"
+          echo "second: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error title=not reproducible::the same source produced a different ESP image"
             exit 1
           fi

@@ -1,0 +1,14 @@
+# x86_64 booted from UEFI firmware by kinboot-efi, under QEMU q35 with OVMF.
+#
+# The same kernel as x86_64-qemu, entered a different way: the firmware starts the
+# loader from an EFI system partition, the loader reads the kernel off it and hands
+# over the boot protocol's own structure. This is the path a real x86_64 machine
+# takes, and the one `-kernel` skips. See docs/bootloader.md.
+ARCH_X86_64=y
+BOOT_KINBOOT=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+# OVMF itself wants memory: 128 MiB boots, but leaves the kernel little to test with.
+QEMU_MEMORY_MB=256

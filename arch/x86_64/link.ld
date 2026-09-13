@@ -65,8 +65,19 @@ SECTIONS {
         __text_end = .;
     }
 
-    .rodata : ALIGN(4K) {
+    /* First in the read-only region, and an output section of its own, so the linker
+     * gives it a PT_NOTE program header: that is how a KinTane loader finds the
+     * protocol entry point without scanning. It must be named before /DISCARD/,
+     * which drops every other note. */
+    . = ALIGN(4K);
+    /* Page-aligned by the assignment above rather than by ALIGN(4K) on the section:
+     * a note section's own alignment must be 4 or 8, or readers refuse its notes. */
+    .note.kintane : {
         __rodata_start = .;
+        KEEP(*(.note.kintane))
+    }
+
+    .rodata : {
         /* The build ID kbuild stamps after linking; see lib/buildid. */
         KEEP(*(.kintane_build_id))
         *(.rodata .rodata.*)

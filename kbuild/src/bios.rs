@@ -137,6 +137,9 @@ fn build_loader(
         rustflags: Vec::new(),
         host_tests: false,
         manifest: dir.join("kmod.toml"),
+        // Built by the `Build` above for `targets/i686-kinboot.json`, not through the
+        // per-unit `target` mechanism, which covers only targets built into rustc.
+        target: None,
     };
     Ok(b.build_unit(&loader, &built)?.path)
 }

@@ -10,4 +10,4 @@ layer = "core"
 units = ["boot_protocol", "multiboot"]
 
 [config]
-requires = "ARCH_X86_64 || ARCH_I686"
+requires = "(ARCH_X86_64 || ARCH_I686) && !BOOT_KINBOOT"

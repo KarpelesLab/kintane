@@ -18,7 +18,13 @@
 #![no_std]
 #![feature(compiler_builtins)]
 #![compiler_builtins]
+#![feature(rustc_attrs)]
 #![allow(internal_features)]
+
+#[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+mod probestack;
+#[cfg(target_os = "uefi")]
+mod uefi_link;
 
 use core::ffi::c_void;
 

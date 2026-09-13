@@ -1,0 +1,19 @@
+# kinboot-efi: the UEFI loader. A PE/COFF EFI application, built for a target built into
+# rustc rather than one of ours, so it needs no hand-written target specification.
+#
+# `target` is what makes this a separate image: kbuild builds it, and everything it
+# depends on, for that triple in a build of its own, next to the kernel's. It links
+# nothing of the kernel's but the boot protocol, which is the whole point of having a
+# protocol.
+[unit]
+name = "kinboot_efi"
+kind = "bin"
+root = "src/main.rs"
+layer = "loader"
+target = "x86_64-unknown-uefi"
+
+[deps]
+units = ["boot_protocol"]
+
+[config]
+requires = "BOOT_KINBOOT"

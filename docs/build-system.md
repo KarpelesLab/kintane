@@ -172,6 +172,31 @@ source with our codegen flags — no prebuilt `core` from rustup, because we nee
 matching `panic_immediate_abort`, `-C soft-float` on targets that require it, and
 consistent `-C relocation-model`.
 
+### Images for another target
+
+A unit may name a target of its own:
+
+```toml
+[unit]
+name = "kinboot_efi"
+kind = "bin"
+layer = "loader"
+target = "x86_64-unknown-uefi"
+```
+
+Such a unit is a separate image — today, the UEFI loader — and it is built after the
+kernel in a build of its own under `build/<kernel target>/<triple>/`: `core`,
+`compiler_builtins` and the generated config compiled for that triple, then its
+dependencies, then itself. Nothing compiled is shared with the kernel, which is not
+waste: the kernel's `boot_protocol` rlib is for a different target and could not be
+linked here. The triple is part of every cache key. The graph enforces the rest: a
+`target` is only for `bin` units, nothing may depend on such a unit, and the `loader`
+layer sits just above `hal`, so a loader can link the boot protocol and nothing of the
+kernel's.
+
+The target must be one built into the pinned rustc, which is the point: firmware
+targets are exactly what rustc already describes, and they need no linker script.
+
 ### Caching
 
 Content-addressed: the key is the hash of (source files, rustc version, full argument
@@ -274,6 +299,12 @@ byte-identical image on any machine:
 - No `__DATE__`-equivalents, no hostname, no build counter anywhere in the image.
 - `kbuild build` records the hash of every output. CI rebuilds each release from
   scratch on a different machine and compares; a mismatch blocks the release.
+- UEFI images are linked with `/Brepro` and without a PDB. lld-link otherwise stamps the
+  PE with the link time, and the PDB rustc asks for records a temporary directory it
+  names at random — which reaches the PE through its debug directory. CI builds the
+  `x86_64-efi` disk image twice from scratch and compares it too.
+- The ESP disk image records the FAT epoch for every timestamp and a constant volume
+  serial and disk signature, and writes directory entries in name order.
 
 This is also what makes the build identity in [modules.md](modules.md) meaningful — a
 module's compatibility check is only as trustworthy as the determinism of the build it
@@ -328,6 +359,10 @@ The release packaging above is ahead of the code. What `kbuild build` writes to
   built beside it in `build/<target>/kinboot-bios/`, for its own target
   (`targets/i686-kinboot.json`) with its own `core`; see
   [bootloader.md](bootloader.md#build-integration).
+- With `BOOT_KINBOOT` (the `x86_64-efi` preset): `kintane.esp.img`, a 33 MiB disk image
+  whose EFI system partition holds `EFI/BOOT/BOOTX64.EFI` — the loader, built to
+  `build/x86_64-kintane/x86_64-unknown-uefi/kinboot_efi.efi` — and `KINTANE/KERNEL.ELF`,
+  the stripped ELF64. The ELF64 rather than the ELF32: the loader enters in long mode.
 
 ### The build ID
 

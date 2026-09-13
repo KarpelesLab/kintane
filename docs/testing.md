@@ -175,7 +175,7 @@ hand:
 
 | Target | Emulator | Machine | Firmware | Result channel |
 |---|---|---|---|---|
-| x86_64 (UEFI) | `qemu-system-x86_64` | `q35` | OVMF | `isa-debug-exit` |
+| x86_64 (UEFI) | `qemu-system-x86_64` | `q35` | OVMF, booting `kinboot-efi` from the image's ESP | `isa-debug-exit` |
 | x86_64 (`x86_64-qemu`) | `qemu-system-x86_64` | `q35` | `-kernel` | `isa-debug-exit` |
 | x86_64 (`x86_64-bios`) | `qemu-system-x86_64` | `q35`, raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | i686 (`i686-qemu`) | `qemu-system-i386` | `pc` (i440FX) | `-kernel` | `isa-debug-exit` |
@@ -183,6 +183,20 @@ hand:
 | aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
 | armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
 | riscv32 | `qemu-system-riscv32` | `virt` | `-bios none` | `sifive_test` |
+
+The UEFI row is the `x86_64-efi` preset. It needs firmware that is not part of the
+pinned toolchain, so `kbuild` looks for OVMF where distributions put it: next to the
+`qemu-system-x86_64` on `PATH` (QEMU's own edk2 build, as Homebrew installs it), then
+Debian/Ubuntu's `ovmf`, Fedora's and Arch's `edk2-ovmf`, or `KINTANE_OVMF_CODE` and
+`KINTANE_OVMF_VARS`. The variable store is copied fresh for every boot, and the disk is
+attached with `snapshot=on`, so a run changes neither the firmware's state nor the
+image the build produced. That preset logs guest errors and resets rather than every
+interrupt, because OVMF takes thousands of them before the kernel starts.
+
+The `x86_64-qemu` preset boots the same kernel with `-kernel` and stays the fast path
+for everyday work. The two differ only in how the kernel is entered and where its
+memory map comes from, and a kernel built for the loader fails its boot check if the
+handover is missing — a lost `rdi` must not read as "no memory map on this port".
 
 QEMU also ships system emulators for `m68k`, `sparc`, `sh4`, `mips`, `alpha`, `hppa`,
 and `ppc` — every architecture in the

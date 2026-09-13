@@ -5,7 +5,7 @@
 //! exist so that a test's verdict never has to be scraped out of console output.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::kcfg::Resolution;
@@ -31,6 +31,52 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             c.to_string()
         }
     };
+
+    if res.is_on("ARCH_X86_64") && res.is_on("BOOT_KINBOOT") {
+        // The firmware path: OVMF boots the disk image's EFI system partition, which
+        // starts kinboot-efi, which starts the kernel. No -kernel: QEMU's own loader is
+        // exactly what this configuration exists to not use.
+        let fw = uefi_firmware(log.parent().unwrap_or(Path::new(".")))?;
+        let mut args = vec![
+            s("-machine"),
+            s("q35"),
+            s("-cpu"),
+            cpu,
+            s("-m"),
+            mem,
+            s("-drive"),
+            format!("if=pflash,format=raw,unit=0,readonly=on,file={}", fw.code.display()),
+        ];
+        if let Some(vars) = &fw.vars {
+            args.push(s("-drive"));
+            args.push(format!("if=pflash,format=raw,unit=1,file={}", vars.display()));
+        }
+        args.extend([
+            // snapshot=on: the guest writes to an overlay, so the image on disk stays
+            // the bytes the build produced.
+            s("-drive"),
+            format!("format=raw,snapshot=on,file={}", image.display()),
+            s("-device"),
+            s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
+            s("-serial"),
+            s("stdio"),
+            s("-display"),
+            s("none"),
+            s("-no-reboot"),
+            // Guest errors only, not every interrupt: the firmware takes thousands of
+            // timer interrupts before the kernel runs, and logging each one would bury
+            // the kernel's few in megabytes of OVMF.
+            s("-d"),
+            s("guest_errors,cpu_reset"),
+            s("-D"),
+            log.display().to_string(),
+        ]);
+        return Ok(Machine {
+            binary: "qemu-system-x86_64",
+            args,
+            success_code: (0x10 << 1) | 1,
+        });
+    }
 
     if res.is_on("ARCH_X86_64") {
         // isa-debug-exit reports (value << 1) | 1, so the guest can never produce 0
@@ -153,6 +199,86 @@ fn x86_boot_media(res: &Resolution, image: &Path) -> Vec<String> {
     } else {
         vec!["-kernel".into(), image.display().to_string()]
     }
+}
+
+/// UEFI firmware for an x86_64 guest: the code image, and a fresh copy of a variable
+/// store if the firmware has a separate one.
+struct Firmware {
+    code: PathBuf,
+    vars: Option<PathBuf>,
+}
+
+/// Find OVMF. Firmware is a system package rather than part of the pinned toolchain, and
+/// every distribution puts it somewhere else, so this looks in the known places:
+///
+/// - `KINTANE_OVMF_CODE` (and optionally `KINTANE_OVMF_VARS`), for anything else;
+/// - the edk2 build QEMU itself ships, next to the `qemu-system-x86_64` on `PATH` —
+///   Homebrew's, for one;
+/// - Debian and Ubuntu's `ovmf` package, Fedora's `edk2-ovmf`, Arch's `edk2-ovmf`.
+///
+/// The variable store is copied into the build directory for every boot, so a run never
+/// inherits boot entries or settings a previous one wrote.
+fn uefi_firmware(scratch: &Path) -> Result<Firmware, String> {
+    let mut candidates: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    if let Some(code) = std::env::var_os("KINTANE_OVMF_CODE") {
+        candidates.push((code.into(), std::env::var_os("KINTANE_OVMF_VARS").map(Into::into)));
+    }
+    if let Some(bin) = find_on_path("qemu-system-x86_64") {
+        let dirs = [Some(bin.clone()), std::fs::canonicalize(&bin).ok()];
+        for b in dirs.into_iter().flatten() {
+            if let Some(share) = b
+                .parent()
+                .and_then(Path::parent)
+                .map(|p| p.join("share/qemu"))
+            {
+                candidates.push((
+                    share.join("edk2-x86_64-code.fd"),
+                    Some(share.join("edk2-i386-vars.fd")),
+                ));
+            }
+        }
+    }
+    for (code, vars) in [
+        ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+        ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+        ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+        ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+    ] {
+        candidates.push((code.into(), Some(vars.into())));
+    }
+
+    let Some((code, vars)) = candidates.iter().find(|(code, _)| code.is_file()) else {
+        let tried: Vec<String> = candidates
+            .iter()
+            .map(|(c, _)| c.display().to_string())
+            .collect();
+        return Err(format!(
+            "no UEFI firmware (OVMF) found for x86_64\n  tried:\n    {}\n  \
+             install the `ovmf` package, or set KINTANE_OVMF_CODE to the firmware image",
+            tried.join("\n    ")
+        ));
+    };
+    let vars = match vars.as_ref().filter(|v| v.is_file()) {
+        Some(template) => {
+            std::fs::create_dir_all(scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+            let copy = scratch.join("ovmf-vars.fd");
+            std::fs::copy(template, &copy).map_err(|e| {
+                format!("copying {} to {}: {e}", template.display(), copy.display())
+            })?;
+            Some(copy)
+        }
+        None => None,
+    };
+    Ok(Firmware {
+        code: code.clone(),
+        vars,
+    })
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
 }
 
 pub struct Outcome {

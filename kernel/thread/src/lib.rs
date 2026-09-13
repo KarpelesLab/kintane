@@ -457,6 +457,15 @@ mod tests {
         panic!("the mock context switch never runs a thread's entry point");
     }
 
+    /// The mock's switch recorder (`SWITCHES`, `last_switch`) is one set of statics for
+    /// the whole test binary, and the harness runs tests in parallel, so two tests
+    /// switching at once see each other's switches. Every test holds this for its whole
+    /// body. A test that panics poisons the lock; the others still run.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn p(n: u8) -> Priority {
         Priority::new(n).unwrap()
     }
@@ -492,6 +501,7 @@ mod tests {
 
     #[test]
     fn a_new_table_holds_only_the_running_thread() {
+        let _serial = serial();
         let t: Threads<MockFull, 8> = Threads::new(p(5));
         assert_eq!(t.current(), ThreadId::new(0));
         assert_eq!(t.state(ThreadId::new(0)), Some(State::Running));
@@ -501,6 +511,7 @@ mod tests {
 
     #[test]
     fn spawned_threads_are_ready_and_queued_not_running() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
         assert_eq!(t.state(a), Some(State::Ready));
@@ -510,6 +521,7 @@ mod tests {
 
     #[test]
     fn yielding_hands_the_cpu_to_a_ready_peer_and_requeues_itself() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
         let before = SWITCHES.load(Ordering::SeqCst);
@@ -523,24 +535,27 @@ mod tests {
 
     #[test]
     fn contended_means_a_yield_would_switch() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         assert!(!t.contended(), "nothing else exists");
         spawn(&mut t, 11, 4);
         assert!(!t.contended(), "a lower priority does not contend");
-        let before = SWITCHES.load(Ordering::SeqCst);
+        // Judged by the table, not the mock's switch counter: that counter is shared by
+        // every test in the binary, and the harness runs them in parallel.
         yield_now(&mut t).unwrap();
-        assert_eq!(SWITCHES.load(Ordering::SeqCst), before, "and a yield agrees");
+        assert_eq!(t.current(), ThreadId::new(0), "and a yield agrees");
         spawn(&mut t, 12, 5);
         assert!(t.contended(), "a peer at the same level contends");
-        spawn(&mut t, 13, 6);
+        let high = spawn(&mut t, 13, 6);
         assert!(t.contended(), "so does a higher level");
         yield_now(&mut t).unwrap();
-        assert_eq!(last_switch().1, 13, "and a yield switches, to the highest");
+        assert_eq!(t.current(), high, "and a yield switches, to the highest");
         assert!(!t.contended(), "everything still ready is below it");
     }
 
     #[test]
     fn yielding_with_nothing_else_ready_does_not_switch() {
+        let _serial = serial();
         // Invariant 4: a thread must never be switched to itself.
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let before = SWITCHES.load(Ordering::SeqCst);
@@ -552,6 +567,7 @@ mod tests {
 
     #[test]
     fn a_lower_priority_thread_does_not_get_a_yielded_cpu() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(9));
         spawn(&mut t, 11, 2);
         yield_now(&mut t).unwrap();
@@ -561,6 +577,7 @@ mod tests {
 
     #[test]
     fn repeated_yields_round_robin_through_equal_peers() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
         let b = spawn(&mut t, 12, 5);
@@ -576,6 +593,7 @@ mod tests {
 
     #[test]
     fn a_blocked_thread_leaves_the_queue_and_is_not_resumed_until_woken() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
         block(&mut t).unwrap();
@@ -597,6 +615,7 @@ mod tests {
 
     #[test]
     fn blocking_the_only_runnable_thread_is_refused() {
+        let _serial = serial();
         // Switching to nothing would resume an empty context. On a machine the idle
         // thread prevents this; here it must be an error, not a jump.
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
@@ -607,6 +626,7 @@ mod tests {
 
     #[test]
     fn waking_a_thread_that_is_not_blocked_is_an_error() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
         assert_eq!(t.wake(a), Err(Error::WrongState(State::Ready)));
@@ -618,6 +638,7 @@ mod tests {
 
     #[test]
     fn an_exited_thread_is_never_resumed_and_can_be_reaped() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
         yield_now(&mut t).unwrap(); // now running a
@@ -638,6 +659,7 @@ mod tests {
 
     #[test]
     fn a_running_or_ready_thread_cannot_be_reaped() {
+        let _serial = serial();
         // Reaping frees the stack. Doing it to a thread that can still run is a
         // use-after-free of its stack.
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
@@ -648,6 +670,7 @@ mod tests {
 
     #[test]
     fn a_stack_too_small_for_the_architecture_is_refused() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         // SAFETY: rejected before init runs, and the mock touches no memory anyway.
         let small = unsafe { t.spawn(never, 1, p(5), STACK, MockFull::MIN_STACK - 1) };
@@ -662,6 +685,7 @@ mod tests {
 
     #[test]
     fn a_corrupted_queue_trips_the_self_switch_guard_instead_of_switching() {
+        let _serial = serial();
         // The guard is unreachable while invariant 2 holds, so the only way to test it is
         // to break invariant 2 deliberately: put the running thread into the run queue.
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
@@ -677,6 +701,7 @@ mod tests {
 
     #[test]
     fn a_full_table_refuses_new_threads() {
+        let _serial = serial();
         let mut t: Threads<MockFull, 2> = Threads::new(p(5));
         // SAFETY: mock init touches no memory.
         unsafe { t.spawn(never, 1, p(5), STACK, SIZE) }.unwrap();
@@ -686,6 +711,7 @@ mod tests {
 
     #[test]
     fn reaped_slots_are_reused_and_ids_are_not() {
+        let _serial = serial();
         // A reused *id* would let a stale reference to a dead thread name a new one —
         // the same class of bug kobject's handle generations prevent.
         let mut t: Threads<MockFull, 2> = Threads::new(p(5));
@@ -700,6 +726,7 @@ mod tests {
 
     #[test]
     fn a_long_random_workload_keeps_every_invariant() {
+        let _serial = serial();
         // Individual tests exercise individual transitions; this checks the invariants
         // survive thousands of arbitrary ones interleaved.
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));

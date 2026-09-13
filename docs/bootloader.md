@@ -52,6 +52,23 @@ Tags carry the memory map, command line, framebuffer description, ACPI RSDP poin
 device tree blob, boot device identity, loaded module/initrd list, entropy seed, TPM
 event log, the kernel's physical and virtual load addresses, and the firmware type.
 
+The byte-level layout — 8-byte tag alignment, `tags_size` including the End tag, the
+memory map's explicit `entry_size` so a region entry can grow — is specified where it
+is implemented, in `boot/protocol/src/tags.rs`, with a host-tested reader and a writer
+that needs no allocator. Of the tags above, v1 as implemented writes the memory map,
+the ACPI RSDP, the kernel's physical range and the firmware type.
+
+### Entering the kernel
+
+A loader also has to know **where to jump**, and the ELF entry point is not always the
+answer. The x86_64 image is a multiboot kernel as well, and its `e_entry` is 32-bit
+protected-mode code, which is what a multiboot loader calls and what a UEFI loader, in
+long mode, cannot. So the image names its protocol entry separately, in an ELF note
+owned by `KinTane` (type 1) that carries the entry's physical address and the protocol
+version it expects. The program headers say exactly where the note is, so there is
+nothing to scan for, and `--strip-all` keeps it. `boot_protocol::image` parses it and
+states the machine state each architecture's entry expects.
+
 ### This is a genuinely stable ABI
 
 Almost nothing else in this project is. [D7](decisions.md#d7--no-stable-module-abi-compatibility-by-hash)
@@ -101,6 +118,44 @@ UEFI-specific behaviour, since the firmware offers things no other platform does
 PE/COFF EFI application with the loader linked in, so firmware boots the kernel
 directly with no separate file. Fewer moving parts, one signature, and it is what most
 modern UEFI systems expect.
+
+#### As built: the minimal loader
+
+Phase 0's loader exists for x86_64 (`boot/kinboot-efi`, preset `x86_64-efi`). It
+does what the Phasing section below asks of the minimal loader and nothing more: read
+`\KINTANE\KERNEL.ELF` from the partition it was started from, place the segments at
+their link addresses, take the ACPI RSDP from the configuration table,
+`ExitBootServices` with the stale-key retry, translate the final map into protocol
+regions, and jump to the note's entry with the structure in `rdi`. It is 27 KiB, a
+fifth of the budget below.
+
+Where the design above was silent or wrong, the implementation decided:
+
+- **Memory that outlives the loader is typed, not remembered.** The kernel image and
+  the boot information are allocated with memory types from the range the UEFI
+  specification reserves for OS loaders, and the translation turns those into the
+  protocol's `KernelImage` and `BootData`. Everything else the firmware or the loader
+  used becomes usable, because after `ExitBootServices` it is.
+- **Handover below 1 GiB.** The kernel's bootstrap page tables map the first gigabyte,
+  so the loader refuses an image above it and allocates the structure below it.
+- **The map is coalesced.** OVMF reports around a hundred descriptors; merged by kind,
+  the kernel receives 26. Without merging the map does not fit the kernel's region
+  buffer, which the boot check turns into a failure rather than a truncated map.
+- **The disk image is written by kbuild** — MBR, one `0xEF` partition, FAT16 — rather
+  than by `mkfs.fat` and `mtools`, which are not part of the pinned toolchain. MBR
+  rather than GPT because UEFI requires firmware to accept both and one partition
+  needs nothing more.
+- **Float symbols the loader never calls, resolved honestly.** lld-link demands every symbol in every
+  object it reads, and `core` puts float code beside integer formatting. The loader's
+  `compiler_builtins` satisfies those symbols with stubs that trap, and kbuild fails the
+  build if one survives the linker's dead-code removal (`lib/builtins/src/uefi_link.rs`).
+
+Not in the minimal loader, and following the phasing below: boot entries and modes,
+GOP framebuffer, the command line from `LoadOptions`, Secure Boot and signature
+verification, measured boot, the boot counter, chainloading, and the aarch64 and i686
+UEFI builds. The loader carries no symbol bundle yet either: it is linked without a
+PDB, because lld-link's PDB records a path rustc picks at random and would make the
+image irreproducible.
 
 ### `kinboot-bios` — MBR / BIOS
 
@@ -349,7 +404,7 @@ contents, not the clock.
 Boot work is spread across the [roadmap](roadmap.md) rather than deferred:
 
 - **Phase 0** — boot protocol v1, and a minimal `kinboot-efi` that gets x86_64 to a
-  banner under QEMU.
+  banner under QEMU. Done: see [As built](#as-built-the-minimal-loader).
 - **Phase 1** — `kinboot-bios`, because tier-1 i686 cannot boot without it. This is the
   scheduling consequence most likely to be missed: the MBR loader is early work, not
   Phase 7 polish.

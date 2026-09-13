@@ -17,6 +17,10 @@ use crate::toml;
 const LAYERS: &[&str] = &[
     "builtins",
     "hal",
+    // Bootloaders: images of their own, built for a firmware target, that may link the
+    // boot protocol and nothing of the kernel's. Ranked just above `hal` so layering
+    // alone keeps arch, core and everything after them out of a loader.
+    "loader",
     "arch",
     "core",
     "device",
@@ -53,6 +57,10 @@ pub struct Unit {
     /// Whether this unit's tests can run on the host against a mock architecture.
     /// Opting in is a claim that the code needs no real hardware.
     pub host_tests: bool,
+    /// A target built into rustc that this unit is built for instead of the kernel's,
+    /// such as `x86_64-unknown-uefi`. Such a unit is a separate image — a bootloader —
+    /// built with its own `core` and its own copies of its dependencies.
+    pub target: Option<String>,
     pub manifest: PathBuf,
 }
 
@@ -144,6 +152,14 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
 
     let dir = manifest.parent().unwrap_or(Path::new(".")).to_path_buf();
 
+    let target = v
+        .get_path("unit.target")
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    if target.is_some() && kind != Kind::Bin {
+        return Err(at("`unit.target` is for images; a library is built for whoever links it"));
+    }
+
     Ok(Unit {
         name,
         kind,
@@ -156,6 +172,7 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
             .get_path("unit.host-tests")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        target,
         dir,
         manifest: manifest.to_path_buf(),
     })
@@ -211,6 +228,18 @@ pub fn plan(units: Vec<Unit>, res: &Resolution) -> Result<Vec<Unit>, String> {
                     u.layer,
                     dep.name,
                     dep.layer,
+                    u.manifest.display()
+                ));
+            }
+            // An image built for another target is not something to link against: its
+            // code is for a different machine state, if not a different machine.
+            if dep.target.is_some() {
+                return Err(format!(
+                    "`{}` depends on `{}`, which is built for {} as an image of its own\n  \
+                     declared at {}",
+                    u.name,
+                    dep.name,
+                    dep.target.as_deref().unwrap_or_default(),
                     u.manifest.display()
                 ));
             }
@@ -302,6 +331,7 @@ mod tests {
             requires: None,
             rustflags: vec![],
             host_tests: false,
+            target: None,
             manifest: PathBuf::from("kmod.toml"),
         }
     }
@@ -374,6 +404,35 @@ mod tests {
         let b = unit("arch", "arch", &[]);
         let e = plan(vec![a, b], &Resolution::default()).unwrap_err();
         assert!(e.contains("provided by two units"), "{e}");
+    }
+
+    #[test]
+    fn a_loader_may_link_the_protocol_but_nothing_above_it() {
+        let mut loader = unit("kinboot", "loader", &["boot_protocol"]);
+        loader.kind = Kind::Bin;
+        loader.target = Some("x86_64-unknown-uefi".into());
+        let ok = vec![loader.clone(), unit("boot_protocol", "hal", &[])];
+        assert!(plan(ok, &Resolution::default()).is_ok());
+
+        let mut greedy = loader;
+        greedy.deps.push("mm".into());
+        let bad = vec![
+            greedy,
+            unit("boot_protocol", "hal", &[]),
+            unit("mm", "core", &[]),
+        ];
+        let e = plan(bad, &Resolution::default()).unwrap_err();
+        assert!(e.contains("layering violation"), "{e}");
+    }
+
+    #[test]
+    fn nothing_may_link_an_image_built_for_another_target() {
+        let mut loader = unit("kinboot", "loader", &[]);
+        loader.kind = Kind::Bin;
+        loader.target = Some("x86_64-unknown-uefi".into());
+        let units = vec![loader, unit("kernel", "kernel", &["kinboot"])];
+        let e = plan(units, &Resolution::default()).unwrap_err();
+        assert!(e.contains("image of its own"), "{e}");
     }
 
     #[test]

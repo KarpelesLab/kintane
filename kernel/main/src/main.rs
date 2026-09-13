@@ -36,11 +36,12 @@ use mm::phys::{FrameAllocator, bitmap_bytes};
 /// whatever execution mode the target needs, and an identity mapping.
 ///
 /// `boot_arg` is whatever the platform's loader left in the first argument register:
-/// the multiboot info pointer on x86, a device tree pointer on aarch64. Turning it
-/// into a `BootInfo` is the next piece of work.
+/// the multiboot info pointer on x86, a device tree pointer on aarch64, or the boot
+/// protocol's own structure when kinboot-efi started the image. The configuration's
+/// `bootinfo` provider knows which.
 ///
 /// # Safety
-/// Called exactly once, by `_start`, with interrupts masked.
+/// Called exactly once, by the architecture's boot code, with interrupts masked.
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // SAFETY: first and only initialisation of COM1, before any other writer exists.
@@ -344,7 +345,20 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
                 bootinfo::Error::TooManyRegions { .. } => "too many regions",
             });
             c.write_str(")");
-            return (Check::Skipped, Live::NONE);
+            // A port with no map source yet skips. A map that is present and broken fails,
+            // and so does a missing one in a configuration built for a KinTane loader:
+            // there the handover *is* the thing under test, and a boot that lost it must not
+            // exit as a pass.
+            let broken = matches!(
+                e,
+                bootinfo::Error::Malformed { .. } | bootinfo::Error::TooManyRegions { .. }
+            );
+            let verdict = if broken || kconfig::BOOT_KINBOOT {
+                Check::Failed
+            } else {
+                Check::Skipped
+            };
+            return (verdict, Live::NONE);
         }
     };
 

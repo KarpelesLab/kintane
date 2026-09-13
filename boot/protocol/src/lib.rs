@@ -14,6 +14,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod image;
+pub mod tags;
+pub mod uefi;
+
+#[cfg(test)]
+mod tests;
+
 pub const MAGIC: u64 = 0x4b_49_4e_54_41_4e_45_00; // "KINTANE\0"
 
 /// Incremented only for an incompatible change. Adding a tag is not one.
@@ -89,12 +96,19 @@ pub enum Firmware {
     Static = 5,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     BadMagic,
     /// The loader is newer than this kernel understands.
     UnsupportedVersion(u16),
     Truncated,
+    /// A tag, or the stream of tags, is inconsistent at this byte offset from the start
+    /// of the structure.
+    Malformed {
+        offset: usize,
+    },
+    /// A loader's buffer is too small for what it is writing.
+    NoRoom,
 }
 
 impl BootInfo {
