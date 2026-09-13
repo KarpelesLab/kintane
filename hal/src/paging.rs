@@ -70,6 +70,12 @@ impl PageFlags {
     pub const fn bits(self) -> u16 {
         self.0
     }
+    /// Reconstruct from raw bits, dropping any this build does not define — the same
+    /// discipline as `kobject::Rights`: authority we cannot reason about is discarded
+    /// rather than carried.
+    pub const fn from_bits_truncate(bits: u16) -> PageFlags {
+        PageFlags(bits & 0x7F)
+    }
     pub const fn contains(self, other: PageFlags) -> bool {
         self.0 & other.0 == other.0
     }

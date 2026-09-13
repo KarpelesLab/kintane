@@ -48,6 +48,7 @@
 
 pub mod directmap;
 pub mod frame;
+pub mod paged;
 pub mod phys;
 
 pub use directmap::DirectMap;

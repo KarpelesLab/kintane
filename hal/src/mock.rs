@@ -8,8 +8,9 @@
 //! The rule this supports, from `docs/testing.md`: **a subsystem that cannot be
 //! tested against `MockArch` has a design problem.**
 
+use crate::paging::{HasPageTables, PageFlags, PageTableEntry};
 use crate::*;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// A full-featured machine: MMU, SMP, atomics, coherent DMA, floating point.
 /// Models the x86_64 and aarch64 end of the range.
@@ -114,6 +115,103 @@ unsafe impl UniProcessor for MockTiny {}
 // Note what MockTiny does NOT implement: HasMmu, HasSmp, HasCas, HasCoherentDma,
 // HasFpu. Any subsystem generic over those simply cannot be instantiated with it,
 // which is the compile-time half of the portability claim.
+
+// ---- page tables ------------------------------------------------------------
+//
+// A software table format, deliberately resembling no real architecture. The point
+// is to test the *walker* — the tree descent, table allocation, huge-page splitting
+// and teardown that `mm::paged` does once for every target — without also testing
+// x86's bit assignments. A mock that copied a real format would make a walker bug and
+// an encoding bug look the same.
+
+/// A mock page table entry.
+///
+/// bit 0 present, bit 1 leaf, bits 2..=8 the neutral `PageFlags`, address from bit 12.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MockEntry(u64);
+
+const M_PRESENT: u64 = 1 << 0;
+const M_LEAF: u64 = 1 << 1;
+const M_FLAG_SHIFT: u32 = 2;
+const M_FLAG_MASK: u64 = 0x7F << M_FLAG_SHIFT;
+const M_ADDR_MASK: u64 = !0xFFF;
+
+impl PageTableEntry for MockEntry {
+    fn empty() -> Self {
+        MockEntry(0)
+    }
+    fn is_present(self) -> bool {
+        self.0 & M_PRESENT != 0
+    }
+    fn is_leaf(self, _level: u8) -> bool {
+        self.is_present() && self.0 & M_LEAF != 0
+    }
+    fn address(self) -> PhysAddr {
+        PhysAddr::new(self.0 & M_ADDR_MASK)
+    }
+    fn flags(self, _level: u8) -> PageFlags {
+        PageFlags::from_bits_truncate(((self.0 & M_FLAG_MASK) >> M_FLAG_SHIFT) as u16)
+    }
+    fn table(table: PhysAddr) -> Self {
+        MockEntry((table.raw() & M_ADDR_MASK) | M_PRESENT)
+    }
+    fn leaf(frame: PhysAddr, flags: PageFlags, _level: u8) -> Self {
+        MockEntry(
+            (frame.raw() & M_ADDR_MASK)
+                | M_PRESENT
+                | M_LEAF
+                | ((flags.bits() as u64) << M_FLAG_SHIFT),
+        )
+    }
+}
+
+static MOCK_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts TLB invalidations, so a test can assert the walker issued one. Forgetting
+/// to flush is a bug that works perfectly until the stale translation is used.
+pub static TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+/// Counts full-address-space invalidations specifically.
+pub static TLB_FLUSHES_ALL: AtomicUsize = AtomicUsize::new(0);
+
+impl HasPageTables for MockFull {
+    type Entry = MockEntry;
+
+    fn index_bits(_level: u8) -> u8 {
+        9
+    }
+
+    fn leaf_allowed(level: u8) -> bool {
+        // 4 KiB, 2 MiB and 1 GiB, matching MockFull::HUGE_PAGE_SIZES.
+        level <= 2
+    }
+
+    fn is_canonical(addr: usize) -> bool {
+        // Mimics x86-64 deliberately: the walker must cope with an architecture that
+        // rejects addresses in the middle of the range, and a mock that accepted
+        // everything would never exercise that path.
+        let sign = (addr >> 47) & 1;
+        let high = addr >> 48;
+        if sign == 1 { high == 0xFFFF } else { high == 0 }
+    }
+
+    unsafe fn set_root(root: PhysAddr) {
+        MOCK_ROOT.store(root.raw(), Ordering::SeqCst);
+    }
+
+    fn root() -> PhysAddr {
+        PhysAddr::new(MOCK_ROOT.load(Ordering::SeqCst))
+    }
+
+    unsafe fn flush_tlb(addr: Option<usize>) {
+        TLB_FLUSHES.fetch_add(1, Ordering::SeqCst);
+        if addr.is_none() {
+            TLB_FLUSHES_ALL.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// Note what is absent: no `impl HasPageTables for MockTiny`. It has no MMU, so a
+// subsystem generic over page tables cannot be instantiated with it at all.
 
 /// An interrupt controller that records what was asked of it.
 pub struct MockIrqChip {
