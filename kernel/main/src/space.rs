@@ -161,8 +161,13 @@ struct Planner<'a> {
 
 impl Planner<'_> {
     fn push(&mut self, start: u64, end: u64, flags: PageFlags, what: &'static str) {
-        let lo = ((start / self.page) * self.page).max(self.watermark);
-        let hi = end.div_ceil(self.page) * self.page;
+        // Masks, not division: `page` is a power of two, and u64 division on a 32-bit
+        // target is a runtime-library call. This one happens to fold into a shift
+        // today because the page size is a constant; relying on that for a link to
+        // succeed is how the previous one broke.
+        let mask = self.page - 1;
+        let lo = (start & !mask).max(self.watermark);
+        let hi = end.saturating_add(mask) & !mask;
         if hi > lo && self.n < self.out.len() {
             self.out[self.n] = Segment {
                 start: lo,
@@ -235,8 +240,9 @@ fn plan(
         let (g0, g1) = s.stack_guard;
         // Rounded *inward*, so rounding can only make the hole smaller and never
         // swallow a page of real data beside it.
-        let g0 = g0.div_ceil(page) * page;
-        let g1 = (g1 / page) * page;
+        let mask = page - 1;
+        let g0 = g0.saturating_add(mask) & !mask;
+        let g1 = g1 & !mask;
         p.push(s.data.0, g0.min(s.data.1), PageFlags::KERNEL_DATA, "data");
         p.hole_until(g1);
         p.push(g1.max(s.data.0), s.data.1, PageFlags::KERNEL_DATA, "data above guard");
@@ -282,6 +288,14 @@ fn check<A: HasPageTables>(
         return ok;
     }
 
+    // Where the CPU cannot forbid execution, every mapping reads back executable no
+    // matter what was requested. That is a limit of the machine, not a bug in the
+    // kernel, and failing on it would produce a failure nobody can fix. So the
+    // no-execute half is only demanded when it can be delivered — and the report says
+    // plainly which half is holding, so a partial guarantee is never read as a full one.
+    let nx = A::can_forbid_execute();
+    let exec_deny = if nx { PageFlags::EXECUTE } else { PageFlags::empty() };
+
     // The property W^X exists for: nothing is both writable and executable.
     for seg in segs {
         if seg.flags.contains(PageFlags::WRITE) && seg.flags.contains(PageFlags::EXECUTE) {
@@ -320,15 +334,10 @@ fn check<A: HasPageTables>(
     ok &= probe(
         s.rodata.0,
         PageFlags::READ,
-        PageFlags::WRITE | PageFlags::EXECUTE,
+        PageFlags::WRITE.union(exec_deny),
         "rodata",
     );
-    ok &= probe(
-        s.data.0,
-        PageFlags::WRITE,
-        PageFlags::EXECUTE,
-        "data",
-    );
+    ok &= probe(s.data.0, PageFlags::WRITE, exec_deny, "data");
 
     // The guard page must not resolve at all. This is the whole point of it: an
     // overflow has to fault rather than quietly write to whatever is below.
@@ -340,9 +349,13 @@ fn check<A: HasPageTables>(
                 ok = false;
             }
         }
-        c.write_str("W^X over ");
+        c.write_str(if nx { "W^X over " } else { "no-write only (CPU has no NX) over " });
     } else {
-        c.write_str("W^X (no guard page on this port) over ");
+        c.write_str(if nx {
+            "W^X (no guard page on this port) over "
+        } else {
+            "no-write only (CPU has no NX, no guard page) over "
+        });
     }
 
     write_kib(c, s.text.1 - s.text.0);

@@ -203,12 +203,54 @@ pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
     paging::selftest(c)
 }
 
-/// The kernel image's sections.
+/// The kernel image's sections, as `link.ld` laid them out.
 ///
-/// Currently unsplit: this port maps its whole image one way. Splitting it needs
-/// section symbols in `link.ld`, and until then saying so through
-/// [`hal::ImageSections::unsplit`] is more honest than inventing boundaries.
+/// Every boundary below is page-aligned at both ends, because the linker script pads
+/// each section to a page before the next one starts. That is what makes the split
+/// enforceable rather than merely described: a page can carry only one set of
+/// permissions, so a boundary inside a page would force that page to hold the union of
+/// both sides' needs and hand the strictest section the weakest of the two.
+///
+/// The `data` range deliberately spans the guard page: `.data`, `.bss`, the guard hole
+/// and `.stack` are one contiguous writable run, and the guard is a page punched back
+/// out of it rather than a gap between two ranges. Reporting it any other way would
+/// leave the boot stack — which is above the guard — outside the range the caller maps
+/// writable, and the first push after the switch would fault.
+///
+/// # What this buys, per CPU
+///
+/// The "no-write" half of W^X holds on both i686 presets: `CR0.WP` is set in
+/// [`paging::enable_write_protect`], so a clear R/W bit binds supervisor code too, and
+/// `.text` and `.rodata` are genuinely unwritable once mapped from these ranges.
+///
+/// The "no-execute" half depends on the CPU. Bit 63 of a PAE entry is execute-disable,
+/// but it is architecturally reserved until `EFER.NXE` is set, and `EFER` need not
+/// exist on an i686 at all — so [`paging::enable_nx`] probes CPUID and
+/// [`paging::nx_enabled`] reports the answer. On `i686-large` (`-cpu max`) NX is
+/// available and `.rodata`, `.data`, `.bss` and the stack are non-executable. On
+/// `i686-qemu` (`-cpu qemu32`, the default CI core) it is not: every mapping on that
+/// machine is executable no matter what flags are asked for, and this port can enforce
+/// only the "no-write" half there. The sections are still split — the split is what
+/// makes `.text` read-only — but a W^X claim for this port holds fully on one of the
+/// two CI configurations and half on the other.
 pub fn image_sections() -> hal::ImageSections {
-    let (start, end) = image_range();
-    hal::ImageSections::unsplit(start, end)
+    unsafe extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+        static __rodata_start: u8;
+        static __rodata_end: u8;
+        static __data_start: u8;
+        static __data_end: u8;
+        static __stack_guard_start: u8;
+        static __stack_guard_end: u8;
+    }
+    // Taking addresses of linker symbols, never reading through them: the symbols mark
+    // positions and have no value of their own.
+    let at = |p: *const u8| p as usize as u64;
+    hal::ImageSections {
+        text: (at(&raw const __text_start), at(&raw const __text_end)),
+        rodata: (at(&raw const __rodata_start), at(&raw const __rodata_end)),
+        data: (at(&raw const __data_start), at(&raw const __data_end)),
+        stack_guard: (at(&raw const __stack_guard_start), at(&raw const __stack_guard_end)),
+    }
 }

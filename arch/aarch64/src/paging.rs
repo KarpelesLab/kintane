@@ -315,6 +315,12 @@ impl Entry {
 // --- HasPageTables --------------------------------------------------------------
 
 impl HasPageTables for Aarch64 {
+    fn can_forbid_execute() -> bool {
+        // UXN and PXN are part of the descriptor format itself and need no feature
+        // probe or enable bit.
+        true
+    }
+
     type Entry = Entry;
 
     fn index_bits(_level: u8) -> u8 {

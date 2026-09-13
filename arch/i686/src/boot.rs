@@ -31,6 +31,25 @@
 //! faults on the `mov %eax, %cr0` that enables paging. The entries below carry `0x01`
 //! and nothing else.
 //!
+//! ## Where the boot stack and the early tables live
+//!
+//! Both are `.bss`, and until recently both were in the *same* `.bss`, with the four
+//! page directories ending exactly where the stack began. A stack that grew one page
+//! too far therefore overwrote the live translation tables — quietly, because a table
+//! stays valid until the corrupted entry is next walked, so the fault landed somewhere
+//! unrelated and much later.
+//!
+//! They are now in sections of their own, `.bss.boot_tables` and `.stack`, and
+//! `link.ld` puts the tables at the bottom of `.bss`, the stack at the top of the
+//! image, and an unmapped guard page between them. That page is the only means this
+//! port has of *detecting* an overflow: a 32-bit gate descriptor has no IST field (see
+//! `idt.rs`), so `#DF` cannot be given a stack of its own here and an overflow that is
+//! not caught at the guard is caught nowhere.
+//!
+//! The guard is not enforced by the map this file builds, which uses 2 MiB leaves and
+//! cannot express a 4 KiB hole; it becomes real when the kernel installs the address
+//! space it builds for itself from `image_sections()`.
+//!
 //! ## Why SSE is enabled here and not on x86_64
 //!
 //! `arch/x86_64` never touches `CR0.EM` or `CR4.OSFXSR` because its target
@@ -152,6 +171,13 @@ _start:
     jmp .Lpaging_on             // serialize: no fetch across the mode change
 
 .Lpaging_on:
+    // EFER.NXE and CR0.WP, before anything above this point in the kernel builds a
+    // mapping and expects it to be enforced. Both are properties of the CPU rather
+    // than of any one mapping, and `paging::i686_early_mmu_init` documents why here is
+    // the right moment. No arguments, no return value, and esp is still 16-byte
+    // aligned afterwards.
+    call i686_early_mmu_init
+
     // cdecl: arguments on the stack, caller-cleaned. Eight bytes are pushed rather
     // than four so the call is correct whether `kmain` takes a 32-bit or a 64-bit
     // multiboot pointer — the low dword is the value either way on a little-endian
@@ -178,7 +204,13 @@ gdt32_pointer:
     .word . - gdt32 - 1
     .long gdt32
 
-.section .bss
+// The early translation tables, in a section of their own so `link.ld` can place them
+// at the *bottom* of .bss. They used to sit at its top, immediately below the boot
+// stack, which made the live page directories the first thing a stack overflow
+// overwrote — silently, since the tables stay valid until the overwritten entry is
+// walked. What is below the stack now is a guard page; what is below that is ordinary
+// Rust statics.
+.section .bss.boot_tables, "aw", @nobits
 .align 4096
 pdpt:
     .skip 4096
@@ -186,7 +218,13 @@ pd:
     .skip 16384
 multiboot_info:
     .skip 4
-.align 16
+
+// The boot stack, in a section of its own so that a page-sized hole can be left below
+// it. `link.ld` aligns the section to a page and exports __stack_guard_start /
+// __stack_guard_end for the page beneath; nothing else may be placed there, and the
+// address space the kernel builds for itself leaves it unmapped.
+.section .stack, "aw", @nobits
+.align 4096
 stack_bottom:
     .skip 16384
 stack_top:

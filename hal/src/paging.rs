@@ -290,6 +290,19 @@ pub trait HasPageTables: crate::HasMmu {
     /// worth catching at the mapping call rather than at the access.
     fn is_canonical(addr: usize) -> bool;
 
+    /// Whether a mapping can currently be made non-executable.
+    ///
+    /// Not a constant, because on x86 it is not: execute-disable needs a CPU feature
+    /// probed at run time *and* a control bit that has to be set before it is honoured.
+    /// The i686 target's default QEMU CPU has no NX at all, so on that machine every
+    /// mapping is executable whatever the page table says.
+    ///
+    /// Callers that verify W^X need this to tell "the kernel asked for the wrong
+    /// permissions" from "the hardware cannot express the right ones". Treating the
+    /// second as the first produces a failure nobody can fix; treating the first as the
+    /// second hides a real bug. So the answer has to come from the architecture.
+    fn can_forbid_execute() -> bool;
+
     /// Install `root` as the active translation table.
     ///
     /// # Safety

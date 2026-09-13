@@ -168,7 +168,12 @@ impl<A: HasPageTables> AddressSpace<A> {
                 break;
             }
             let size = level_size::<A>(l);
-            if size > left || virt % size != 0 || phys.raw() % (size as u64) != 0 {
+            // Masks rather than `%`: every size here is a power of two, and a `u64 %`
+            // on a 32-bit target is a call to `__umoddi3` rather than an instruction.
+            // It linked on x86_64 and failed on i686, where `size` varies per level and
+            // so cannot be folded into a shift by the compiler.
+            let mask = size - 1;
+            if size > left || virt & mask != 0 || phys.raw() & (mask as u64) != 0 {
                 break;
             }
             level = l;
@@ -191,7 +196,8 @@ impl<A: HasPageTables> AddressSpace<A> {
         frames: &mut impl FrameSource,
     ) -> Result<(), MapError> {
         let page = A::PAGE_SIZE;
-        if virt % page != 0 || len % page != 0 || phys.raw() % (page as u64) != 0 {
+        let mask = page - 1;
+        if virt & mask != 0 || len & mask != 0 || phys.raw() & (mask as u64) != 0 {
             return Err(MapError::Misaligned);
         }
         if len == 0 {

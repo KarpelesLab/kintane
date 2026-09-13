@@ -269,6 +269,12 @@ impl PageTableEntry for Entry {
 }
 
 impl HasPageTables for I686 {
+    fn can_forbid_execute() -> bool {
+        // False on QEMU's default 32-bit CPU, which has no NX: the i686-qemu preset can
+        // enforce the no-write half of W^X and not the no-execute half.
+        nx_enabled()
+    }
+
     type Entry = Entry;
 
     fn index_bits(level: u8) -> u8 {
@@ -383,6 +389,28 @@ pub fn enable_write_protect() -> bool {
         core::arch::asm!("mov {}, cr0", out(reg) check, options(nomem, nostack, preserves_flags));
         check & (1 << 16) != 0
     }
+}
+
+/// Turn on the two CPU features every later permission decision depends on.
+///
+/// Called from `_start`, immediately after paging comes up and before `kmain`, because
+/// both answers have to be settled *before* anything builds a mapping it expects to be
+/// enforced. `EFER.NXE` decides whether [`Entry::leaf`] may emit bit 63 at all, and
+/// `CR0.WP` decides whether a clear R/W bit binds supervisor code; a page table built
+/// while either is still off is decorative, and the symptom is the absence of a fault
+/// rather than the presence of one. They used to be enabled inside [`selftest`], which
+/// runs well after the kernel has built the address space it means to protect.
+///
+/// Safe at this point specifically: every page the early map covers is writable and
+/// executable, so neither bit can fault anything already in flight. Both calls are
+/// idempotent, so [`selftest`] still calls them and still reports what took.
+///
+/// `extern "C"` with a fixed symbol name because its only caller is the assembly in
+/// `boot.rs`; nothing in the kernel above `arch` names it.
+#[unsafe(no_mangle)]
+pub extern "C" fn i686_early_mmu_init() {
+    enable_nx();
+    enable_write_protect();
 }
 
 /// Whether `CR0.WP` is set, so a clear R/W bit binds the kernel too.
@@ -593,9 +621,12 @@ const WIDE_PHYS: u64 = 0x0000_000F_1234_5000;
 /// ones did before CR3 is touched, and the only mapping that changes is a 2 MiB window
 /// no code or data lives in.
 pub fn selftest(c: &dyn EarlyConsole) -> bool {
+    // Both were already settled by `i686_early_mmu_init` on the way out of `_start`;
+    // both are idempotent, and asking again is how this line reports what the CPU
+    // actually agreed to rather than what was requested of it. Without WP a read-only
+    // mapping does not bind the kernel at all, so every protection the kernel makes
+    // for itself would report success while enforcing nothing.
     let nx = enable_nx();
-    // Without this a read-only mapping does not bind the kernel at all, so every
-    // protection below would report success while enforcing nothing.
     let wp = enable_write_protect();
 
     let geometry_ok = check_geometry(c, nx);

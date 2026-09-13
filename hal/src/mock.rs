@@ -174,6 +174,10 @@ pub static TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 pub static TLB_FLUSHES_ALL: AtomicUsize = AtomicUsize::new(0);
 
 impl HasPageTables for MockFull {
+    fn can_forbid_execute() -> bool {
+        true
+    }
+
     type Entry = MockEntry;
 
     fn index_bits(_level: u8) -> u8 {

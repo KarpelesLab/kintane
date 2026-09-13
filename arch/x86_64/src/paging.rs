@@ -239,6 +239,12 @@ impl PageTableEntry for Entry {
 }
 
 impl HasPageTables for X86_64 {
+    fn can_forbid_execute() -> bool {
+        // Probed CPUID *and* EFER.NXE read back set; before `init` runs this is false,
+        // which is the honest answer at that point.
+        features().nx
+    }
+
     type Entry = Entry;
 
     fn index_bits(_level: u8) -> u8 {

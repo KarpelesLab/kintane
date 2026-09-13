@@ -72,6 +72,7 @@ pub fn run_all<A: Arch>(
     arch_constants::<A>(&mut r);
     interrupt_masking::<A>(&mut r);
     atomics(&mut r);
+    wide_arithmetic(&mut r);
     memory::<A>(&mut r, boot_arg, reserved);
 
     c.write_str("\n    ");
@@ -150,6 +151,52 @@ fn atomics(r: &mut Report) {
         v.compare_exchange(42, 9, Ordering::SeqCst, Ordering::SeqCst) == Err(7),
     );
     r.check("atomic swap", v.swap(0, Ordering::SeqCst) == 7);
+}
+
+/// 64-bit division, which on a 32-bit target is a runtime-library call rather than an
+/// instruction.
+///
+/// This exists because the i686 build once failed to link on `__umoddi3`: the kernel's
+/// `compiler_builtins` did not provide it, and nothing noticed until the shared page
+/// table walker divided by a value the compiler could not fold into a shift. Linking
+/// is not the same as working, so this exercises the intrinsics the way real code
+/// would. `black_box` is what makes it a real test — without it every operand here is
+/// a constant, the compiler folds the answers at build time, and the intrinsics are
+/// never called at all.
+///
+/// On 64-bit targets these are native instructions and the check is merely cheap.
+fn wide_arithmetic(r: &mut Report) {
+    use core::hint::black_box;
+
+    // Operands that do not fit in 32 bits, so the fast path cannot take them.
+    let n = black_box(0x1234_5678_9ABC_DEF0u64);
+    let d = black_box(0x0000_0001_0000_0003u64);
+    r.check("u64 divide above 32 bits", n / d == 0x1234_5678);
+    // Expected values computed independently rather than by hand: the first draft of
+    // this check had two of them wrong, and it was running it on x86_64 — where the
+    // division is a native instruction and these intrinsics are never called — that
+    // showed the *test* was at fault rather than the implementation.
+    r.check("u64 remainder above 32 bits", n % d == 0x641F_DB88);
+
+    // The fast path, where both fit in 32 bits.
+    let small = black_box(1_000_000_007u64);
+    r.check("u64 divide within 32 bits", small / black_box(10u64) == 100_000_000);
+
+    // A power-of-two divisor that varies at run time — the exact shape of the walker's
+    // `phys % size`, where `size` depends on the page table level.
+    let size = black_box(1u64 << 21);
+    r.check(
+        "u64 remainder by a run-time power of two",
+        black_box(0x1234_5600u64) % size == 0x14_5600,
+    );
+
+    // Signed: truncation toward zero, and a remainder taking the dividend's sign.
+    let a = black_box(-7_000_000_000i64);
+    let b = black_box(3i64);
+    r.check("i64 divide truncates toward zero", a / b == -2_333_333_333);
+    r.check("i64 remainder takes the dividend's sign", a % b == -1);
+    // i64::MIN has no positive counterpart, which is where naive sign handling breaks.
+    r.check("i64::MIN divided by one", black_box(i64::MIN) / black_box(1i64) == i64::MIN);
 }
 
 /// The frame allocator over the machine's real memory map, and — the part no host
