@@ -1,0 +1,9 @@
+[unit]
+name = "kobject"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+[deps]
+units = ["hal"]
