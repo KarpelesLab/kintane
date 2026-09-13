@@ -48,6 +48,26 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         });
     }
 
+    if res.is_on("ARCH_I686") {
+        return Ok(Machine {
+            binary: "qemu-system-i386",
+            args: vec![
+                // i440FX rather than q35: this target exists for legacy PCs, and
+                // testing it on a modern chipset would defeat the point.
+                s("-machine"), s("pc"),
+                s("-m"), s("128M"),
+                s("-kernel"), image.display().to_string(),
+                s("-device"), s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
+                s("-serial"), s("stdio"),
+                s("-display"), s("none"),
+                s("-no-reboot"),
+                s("-d"), s("int,guest_errors"),
+                s("-D"), log.display().to_string(),
+            ],
+            success_code: (0x10 << 1) | 1,
+        });
+    }
+
     if res.is_on("ARCH_AARCH64") {
         return Ok(Machine {
             binary: "qemu-system-aarch64",

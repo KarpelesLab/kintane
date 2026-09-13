@@ -7,37 +7,38 @@
 #![no_std]
 #![no_main]
 
-use arch_x86_64 as arch;
-use arch::X86_64 as Cpu;
+
+use arch::Cpu;
 use hal::{Arch, EarlyConsole, HasMmu};
 
-/// Entry from the architecture's boot code, which has already established long mode,
-/// a stack, and an identity mapping.
+/// Entry from the architecture's boot code, which has already established a stack,
+/// whatever execution mode the target needs, and an identity mapping.
 ///
-/// `multiboot` is the pointer the loader left in `ebx`. Phase 0 records it without
-/// parsing it; turning it into a `BootInfo` is the next piece of work.
+/// `boot_arg` is whatever the platform's loader left in the first argument register:
+/// the multiboot info pointer on x86, a device tree pointer on aarch64. Turning it
+/// into a `BootInfo` is the next piece of work.
 ///
 /// # Safety
 /// Called exactly once, by `_start`, with interrupts masked.
 #[unsafe(no_mangle)]
-pub extern "C" fn kmain(multiboot: u64) -> ! {
+pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // SAFETY: first and only initialisation of COM1, before any other writer exists.
     unsafe { arch::EARLY.init() };
 
-    banner(multiboot);
+    banner(boot_arg);
 
     #[cfg(CONFIG_QEMU_EXIT)]
     {
         // The result channel the test protocol uses: a real exit status rather than
         // console output for a harness to scrape. See docs/testing.md.
-        arch::qemu_exit(0x10);
+        arch::exit_emulator(true);
     }
 
     #[cfg(not(CONFIG_QEMU_EXIT))]
     Cpu::halt()
 }
 
-fn banner(multiboot: u64) {
+fn banner(boot_arg: u64) {
     let c = &arch::EARLY;
     c.write_str("\nKinTane\n");
     c.write_str("  arch       ");
@@ -46,8 +47,8 @@ fn banner(multiboot: u64) {
     write_usize(c, Cpu::PAGE_SIZE);
     c.write_str("\n  paging     ");
     write_usize(c, <Cpu as HasMmu>::LEVELS as usize);
-    c.write_str(" levels\n  multiboot  ");
-    write_hex(c, multiboot);
+    c.write_str(" levels\n  boot arg   ");
+    write_hex(c, boot_arg);
 
     c.write_str("\n  config     SMP=");
     c.write_str(if kconfig::SMP { "y" } else { "n" });
@@ -100,7 +101,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     c.write_str("\n");
 
     #[cfg(CONFIG_QEMU_EXIT)]
-    arch::qemu_exit(0x11);
+    arch::exit_emulator(false);
 
     #[cfg(not(CONFIG_QEMU_EXIT))]
     Cpu::halt()

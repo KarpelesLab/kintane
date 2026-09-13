@@ -1,0 +1,10 @@
+# i686 under QEMU's `pc` machine — the 32-bit x86 tier-1 configuration.
+#
+# This is the target that keeps PhysAddr honest: PAE gives 36-bit physical
+# addresses behind a 32-bit pointer, so `PhysAddr` cannot be `usize` here.
+# See docs/targets.md#i686.
+ARCH_I686=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y

@@ -76,19 +76,9 @@ pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
             }
         }
     }
-    units.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let mut seen = BTreeMap::new();
-    for u in &units {
-        if let Some(prev) = seen.insert(u.name.clone(), u.manifest.clone()) {
-            return Err(format!(
-                "two units are both named `{}`:\n  {}\n  {}",
-                u.name,
-                prev.display(),
-                u.manifest.display()
-            ));
-        }
-    }
+    units.sort_by(|a, b| (a.name.clone(), a.dir.clone()).cmp(&(b.name.clone(), b.dir.clone())));
+    // Duplicate names are checked in `plan`, after the configuration has filtered
+    // units out — several may *provide* a name so long as one is selected.
     Ok(units)
 }
 
@@ -161,7 +151,20 @@ pub fn plan(units: Vec<Unit>, res: &Resolution) -> Result<Vec<Unit>, String> {
         })
         .collect();
 
-    let by_name: BTreeMap<&str, &Unit> = active.iter().map(|u| (u.name.as_str(), u)).collect();
+    // Exactly one provider per name must survive configuration.
+    let mut seen: BTreeMap<&str, &Unit> = BTreeMap::new();
+    for u in &active {
+        if let Some(prev) = seen.insert(u.name.as_str(), u) {
+            return Err(format!(
+                "`{}` is provided by two units that are both enabled:\n  {}\n  {}\n  \
+                 narrow their `config.requires` so the configuration selects one",
+                u.name,
+                prev.manifest.display(),
+                u.manifest.display()
+            ));
+        }
+    }
+    let by_name = seen;
 
     for u in &active {
         let rank = layer_rank(&u.layer).unwrap();
@@ -326,6 +329,31 @@ mod tests {
         ];
         let e = plan(units, &Resolution::default()).unwrap_err();
         assert!(e.contains("dependency cycle"), "{e}");
+    }
+
+    #[test]
+    fn several_units_may_provide_one_name_if_config_picks_one() {
+        // Two arch crates both called "arch": the configuration selects one, and the
+        // kernel image depends on the name rather than on a specific architecture.
+        let mut a = unit("arch", "arch", &[]);
+        a.requires = Some(expr::parse("ARCH_A").unwrap());
+        a.dir = PathBuf::from("arch/a");
+        let mut b = unit("arch", "arch", &[]);
+        b.requires = Some(expr::parse("ARCH_B").unwrap());
+        b.dir = PathBuf::from("arch/b");
+
+        // Neither selected: both filtered out, nothing to build.
+        assert!(plan(vec![a.clone(), b.clone()], &Resolution::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn two_enabled_providers_of_one_name_is_an_error() {
+        let a = unit("arch", "arch", &[]);
+        let b = unit("arch", "arch", &[]);
+        let e = plan(vec![a, b], &Resolution::default()).unwrap_err();
+        assert!(e.contains("provided by two units"), "{e}");
     }
 
     #[test]

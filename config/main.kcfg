@@ -74,14 +74,19 @@ config DEBUG_BUILD
         produced and always shipped separately.
 
 config QEMU_EXIT
-    bool "QEMU exit device"
-    depends on ARCH_X86_64 || ARCH_I686
+    bool "Guest-initiated emulator exit"
+    depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64
     default n
     help
-        Let the guest terminate QEMU with a status through isa-debug-exit.
-        This is the result channel the test protocol uses; see docs/testing.md.
-        It writes to an I/O port that does nothing on real hardware, but it has
-        no business in a production image.
+        Let the guest terminate the emulator with a status. This is the result
+        channel the test protocol uses, so that a verdict is an exit code and
+        never a string scraped from console output; see docs/testing.md.
+
+        How it is done is per-architecture: isa-debug-exit on x86, semihosting
+        on AArch64. Neither belongs in a production image. The x86 form writes
+        to an I/O port that is merely inert on real hardware, but the AArch64
+        form executes HLT #0xF000, which is UNDEFINED without a debugger
+        attached — so this must be off in anything that ships.
 
 config IMAGE_FORMAT
     string

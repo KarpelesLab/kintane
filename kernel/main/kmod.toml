@@ -4,8 +4,7 @@ kind = "bin"
 root = "src/main.rs"
 layer = "kernel"
 
+# `arch` is provided by whichever architecture the configuration selects. The image
+# names the role, not the machine.
 [deps]
-units = ["hal", "arch_x86_64", "boot_protocol"]
-
-[config]
-requires = "ARCH_X86_64"
+units = ["hal", "arch", "boot_protocol"]

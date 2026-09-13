@@ -1,0 +1,14 @@
+# aarch64 under QEMU's `virt` machine — the Phase 1 development and CI configuration.
+#
+# QEMU_EXIT means "the guest may terminate the emulator with a status", not any
+# particular device. On x86 that is isa-debug-exit; here it is ARM semihosting, which
+# QEMU offers whenever it is started with -semihosting-config. Either way the verdict
+# is an exit code rather than a string scraped from console output.
+#
+# It must stay off in anything that ships: the AArch64 form executes HLT #0xF000,
+# which is UNDEFINED without a debugger attached rather than merely inert.
+ARCH_AARCH64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y

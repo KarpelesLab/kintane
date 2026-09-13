@@ -8,4 +8,4 @@ layer = "arch"
 units = ["hal"]
 
 [config]
-requires = "ARCH_X86_64"
+requires = "ARCH_AARCH64"

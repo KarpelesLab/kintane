@@ -1,0 +1,137 @@
+//! Early boot: the ELF entry point, the exception-level descent, and the jump to
+//! `kmain`.
+//!
+//! Far less has to happen here than on x86. AArch64 starts in a 64-bit mode with a
+//! flat address space and the MMU off, so there is no mode switch to engineer and no
+//! page table to build before Rust can run. What is left is the handful of things
+//! that genuinely cannot be expressed in Rust:
+//!
+//! 1. **Park the secondary CPUs.** QEMU releases every `-smp` CPU at the same entry
+//!    point. Without the MPIDR check below they would all race through `.bss`
+//!    zeroing and share one stack. They spin in `wfe` until the SMP bring-up path
+//!    exists to claim them.
+//! 2. **Descend to EL1 if we came up at EL2.** QEMU's `virt` machine starts the
+//!    kernel at EL1 unless it was given `virtualization=on`, in which case the same
+//!    image lands at EL2 instead. That is a machine-configuration detail, not an
+//!    architecture one, so the code handles both rather than asserting one.
+//! 3. **Zero `.bss`, then take a stack.** In that order: the boot stack lives in
+//!    `.bss`, so zeroing after switching to it would erase the frames underneath us.
+//!    Nothing before the stack switch needs a stack — the descent to EL1 goes
+//!    through system registers and `eret`, and the zeroing loop uses registers only.
+//!
+//! Register state on entry is whatever QEMU left. Its ELF path is documented as
+//! "assume that raw images are Linux kernels and ELF images are not", so unlike the
+//! Linux boot protocol there is no device-tree pointer in `x0` — QEMU parks the DTB
+//! at the base of RAM instead. `x0` is still carried through to `kmain` unchanged,
+//! because that is where a pointer will arrive from every other loader, and a value
+//! the banner prints is a value somebody notices when it becomes wrong.
+//!
+//! Entry at EL3 is not handled. It would mean a board booting its own kernel as
+//! secure firmware, which is a different port with a different linker script, not a
+//! variation of this one.
+
+core::arch::global_asm!(
+    r#"
+.section .text.boot, "ax"
+.globl _start
+_start:
+    // Mask debug, SError, IRQ and FIQ for all of early boot. There is no vector
+    // table installed yet, so any exception taken here would be unrecoverable and
+    // silent.
+    msr     daifset, #0xf
+
+    // Carry whatever the loader left in x0 through to kmain.
+    mov     x19, x0
+
+    // Aff2:Aff1:Aff0 of zero identifies the boot CPU on every machine we target.
+    // The rest have nothing to do until SMP bring-up exists.
+    mrs     x0, mpidr_el1
+    and     x0, x0, #0xffffff
+    cbz     x0, .Lprimary
+.Lpark:
+    wfe
+    b       .Lpark
+
+.Lprimary:
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    .Lat_el1
+
+    // --- EL2: hand the machine to EL1 and never come back -------------------
+
+    // HCR_EL2.RW: the lower exception level is AArch64, not AArch32.
+    mov     x0, #(1 << 31)
+    msr     hcr_el2, x0
+
+    // Let EL1 read the counter and program the timer, with no virtual offset, so
+    // the two exception levels agree on what time it is.
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr
+
+    // SCTLR_EL1 to its architectural reset shape: MMU off, caches off, all the RES1
+    // bits set. EL1's copy is not reset by entering EL2, so it must be written
+    // before the eret or EL1 starts with whatever was left there.
+    mov     x0, #0x0800
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+
+    // Return into EL1h — EL1 using SP_EL1 — with the same four exceptions masked
+    // that were masked on entry. SPSR bits: D,A,I,F set, M[4:0] = 0b00101.
+    mov     x0, #0x3c5
+    msr     spsr_el2, x0
+    adr     x0, .Lat_el1
+    msr     elr_el2, x0
+    eret
+
+.Lat_el1:
+    // CPACR_EL1.FPEN = 0b11: do not trap FP or Advanced SIMD at EL1 or EL0.
+    // The kernel is built softfloat and should never issue one, but a trap with no
+    // vector table is an unreadable hang, whereas an FP instruction that simply
+    // executes is a bug somebody can find later.
+    mov     x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+
+    // Zero .bss. The linker aligns __bss_end to 16, so storing 8 bytes at a time
+    // and stopping on >= never overruns and never leaves a tail behind.
+    adrp    x0, __bss_start
+    add     x0, x0, :lo12:__bss_start
+    adrp    x1, __bss_end
+    add     x1, x1, :lo12:__bss_end
+.Lzero_bss:
+    cmp     x0, x1
+    b.hs    .Lbss_done
+    str     xzr, [x0], #8
+    b       .Lzero_bss
+.Lbss_done:
+
+    // The stack lives in .bss and is therefore now zero. SP must be 16-byte aligned
+    // on aarch64 whenever it is used as a base address, which __stack_top is.
+    adrp    x0, __stack_top
+    add     x0, x0, :lo12:__stack_top
+    mov     sp, x0
+
+    // Terminate the frame and return-address chains so an unwinder or a debugger
+    // stops here instead of walking into whatever the loader left behind.
+    mov     x29, xzr
+    mov     x30, xzr
+
+    mov     x0, x19
+    bl      kmain
+
+    // kmain is diverging; reaching this is a bug in the kernel, not a normal exit.
+.Lhang:
+    msr     daifset, #0xf
+    wfi
+    b       .Lhang
+
+.section .bss, "aw", @nobits
+.balign 16
+__stack_bottom:
+    .skip 16384
+__stack_top:
+"#
+);

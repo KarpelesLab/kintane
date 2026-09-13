@@ -60,18 +60,35 @@ hand-written target specification — which is nightly-gated, and is therefore t
 single reason we cannot build on stable
 ([build-system.md](build-system.md#engine-a-pinned-nightly)).
 
-Two known hazards in that specification, found while validating it:
+Two hazards in that specification, and their resolution — found by building it:
 
 - `+soft-float` is rejected outright as incompatible with the i686 ABI, which returns
   floats in x87 registers. The x86_64 approach of `-mmx,-sse,+soft-float` does not
   transfer.
 - Disabling SSE fails to build `core`, which contains functions requiring the `sse`
-  target feature. A kernel that does not want SSE in kernel context still has to get
-  `core` compiled, so the feature set and the FP-usage policy have to be settled
-  together rather than assumed.
+  target feature.
 
-Neither is a blocker; both are Phase 1 work that would otherwise have been discovered
-late.
+So the i686 specification leaves SSE enabled, and the consequence is the part worth
+knowing: **SSE instructions end up in the image whether or not kernel code uses
+floating point.** LLVM emits `xorps`/`movaps` to zero a stack buffer. The first i686
+boot triple-faulted on exactly that, three lines into the banner, and the fault chain
+is instructive — `#UD` on the SSE instruction, delivered through the BIOS IVT that is
+still installed at that point, becoming `#GP` with error `0x32` (`(6 << 3) | IDT`),
+then `#DF`, then reset.
+
+The resolution is that the i686 boot path clears `CR0.EM`, sets `CR0.MP`, and sets
+`CR4.OSFXSR | CR4.OSXMMEXCPT` alongside enabling PAE and paging. `arch/x86_64` needs
+none of this because its specification really can disable SSE.
+
+This is not a workaround. "The kernel must not use floating point" is a policy about
+code we write and about what a context switch has to save; it is not a claim about
+what the code generator emits, and the port has to make the emitted instructions
+legal.
+
+One more difference that will bite anyone copying from `arch/x86_64`: **a 32-bit PAE
+PDPT entry is not a long-mode one.** It carries only the present bit and the two cache
+bits — bits 1 and 2 (R/W and U/S) are reserved and must be zero. The `0x03` that
+x86_64 writes into its PDPTE is correct there and faults here.
 
 ### `armv7m` — Cortex-M, no MMU
 
