@@ -1,0 +1,15 @@
+# One of the units providing the name `bootinfo`: boards no loader or firmware starts,
+# whose memory map is a fact of the board written in config/boards/ and emitted by
+# kbuild as a constant. The configuration selects which provider; see boot/info-none.
+[unit]
+name = "bootinfo"
+kind = "lib"
+root = "src/lib.rs"
+layer = "core"
+host-tests = true
+
+[deps]
+units = ["boot_protocol"]
+
+[config]
+requires = "BOARD_DESCRIBED"

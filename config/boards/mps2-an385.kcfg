@@ -1,0 +1,23 @@
+# ARM MPS2 with the AN385 FPGA image: one Cortex-M3.
+#
+# The machine QEMU models as `mps2-an385`. Its memory, as QEMU lays it out and as
+# Arm's AN385 application note describes the board:
+#
+#   0x00000000  4 MiB  ZBT SSRAM1. Code: where the vector table must be at reset, so
+#                      the image's .text, .rodata and the load copy of .data live
+#                      here. SRAM on the real board, written by the FPGA's loader,
+#                      and treated as flash by this port: the kernel executes in
+#                      place and never allocates from it.
+#   0x20000000  4 MiB  ZBT SSRAM2 and 3. Data: .data, .bss, the stacks.
+#   0x21000000 16 MiB  PSRAM on QEMU's model of the board.
+#
+# The devices the port uses are fixed by the FPGA image rather than described
+# anywhere the kernel could read: the CMSDK APB UART0 at 0x40004000, APB timer 0 at
+# 0x40000000 (interrupt 8), and the Cortex-M3's own System Control Space. Those live
+# in arch/armv7m as constants, like riscv32's `virt` addresses, until a board
+# description grows devices.
+
+config BOARD_MPS2_AN385
+    bool
+    readonly
+    default y if ARCH_ARMV7M

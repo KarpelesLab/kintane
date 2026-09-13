@@ -237,6 +237,10 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         });
     }
 
+    if res.is_on("ARCH_ARMV7M") {
+        return Ok(crate::qemu_armv7m::machine(res, image, log));
+    }
+
     Err("no QEMU machine is defined for this configuration".into())
 }
 

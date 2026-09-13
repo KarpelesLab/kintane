@@ -1,0 +1,35 @@
+# Boards: machines whose memory layout no loader or firmware reports.
+#
+# An x86 PC's firmware hands over E820 or a UEFI map, and aarch64 and riscv32 boards
+# hand over a device tree. A Cortex-M part has nothing: the kernel is the first code
+# on the machine, started from the vector table at reset. What would have been the
+# loader's memory map is instead a fact about the board, written down once here and
+# emitted by kbuild into the generated configuration as a constant, which
+# `boot/info-board` turns into the same memory map the other `bootinfo` providers
+# return. See docs/bootloader.md, "Build-time BootInfo".
+#
+# Each board is a file under boards/ that declares its symbol; BOARD_MEMORY below
+# says what that board's memory is. A configuration with no board leaves it empty,
+# and nothing reads it.
+
+source "boards/mps2-an385.kcfg"
+
+config BOARD_DESCRIBED
+    bool
+    readonly
+    default y if BOARD_MPS2_AN385
+    help
+        The configuration's board has a description, so `boot/info-board`
+        provides the memory map. Every board file adds its symbol here.
+
+config BOARD_MEMORY
+    string
+    readonly
+    default "kernel-image 0x00000000 0x00400000; usable 0x20000000 0x00400000; usable 0x21000000 0x01000000" if BOARD_MPS2_AN385
+    default ""
+    help
+        The board's physical memory, as `kind start length` entries separated
+        by semicolons. Kinds are those of the boot protocol's memory map:
+        usable, reserved, kernel-image, boot-data, bad. Parsed at compile time
+        by boot/info-board, so a malformed description is a build error, not
+        a boot that trusts a wrong map.

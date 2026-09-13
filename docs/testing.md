@@ -147,6 +147,17 @@ is an unmapped page, and `riscv32-virt` has nothing to unmap: the three symbols 
 An overflow on `riscv32` is not caught today. PMP regions could catch it and are not
 programmed yet.
 
+`armv7m-mps2` has no page to unmap either, but it has an MPU, and its guards are MPU
+regions: no access to the page below the boot stack, or to the bottom 8 KiB of each
+thread-stack slot. The configuration refuses the three test modes there too, because
+they are written against `MM_PAGED`. So its interrupt selftest proves the guards instead:
+it reads the boot stack's guard and a thread stack's guard, writes `.rodata`, and requires
+the first three to fault and a read of `.rodata` not to, stepping over each faulting
+instruction. A genuine overflow of the boot stack was run by hand as a mutation. The core
+fails to stack the exception frame, and the report still names the guard (`stack
+overflow: the address is in the guard below the boot stack`), because handlers run on the
+main stack and threads on the process stack.
+
 ### Boot entries, the command line and chainloading
 
 The boot path has its own settings, and each is proven the same way: by a boot whose exit
@@ -338,7 +349,7 @@ hand:
 | i686 (`i686-bios`) | `qemu-system-i386` | `pc` (i440FX), raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
 | aarch64 (`aarch64-virt-smp`) | `qemu-system-aarch64` | `virt`, `-smp 4` | `-kernel`, secondaries through PSCI | semihosting |
-| armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
+| armv7m (`armv7m-mps2`) | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none: `-kernel`, executing in place | semihosting |
 | riscv32 (`riscv32-virt`) | `qemu-system-riscv32` | `virt` | `-bios none`, `-kernel` | `sifive_test` |
 
 The `-kernel` rows also pass `-append` with the command line the configuration's default

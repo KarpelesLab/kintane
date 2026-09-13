@@ -294,6 +294,27 @@ at all.
 This is the project's thesis applied to boot: the same kernel code, the difference
 pushed into configuration rather than into a parallel code path.
 
+**As built** (`armv7m-mps2`). The board description is a file under `config/boards/`
+that declares the board and a `BOARD_MEMORY` string under `config/board.kcfg`: the
+board's memory as `kind start length` entries. kbuild already emits every configuration
+symbol into the generated `kconfig` crate as a constant, so no generator was needed.
+`boot/info-board` is the `bootinfo` provider for any configuration with
+`BOARD_DESCRIBED`:
+
+- Its `MAP` is a `const` item that parses `BOARD_MEMORY` **in the compiler**, so a
+  description with an unknown kind, a malformed number or an overflowing region stops the
+  build with the reason. The parser is host-tested on its own.
+- Its `command_line` composes `mode=` from `BOOT_MODE` and then `CMDLINE`: the line a
+  KinTane loader's default entry would pass. So `BOOT_ARGS_CHECK` means the same thing
+  here as on a loaded port.
+- It returns the same `memory_regions` and `command_line` every other provider does. The
+  plan above said a `BootInfo` structure; what is linked in is the provider's answer
+  rather than a tag block, because `kmain` reads the provider, not the tags, on every
+  port.
+
+What it cannot do is notice a board that differs from its description. A loader's map is
+measured and this one is asserted.
+
 ### Being loaded by others
 
 Supporting foreign loaders is cheap and buys reach we should not refuse:
