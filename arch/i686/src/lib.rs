@@ -47,6 +47,7 @@ pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod serial;
+pub mod tick;
 
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};
 pub use serial::EARLY;

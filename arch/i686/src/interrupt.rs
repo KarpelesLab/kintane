@@ -75,7 +75,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal::{Arch, EarlyConsole, IrqChip, IrqNumber};
 
 use crate::serial::{write_dec, write_hex};
-use crate::{I686, exception, idt, pic, pit};
+use crate::{I686, exception, idt, pic, pit, tick};
 
 /// Install plain (no error code) handlers for a list of vectors.
 ///
@@ -143,7 +143,7 @@ pub static TICKS: AtomicU64 = AtomicU64::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// The line the PIT is wired to. Fixed by the PC architecture, not discovered.
-const TIMER_IRQ: IrqNumber = IrqNumber(0);
+pub(crate) const TIMER_IRQ: IrqNumber = IrqNumber(0);
 
 /// Tick rate for the selftest. Fast enough that waiting for one tick is imperceptible,
 /// slow enough that it is not a meaningful share of a TCG-emulated CPU.
@@ -183,6 +183,11 @@ extern "x86-interrupt" fn irq_entry<const LINE: u8>(_frame: idt::InterruptFrame)
     let irq = IrqNumber(u32::from(LINE));
     dispatch(irq);
     CHIP.eoi(irq);
+    // Last, and after the EOI: the hook may switch threads, and this line must be
+    // acknowledged before the interrupted thread is suspended. See `tick`.
+    if irq == TIMER_IRQ {
+        tick::run_hook();
+    }
 }
 
 /// Route a line to its handler.

@@ -13,6 +13,7 @@ pub mod gic;
 pub mod irq;
 pub mod paging;
 pub mod serial;
+pub mod tick;
 pub mod timer;
 
 use hal::{Arch, Endian, HasCas, HasFpu, HasMmu, HasSmp, IrqNumber};
