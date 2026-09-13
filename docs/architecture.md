@@ -332,17 +332,85 @@ one CPU holds says nothing about what another may take.
 Sleeping locks (mutex, rwlock, semaphore) sit above the scheduler and exist only in
 builds that have one.
 
-For reclamation of shared read-mostly data on SMP builds we plan epoch-based
-reclamation rather than a full RCU. RCU's quiescent-state tracking has deep
-interactions with the scheduler and idle loop that we would rather not commit to
-before Phase 3.
+#### Epoch-based reclamation (`sync::epoch`)
+
+Shared read-mostly data is reclaimed by epochs rather than by a full RCU. RCU's
+quiescent-state tracking is deeply tied to the scheduler and idle loop, and that is not a
+commitment to make before the SMP scheduler exists.
+
+- **Participants.** One global epoch, and one participant per CPU in `PerCpu` storage.
+- **Readers** `pin` a guard, which masks interrupts and records "active at epoch `g`". Every
+  pointer loaded through `EpochPtr::load` stays valid until the guard drops.
+- **Writers** unlink a node and `retire` it into their CPU's fixed-size limbo bag, stamped
+  with the current epoch. Writers of one pointer are serialised by the caller's own lock;
+  readers take none.
+- **Advancing.** The epoch moves from `g` to `g + 1` only when every active participant is
+  at `g`.
+- **Reclaiming.** A node stamped `e` is reclaimed at `e + 2`. The two-epoch argument is
+  written out in the module.
+- **Nothing needs compare-and-swap.** State words are only loaded and stored, and
+  advancing and the bags use a `LockFamily` lock. The same code serves rv32i. A
+  uniprocessor collector has one participant, and reclaims at the second collection after
+  its last unpin.
+- **Stalls are reported, not leaked.** A CPU that stays pinned stops every reclamation.
+  - After 64 consecutive advances held back by one CPU at one epoch, `Collector::stall`
+    names it.
+  - A retirement that finds its bag full, even after advancing and reclaiming, is
+    refused. The caller keeps the node.
+
+Checked on the host with real threads playing CPUs: a reader held across a concurrent
+unlink, a stalled participant, and three readers racing a writer through 20 000
+replacements. Checked at boot on every port: a pinned reader keeps its node through an
+unlink and repeated collections. On `aarch64-virt-smp`, three secondaries run readers
+inside their function-call IPI, because nothing else runs code on a secondary yet, while
+the boot CPU makes 4 000 replacements. A node reclaimed one epoch early shows up there as
+thousands of torn reads. What neither can prove is every interleaving, or weak memory
+ordering: the `SeqCst` handshake between pinning and advancing is reviewed, not tested.
 
 ### `kobject` — the object and reference model
 
 Every kernel-managed thing a userspace program can hold — a process, a channel
-endpoint, a memory region, a device handle — is a `KObject` with refcounting, a type
-tag, and a rights mask. This is the substrate the syscall layer exposes as
-capabilities; see [userspace-abi.md](userspace-abi.md).
+endpoint, a memory region, a device handle — is an object with an identity, a type
+tag and a reference count, named through a handle that carries a rights mask. This is the
+substrate the syscall layer exposes as capabilities; see
+[userspace-abi.md](userspace-abi.md).
+
+#### What exists today
+
+- **Handle tables** (`kobject::handle`): generation-checked handles, rights that only
+  narrow, and all-or-nothing transfer.
+- **Identities** from an `IdSource`, which never repeats one. `ObjectIds` is a 64-bit atomic
+  counter. `LockedIds` is the same counter behind a `LockFamily` lock, for rv32imac and
+  thumbv7m, which have no 64-bit atomics.
+- **The object store** (`kobject::store`): the step from a handle to the object it names.
+  An `ObjectStore<T, L, N>` holds references to up to `N` objects of one type whose memory
+  belongs to their owner, and calls the owner's `destroy` when an object's last reference
+  is gone.
+  - `insert(id, kind, &object)` adds an object, held by the store.
+  - `get(id)`, `get_at(locator, id)` (O(1)) and `resolve(table, handle, kind, rights)` each
+    return a counted `ObjRef` that derefs to the object.
+  - `retire(id)` gives up the store's reference. Nothing new finds the object, holders
+    keep it alive, and the last `ObjRef` to drop destroys it.
+  - A slot's generation advances each time it is vacated, and a slot that would wrap is
+    never reused, so a stale `Locator` cannot reach the next occupant.
+  - Everything runs under one lock per store, with no allocation and no `unsafe`.
+
+### `ipc` — channels
+
+A channel is two endpoints with bounded inboxes. Sending moves handles, all or nothing.
+A channel refuses to carry its own endpoints. Cycles through two or more channels are
+collected by a `ChannelSet`, which owns its channels:
+
+- **When it runs.** On every `close` or `release` through the set, a mark and sweep counts each
+  endpoint's references against its copies queued in the set.
+- **Mark.** Endpoints held from outside the queues are roots, and anything queued in a reachable
+  inbox is reachable.
+- **Sweep.** Unreachable inboxes are taken apart. Their endpoint entries are released, which
+  closes the cycle, and other objects go to the caller's sink. Rounds repeat until nothing is
+  left to take apart.
+- **Exclusion.** Collection takes `&mut` on the set, so no send can run under it. Sends and
+  receives still go through each channel's own lock.
+- **Outside a set.** Channels used on their own still leak such cycles, as before.
 
 ### `time` — the monotonic clock and timers
 

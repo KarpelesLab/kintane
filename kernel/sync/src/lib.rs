@@ -97,6 +97,7 @@
 // `no_std` except under the host test harness, which needs `std` to link `libtest`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod epoch;
 pub mod family;
 pub mod irq;
 pub mod lockdep;

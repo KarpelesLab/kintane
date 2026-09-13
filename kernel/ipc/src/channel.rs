@@ -500,7 +500,26 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
     /// Behaves as [`Channel::close`] from there on.
     pub fn release(&self, entry: Entry, mut sink: impl FnMut(Entry)) -> Result<(), Error> {
         let side = self.side_of_entry(entry)?;
-        let closed_now = L::with(&self.state, |st| {
+        if self.release_keeping_inbox(entry)? {
+            // One message per lock acquisition, with the entries handed out after the
+            // lock is dropped. Nothing can be added behind us — this endpoint is closed,
+            // so the peer's sends are refused — so the loop ends, and no entry is seen
+            // by both the queue and `sink` at once.
+            while let Some(entries) = self.take_message(side) {
+                entries.into_iter().flatten().for_each(&mut sink);
+            }
+        }
+        Ok(())
+    }
+
+    /// Give back one reference, as [`Channel::release`], but leave the inbox of an endpoint
+    /// that closes as it is. Returns whether the endpoint closed.
+    ///
+    /// For [`crate::ChannelSet`]'s collector, which takes closed inboxes apart itself so that
+    /// a chain of endpoints closing one another is a loop rather than a recursion.
+    pub(crate) fn release_keeping_inbox(&self, entry: Entry) -> Result<bool, Error> {
+        let side = self.side_of_entry(entry)?;
+        L::with(&self.state, |st| {
             let (mine, _) = st.ends(side);
             let refs = mine.refs.checked_sub(1).ok_or(Error::NotHeld)?;
             mine.refs = refs;
@@ -508,19 +527,20 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
                 mine.open = false;
             }
             Ok(refs == 0)
-        })?;
+        })
+    }
 
-        if closed_now {
-            // One message per lock acquisition, with the entries handed out after the
-            // lock is dropped. Nothing can be added behind us — this endpoint is closed,
-            // so the peer's sends are refused — so the loop ends, and no entry is seen
-            // by both the queue and `sink` at once.
-            while let Some(entries) = L::with(&self.state, |st| st.ends(side).0.inbox.take_front())
-            {
-                entries.into_iter().flatten().for_each(&mut sink);
-            }
-        }
-        Ok(())
+    /// Remove the front message of `side`'s inbox, handing over every entry it carried.
+    pub(crate) fn take_message(&self, side: Side) -> Option<[Option<Entry>; H]> {
+        L::with(&self.state, |st| st.ends(side).0.inbox.take_front())
+    }
+
+    /// `(references, open, messages queued)` for one endpoint.
+    pub(crate) fn end_state(&self, side: Side) -> (u32, bool, usize) {
+        L::with(&self.state, |st| {
+            let (mine, _) = st.ends(side);
+            (mine.refs, mine.open, mine.inbox.len())
+        })
     }
 
     /// References currently outstanding on one endpoint. For accounting.

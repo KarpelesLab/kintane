@@ -28,6 +28,16 @@ pub unsafe fn start_secondaries(c: &dyn EarlyConsole) -> Option<bool> {
     None
 }
 
+/// No secondary CPU is ever online here.
+pub fn secondary_online(_cpu: usize) -> bool {
+    false
+}
+
+/// No secondary CPU to call. Always `None`.
+pub fn call_on_secondary(_cpu: usize, _f: fn(u64) -> u64, _arg: u64) -> Option<u64> {
+    None
+}
+
 /// Device memory the kernel touches after its own tables are installed: whatever the
 /// architecture names. Always known here, so never `None`.
 pub fn device_windows() -> Option<&'static [DeviceWindow]> {

@@ -101,23 +101,27 @@
 //! reference is in a queue only it could drain. Its count never reaches zero, and the
 //! channel leaks.
 //!
-//! The same shape across **two or more** channels is not refused and does leak: `C1`'s
-//! endpoint queued in `C2`, `C2`'s queued in `C1`, no table holding either. Detecting it
-//! locally is impossible; it needs a collector over in-flight references (what Unix
-//! domain sockets carry for `SCM_RIGHTS`) or an object store that can walk them. The
-//! conservation invariant still holds — nothing duplicated, nothing silently freed — but
-//! the objects are unreachable. A test pins this, so that fixing it is a visible change.
+//! The same shape across **two or more** channels cannot be refused locally: `C1`'s
+//! endpoint queued in `C2`, `C2`'s queued in `C1`, no table holding either. No single
+//! channel can see it. A [`ChannelSet`] owns its channels, and it collects such cycles on
+//! every close through it, with a mark and sweep over in-flight references, which is what
+//! Unix domain sockets do for `SCM_RIGHTS`. See [`set`] for how, and for what that costs.
+//! Channels used on their own, outside a set, still leak these cycles. The conservation
+//! invariant holds either way: nothing is duplicated, and nothing is silently freed. A test
+//! pins the leak outside a set, so that the difference stays visible.
 //!
 //! # Accounting that can be bypassed
 //!
-//! kobject deliberately has no object store yet, so a handle table does not know which
-//! object a handle names beyond its identity. Calling `HandleTable::close` or
-//! `HandleTable::duplicate` directly on an endpoint handle skips the reference count: a
-//! direct close leaves the endpoint open for ever, a direct duplicate lets it close while a
-//! handle still names it (operations through that handle then return [`Error::Closed`]).
-//! Endpoint handles must go through [`Channel::close`] and [`Channel::duplicate`] until
-//! an object store routes table operations to the object. This is the one place the
-//! capability bookkeeping here relies on callers rather than on types.
+//! A handle table does not know which object a handle names beyond its identity, and
+//! nothing yet routes table operations to the object. `kobject::store` resolves a handle to
+//! an object, but a table's own `close` and `duplicate` do not consult it. Calling
+//! `HandleTable::close` or `HandleTable::duplicate` directly on an endpoint handle skips the
+//! reference count: a direct close leaves the endpoint open for ever, a direct duplicate
+//! lets it close while a handle still names it (operations through that handle then return
+//! [`Error::Closed`]). Endpoint handles must go through [`Channel::close`] (or
+//! [`ChannelSet::close`]) and [`Channel::duplicate`] until the syscall layer routes table
+//! operations through the objects. This is the one place the capability bookkeeping here
+//! relies on callers rather than on types.
 //!
 //! # Locking
 //!
@@ -139,15 +143,16 @@
 //!
 //! # Not yet here
 //!
-//! Blocking and wake-ups (there is no scheduler; `Full` and `Empty` are the would-block
-//! answers), signals for waiting on an endpoint, and the object store that would make
-//! the bypass above impossible.
+//! Blocking and wake-ups (`Full` and `Empty` are the would-block answers), signals for
+//! waiting on an endpoint, and handle-table operations routed through the objects, which
+//! would make the bypass above impossible.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
 mod channel;
 mod inbox;
+pub mod set;
 
 #[cfg(test)]
 mod tests;
@@ -155,6 +160,7 @@ mod tests;
 pub use channel::{
     CHANNEL_LOCK, Channel, ENDPOINT_RIGHTS, Error, Received, Side, Status, Transfer,
 };
+pub use set::{ChannelSet, Collected, SetFull};
 /// The lock families live in `sync`, where every generic subsystem finds the same ones.
 /// Re-exported because they appear in this unit's signatures.
 #[cfg(target_has_atomic = "32")]

@@ -40,6 +40,16 @@ that requires rules.
    Anything reading a hardware or on-disk structure goes through a checked parser,
    not a cast.
 
+7. **Epoch-protected data follows the reclamation contract** (`sync::epoch`):
+   - A pointer readers load through `EpochPtr` is retired, never freed. The node is
+     unlinked before it is retired, and it is retired exactly once.
+   - Writers of one pointer are serialised by a lock of the writer's own.
+   - A reference obtained through a guard never outlives the guard, which the borrow checker
+     enforces. It is never stored anywhere.
+   - Nothing sleeps, yields or waits for another CPU while holding a guard. A guard held
+     indefinitely stops reclamation on every CPU, and is reported as a stall.
+   - A `reclaim` function must be sound on any CPU with interrupts masked.
+
 ## Lints
 
 Denied tree-wide:

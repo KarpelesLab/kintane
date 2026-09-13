@@ -621,9 +621,169 @@ both! {
         an_endpoint_stays_open_while_any_duplicate_does_full,
         an_endpoint_stays_open_while_any_duplicate_does_tiny;
     releases_are_checked => releases_are_checked_full, releases_are_checked_tiny;
-    a_cycle_across_two_channels_is_not_collected_yet =>
-        a_cycle_across_two_channels_is_not_collected_yet_full,
-        a_cycle_across_two_channels_is_not_collected_yet_tiny;
+    outside_a_set_a_cycle_across_two_channels_leaks =>
+        outside_a_set_a_cycle_across_two_channels_leaks_full,
+        outside_a_set_a_cycle_across_two_channels_leaks_tiny;
+}
+
+// ---- cycles, collected by a set -------------------------------------------------------
+
+both! {
+    a_cycle_across_two_channels_is_collected => a_cycle_across_two_channels_is_collected_full,
+        a_cycle_across_two_channels_is_collected_tiny;
+    a_live_chain_is_not_collected => a_live_chain_is_not_collected_full,
+        a_live_chain_is_not_collected_tiny;
+    a_cycle_through_three_channels_is_collected =>
+        a_cycle_through_three_channels_is_collected_full,
+        a_cycle_through_three_channels_is_collected_tiny;
+    other_objects_in_a_collected_inbox_go_to_the_sink =>
+        other_objects_in_a_collected_inbox_go_to_the_sink_full,
+        other_objects_in_a_collected_inbox_go_to_the_sink_tiny;
+    a_finished_channels_slot_is_reused => a_finished_channels_slot_is_reused_full,
+        a_finished_channels_slot_is_reused_tiny;
+}
+
+type Set<L> = ChannelSet<L, 4, 2, 8, 2>;
+
+/// A channel created in `set`, with endpoint A installed in `ta` and B in `tb`.
+fn open_in<L: LockFamily, const NA: usize, const NB: usize>(
+    set: &mut Set<L>,
+    ids: &ObjectIds,
+    ta: &mut HandleTable<NA>,
+    tb: &mut HandleTable<NB>,
+) -> (usize, Handle, Handle) {
+    let (i, [a, b]) = set.create(ids, ENDPOINT_RIGHTS).unwrap();
+    (i, install(ta, a), install(tb, b))
+}
+
+fn a_cycle_across_two_channels_is_collected<L: LockFamily>() {
+    let ids = ObjectIds::new();
+    let mut set = Set::<L>::new();
+    let (mut ta, mut tb) = (HandleTable::<8>::new(), HandleTable::<8>::new());
+    let (c1, a1, b1) = open_in(&mut set, &ids, &mut ta, &mut tb);
+    let (c2, a2, b2) = open_in(&mut set, &ids, &mut ta, &mut tb);
+
+    let ch1 = set.channel(c1).unwrap();
+    let ch2 = set.channel(c2).unwrap();
+    ch1.send(&mut tb, b1, b"", &[Transfer::whole(b2)]).unwrap(); // b2 now in a1's inbox
+    ch2.send(&mut ta, a2, b"", &[Transfer::whole(a1)]).unwrap(); // a1 now in b2's inbox
+
+    // a1 and b2 are unreachable already: b1 and a2 can send into their inboxes, but nothing
+    // can receive from them. The first close anywhere in the set finds that.
+    let first = set.close(&mut ta, a2, no_sink).unwrap();
+    assert_eq!(
+        first,
+        Collected {
+            rounds: 1,
+            closed: 2,
+            messages: 2
+        }
+    );
+    let ch1 = set.channel(c1).unwrap();
+    let ch2 = set.channel(c2).unwrap();
+    assert!(!ch1.is_open(Side::A) && !ch2.is_open(Side::B), "the cycle was collected");
+    assert_eq!(ch1.references(Side::A), 0);
+    assert_eq!(ch2.references(Side::B), 0);
+    assert!(queued(ch1).is_empty() && queued(ch2).is_empty());
+    assert!(ch1.status(&tb, b1).unwrap().peer_closed, "b1 sees its peer gone");
+
+    let last = set.close(&mut tb, b1, no_sink).unwrap();
+    assert_eq!(last, Collected::default());
+    assert!(ta.is_empty() && tb.is_empty());
+}
+
+fn a_live_chain_is_not_collected<L: LockFamily>() {
+    let ids = ObjectIds::new();
+    let mut set = Set::<L>::new();
+    let (mut ta, mut tb) = (HandleTable::<8>::new(), HandleTable::<8>::new());
+    let (c1, a1, b1) = open_in(&mut set, &ids, &mut ta, &mut tb);
+    let (c2, a2, b2) = open_in(&mut set, &ids, &mut ta, &mut tb);
+
+    // b2 travels in a1's inbox, and a1 stays in a table: the chain hangs off a live handle.
+    set.channel(c1)
+        .unwrap()
+        .send(&mut tb, b1, b"", &[Transfer::whole(b2)])
+        .unwrap();
+    let got = set.close(&mut tb, b1, no_sink).unwrap();
+    assert_eq!(got, Collected::default(), "reachable through a1");
+    let got = set.close(&mut ta, a2, no_sink).unwrap();
+    assert_eq!(got, Collected::default(), "b2's peer closing does not strand b2");
+    assert!(set.channel(c2).unwrap().is_open(Side::B));
+
+    // And it is really reachable: a1 receives b2.
+    let (_, handles) = recv(set.channel(c1).unwrap(), &mut ta, a1).unwrap();
+    assert_eq!(handles.len(), 1);
+    assert_eq!(ta.get(handles[0]).unwrap().object, set.channel(c2).unwrap().id(Side::B));
+}
+
+fn a_cycle_through_three_channels_is_collected<L: LockFamily>() {
+    let ids = ObjectIds::new();
+    let mut set = Set::<L>::new();
+    let mut t = HandleTable::<16>::new();
+    let mut ends = [(0, Handle::from_raw(0), Handle::from_raw(0)); 3];
+    for e in &mut ends {
+        let (i, [a, b]) = set.create(&ids, ENDPOINT_RIGHTS).unwrap();
+        *e = (i, install(&mut t, a), install(&mut t, b));
+    }
+    // Channel k's A endpoint travels in channel k+1's A inbox (sent from its B side).
+    for k in 0..3 {
+        let (next, _, next_b) = ends[(k + 1) % 3];
+        let (_, a, _) = ends[k];
+        set.channel(next)
+            .unwrap()
+            .send(&mut t, next_b, b"", &[Transfer::whole(a)])
+            .unwrap();
+    }
+    let mut closed = 0;
+    for (_, _, b) in ends {
+        closed += set.close(&mut t, b, no_sink).unwrap().closed;
+    }
+    assert!(t.is_empty());
+    for (i, _, _) in ends {
+        assert!(!set.channel(i).unwrap().is_open(Side::A), "channel {i} leaked");
+    }
+    assert_eq!(closed, 3, "each A endpoint closed by the collector, once");
+}
+
+fn other_objects_in_a_collected_inbox_go_to_the_sink<L: LockFamily>() {
+    let ids = ObjectIds::new();
+    let mut set = Set::<L>::new();
+    let (mut ta, mut tb) = (HandleTable::<8>::new(), HandleTable::<8>::new());
+    let (c1, a1, b1) = open_in(&mut set, &ids, &mut ta, &mut tb);
+    let (c2, a2, b2) = open_in(&mut set, &ids, &mut ta, &mut tb);
+    let ev = event(&ids, &mut tb, MOVABLE);
+    let ev_id = tb.get(ev).unwrap().object;
+
+    set.channel(c1)
+        .unwrap()
+        .send(&mut tb, b1, b"", &[Transfer::whole(b2), Transfer::whole(ev)])
+        .unwrap();
+    set.channel(c2)
+        .unwrap()
+        .send(&mut ta, a2, b"", &[Transfer::whole(a1)])
+        .unwrap();
+
+    let mut sunk = Vec::new();
+    set.close(&mut ta, a2, |e| sunk.push(e)).unwrap();
+    set.close(&mut tb, b1, |e| sunk.push(e)).unwrap();
+    assert_eq!(sunk.len(), 1, "the event, exactly once");
+    assert_eq!(sunk[0].object, ev_id);
+}
+
+fn a_finished_channels_slot_is_reused<L: LockFamily>() {
+    let ids = ObjectIds::new();
+    let mut set = ChannelSet::<L, 1, 2, 8, 2>::new();
+    let (mut ta, mut tb) = (HandleTable::<8>::new(), HandleTable::<8>::new());
+    let (i, [a, b]) = set.create(&ids, ENDPOINT_RIGHTS).unwrap();
+    assert_eq!(set.create(&ids, ENDPOINT_RIGHTS).err(), Some(SetFull));
+    let (ha, hb) = (install(&mut ta, a), install(&mut tb, b));
+    set.close(&mut ta, ha, no_sink).unwrap();
+    assert_eq!(set.create(&ids, ENDPOINT_RIGHTS).err(), Some(SetFull), "B is still open");
+    set.close(&mut tb, hb, no_sink).unwrap();
+    let (j, [a2, b2]) = set.create(&ids, ENDPOINT_RIGHTS).unwrap();
+    assert_eq!(i, j);
+    set.release(a2, no_sink).unwrap();
+    set.release(b2, no_sink).unwrap();
 }
 
 fn peer_closure_is_observed_after_draining<L: LockFamily>() {
@@ -774,10 +934,11 @@ fn releases_are_checked<L: LockFamily>() {
     other.release(ob, no_sink).unwrap();
 }
 
-/// The limitation the crate docs describe, pinned so that fixing it is a visible change.
-/// Conservation still holds — every reference is in exactly one place — but the place is
-/// a queue that only the other, equally unreachable, endpoint could drain.
-fn a_cycle_across_two_channels_is_not_collected_yet<L: LockFamily>() {
+/// Channels used on their own, outside a [`ChannelSet`], have nobody to see a cycle across
+/// them: the limitation the crate docs describe, pinned. Conservation still holds — every
+/// reference is in exactly one place — but the place is a queue that only the other,
+/// equally unreachable, endpoint could drain.
+fn outside_a_set_a_cycle_across_two_channels_leaks<L: LockFamily>() {
     let ids = ObjectIds::new();
     let (mut ta, mut tb) = (HandleTable::<8>::new(), HandleTable::<8>::new());
     let (c1, a1, b1) = open::<L, 2, 8, 8>(&ids, &mut ta, &mut tb);

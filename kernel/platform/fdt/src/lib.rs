@@ -284,6 +284,24 @@ pub unsafe fn start_secondaries(c: &dyn EarlyConsole) -> Option<bool> {
     unsafe { smp::start_secondaries(c) }
 }
 
+/// Whether CPU `cpu`, other than the boot CPU, came up and takes function calls.
+pub fn secondary_online(cpu: usize) -> bool {
+    cpu != 0 && arch::smp::is_online(cpu)
+}
+
+/// Run `f(arg)` on secondary CPU `cpu` from its function-call IPI, waiting up to a second
+/// for the result.
+///
+/// `None` if that CPU is not online, or if `f` had not returned when the wait ended. A
+/// function still running then goes on running, and nobody collects its result. Boot path
+/// only, with the boot CPU the only caller: see `arch::smp::call`.
+pub fn call_on_secondary(cpu: usize, f: fn(u64) -> u64, arg: u64) -> Option<u64> {
+    if !secondary_online(cpu) {
+        return None;
+    }
+    arch::smp::call(cpu, f, arg)
+}
+
 pub(crate) fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();

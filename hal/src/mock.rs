@@ -25,7 +25,8 @@ pub struct MockFull;
 /// acquired a hardware requirement, which is exactly what we want to find out early.
 pub struct MockTiny;
 
-static FULL_IRQ: AtomicBool = AtomicBool::new(true);
+/// `MockTiny`'s interrupt flag. One CPU, so one flag for the whole test binary; tests that
+/// observe it serialise. `MockFull`'s is per host thread, below.
 static TINY_IRQ: AtomicBool = AtomicBool::new(true);
 
 /// Counts barriers issued, so a test can assert that ordering was requested where the
@@ -43,11 +44,11 @@ impl Arch for MockFull {
     type IrqState = bool;
 
     fn irq_save() -> bool {
-        FULL_IRQ.swap(false, Ordering::SeqCst)
+        FULL_IRQ.with(|f| f.replace(false))
     }
 
     unsafe fn irq_restore(state: bool) {
-        FULL_IRQ.store(state, Ordering::SeqCst);
+        FULL_IRQ.with(|f| f.set(state));
     }
 
     fn memory_barrier() {
@@ -82,6 +83,12 @@ pub const MOCK_CPUS: usize = 4;
 extern crate std;
 
 std::thread_local! {
+    /// `MockFull`'s interrupt flag, one per host thread, as a real SMP machine has one per
+    /// CPU. It was a single static, so any test masking interrupts on two threads at once
+    /// could restore the other's saved state. Epoch reclamation's readers pin on every mock
+    /// CPU at the same moment, which is exactly that.
+    static FULL_IRQ: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+
     /// Which of `MockFull`'s CPUs the current host thread is playing. A host thread is
     /// what a CPU is to the tests, so this is per thread rather than a shared static, and
     /// tests running in parallel cannot see each other's choice.

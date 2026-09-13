@@ -15,6 +15,7 @@ mod clock;
 mod crash;
 #[cfg(CONFIG_MM_PAGED)]
 mod demand;
+mod epoch;
 mod heap;
 mod kheap;
 mod lockcheck;
@@ -262,6 +263,10 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // preemption check has stopped the tick: `start_secondaries`'s contract.
     let smp = unsafe { platform::start_secondaries(c) }.map_or(Check::Skipped, Check::from_ok);
 
+    // After the secondaries are up, whose readers it races.
+    c.write_str("\n  epoch      ");
+    let epochs = epoch::check(c);
+
     // Last, so it sees every lock the checks above took.
     c.write_str("\n  lockdep    ");
     let lockdep = lockcheck::verdict(c);
@@ -277,6 +282,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))
         .and(smp)
+        .and(epochs)
         .and(lockdep);
     (verdict, live)
 }

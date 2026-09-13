@@ -10,17 +10,20 @@
 //! * [`rights`] — what a handle permits, and the rule that rights only ever narrow.
 //! * [`handle`] — the per-process table, and the generation counters that stop a closed handle from
 //!   reaching a slot's next occupant.
-//! * [`Refcount`] — how long an object lives.
+//! * [`store`] — objects found by identity and kept alive while referenced: the step from a
+//!   handle's entry to the object it names.
+//! * [`Refcount`] — a reference count embedded in an object, for objects that live outside a store.
 //!
-//! This layer deliberately does not own object *storage*. There is no heap beneath
-//! it yet, and more importantly the lifetime rules are worth getting right before
-//! deciding where the bytes live. An object store arrives with the allocator.
+//! This layer still does not own object *bytes*. A store holds references to objects whose
+//! memory belongs to someone else, and tells that owner when to free them. Where the bytes
+//! live is a decision for each kind of object.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
 pub mod handle;
 pub mod rights;
+pub mod store;
 
 #[cfg(target_has_atomic = "32")]
 use core::sync::atomic::AtomicU32;
@@ -31,6 +34,8 @@ use core::sync::atomic::Ordering;
 
 pub use handle::{Handle, HandleTable, TransferError};
 pub use rights::Rights;
+pub use store::{Locator, ObjRef, ObjectStore, StoreError};
+use sync::{LockClass, LockFamily};
 
 /// A kernel object's identity.
 ///
@@ -53,12 +58,48 @@ impl ObjectId {
 ///
 /// Code that creates objects takes this rather than [`ObjectIds`], so it does not inherit
 /// the allocator's requirements. [`ObjectIds`] needs a 64-bit atomic counter, which rv32imac
-/// does not have and rv32i has no atomics of any width; a lock-protected source for those
-/// machines arrives with the object store, and nothing that creates objects has to change.
+/// and thumbv7m do not have, and rv32i has no compare-and-swap at all. [`LockedIds`] is the
+/// same counter behind a lock, for those machines.
 ///
 /// Every implementation must never return the same identity twice.
 pub trait IdSource {
     fn next(&self) -> ObjectId;
+}
+
+/// The lock-order class of every [`LockedIds`].
+pub static IDS_LOCK: LockClass = LockClass::new("kobject.ids");
+
+/// Hands out object identities, like [`ObjectIds`], from a counter behind a lock of family
+/// `L`. For machines without 64-bit atomics; it works on every machine, at the cost of a
+/// lock per identity.
+pub struct LockedIds<L: LockFamily> {
+    next: L::Lock<u64>,
+}
+
+impl<L: LockFamily> LockedIds<L> {
+    pub fn new() -> Self {
+        // Zero is never issued, as for `ObjectIds`.
+        LockedIds {
+            next: L::new(1, &IDS_LOCK),
+        }
+    }
+}
+
+impl<L: LockFamily> Default for LockedIds<L> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<L: LockFamily> IdSource for LockedIds<L> {
+    fn next(&self) -> ObjectId {
+        L::with(&self.next, |n| {
+            let id = *n;
+            // Wrapping, like `ObjectIds`: 2^64 identities outlast the hardware.
+            *n = n.wrapping_add(1);
+            ObjectId(id)
+        })
+    }
 }
 
 /// Hands out object identities.

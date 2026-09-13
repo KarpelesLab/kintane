@@ -5,5 +5,7 @@ root = "src/lib.rs"
 host-tests = true
 layer = "core"
 
+# `sync` for the locks behind the object store and `LockedIds`, chosen by lock family
+# like every generic subsystem's; `hal` for the mocks the host tests run against.
 [deps]
-units = ["hal"]
+units = ["hal", "sync"]
