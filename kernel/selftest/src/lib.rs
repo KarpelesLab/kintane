@@ -24,6 +24,8 @@ use boot_protocol::MemoryRegion;
 use hal::{Arch, EarlyConsole, PhysAddr};
 use mm::phys::{FrameAllocator, bitmap_bytes};
 
+mod heap;
+
 /// Whether this build contains in-kernel tests.
 pub const PRESENT: bool = true;
 
@@ -315,6 +317,8 @@ fn memory<A: Arch>(r: &mut Report, boot_arg: u64, reserved: &[(u64, u64)]) {
     }
     r.check("frames free without error", freed);
     r.check("accounting returns to where it started", frames.stats().free == before);
+
+    heap::exhaust_and_return::<A>(r, &mut frames);
 }
 
 const STORE_BYTES: usize = kconfig::FRAME_BITMAP_KIB * 1024;

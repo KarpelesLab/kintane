@@ -21,6 +21,7 @@
 //! |---|---|---|
 //! | [`AllocFlags::ZERO`] | **honoured** — the block is zeroed before it is returned | — |
 //! | [`AllocFlags::MAY_SLEEP`] | advisory; every allocation is effectively atomic | a scheduler to sleep on, and a reclaim path worth waiting for |
+//! | [`AllocFlags::NO_RECLAIM`] | **honoured**, vacuously: nothing reclaims yet | — until reclaim exists, then a check on its entry path |
 //! | [`AllocFlags::DMA32`] | advisory | a zoned frame allocator, so the request can be served from below 4 GiB rather than checked afterwards |
 //! | [`AllocFlags::DMA_COHERENT`] | advisory | cache maintenance, which is `HasCoherentDma`-shaped and belongs to the device framework |
 //! | [`NumaNode`] | advisory | a topology source (ACPI SRAT, device tree) and per-node frame pools |
@@ -36,6 +37,19 @@
 //!
 //! Putting the flags in before they work is the whole point. Retrofitting a context
 //! parameter through a kernel's worth of call sites is the expensive version.
+//!
+//! # What the compiler checks, and what it does not
+//!
+//! The flags are a runtime value, so the compiler does not stop an interrupt handler
+//! passing [`AllocContext::KERNEL`]. It does check the constraint that matters most
+//! today, in a different shape. "May this allocation take the frame allocator's lock"
+//! is a type: [`crate::Heap::try_alloc`] cannot take frames at all, and
+//! [`crate::Heap::try_alloc_in`] can only take them from a
+//! [`FrameSource`](crate::FrameSource) the caller holds and passes in. Code without the
+//! frame allocator cannot grow the heap, however it sets its flags.
+//! `MAY_SLEEP` could get the same treatment once sleeping exists, as a token that only
+//! a sleepable context can construct. Doing it now would type-check a promise that
+//! nothing yet keeps.
 
 use core::fmt;
 
@@ -84,6 +98,14 @@ impl AllocFlags {
     /// does not have.
     pub const DMA_COHERENT: Self = AllocFlags(1 << 3);
 
+    /// The allocator must not reclaim memory from elsewhere to satisfy this request.
+    ///
+    /// For the code that reclaim itself calls: a shrinker that allocates while freeing
+    /// memory, and would otherwise recurse into itself. Honoured today because nothing
+    /// reclaims, and listed as honoured for that reason. The flag has to exist before
+    /// reclaim does, or the first shrinker is written without it.
+    pub const NO_RECLAIM: Self = AllocFlags(1 << 4);
+
     /// The raw bits, for logging and for tests.
     pub const fn bits(self) -> u32 {
         self.0
@@ -121,6 +143,7 @@ impl fmt::Debug for AllocFlags {
             (Self::ZERO, "ZERO"),
             (Self::DMA32, "DMA32"),
             (Self::DMA_COHERENT, "DMA_COHERENT"),
+            (Self::NO_RECLAIM, "NO_RECLAIM"),
         ];
         let mut first = true;
         f.write_str("AllocFlags(")?;
@@ -286,6 +309,19 @@ mod tests {
         let zeroed = AllocContext::ATOMIC.with(AllocFlags::ZERO);
         assert!(!zeroed.is_best_effort());
         assert!(zeroed.wants_zero());
+        // So is NO_RECLAIM, because there is no reclaim to refrain from.
+        assert!(
+            !AllocContext::KERNEL
+                .with(AllocFlags::NO_RECLAIM)
+                .flags()
+                .advisory()
+                .contains(AllocFlags::NO_RECLAIM)
+        );
+        assert!(
+            !AllocContext::ATOMIC
+                .with(AllocFlags::NO_RECLAIM)
+                .is_best_effort()
+        );
 
         // Everything else currently is.
         for flag in [

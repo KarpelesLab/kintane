@@ -73,6 +73,21 @@ config DEBUG_BUILD
         lock-order checking. Separate from debug symbols, which are always
         produced and always shipped separately.
 
+config KALLOC_FAULT_INJECT
+    bool "Allocation fault injection"
+    default n
+    help
+        Let the kernel heap fail chosen allocations on purpose, under a
+        deterministic policy: the Nth request, every request from the Nth,
+        or one in N from a seeded generator. This is how the error branches
+        of allocating code are made to run, since on a machine with memory
+        to spare they otherwise never do.
+
+        Off, every injection point is a constant false the compiler removes.
+        The heap's own host tests always have it, whatever this says. Never
+        enable it in anything that ships: a policy left armed fails real
+        allocations.
+
 config QEMU_EXIT
     bool "Guest-initiated emulator exit"
     depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64

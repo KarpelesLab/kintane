@@ -11,6 +11,7 @@
 #![feature(sync_unsafe_cell)]
 
 mod clock;
+mod heap;
 mod preempt;
 mod space;
 
@@ -315,7 +316,9 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
         }
     };
 
-    space.and(alloc)
+    space
+        .and(alloc)
+        .and(heap::bring_up(c, &mut frames, &regions[..n]))
 }
 
 /// The largest region of physical memory the kernel will address directly.
