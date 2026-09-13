@@ -164,7 +164,9 @@ fn fatal(vector: Option<u8>, code: Option<u32>, frame: &InterruptFrame) -> ! {
     write_hex(c, frame.cs, 4);
     c.write_str("\n    eflags ");
     write_hex(c, frame.eflags, 8);
-    c.write_str("\n\nhalted.\n");
+    c.write_str("\n");
+    crate::kspace::after_fault_report(c, vector, cr2());
+    c.write_str("\nhalted.\n");
 
     crate::I686::halt()
 }

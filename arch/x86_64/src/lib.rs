@@ -18,6 +18,7 @@ mod exception;
 mod gdt;
 mod idt;
 pub mod interrupt;
+pub mod kspace;
 pub mod paging;
 pub mod pic;
 pub mod pit;

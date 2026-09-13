@@ -81,7 +81,7 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 /// Bit 0, P: the entry maps something.
 const PRESENT: u64 = 1 << 0;
 /// Bit 1, R/W: writes are permitted through this entry and everything below it.
-const WRITABLE: u64 = 1 << 1;
+pub(crate) const WRITABLE: u64 = 1 << 1;
 /// Bit 2, U/S: unprivileged code may use this entry and everything below it.
 const USER: u64 = 1 << 2;
 /// Bit 3, PWT: write-through rather than write-back caching.
@@ -100,7 +100,7 @@ const PAGE_SIZE_BIT: u64 = 1 << 7;
 const GLOBAL: u64 = 1 << 8;
 /// Bit 63, XD/NX: instruction fetches from this entry's range fault. Reserved unless
 /// `EFER.NXE` is set.
-const NO_EXECUTE: u64 = 1 << 63;
+pub(crate) const NO_EXECUTE: u64 = 1 << 63;
 
 /// One word of an x86-64 page table, at any of the four levels.
 ///
@@ -324,11 +324,11 @@ impl HasPageTables for X86_64 {
 // ---------------------------------------------------------------------------
 
 /// The `IA32_EFER` model-specific register.
-const EFER: u32 = 0xc000_0080;
+pub(crate) const EFER: u32 = 0xc000_0080;
 /// `EFER.NXE`, bit 11: makes bit 63 of a page table entry mean NX instead of reserved.
-const EFER_NXE: u64 = 1 << 11;
+pub(crate) const EFER_NXE: u64 = 1 << 11;
 /// `CR0.WP`, bit 16: makes the R/W bit apply to supervisor-mode writes too.
-const CR0_WP: u64 = 1 << 16;
+pub(crate) const CR0_WP: u64 = 1 << 16;
 
 /// Probed state, packed into one atomic so a reader gets a consistent answer.
 static FEATURES: AtomicU8 = AtomicU8::new(0);
@@ -430,7 +430,7 @@ pub fn init() {
 }
 
 /// CR0, which holds the mode bits paging depends on.
-fn read_cr0() -> u64 {
+pub(crate) fn read_cr0() -> u64 {
     let v: u64;
     // SAFETY: reading a control register has no side effects and is permitted at CPL 0.
     unsafe { asm!("mov {}, cr0", out(reg) v, options(nomem, nostack, preserves_flags)) };
@@ -456,7 +456,7 @@ unsafe fn write_cr0(value: u64) {
 /// `msr` must be implemented by this CPU. `rdmsr` on an unimplemented register raises
 /// #GP, which this early in boot is a fault inside the code that exists to make faults
 /// reportable.
-unsafe fn read_msr(msr: u32) -> u64 {
+pub(crate) unsafe fn read_msr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
     // SAFETY: `rdmsr` reads the register named by ECX into EDX:EAX and touches nothing
@@ -739,7 +739,7 @@ const fn page_of(va: usize) -> usize {
 /// Arming is not a promise that a fault will happen; [`disarm`] reports whether one
 /// did, which is what makes "the write was refused" an observation rather than an
 /// inference from survival.
-fn arm(va: usize, set: u64, clear: u64) {
+pub(crate) fn arm(va: usize, set: u64, clear: u64) {
     TRAP.set.store(set, Ordering::Relaxed);
     TRAP.clear.store(clear, Ordering::Relaxed);
     TRAP.code.store(0, Ordering::Relaxed);
@@ -757,7 +757,7 @@ fn arm(va: usize, set: u64, clear: u64) {
 ///
 /// `None` means no fault was trapped, which for a check that expected one is a
 /// failure: the access it guarded went through when it should not have.
-fn disarm() -> Option<u64> {
+pub(crate) fn disarm() -> Option<u64> {
     compiler_fence(Ordering::SeqCst);
     let armed = TRAP.page.swap(0, Ordering::SeqCst);
     let code = TRAP.code.load(Ordering::Relaxed);
@@ -805,6 +805,28 @@ pub(crate) fn on_page_fault(cr2: u64, code: u64) -> bool {
     TRAP.code.store(code, Ordering::Relaxed);
     TRAP.hits.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// Set and clear bits in the live leaf entry translating `va`, and invalidate it.
+///
+/// The undo for a trap's fixup: a check that let the trap make a read-only page writable
+/// in order to observe the refusal has to make it read-only again, or the check itself
+/// is the hole. Returns false when nothing maps `va`.
+pub(crate) fn edit_live_leaf(va: usize, set: u64, clear: u64) -> bool {
+    let Some((table, index)) = leaf_of(X86_64::root(), page_of(va)) else {
+        return false;
+    };
+    let entry = table.get(index);
+    table.set(index, Entry((entry.bits() | set) & !clear));
+    // SAFETY: the entry write above has retired, which is all x86's walker needs before
+    // an invalidate; see `on_page_fault`.
+    unsafe { X86_64::flush_tlb(Some(page_of(va))) };
+    true
+}
+
+/// The bits of the live leaf entry translating `va`, or `None` when nothing maps it.
+pub(crate) fn live_leaf_bits(va: usize) -> Option<u64> {
+    leaf_of(X86_64::root(), page_of(va)).map(|(table, index)| table.get(index).bits())
 }
 
 // ---------------------------------------------------------------------------

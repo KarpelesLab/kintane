@@ -11,6 +11,7 @@ pub mod context;
 pub mod exception;
 pub mod gic;
 pub mod irq;
+pub mod kspace;
 pub mod paging;
 pub mod serial;
 pub mod timer;

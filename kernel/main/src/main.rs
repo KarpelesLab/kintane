@@ -16,7 +16,7 @@ use core::cell::SyncUnsafeCell;
 
 use arch::Cpu;
 use boot_protocol::{MemoryKind, MemoryRegion};
-use hal::{Arch, EarlyConsole, HasMmu};
+use hal::{Arch, EarlyConsole, HasMmu, HasPageTables};
 use mm::phys::{FrameAllocator, bitmap_bytes};
 
 /// Entry from the architecture's boot code, which has already established a stack,
@@ -33,28 +33,78 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // SAFETY: first and only initialisation of COM1, before any other writer exists.
     unsafe { arch::EARLY.init() };
 
-    let boot = banner(boot_arg);
+    let (boot, live) = banner(boot_arg);
     let c = &arch::EARLY;
+
+    // A test mode that ends the run from the fault handler. Only on a machine that came
+    // up cleanly: an overflow on tables that failed verification proves nothing.
+    if kconfig::STACK_GUARD_TEST {
+        if boot == Check::Failed {
+            finish(false);
+        }
+        c.write_str("\n  overflowing the boot stack into its guard page\n");
+        arch::kspace::provoke_guard_fault();
+    }
 
     // In a production image this is the no-op provider and folds away entirely; the
     // test image gets the real one. Which is linked is a configuration question, so
     // there is no cfg here.
+    //
+    // The kernel's live page tables are reserved as well. The suite builds its own frame
+    // pool from the loader's map, and that map does not know those frames are in use:
+    // without this its first allocation is a page table, and its read/write check
+    // overwrites a translation the CPU is running on.
     let (img_start, img_end) = arch::image_range();
     let reserved = [
         (0, LOW_MEMORY),
         (img_start, img_end.saturating_sub(img_start)),
+        (live.tables.0, live.tables.1.saturating_sub(live.tables.0)),
     ];
     let ok = selftest::run_all::<Cpu>(c, boot_arg, &reserved);
     if selftest::PRESENT {
         c.write_str("\n");
     }
 
+    // The suite writes to frames it allocates. Walk the live tables again afterwards,
+    // so that a frame pool which overlaps them is a failure rather than a latent
+    // corruption: x86 keeps running on cached translations after an entry is
+    // overwritten, and the damage would surface much later, somewhere else.
+    let intact = live.still_intact(c);
+
     // Both halves gate the exit status. Until this line existed, only the in-kernel
     // suite did: the banner computed verdicts for paging, interrupts, memory and the
     // kernel address space, printed them, and discarded all four — so a W^X regression
     // printed FAILED and still exited as a pass. A check that cannot change the outcome
     // is a log line.
-    finish(ok && boot != Check::Failed)
+    finish(ok && boot != Check::Failed && intact)
+}
+
+/// The kernel address space as installed, for checks made after bring-up.
+#[derive(Clone, Copy)]
+struct Live {
+    /// Frames the tables occupy, `[lo, hi)`. Empty when nothing was installed.
+    tables: (u64, u64),
+    /// The direct map the tables are reached through, when they were installed.
+    direct: Option<mm::DirectMap>,
+}
+
+impl Live {
+    const NONE: Live = Live {
+        tables: (0, 0),
+        direct: None,
+    };
+
+    /// Whether the installed tables still say what they said at bring-up. Trivially true
+    /// when nothing was installed, which the bring-up verdict has already failed.
+    fn still_intact(self, c: &dyn EarlyConsole) -> bool {
+        let Some(direct) = self.direct else {
+            return true;
+        };
+        c.write_str("  kspace     after the suite: ");
+        let ok = space::check_live::<Cpu>(c, direct, arch::image_sections());
+        c.write_str(if ok { " ok\n" } else { " DAMAGED\n" });
+        ok
+    }
 }
 
 /// The outcome of a bring-up check.
@@ -103,7 +153,8 @@ fn finish(_ok: bool) -> ! {
     Cpu::halt()
 }
 
-fn banner(boot_arg: u64) -> Check {
+/// The bring-up report. Returns its verdict and the kernel address space it installed.
+fn banner(boot_arg: u64) -> (Check, Live) {
     let c = &arch::EARLY;
     c.write_str("\nKinTane\n");
     c.write_str("  arch       ");
@@ -128,7 +179,7 @@ fn banner(boot_arg: u64) -> Check {
     let paging_ok = arch::paging_selftest(c);
     c.write_str(if paging_ok { " ok" } else { "" });
 
-    let mem = memory(c, boot_arg);
+    let (mem, live) = memory(c, boot_arg);
 
     c.write_str("\n  interrupts ");
     // The architecture brings up its own interrupt path; the image only reports the
@@ -144,10 +195,11 @@ fn banner(boot_arg: u64) -> Check {
     let switch_ok = arch::context_switch_selftest(c);
 
     c.write_str("\n\nreached kmain\n");
-    Check::from_ok(paging_ok)
+    let verdict = Check::from_ok(paging_ok)
         .and(mem)
         .and(Check::from_ok(irq_ok))
-        .and(Check::from_ok(switch_ok))
+        .and(Check::from_ok(switch_ok));
+    (verdict, live)
 }
 
 /// Room for the loader's memory map. QEMU reports a handful of regions; real
@@ -172,8 +224,9 @@ const LOW_MEMORY: u64 = 1024 * 1024;
 static STORE: SyncUnsafeCell<[u8; STORE_BYTES]> = SyncUnsafeCell::new([0; STORE_BYTES]);
 
 /// Report what the loader said about memory, then prove the frame allocator works on
-/// it by handing out a frame and giving it back.
-fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
+/// it by handing out a frame and giving it back. Also returns the kernel address space
+/// [`kernel_space`] installed.
+fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
     c.write_str("\n  memory map ");
     c.write_str(bootinfo::SOURCE);
 
@@ -197,7 +250,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
                 bootinfo::Error::TooManyRegions { .. } => "too many regions",
             });
             c.write_str(")");
-            return Check::Skipped;
+            return (Check::Skipped, Live::NONE);
         }
     };
 
@@ -216,7 +269,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
         Ok(b) => b,
         Err(_) => {
             c.write_str("\n  frames     unusable map");
-            return Check::Failed;
+            return (Check::Failed, Live::NONE);
         }
     };
     if needed > STORE_BYTES {
@@ -225,7 +278,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
         c.write_str(" bytes of bitmap, have ");
         write_usize(c, STORE_BYTES);
         c.write_str(" (raise FRAME_BITMAP_KIB)");
-        return Check::Failed;
+        return (Check::Failed, Live::NONE);
     }
 
     // SAFETY: the only write to STORE, from the single-threaded boot path before any
@@ -239,7 +292,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
         Ok(f) => f,
         Err(_) => {
             c.write_str("\n  frames     allocator rejected the map");
-            return Check::Failed;
+            return (Check::Failed, Live::NONE);
         }
     };
 
@@ -268,7 +321,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
     write_usize(c, stats.free);
     c.write_str(" free");
 
-    let space = kernel_space(c, &mut frames, &regions[..n]);
+    let (space, live) = kernel_space(c, &mut frames, &regions[..n], boot_arg);
     // Re-read: building the kernel space consumed frames for its tables, so the
     // accounting check below has to compare against the books as they are now.
     let stats = frames.stats();
@@ -297,7 +350,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
         }
     };
 
-    space.and(alloc)
+    (space.and(alloc), live)
 }
 
 /// The largest region of physical memory the kernel will address directly.
@@ -309,12 +362,16 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
 /// pretends about.
 const DIRECT_MAP_MAX: u64 = 1024 * 1024 * 1024;
 
-/// Build the kernel's own address space from the image's sections and check it.
+/// Build the kernel's own address space, check it, and install it.
+///
+/// Returns the verdict and what was installed. Nothing is installed unless every check
+/// of the built tables passed.
 fn kernel_space(
     c: &dyn EarlyConsole,
     frames: &mut mm::phys::FrameAllocator<'_, Cpu>,
     map: &[MemoryRegion],
-) -> Check {
+    boot_arg: u64,
+) -> (Check, Live) {
     c.write_str("\n  kspace     ");
 
     // The direct map spans where RAM actually is, not `[0, top)`. An earlier version
@@ -324,13 +381,13 @@ fn kernel_space(
     let usable = || map.iter().filter(|r| r.kind == MemoryKind::Usable as u32);
     let Some(lo) = usable().map(|r| r.start).min() else {
         c.write_str("no usable memory");
-        return Check::Failed;
+        return (Check::Failed, Live::NONE);
     };
     let hi = usable().map(|r| r.start + r.len).max().unwrap_or(lo);
     let len = (hi - lo).min(DIRECT_MAP_MAX);
     if len == 0 {
         c.write_str("no usable memory");
-        return Check::Failed;
+        return (Check::Failed, Live::NONE);
     }
 
     let base = hal::PhysAddr::new(lo);
@@ -338,20 +395,63 @@ fn kernel_space(
         Ok(v) => hal::KernAddr::new(v),
         Err(_) => {
             c.write_str("RAM starts above the addressable range");
-            return Check::Failed;
+            return (Check::Failed, Live::NONE);
         }
     };
     let direct = match mm::DirectMap::new(base, virt, len) {
         Ok(d) => d,
         Err(_) => {
             c.write_str("direct map rejected");
-            return Check::Failed;
+            return (Check::Failed, Live::NONE);
         }
     };
 
-    let ok = space::build_and_verify::<Cpu>(c, frames, direct, arch::image_sections());
-    c.write_str(if ok { " ok" } else { " FAILED" });
-    Check::from_ok(ok)
+    // The loader's structure is read again after the switch, by the in-kernel suite, so
+    // it has to be inside the space. Zero means there is no such pointer on this port.
+    let boot_data = [boot_arg];
+    let must_reach: &[u64] = if boot_arg == 0 { &[] } else { &boot_data };
+    let sections = arch::image_sections();
+    let devices = arch::kspace::device_windows();
+    let Some(built) =
+        space::build_and_verify::<Cpu>(c, frames, direct, sections, devices, must_reach)
+    else {
+        c.write_str(" FAILED, not installed");
+        return (Check::Failed, Live::NONE);
+    };
+    c.write_str(" ok");
+
+    c.write_str("\n  live       ");
+    let root = built.space.root();
+    // SAFETY: `build_and_verify` returned the space only after walking it and confirming
+    // that it maps the image with its sections' permissions, the boot stack, the whole
+    // direct map (which holds the frame allocator's bitmap and these tables), every
+    // device window the port names, and the boot data. The code running now is in
+    // `.text`, the stack is the boot stack, and interrupts are masked, so the instruction
+    // after the switch is fetchable and nothing can be delivered against a stale map.
+    // Nothing is ever freed from this space: it is the kernel's for the life of the
+    // machine, so dropping the handle below leaks nothing that should be reclaimed.
+    unsafe { built.space.activate() };
+    let installed = <Cpu as HasPageTables>::root() == root;
+    let live = Live {
+        tables: built.tables,
+        direct: Some(direct),
+    };
+    c.write_str(if installed {
+        "root "
+    } else {
+        "ROOT READ BACK WRONG "
+    });
+    write_hex(c, root.raw());
+    if !installed {
+        // Nothing below means anything on tables that are not ours, and the hardware
+        // probes edit whatever table is live.
+        return (Check::Failed, live);
+    }
+    c.write_str(", ");
+    let walked = space::check_live::<Cpu>(c, direct, sections);
+    c.write_str("\n             ");
+    let enforced = arch::kspace::enforcement_selftest(c);
+    (Check::from_ok(walked && enforced), live)
 }
 
 fn write_usize(c: &dyn EarlyConsole, mut v: usize) {

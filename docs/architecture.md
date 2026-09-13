@@ -94,6 +94,51 @@ what a flat build cannot do: `mm::flat` has no `fork`-style address space clonin
 and the process layer's config marks that feature unavailable rather than emulating
 it badly.
 
+#### The kernel's own address space, as built today
+
+Every `mm::paged` port runs on tables the kernel builds for itself, not on the ones its
+boot code left behind. `kernel/main` builds them with the shared walker from three
+inputs, verifies them, installs them, and checks them again through the live root:
+
+- **The direct map**, over usable RAM as the memory map describes it (capped at 1 GiB so
+  a 32-bit kernel can address it). This is where the frame allocator's bitmap and the
+  page tables themselves live.
+- **The image**, from `image_sections()`: `.text` read-execute, `.rodata` read-only,
+  data and stacks read-write and never executable. A one-page hole below the boot stack
+  is left unmapped. That hole is the stack guard.
+- **Device windows**, from `arch::kspace::device_windows()`. Neither of the other two
+  inputs describes a device. A device left out of the map is a fault on its first
+  register access after the switch, and on aarch64, where the console is MMIO, that
+  fault has nowhere to print. x86 needs none today, because its devices are I/O ports.
+
+Nothing is installed unless every mapping reads back with the intended permissions, the
+guard page reads back unmapped, and the loader's boot data is reachable. After the switch
+each port shows that the hardware enforces the tables, not only that they are written
+correctly:
+
+| Port | Enforcement observed after the switch |
+|---|---|
+| x86_64 | `CR0.WP` and `EFER.NXE` read live; a write to `.rodata` takes #PF (err 0x03) and a call into `.data` takes #PF (err 0x11), both through the expected-fault trap, with the permission restored afterwards |
+| i686 | `CR0.WP` read live and NX reported. No fault probe: the #PF handler has no expected-fault path yet |
+| aarch64 | `SCTLR_EL1.M` read live; `AT S1E1W` reports a permission fault on `.text` and `.rodata`; `AT S1E1R` reports a translation fault on the guard page |
+
+The frames holding the live tables are handed to anything else that builds a frame pool
+from the loader's map, which does not know they are in use. The in-kernel suite is the
+first such pool, and the live tables are walked again after it runs. On x86 an overwritten
+entry goes unnoticed while the TLB still holds the old translation, so without that second
+walk the corruption would surface much later, somewhere else.
+
+**What a stack overflow does now.** On x86_64 an overflow of the boot stack faults on the
+guard page. The #PF cannot be pushed onto the exhausted stack, so #DF is raised and runs on
+its IST stack, and the report names the guard page. On aarch64 the synchronous vector
+checks, before touching memory, whether its own frame would land in the guard page. If it
+would, it switches to a reserved stack. Otherwise the frame would go beneath the guard and
+overwrite `.bss` to print the report. On i686 a real overflow still triple-faults: a 32-bit
+gate has no IST, and this port has no #DF task gate. The guard page is unmapped and a touch
+of it is reported, but an overflow that exhausts the stack cannot be reported yet.
+`STACK_GUARD_TEST` exercises all of this; see
+[testing.md](testing.md#expected-faults-the-stack-guard-test).
+
 ### `kalloc` — allocation
 
 We do **not** use the `alloc` crate. Its collections abort on allocation failure,

@@ -263,6 +263,27 @@ impl ImageSections {
     }
 }
 
+/// A range of device memory the kernel reaches after it installs its own tables.
+///
+/// The address space the kernel builds for itself maps RAM and the image, because those
+/// are what a memory map and a linker script describe. It knows nothing about devices,
+/// and a device left out of it is not an error anyone sees at build time. It becomes a
+/// fault on the first register access after the switch, which on a port whose console
+/// is MMIO is a fault with nowhere to print. So each port states its windows, and the
+/// builder maps them.
+///
+/// Mapped at the same virtual address as the physical one while the kernel is
+/// identity-mapped, and never executable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceWindow {
+    /// First byte of the window. Need not be page-aligned; the builder rounds outward.
+    pub phys: u64,
+    /// Length in bytes.
+    pub len: u64,
+    /// What lives there, for the report when mapping it fails.
+    pub what: &'static str,
+}
+
 /// An architecture with page tables.
 ///
 /// Extends [`crate::HasMmu`] with everything the shared walker needs. Kept separate
