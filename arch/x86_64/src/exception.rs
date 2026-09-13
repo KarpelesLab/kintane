@@ -104,7 +104,7 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptFrame, code: u6
 /// Everything else still ends at [`fatal`], so an unexpected #PF is as fatal as it was
 /// before this path existed.
 pub extern "x86-interrupt" fn page_fault(frame: InterruptFrame, code: u64) {
-    if crate::paging::on_page_fault(cr2(), code) {
+    if crate::paging::on_page_fault(cr2(), code) || crate::fault::route(cr2(), code) {
         return;
     }
     fatal(Some(14), Some(code), &frame)

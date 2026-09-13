@@ -325,6 +325,20 @@ pub trait HasPageTables: crate::HasMmu {
     /// second hides a real bug. So the answer has to come from the architecture.
     fn can_forbid_execute() -> bool;
 
+    /// Whether the CPU copies entries of the table at `level` when the root is loaded,
+    /// rather than walking them through the TLB.
+    ///
+    /// When it does, filling an absent entry at that level is invisible until the root
+    /// is reloaded: `flush_tlb(Some(addr))` does not re-read it, and a fault on the new
+    /// mapping looks spurious to a handler that only flushes one address, so it faults
+    /// again for ever. 32-bit PAE is the case: the four PDPT entries are loaded into
+    /// internal registers with CR3. Everywhere else a not-present-to-present change
+    /// needs no invalidation at all, which is the default.
+    fn root_load_caches(level: u8) -> bool {
+        let _ = level;
+        false
+    }
+
     /// Install `root` as the active translation table.
     ///
     /// # Safety

@@ -17,6 +17,7 @@ mod boot;
 pub mod clock;
 pub mod context;
 mod exception;
+pub mod fault;
 mod gdt;
 mod idt;
 pub mod interrupt;

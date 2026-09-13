@@ -50,6 +50,7 @@ pub mod directmap;
 pub mod frame;
 pub mod paged;
 pub mod phys;
+pub mod vm;
 
 pub use directmap::DirectMap;
 pub use frame::{Frame, FrameIter, FrameRange};

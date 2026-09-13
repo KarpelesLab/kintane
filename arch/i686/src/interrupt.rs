@@ -228,7 +228,7 @@ pub fn init() {
         idt::set_gate(6, idt::EntryPoint::diverging(exception::invalid_opcode));
         idt::set_gate(8, idt::EntryPoint::with_code(exception::double_fault));
         idt::set_gate(13, idt::EntryPoint::with_code(exception::general_protection));
-        idt::set_gate(14, idt::EntryPoint::with_code(exception::page_fault));
+        idt::set_gate(14, idt::EntryPoint::with_code_resumable(exception::page_fault));
 
         // The rest of the architecturally defined range, so that an unexpected one
         // reports itself instead of escalating to a triple fault.

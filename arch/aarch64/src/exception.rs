@@ -182,6 +182,10 @@ struct TrapFrame {
 /// reaches during normal operation.
 const VEC_CURRENT_SPX_IRQ: u64 = 5;
 
+/// Vector index for "current EL with `SP_ELx`, synchronous": where a kernel page fault
+/// arrives.
+const VEC_CURRENT_SPX_SYNC: u64 = 4;
+
 /// Install the vector table in `VBAR_EL1`.
 ///
 /// # Safety
@@ -228,6 +232,12 @@ extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
     // is live for the whole call and is not aliased by anything else.
     let (esr, elr, far, spsr) =
         unsafe { ((*frame).esr, (*frame).elr, (*frame).far, (*frame).spsr) };
+
+    // A page fault the kernel resolves returns to the faulting instruction; `fault.rs`
+    // decides which aborts are offered.
+    if index == VEC_CURRENT_SPX_SYNC && crate::fault::route(esr, far) {
+        return;
+    }
 
     let c = &EARLY;
     c.write_str("\n\nunhandled exception: vector ");

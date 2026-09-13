@@ -15,12 +15,14 @@
 //! but making that an ambient assumption is how a second one becomes impossible to
 //! introduce later.
 //!
-//! # What this does not do yet
+//! # Huge pages
 //!
-//! Splitting a huge page into smaller ones. A walk that needs to descend through a
-//! leaf returns [`MapError::WouldSplit`] rather than silently doing something
-//! surprising. Splitting is straightforward to add and needs a TLB-shootdown story to
-//! be correct on SMP, which is Phase 3.
+//! `map`, `unmap` and `protect` never split a huge page implicitly. A walk that would
+//! have to descend through one returns [`MapError::WouldSplit`] instead of doing
+//! something surprising. Splitting is an explicit operation (`split_leaf`), used by
+//! [`crate::vm`] where a copy-on-write share or a partial protect needs it. It
+//! invalidates one address, which is correct on one CPU; on SMP it needs a shootdown,
+//! which is Phase 3.
 
 // This module is the one place in `mm` that needs `unsafe`, and the crate's
 // `deny(unsafe_code)` is overridden here rather than removed, as
@@ -38,7 +40,9 @@
 use core::marker::PhantomData;
 
 use hal::PhysAddr;
-use hal::paging::{HasPageTables, MapError, PageFlags, PageTableEntry, level_index, level_size};
+use hal::paging::{
+    HasPageTables, MapError, PageFlags, PageTableEntry, level_entries, level_index, level_size,
+};
 
 use crate::DirectMap;
 
@@ -56,6 +60,48 @@ pub trait FrameSource {
     /// Return a frame. Failure is not reportable and not fatal; a leaked frame is
     /// better than a teardown that cannot complete.
     fn free(&mut self, frame: PhysAddr);
+
+    /// A frame whose contents are unspecified.
+    ///
+    /// For a caller about to overwrite the whole frame anyway: a copy-on-write copy, or
+    /// a demand page that [`crate::vm`] zeroes itself. Defaults to [`Self::alloc_zeroed`],
+    /// so a source with no cheaper answer need not provide one.
+    fn alloc(&mut self) -> Result<PhysAddr, MapError> {
+        self.alloc_zeroed()
+    }
+
+    /// `frames` physically contiguous frames, the first on a multiple of `align` bytes,
+    /// contents unspecified. Each frame is later returned on its own with [`Self::free`].
+    ///
+    /// What a huge page needs: a 2 MiB leaf names one physical address, so the frames
+    /// behind it must be adjacent and the first must sit on a 2 MiB boundary. The
+    /// default refuses, and a caller that wanted a huge page maps small ones instead.
+    fn alloc_block(&mut self, frames: usize, align: usize) -> Result<PhysAddr, MapError> {
+        let _ = (frames, align);
+        Err(MapError::OutOfFrames)
+    }
+}
+
+/// What a walk to an address found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Probe<E> {
+    /// A leaf maps the address.
+    Leaf {
+        /// The table holding the leaf.
+        table: PhysAddr,
+        /// The leaf's index in `table`.
+        index: usize,
+        /// The level the leaf is at; it maps `level_size(level)` bytes.
+        level: u8,
+        /// The entry as read.
+        entry: E,
+    },
+    /// Nothing maps the address. The absent entry was found at `level`, so nothing is
+    /// mapped anywhere in the `level_size(level)` bytes around it either.
+    Hole {
+        /// Level of the absent entry.
+        level: u8,
+    },
 }
 
 /// The largest number of levels any supported architecture uses. Used only to size a
@@ -95,6 +141,11 @@ impl<A: HasPageTables> AddressSpace<A> {
 
     pub fn root(&self) -> PhysAddr {
         self.root
+    }
+
+    /// The direct map these tables are reached through.
+    pub fn direct(&self) -> DirectMap {
+        self.direct
     }
 
     /// Make these tables the active ones.
@@ -214,13 +265,14 @@ impl<A: HasPageTables> AddressSpace<A> {
                 .checked_add(off as u64)
                 .map_err(|_| MapError::BadPhysAddr)?;
             let level = self.best_level(v, p, len - off);
-            self.map_one(v, p, level, flags, frames)?;
+            self.map_at_level(v, p, level, flags, frames)?;
             off += level_size::<A>(level);
         }
         Ok(())
     }
 
-    fn map_one(
+    /// Map one leaf of `level_size(level)` bytes at `virt`, which must be aligned to it.
+    pub(crate) fn map_at_level(
         &mut self,
         virt: usize,
         phys: PhysAddr,
@@ -236,6 +288,13 @@ impl<A: HasPageTables> AddressSpace<A> {
             table = if !e.is_present() {
                 let new = frames.alloc_zeroed()?;
                 self.write(table, idx, A::Entry::table(new, l))?;
+                if A::root_load_caches(l) {
+                    // SAFETY: the new entry is written. The CPU holds a copy of this
+                    // level taken when the root was loaded, and only a full flush
+                    // reloads it; without this the mapping below exists in the table
+                    // and not in the machine.
+                    unsafe { A::flush_tlb(None) };
+                }
                 new
             } else if e.is_leaf(l) {
                 // A huge page already covers this address. Replacing it would unmap
@@ -371,6 +430,12 @@ impl<A: HasPageTables> AddressSpace<A> {
             depth -= 1;
             let (parent, parent_idx) = chain[depth];
             self.write(parent, parent_idx, A::Entry::empty())?;
+            if A::root_load_caches(child_level + 1) {
+                // SAFETY: the entry is cleared. The CPU's copy of it, taken at root load,
+                // still names the table about to be freed, and the invalidation of the
+                // leaf above did not touch that copy.
+                unsafe { A::flush_tlb(None) };
+            }
             frames.free(child);
             child = parent;
             child_level += 1;
@@ -401,6 +466,162 @@ impl<A: HasPageTables> AddressSpace<A> {
             unsafe { A::flush_tlb(Some(v)) };
             off += size;
         }
+        Ok(())
+    }
+
+    /// Walk to `virt` and say what maps it, or at which level nothing does.
+    pub(crate) fn probe(&self, virt: usize) -> Result<Probe<A::Entry>, MapError> {
+        if !A::is_canonical(virt) {
+            return Err(MapError::NotCanonical);
+        }
+        let mut table = self.root;
+        let mut l = A::LEVELS - 1;
+        loop {
+            let index = level_index::<A>(virt, l);
+            let entry = self.read(table, index)?;
+            if !entry.is_present() {
+                return Ok(Probe::Hole { level: l });
+            }
+            if entry.is_leaf(l) {
+                return Ok(Probe::Leaf {
+                    table,
+                    index,
+                    level: l,
+                    entry,
+                });
+            }
+            if l == 0 {
+                // Present at the leaf level but not a leaf: a malformed table.
+                return Err(MapError::NotMapped);
+            }
+            table = entry.address();
+            l -= 1;
+        }
+    }
+
+    /// Free the tables on the path to `virt` that hold nothing, deepest first.
+    ///
+    /// For after a mapping that failed part-way: `map` allocates intermediate tables on
+    /// the way down, and if the leaf itself then cannot be placed they are left empty. They
+    /// are harmless, but they are frames nothing will ever return, and the next teardown
+    /// only reclaims tables it empties itself. The root is never freed.
+    pub(crate) fn prune(&mut self, virt: usize, frames: &mut impl FrameSource) {
+        let mut chain = [(PhysAddr::ZERO, 0usize); MAX_LEVELS];
+        let mut depth = 0usize;
+        let mut table = self.root;
+        let mut l = A::LEVELS - 1;
+        while l > 0 {
+            let idx = level_index::<A>(virt, l);
+            let Ok(e) = self.read(table, idx) else {
+                return;
+            };
+            if !e.is_present() || e.is_leaf(l) {
+                break;
+            }
+            chain[depth] = (table, idx);
+            depth += 1;
+            table = e.address();
+            l -= 1;
+        }
+        let mut freed = false;
+        while depth > 0 {
+            if self.is_table_empty(table, l) != Ok(true) {
+                break;
+            }
+            depth -= 1;
+            let (parent, idx) = chain[depth];
+            if self.write(parent, idx, A::Entry::empty()).is_err() {
+                break;
+            }
+            frames.free(table);
+            freed = true;
+            table = parent;
+            l += 1;
+        }
+        if freed {
+            // SAFETY: the entries are written. No leaf was below them, but a CPU may cache
+            // intermediate entries (paging-structure caches on x86, the PDPT on PAE), and
+            // one naming a freed frame must not survive that frame's reuse.
+            unsafe { A::flush_tlb(None) };
+        }
+    }
+
+    /// Replace the leaf at `(table, index)`, which maps `virt`, and invalidate it.
+    ///
+    /// The frame, the permissions or both may change. Every replacement is followed by
+    /// an invalidation, including one that only adds permission. Leaving that one stale
+    /// is harmless on x86, which refaults and finds the new entry, but which changes may
+    /// skip the flush is an architecture's question and this layer does not answer it.
+    pub(crate) fn replace_leaf(
+        &mut self,
+        (table, index): (PhysAddr, usize),
+        virt: usize,
+        phys: PhysAddr,
+        flags: PageFlags,
+        level: u8,
+    ) -> Result<(), MapError> {
+        if phys.truncate(A::PHYS_ADDR_BITS).1 {
+            return Err(MapError::BadPhysAddr);
+        }
+        self.write(table, index, A::Entry::leaf(phys, flags, level))?;
+        // SAFETY: the entry is written, so any cached translation of `virt` names the old
+        // frame or the old permissions. A stale writable one is how a shared frame gets
+        // written through a mapping that was made read-only to protect it.
+        unsafe { A::flush_tlb(Some(virt)) };
+        Ok(())
+    }
+
+    /// Turn the huge leaf covering `virt` into a table of leaves one level down, mapping
+    /// the same frames with the same permissions.
+    ///
+    /// Nothing observable changes: every address translates to the same byte before and
+    /// after, which is what makes this safe to do at any time. Does nothing if `virt` is
+    /// already mapped at the smallest size, and is [`MapError::NotMapped`] if nothing maps
+    /// it. On any error the tables are as they were.
+    pub(crate) fn split_leaf(
+        &mut self,
+        virt: usize,
+        frames: &mut impl FrameSource,
+    ) -> Result<(), MapError> {
+        let (table, index, level, entry) = match self.probe(virt)? {
+            Probe::Hole { .. } => return Err(MapError::NotMapped),
+            Probe::Leaf { level: 0, .. } => return Ok(()),
+            Probe::Leaf {
+                table,
+                index,
+                level,
+                entry,
+            } => (table, index, level, entry),
+        };
+        let sub = level - 1;
+        if !A::leaf_allowed(sub) {
+            return Err(MapError::WouldSplit);
+        }
+        let flags = entry.flags(level);
+        let base = entry.address();
+        let size = level_size::<A>(sub) as u64;
+        let new = frames.alloc_zeroed()?;
+        // Filled completely before it is linked in, so the hardware never walks a
+        // half-built table.
+        for i in 0..level_entries::<A>(sub) {
+            let phys = (i as u64)
+                .checked_mul(size)
+                .and_then(|o| base.checked_add(o).ok());
+            let written = match phys {
+                Some(p) => self.write(new, i, A::Entry::leaf(p, flags, sub)),
+                None => Err(MapError::BadPhysAddr),
+            };
+            if let Err(e) = written {
+                frames.free(new);
+                return Err(e);
+            }
+        }
+        self.write(table, index, A::Entry::table(new, level))?;
+        let block = virt & !(level_size::<A>(level) - 1);
+        // SAFETY: the table is linked in. Invalidating any address inside a huge page
+        // drops the huge translation on both x86 (`invlpg`) and AArch64
+        // (`tlbi vaae1is`), so one flush covers the block.
+        unsafe { A::flush_tlb(Some(block)) };
         Ok(())
     }
 
