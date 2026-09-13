@@ -15,25 +15,80 @@ demonstrable — something boots, something passes, something fits in a budget �
 
 ### Phase 2, so far
 
-Landed: `kernel/sync` (capability-selected locks), `kernel/kalloc` (fallible heap over
-the frame allocator), `kernel/kobject` (rights, handle tables, refcounting), the
-in-kernel test suite, i686 interrupt support, and a TSS with an IST stack for `#DF` on
-x86_64.
+Every Phase 2 item except `mm::paged` has landed on all three tier-1 architectures.
+Each one gates the boot verdict or the host suite, and each check was falsified:
+mutated, confirmed to fail, then restored. Today a boot runs 35 in-kernel checks on
+each architecture, plus 13 host-tested units.
 
-**A finding worth carrying forward: an IST is necessary for diagnosing a stack
-overflow and is not sufficient.** With `#DF` given its own stack, a deliberately
-corrupted `RSP` produces a clean fault report — and a control build with the IST index
-set back to 0, changing nothing else, produces no output at all, which is what
-isolates the IST as the cause. But a *genuine* unbounded recursion still does not
-report: the boot stack has no guard page, so the overflow walks straight into the page
-tables that sit below it in `.bss`, unmaps the machine including the IST stack itself,
-and ends in an endless `#PF`/`#DF` alternation. **What makes a stack overflow
-diagnosable is a guard page**, which needs the address-space work this phase is for.
+- **Address space.** The kernel runs on page tables it built itself. They are verified
+  before they are loaded and checked against the CPU afterwards. W^X is enforced by
+  the hardware and observed with real faults on x86_64 and with translation queries on
+  aarch64. The boot-stack guard page is live, and `STACK_GUARD_TEST` in CI proves an
+  overflow is caught.
+- **Scheduling.** Fixed-priority round robin, preempted from the timer interrupt, with
+  an idle thread that halts. The boot check demonstrates interleaving, priority, tick
+  delivery and a halting idle thread.
+- **Time.** `kernel/time` provides a monotonic clock that never divides on the hot
+  path, and a fixed-capacity timer queue that supports tickless operation. The clock
+  is driven by a PIT-calibrated TSC on x86 and by `CNTVCT_EL0` on aarch64.
+- **Allocation.** `kalloc` has slab, buddy and arena allocators, context flags and
+  poisoning. Deterministic fault injection covers every allocation site, and an
+  in-kernel exhaust-and-free check runs on real frames.
+- **Locking and objects.**
+  - `sync` owns the one `LockFamily`, and debug builds check lock order: inversions,
+    recursion and same-class nesting.
+  - `kobject` handle transfer is all-or-nothing. `ipc` channels are built on it.
+- **Crash reports.** Backtraces use frame pointers. The image is stripped, and a
+  separate `.debug` bundle lets `kbuild symbolize` decode reports. `run` and `test`
+  decode them automatically. CI crashes each architecture both ways and requires the
+  decoded names.
+- **Portability.** `kbuild portability` compiles every host-tested unit for riscv32i,
+  riscv32imac and thumbv7m.
 
-Also worth recording, because it was invisible: the `#DF` stack first landed in
-`.rodata`, because an immutable zeroed static is const data. Harmless under today's
-boot map — 2 MiB pages, writable, no NX — and a triple fault the moment real page
-protections exist, in the one handler whose entire purpose is not to triple-fault.
+**The largest finding: a capability bound does not remove code.** `sync`, `kobject`
+and `ipc` did not compile for either no-MMU target. On a machine without CAS, a
+`compare_exchange` behind `A: HasCas` is still a compile error, and host tests could
+not see it because the host has every atomic. See
+[portability.md](portability.md#where-a-bound-is-not-enough).
+
+Integration also turned up bugs that the unit-level tests could not have found:
+
+- **Aliasing in `kernel/thread`.** Its `&mut self` switching API left a suspended
+  thread holding a live exclusive reference to the table. The mock switch returns
+  immediately, so host tests never saw it.
+- **EOI ordering.** Sending the EOI after the tick hook instead of before it still
+  passed the round-robin and priority checks. Only the tick-gap measurement caught it.
+- **Page-table corruption.** The in-kernel suite's frame pool overwrote the live
+  x86_64 top-level table, and the suite kept passing on cached translations. The live
+  tables are now reserved from that pool and walked again after the suite.
+- **Heap accounting.** In the slab-overflow path, the heap freed with the caller's
+  layout instead of the size class, which under-counted the arena. Only the
+  fault-injection sweep reached that path.
+- **Lockdep false positives.** The first lock-order checker kept one global held-lock
+  stack and reported ordinary contention as recursion.
+
+An older finding still stands: **an IST alone does not make a stack overflow
+diagnosable; a guard page does.** On x86_64 a real overflow is now reported from the
+`#DF` IST stack. The `#DF` stack itself had first landed in `.rodata`, because an
+immutable zeroed static is const data. That stayed harmless until real page
+protections arrived.
+
+Not done, and needed for the Phase 2 exit:
+
+- **`mm::paged`:** virtual memory objects, demand paging, copy-on-write and huge
+  pages.
+- **Shared kernel state.** A global, locked heap and clock that outlive boot. Timer
+  interrupts are still periodic rather than programmed from `next_deadline`, and sleep
+  still counts ticks.
+- **Stress.** The 24-hour stress run, and fault injection exercised across the whole
+  kernel, not only `kalloc`.
+- **Smaller gaps:**
+  - Thread stacks have no guard pages.
+  - On i686 a real overflow still triple-faults, because it needs a `#DF` task gate.
+  - aarch64 device windows are hardcoded for QEMU `virt`.
+  - Lockdep's first report is recorded but not printed.
+  - No build ID ties a console log to its symbol bundle.
+  - Page 0 is still mapped on x86.
 
 ### Phase 1, as it actually stands
 
@@ -63,8 +118,7 @@ memory checks it cannot run.
 
 Not done, and deliberately named rather than quietly folded into "done":
 
-- **No page table manipulation or kernel address space.** The frame allocator exists;
-  building mappings on top of it does not. Phase 2.
+- ~~No page table manipulation or kernel address space.~~ Done in Phase 2: see above.
 - **The GIC drivers are in `arch/aarch64/`**, not `drivers/irqchip/` where
   [architecture.md](architecture.md) says they belong, because `arch` may not depend
   on the `device` layer and nothing else would reference them yet. They move when the
