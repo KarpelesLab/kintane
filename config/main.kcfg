@@ -88,6 +88,16 @@ config KALLOC_FAULT_INJECT
         enable it in anything that ships: a policy left armed fails real
         allocations.
 
+config DEBUG_LOCKDEP
+    bool "Lock-order checking"
+    default y if DEBUG_BUILD
+    help
+        Every lock with a class reports acquisitions and releases to a
+        validator that records the order classes are taken in and reports an
+        inversion the first time both orders have been seen, without needing
+        the deadlock to happen. Recursion stops the CPU. When off, locks carry
+        no class and pay nothing. See kernel/sync/src/lockdep.rs.
+
 config QEMU_EXIT
     bool "Guest-initiated emulator exit"
     depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64

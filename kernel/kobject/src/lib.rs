@@ -29,7 +29,7 @@ use core::sync::atomic::AtomicU64;
 #[cfg(any(target_has_atomic = "32", target_has_atomic = "64"))]
 use core::sync::atomic::Ordering;
 
-pub use handle::{Handle, HandleTable};
+pub use handle::{Handle, HandleTable, TransferError};
 pub use rights::Rights;
 
 /// A kernel object's identity.

@@ -37,9 +37,9 @@
 //!
 //! # Locking discipline
 //!
-//! Rules for callers, in the absence of a lock validator (`docs/coding-standards.md`
-//! asks for one; it arrives with the scheduler, when there is a lock order worth
-//! checking):
+//! Rules for callers. Lock *order* is not among them because it is checked rather than
+//! stated: give a lock a [`LockClass`] and debug builds report an inversion the first
+//! time both orders are seen ([`lockdep`]).
 //!
 //! 1. **A lock shared with an interrupt handler is taken with interrupts masked** —
 //!    [`SpinLock::lock_irqsave`] or [`IrqLock::lock`], never [`SpinLock::lock`]. The classic
@@ -53,8 +53,9 @@
 //!    merely a convention.
 //! 4. **Re-entering a held lock is a bug, and it is treated as one.** [`IrqLock`] detects it and
 //!    stops the CPU rather than handing out a second `&mut` to the same data, which would be
-//!    undefined behaviour. [`SpinLock`] cannot detect it without an owner field and deadlocks
-//!    instead, like every other kernel's spinlock.
+//!    undefined behaviour. [`SpinLock`] cannot detect it without an owner field and deadlocks, like
+//!    every other kernel's spinlock. In a debug build, a spinlock with a class is caught by
+//!    lock-order checking first, and the CPU is stopped with a report.
 //!
 //! # Memory ordering
 //!
@@ -88,14 +89,17 @@
 //!
 //! Allowed here by `docs/coding-standards.md`, and unavoidable: a lock is precisely a
 //! safe interface over an [`UnsafeCell`](core::cell::UnsafeCell) plus a proof that
-//! only one guard exists at a time. It is confined to the three lock types, every
-//! block carries the invariant it depends on, and no public API is `unsafe` except
-//! the marker trait, whose unsafety *is* the point.
+//! only one guard exists at a time. It is confined to the three lock types and the
+//! shared state of lock-order checking, every block carries the invariant it depends
+//! on, and no public API is `unsafe` except the marker trait, whose unsafety *is* the
+//! point.
 
 // `no_std` except under the host test harness, which needs `std` to link `libtest`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod family;
 pub mod irq;
+pub mod lockdep;
 pub mod once;
 #[cfg(target_has_atomic = "32")]
 pub mod spin;
@@ -103,6 +107,9 @@ pub mod spin;
 #[cfg(test)]
 mod testing;
 
+#[cfg(target_has_atomic = "32")]
+pub use family::Spin;
+pub use family::{Irq, LockFamily};
 /// Re-exported from `hal`, where the capability traits live.
 ///
 /// It was first written here, next to its only user, which made it unimplementable by
@@ -110,6 +117,7 @@ mod testing;
 /// so nothing else in this unit changed when it moved.
 pub use hal::UniProcessor;
 pub use irq::{IrqGuard, IrqLock, IrqLockGuard};
+pub use lockdep::LockClass;
 #[cfg(target_has_atomic = "8")]
 pub use once::{CasGate, CasOnce};
 pub use once::{Claim, IrqGate, IrqOnce, Once, OnceGate};

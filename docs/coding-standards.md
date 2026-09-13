@@ -99,7 +99,11 @@ checks it.
 - Every subsystem has a `//!` module-level comment explaining its model, its locking
   discipline, and its invariants — not a restatement of its function list.
 - Locking order is documented at the subsystem level and checked at runtime in debug
-  builds. A lock hierarchy that lives only in someone's head will be violated.
+  builds. A lock hierarchy that lives only in someone's head will be violated. The check
+  sees a lock only if it has a class: create long-lived locks with `with_class` and a
+  `static LockClass` named for the lock's role (`"ipc.channel"`), and give every
+  `LockFamily::new` one, which the signature requires. A lock without a class is
+  invisible to the checker, which should be a decision rather than an accident.
 - Anything with a hardware reference cites it: manual name, revision, section.
 
 ## Commits and review

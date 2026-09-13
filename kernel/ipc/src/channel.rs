@@ -3,11 +3,18 @@
 //! this file is the mechanism, and the comments at each commit point say why it is
 //! all-or-nothing.
 
-use kobject::handle::{self, Entry, Handle, HandleTable};
+use kobject::handle::{self, Entry, Handle, HandleTable, TransferError};
 use kobject::{IdSource, ObjectId, ObjectType, Rights};
+use sync::{LockClass, LockFamily};
 
 use crate::inbox::Inbox;
-use crate::lock::LockFamily;
+
+/// The lock-order class of every channel's lock.
+///
+/// Nothing in this unit takes a channel lock while holding another. The class exists so
+/// that debug builds find out if a caller does, and find out which order subsystems
+/// above this one take a channel lock in relative to their own.
+pub static CHANNEL_LOCK: LockClass = LockClass::new("ipc.channel");
 
 /// Which end of a channel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,8 +82,7 @@ pub struct Status {
 
 /// Why a channel operation failed.
 ///
-/// Every failure leaves every handle table and every queue exactly as it was, with one
-/// cosmetic exception noted on [`Error::NoRoom`].
+/// Every failure leaves every handle table and every queue exactly as it was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     /// The endpoint handle is invalid, not a channel, or lacks the right the operation
@@ -106,11 +112,8 @@ pub enum Error {
     /// The front message needs larger buffers than were supplied. It stays queued.
     BufferTooSmall { bytes: usize, handles: usize },
     /// The receiver's handle table could not hold all `handles` the front message
-    /// carries. The message stays queued with every handle; nothing was installed.
-    ///
-    /// Slots that were filled and then rolled back have had their generation advanced,
-    /// exactly as if a handle had been opened and closed there. No handle value was
-    /// ever returned for them.
+    /// carries. The message stays queued with every handle; nothing was installed, and
+    /// the table is exactly as it was.
     NoRoom {
         handles: usize,
         error: handle::Error,
@@ -119,6 +122,13 @@ pub enum Error {
     TooManyRefs,
     /// A release for an endpoint that holds no references: a double release.
     NotHeld,
+}
+
+fn transfer_error(e: TransferError) -> Error {
+    match e {
+        TransferError::Handle { index, error } => Error::Transfer { index, error },
+        TransferError::Duplicate { index } => Error::DuplicateTransfer { index },
+    }
 }
 
 /// One endpoint's state.
@@ -190,7 +200,7 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
         let channel = Channel {
             a,
             b,
-            state: L::new(State { a: end(), b: end() }),
+            state: L::new(State { a: end(), b: end() }, &CHANNEL_LOCK),
         };
         let entry = |object| Entry {
             object,
@@ -265,27 +275,17 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
             });
         }
 
-        // Phase 1: prove, without changing anything, that every handle can be moved.
-        // These are precisely the checks `transfer_out` makes — the handle is live and
-        // carries TRANSFER — plus the two it cannot make because it sees one handle at a
-        // time: no handle listed twice (the second `transfer_out` would find it gone
-        // after the first had succeeded), and no endpoint of this channel.
+        // Phase 1: prove, without changing anything, that every handle can be moved:
+        // kobject's checks (live, TRANSFER, not listed twice), then the one it cannot
+        // make because it does not know what a channel is — no endpoint of this channel.
+        let listed = handles.iter().map(|t| t.handle);
+        table
+            .check_transfer_out_many(listed.clone())
+            .map_err(transfer_error)?;
         for (index, t) in handles.iter().enumerate() {
             let entry = table
                 .get(t.handle)
                 .map_err(|error| Error::Transfer { index, error })?;
-            if !entry.rights.contains(Rights::TRANSFER) {
-                return Err(Error::Transfer {
-                    index,
-                    error: handle::Error::AccessDenied {
-                        required: Rights::TRANSFER,
-                        held: entry.rights,
-                    },
-                });
-            }
-            if handles.iter().take(index).any(|p| p.handle == t.handle) {
-                return Err(Error::DuplicateTransfer { index });
-            }
             if entry.kind == ObjectType::Channel && self.side_of(entry.object).is_some() {
                 return Err(Error::WouldCycle { index });
             }
@@ -306,47 +306,25 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
                 return Err(Error::Full);
             };
 
-            // Phase 2: move. `table` has been exclusively borrowed since phase 1, so
-            // nothing can have closed, replaced or re-righted any of these handles, and
-            // phase 1 ruled out the one way this loop could invalidate its own later
-            // input. `transfer_out` therefore cannot fail here.
-            //
-            // It still returns a `Result`, and kobject has no two-phase transfer that
-            // would let the type system know this, so the arm exists. It puts back what
-            // it took. Reinstallation gives new handle values, and could itself fail if
-            // a slot just vacated was retired — which is why it is asserted unreachable
-            // in debug builds rather than trusted as a recovery path.
-            let mut moved = 0usize;
-            let mut failure = None;
-            for (dst, t) in slot.handle_slots().zip(handles) {
-                match table.transfer_out(t.handle) {
-                    Ok(entry) => {
-                        *dst = Some(entry);
-                        moved += 1;
-                    }
-                    Err(error) => {
-                        failure = Some(Error::Transfer {
-                            index: moved,
-                            error,
+            // Phase 2: move, all or nothing. `table` has been exclusively borrowed since
+            // phase 1, so the checks `transfer_out_many` repeats cannot fail. If they
+            // somehow did, nothing has moved — that is what the call guarantees — so the
+            // arm only has to leave the reserved slot unused, which dropping it does.
+            let moved = {
+                let mut dsts = slot.handle_slots();
+                table.transfer_out_many(listed, |index, entry| {
+                    let mask = handles.get(index).map_or(Rights::empty(), |t| t.mask);
+                    if let Some(dst) = dsts.next() {
+                        *dst = Some(Entry {
+                            rights: entry.rights.narrow(mask),
+                            ..entry
                         });
-                        break;
                     }
-                }
-            }
-            if let Some(err) = failure {
-                debug_assert!(false, "transfer_out failed after validation: {err:?}");
-                for entry in slot.unstage().into_iter().flatten() {
-                    let _ = table.insert(entry.object, entry.kind, entry.rights);
-                }
-                return Err(err);
-            }
-
-            // Narrow last, so that the rollback above would have reinstalled the rights
-            // the sender actually held rather than the rights it was sending.
-            for (dst, t) in slot.handle_slots().zip(handles) {
-                if let Some(entry) = dst {
-                    entry.rights = entry.rights.narrow(t.mask);
-                }
+                })
+            };
+            if let Err(err) = moved {
+                debug_assert!(false, "transfer_out_many failed after validation: {err:?}");
+                return Err(transfer_error(err));
             }
             slot.commit(bytes);
             Ok(())
@@ -395,15 +373,23 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
                 });
             }
 
+            // Room first, so a table that cannot take the whole message is refused
+            // before anything is inserted — and before any slot's generation moves.
+            if table.free_slots() < got.handles {
+                return Err(Error::NoRoom {
+                    handles: got.handles,
+                    error: handle::Error::TableFull,
+                });
+            }
+
             // Install, then remove from the queue — never the other way round. Until
             // the `discard_front` below, every entry is still in the message, so a
-            // failure part-way has only to undo the installs it made.
+            // failure part-way would only have to undo the installs it made.
             //
-            // A `HandleTable` cannot say in advance whether it has room for `k` more
-            // (retired slots are invisible from outside), so room is found out by
-            // trying. Undoing an install is a `close` of a handle that was created a
-            // moment ago under this same exclusive borrow and never returned, so it
-            // cannot fail; the arm is asserted rather than trusted.
+            // After the check above, and under the same exclusive borrow of `table`, no
+            // insert can fail. The arm still exists because `insert` returns a `Result`.
+            // It undoes what it installed, with `close`s of handles created a moment ago
+            // and never returned, and it is asserted rather than trusted.
             let mut installed = 0usize;
             let mut failure = None;
             for (out, entry) in handles.iter_mut().zip(msg.entries()) {
@@ -419,6 +405,7 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
                 }
             }
             if let Some(error) = failure {
+                debug_assert!(false, "insert failed after free_slots said there was room");
                 for undo in handles.iter_mut().take(installed) {
                     let closed = table.close(*undo);
                     debug_assert!(closed.is_ok(), "rollback of a fresh insert failed");

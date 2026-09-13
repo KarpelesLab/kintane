@@ -16,11 +16,13 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
+use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use hal::Arch;
 
 use crate::UniProcessor;
+use crate::lockdep::{self, ClassTag, LockClass};
 
 /// Interrupts masked on this CPU until this value is dropped.
 ///
@@ -93,6 +95,8 @@ pub struct IrqLock<T, A: UniProcessor> {
     /// CPUs can both read `false` before either writes `true`. That is exactly the
     /// race [`UniProcessor`] asserts cannot happen.
     held: AtomicBool,
+    /// Its lock-order class. Zero-sized in a build without lock-order checking.
+    class: ClassTag,
     data: UnsafeCell<T>,
     /// `fn() -> A` rather than `A`: the architecture is a tag, never stored, and the
     /// lock's auto traits should not depend on what the marker type happens to be.
@@ -112,19 +116,41 @@ impl<T, A: UniProcessor> IrqLock<T, A> {
     /// A new, unlocked lock. `const`, so it can be a `static` without an initialiser
     /// running first — which matters, since this is a type for machines whose whole
     /// heap may be a few kilobytes.
+    ///
+    /// Lock-order checking does not see it; see [`IrqLock::with_class`].
     pub const fn new(value: T) -> Self {
+        Self::build(value, None)
+    }
+
+    /// A new, unlocked lock of class `class`, checked for lock order in debug builds.
+    pub const fn with_class(value: T, class: &'static LockClass) -> Self {
+        Self::build(value, Some(class))
+    }
+
+    const fn build(value: T, class: Option<&'static LockClass>) -> Self {
         IrqLock {
             held: AtomicBool::new(false),
+            class: ClassTag::new(class),
             data: UnsafeCell::new(value),
             _arch: PhantomData,
         }
+    }
+
+    /// This lock's identity for lock-order checking. A held lock is borrowed by its
+    /// guard, so it cannot move while the identity matters.
+    fn instance(&self) -> usize {
+        ptr::from_ref(self).addr()
     }
 
     /// Mask interrupts and take the lock.
     ///
     /// Stops the CPU if the lock is already held; see the type's documentation.
     pub fn lock(&self) -> IrqLockGuard<'_, T, A> {
-        match self.try_lock() {
+        // Checked as a blocking acquisition, which in effect it is: re-entering it is the
+        // same bug as re-entering a spinlock, and the order it is taken in matters the
+        // same way once there are two CPUs.
+        lockdep::acquire::<A>(&self.class, self.instance());
+        match self.take() {
             Some(g) => g,
             // Reached only by re-entering the critical section from inside itself:
             // with interrupts masked, nothing else on this machine runs.
@@ -135,6 +161,16 @@ impl<T, A: UniProcessor> IrqLock<T, A> {
     /// Mask interrupts and take the lock, or give the interrupts back and return
     /// `None` if it is already held.
     pub fn try_lock(&self) -> Option<IrqLockGuard<'_, T, A>> {
+        let guard = self.take();
+        if guard.is_some() {
+            lockdep::acquire_try::<A>(&self.class, self.instance());
+        }
+        guard
+    }
+
+    /// The acquisition itself, shared by `lock` and `try_lock`, each of which tells
+    /// lock-order checking what kind of acquisition it was.
+    fn take(&self) -> Option<IrqLockGuard<'_, T, A>> {
         // Mask first. Testing the flag with interrupts enabled would leave a window
         // between the test and the set in which an interrupt handler could take the
         // lock, which is the race this whole type is meant not to have.
@@ -206,6 +242,7 @@ impl<T, A: UniProcessor> DerefMut for IrqLockGuard<'_, T, A> {
 
 impl<T, A: UniProcessor> Drop for IrqLockGuard<'_, T, A> {
     fn drop(&mut self) {
+        lockdep::release::<A>(&self.lock.class, self.lock.instance());
         // `Release` publishes everything written inside the critical section to
         // whoever acquires the flag next — on this machine, an interrupt handler on
         // this CPU. It also stops the compiler from sinking those writes past here.

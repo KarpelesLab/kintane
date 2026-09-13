@@ -39,10 +39,11 @@ impl<const B: usize, const H: usize> Message<B, H> {
 
 /// A slot at the tail of a non-full queue, being filled by a send.
 ///
-/// Not part of the queue until [`Vacant::commit`]. There is deliberately no `Drop`:
-/// a staging that is abandoned must hand its entries back explicitly (see
-/// [`Vacant::unstage`]), because a destructor that cleared them would be a silent loss
-/// of exactly the kind this unit exists to prevent.
+/// Not part of the queue until [`Vacant::commit`]. There is deliberately no `Drop` and
+/// no way to take staged entries back: the send stages entries only from a transfer
+/// that has already moved every handle, and commits straight after. A destructor that
+/// cleared a half-staged slot would be a silent loss of exactly the kind this unit
+/// exists to prevent, so the way to abandon a staging is not to start one.
 pub(crate) struct Vacant<'a, const D: usize, const B: usize, const H: usize> {
     inbox: &'a mut Inbox<D, B, H>,
     index: usize,
@@ -56,14 +57,6 @@ impl<const D: usize, const B: usize, const H: usize> Vacant<'_, D, B, H> {
     /// The handle positions, for the send to stage entries into in order.
     pub(crate) fn handle_slots(&mut self) -> impl Iterator<Item = &mut Option<Entry>> {
         self.slot().into_iter().flat_map(|m| m.handles.iter_mut())
-    }
-
-    /// Take back every entry staged so far, emptying the slot.
-    pub(crate) fn unstage(&mut self) -> [Option<Entry>; H] {
-        match self.slot() {
-            Some(m) => core::mem::replace(&mut m.handles, [None; H]),
-            None => [None; H],
-        }
     }
 
     /// Append the message to the queue. `bytes` must be at most `B` long; the caller
