@@ -10,9 +10,73 @@ demonstrable — something boots, something passes, something fits in a budget �
 |---|---|
 | 0 — Build system and first boot | **done**, including `kinboot-efi` |
 | 1 — The portability spine | **done**, including `kinboot-bios` |
-| 2 — Core kernel | **every item landed**; the 24-hour stress exit criterion is not yet run |
-| 3 — SMP and the device model | in progress: the device model and FDT-driven drivers |
-| 4 onward | not started |
+| 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
+| 3 — SMP and the device model | in progress: aarch64 SMP, the device model from FDT and from ACPI/PCIe |
+| 4 — Configurability, scaling down | in progress: riscv32 without an MMU, `mm::flat`, the full config language, random configs, size budgets |
+| 5 onward | not started |
+
+### The third round of landings
+
+Six more branches landed. The tree now boots nine presets: the seven from before, plus
+`aarch64-virt-smp` and `riscv32-virt`.
+
+- **Phase 2's exit instrument.** After bring-up the scheduler keeps the CPU for good.
+  `kbuild stress` runs seven workloads under seeded heap fault injection: heap churn,
+  channel ping-pong with handle transfer, sleeps, demand paging and COW, and buddy
+  pages. An auditor checks every book once a second, and a heartbeat watchdog turns a
+  hang into a failure. Ten minutes pass all 600 audits on x86_64, i686 and aarch64. A
+  nightly workflow runs 30 minutes each. The 24-hour run needs a self-hosted runner and
+  has not been done.
+- **SMP on aarch64.** `sync::PerCpu` is sized by `HasSmp::MAX_CPUS` at build time and
+  reachable only through an interrupt-masking `Pinned` guard. PSCI `CPU_ON` starts every
+  CPU in the device tree. Each CPU gets its own redistributor, which is found by
+  affinity, or its banked GICv2 interface, plus its own timer. SGI IPIs work on both GIC
+  versions, and lockdep keeps one held-lock stack per CPU. The scheduler itself is still
+  single-CPU.
+- **ACPI and PCIe on x86.** `boot/acpi` validates checksums before reading any field and
+  is tested against real firmware tables captured from three machines. `device::pci`
+  walks buses through bridges and sizes BARs without disturbing them. `platform/acpi`
+  turns the MADT, MCFG and PCI functions into device nodes, the same model aarch64's
+  device tree feeds.
+- **Boot entries, command line, chainloading.**
+  - Both loaders show a normal/safe/recovery menu, selectable by key, and hand the
+    kernel a command line. `kinboot-bios` now hands over the native `BootInfo`.
+  - BIOS chainloads another partition's boot record; UEFI chainloads another
+    application.
+  - The boot counter waits on a kernel-side writer.
+- **riscv32 without an MMU** (Phase 4). rv32imac runs in M-mode with `mm::flat`. All 35
+  in-kernel checks run, and the MMU-only ones honestly report Skipped.
+- **kbuild** (Phase 4). The config language gains hex symbols, conditional ranges, menus
+  and honest tristates. `menuconfig` is a real terminal editor. Random, allyes and allno
+  configurations are generated valid by construction. Every preset has a size budget,
+  enforced against committed baselines.
+
+**The central claim met its first real counterexample.** Adding riscv32 did not stay
+inside `arch/`, `targets/` and `config/`:
+
+- `kernel/main` had to split its MMU bring-up behind a memory-model seam.
+- `kernel/main` also used 64-bit atomics that the portability check never compiled,
+  because the check only covers host-tested units.
+- Shared code carried two latent 32-bit bugs: the device-tree reader rejected blobs above
+  `isize::MAX`, and the unwinder had unsigned frame offsets.
+
+These are one-time costs of the first no-MMU target, the same shape as Phase 1's
+provider-unit cost. They are recorded rather than explained away. ARMv7-M is where the
+rule gets tested again.
+
+Other findings from this round:
+
+- **Arm's timer compare value is signed.** `CNTP_TVAL_EL0` holds a signed 32-bit value.
+  Arming it for `u32::MAX` ticks sign-extended into the past and caused an interrupt
+  storm whenever the timer queue emptied. Only the long stress run found it, after
+  109–406 seconds.
+- **SGI pending state is per target, not per sender.** Three CPUs raising the same SGI
+  at one masked CPU deliver it once.
+- **Two branches invented the same configuration symbol under two names**
+  (`QEMU_SMP`/`QEMU_CPUS`), and three merges needed fixes that neither side could see
+  alone. Parallel work is fast. The integration tax is real and lands on whoever merges.
+- **Random configurations earned their keep on the first run.** `MOCK_ARCH` was
+  user-settable and broke 36 of 50 builds.
 
 ### The second round of landings
 
