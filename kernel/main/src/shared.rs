@@ -409,8 +409,59 @@ fn tickless_phase(c: &dyn EarlyConsole) -> Check {
     write_usize(c, periodic as usize);
     c.write_str(")");
     let ok = taken >= 1 && taken <= bound && taken < periodic && slept >= IDLE_FOR;
-    c.write_str(if ok { " ok" } else { " FAILED" });
-    Check::from_ok(ok)
+    let full_reach = full_reach_is_not_early(c, reach);
+    c.write_str(if ok && full_reach { " ok" } else { " FAILED" });
+    Check::from_ok(ok && full_reach)
+}
+
+/// How long [`full_reach_is_not_early`] waits for an interrupt that must not come.
+const REACH_WATCH: Duration = Duration::from_nanos(20_000_000);
+
+/// Arm the timer as far as one arming reaches, and require no interrupt for
+/// [`REACH_WATCH`].
+///
+/// The idle phase above never arms more than [`IDLE_FOR`], so it cannot see a limit that
+/// the hardware does not honour. The Arm generic timer's value register is signed, and
+/// arming its full unsigned range put the deadline in the past: the interrupt fired at
+/// once, the handler re-armed the same, and the CPU did nothing else. The stress run found
+/// that after minutes; this finds it at boot.
+fn full_reach_is_not_early(c: &dyn EarlyConsole, reach: u64) -> bool {
+    let irq = <arch::Cpu as Arch>::irq_save();
+    // No hook while watching. The scheduler's hook would re-arm the same full reach from
+    // the early interrupt, which fires at once again: the failure this looks for would be
+    // a hang instead of a report. Without a hook the handler stops the timer.
+    arch::tick::set_hook(None);
+    // SAFETY: masked, as `arm_ns` requires. The timer is in one-shot mode, since
+    // `timekeeping::init` succeeded or `reach` would be zero.
+    unsafe { arch::tick::arm_ns(reach) };
+    let interrupts = arch::tick::ticks();
+    let start = timekeeping::now();
+    // Unmasked explicitly, not restored: boot runs these phases masked, and a restore
+    // would keep the interrupt this is watching for from ever being taken. The first
+    // version did exactly that and passed with the bug in place.
+    //
+    // SAFETY: the vector table is installed and the timer's handler is the scheduler's
+    // hook. Boot is the highest-priority thread and nothing else is ready but idle, so
+    // only the timer can take the CPU from this loop, and the `irq_restore` below puts
+    // back the state saved above.
+    unsafe { arch::tick::enable_interrupts() };
+    while timekeeping::now().saturating_duration_since(start) < REACH_WATCH
+        && arch::tick::ticks() == interrupts
+    {
+        core::hint::spin_loop();
+    }
+    let _ = <arch::Cpu as Arch>::irq_save();
+    preempt::restore_tick_hook();
+    // SAFETY: masked, as `program` requires; the watch above left the timer armed far away
+    // or stopped, and the scheduler needs its own deadline back.
+    unsafe { timekeeping::program(Some(SLICE)) };
+    // SAFETY: pairs with the first `irq_save`, on this thread.
+    unsafe { <arch::Cpu as Arch>::irq_restore(irq) };
+    let early = arch::tick::ticks() != interrupts;
+    if early {
+        c.write_str(", AN ARMING AT FULL REACH FIRED AT ONCE");
+    }
+    !early
 }
 
 // ---- driver ---------------------------------------------------------------------------

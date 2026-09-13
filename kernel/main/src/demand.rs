@@ -167,10 +167,11 @@ fn free_frames() -> usize {
     edit(|_, frames| frames.alloc.stats().free).unwrap_or(0)
 }
 
-/// Frames for the `Vm`, from the boot frame allocator.
-struct KernelFrames<'a> {
-    alloc: &'a mut FrameAllocator<'static, Cpu>,
-    direct: DirectMap,
+/// Frames for a `Vm`, from a frame allocator reached through the direct map. The boot
+/// check uses the boot allocator; the stress workload, its own pool.
+pub(crate) struct KernelFrames<'a> {
+    pub(crate) alloc: &'a mut FrameAllocator<'static, Cpu>,
+    pub(crate) direct: DirectMap,
 }
 
 impl KernelFrames<'_> {
@@ -264,7 +265,7 @@ fn poke(addr: usize, v: u8) {
 
 /// The first 1 GiB boundary above everything the kernel space maps: the direct map, the
 /// image and every device window. Nothing is mapped there, which `reserve` confirms.
-fn window(direct: DirectMap) -> Option<usize> {
+pub(crate) fn window(direct: DirectMap) -> Option<usize> {
     let (_, img_end) = arch::image_range();
     let mut top = direct.virt_base().raw() as u64 + direct.len();
     top = top.max(img_end);

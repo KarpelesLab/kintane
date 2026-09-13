@@ -89,7 +89,7 @@ pub unsafe fn start(hz: u32) -> u32 {
 ///
 /// One-shot is the generic timer's own shape, so this only means "do not re-arm from
 /// the interrupt": the handler stops the timer, and the hook arms the next deadline.
-/// The limit is `CNTP_TVAL_EL0`'s 32 bits of counter ticks, 4.29 s at QEMU's 1 GHz.
+/// The limit is [`MAX_TVAL`] counter ticks, 2.15 s at QEMU's 1 GHz.
 ///
 /// # Safety
 /// As [`start`].
@@ -101,8 +101,20 @@ pub unsafe fn start_oneshot() -> u64 {
     }
     PERIOD.store(0, Ordering::Release);
     chip.enable(IrqNumber(timer::PPI));
-    ticks_to_ns(u64::from(u32::MAX), freq)
+    ticks_to_ns(u64::from(MAX_TVAL), freq)
 }
+
+/// The most ticks one write of `CNTP_TVAL_EL0` can arm.
+///
+/// The register holds 32 bits, but they are a *signed* value: a write sets the compare
+/// value to the counter plus the sign-extended timer value. So anything above
+/// `i32::MAX` is a deadline in the past, and the interrupt fires at once. This limit was
+/// `u32::MAX` until the stress run found it. An idle kernel with no timer pending armed
+/// the full 4.29 s and got an interrupt immediately. The handler re-armed the same
+/// 4.29 s, which fired again, and the CPU took timer interrupts and nothing else. That
+/// was on the first run long enough to reach a moment with an empty timer queue and no
+/// thread waiting; the boot checks never arm more than half a second.
+const MAX_TVAL: u32 = i32::MAX as u32;
 
 /// Raise one timer interrupt `ns` nanoseconds from now, replacing any deadline already
 /// armed. Delays beyond what [`start_oneshot`] returned are cut to it, and the caller
@@ -119,7 +131,7 @@ pub unsafe fn arm_ns(ns: u64) {
     let ticks = (ns / NS)
         .saturating_mul(freq)
         .saturating_add(((ns % NS) * freq).div_ceil(NS));
-    timer::arm(ticks.clamp(1, u64::from(u32::MAX)) as u32);
+    timer::arm(ticks.clamp(1, u64::from(MAX_TVAL)) as u32);
 }
 
 /// `ticks` counter ticks in nanoseconds, rounded down. Exact for any `ticks` up to

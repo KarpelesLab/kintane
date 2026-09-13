@@ -75,8 +75,12 @@ use time::{Duration, Instant};
 
 use crate::{Check, kheap, shared, timekeeping, write_usize};
 
-/// Boot, idle, high, two workers, and one spare slot.
-pub const SLOTS: usize = 6;
+/// Room in the thread table: boot and idle, plus every slot of the port's guarded
+/// stack array, so a thread table slot is never what refuses a spawn.
+pub const SLOTS: usize = 2 + MAX_STACKS;
+
+/// The threads this module's own check runs: boot, idle, high and two workers.
+const DEMO_THREADS: usize = 5;
 
 /// How long a thread runs before a waiting peer gets the CPU. Long enough that a
 /// TCG-emulated interrupt does not dominate the CPU, short enough that the check takes
@@ -114,18 +118,25 @@ const BOOT_PRIORITY: u8 = 10;
 const HIGH_PRIORITY: u8 = 8;
 const WORKER_PRIORITY: u8 = 4;
 
-/// The guarded stacks the scheduler's threads run on, `(top, size)`, claimed from the
-/// port's thread-stack array once, by `demonstrate`. A slot is reused by `spawn` after
-/// its previous thread is reaped, so a guard-page report names the slot's first owner
-/// rather than whichever later check is running on it.
+/// The guarded stacks the scheduler's threads run on, `(top, size)`. `demonstrate` claims
+/// the first [`THREAD_STACKS`] from the port's thread-stack array, and [`claim_stacks`]
+/// more after it. A slot is reused by `spawn` after its previous thread is reaped, so a
+/// guard-page report names the slot's first owner rather than whichever later check is
+/// running on it.
 ///
 /// Written only by boot with interrupts masked, before any thread is spawned on the slot.
-static STACKS: [(AtomicUsize, AtomicUsize); THREAD_STACKS] =
-    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; THREAD_STACKS];
+static STACKS: [(AtomicUsize, AtomicUsize); MAX_STACKS] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; MAX_STACKS];
 
-/// How many guarded slots the scheduler holds. The port reserves eight; test modes that
-/// overflow a thread stack claim theirs after these.
+/// Slots of `STACKS` claimed so far.
+static CLAIMED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many guarded slots the scheduler's own check holds. Test modes that overflow a
+/// thread stack claim theirs after these.
 const THREAD_STACKS: usize = 4;
+
+/// Every slot the ports' linker scripts reserve.
+pub const MAX_STACKS: usize = 8;
 
 /// The scheduler state: the thread table.
 struct Sched {
@@ -140,6 +151,10 @@ static SCHED: SyncUnsafeCell<MaybeUninit<Sched>> = SyncUnsafeCell::new(MaybeUnin
 
 /// Set by the first run. A second would re-`init` stacks a suspended thread still owns.
 static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Set once `demonstrate` has built the table and spawned idle, so [`resume`] has a
+/// scheduler to resume.
+static SCHEDULER_BUILT: AtomicBool = AtomicBool::new(false);
 
 /// The instant the check started, in nanoseconds.
 static START: AtomicU64 = AtomicU64::new(0);
@@ -322,6 +337,91 @@ pub fn reap(id: ThreadId) -> bool {
     ok
 }
 
+/// Claim guarded stack slots for threads named `names`, after those already claimed.
+///
+/// Returns the index of the first, for [`spawn`]. `None`, having claimed nothing, if
+/// the scheduler's array or the port's has too few slots left. Called by boot with
+/// interrupts masked.
+pub fn claim_stacks(names: &[&'static str]) -> Option<usize> {
+    let first = CLAIMED.load(Ordering::Relaxed);
+    if first + names.len() > MAX_STACKS {
+        return None;
+    }
+    let mut claimed = [(0usize, 0usize); MAX_STACKS];
+    for (i, &name) in names.iter().enumerate() {
+        // A port that runs out part of the way leaves the slots it did hand out
+        // unused. They cannot be given back, and nothing spawns on them.
+        let (_, top, size) = arch::kspace::claim_thread_stack(name)?;
+        claimed[i] = (top.raw(), size);
+    }
+    for (i, &(top, size)) in claimed[..names.len()].iter().enumerate() {
+        STACKS[first + i].0.store(top, Ordering::Relaxed);
+        STACKS[first + i].1.store(size, Ordering::Relaxed);
+    }
+    CLAIMED.store(first + names.len(), Ordering::Relaxed);
+    Some(first)
+}
+
+/// Give the CPU to a ready thread of the same or higher priority, if there is one.
+pub fn yield_now() {
+    let irq = Cpu::irq_save();
+    // SAFETY: masked, no reference into the table is live, and every thread runs on a
+    // stack in `STACKS` or the boot stack.
+    if unsafe { Threads::yield_now(threads()) }.is_err() {
+        broke(BROKE_YIELD);
+    }
+    // SAFETY: pairs with the `irq_save` above, on this thread.
+    unsafe { Cpu::irq_restore(irq) };
+}
+
+/// Whether the thread table's invariants hold right now.
+pub fn table_ok() -> bool {
+    let irq = Cpu::irq_save();
+    // SAFETY: masked, and the reference ends with the statement.
+    let ok = unsafe { (*threads()).check() }.is_ok();
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { Cpu::irq_restore(irq) };
+    ok
+}
+
+/// Put the scheduler's hook back on the timer interrupt, after a check that removed it.
+pub fn restore_tick_hook() {
+    arch::tick::set_hook(Some(on_tick));
+}
+
+/// What went wrong where nothing could report it, as the `BROKE_*` bits. Zero is good.
+pub fn broken() -> u32 {
+    BROKEN.load(Ordering::Relaxed)
+}
+
+/// Hand the CPU to the scheduler for good, from the boot thread.
+///
+/// `demonstrate` runs the scheduler for the boot checks and then stops the timer,
+/// because what follows it in `kmain` — the in-kernel suite, the test modes that end the
+/// run from a fault handler, a deliberate crash — assumes one thread with interrupts
+/// masked. Once those are done, this starts the one-shot timer again with the scheduler's
+/// hook and unmasks. The thread table is still the one the checks used, with idle in it,
+/// so from here boot is one thread among others and returns to its caller as one.
+///
+/// `false`, having changed nothing, if the scheduler was never built, which only
+/// happens when the boot checks failed.
+pub fn resume() -> bool {
+    if !SCHEDULER_BUILT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let _ = Cpu::irq_save();
+    // SAFETY: masked, and nothing else programs the timer: the boot checks that did have
+    // finished. This re-enables the line `demonstrate` disabled when it stopped the tick.
+    if unsafe { arch::tick::start_oneshot() } == 0 {
+        return false;
+    }
+    arch::tick::set_hook(Some(on_tick));
+    // SAFETY: masked, as `program` requires.
+    unsafe { timekeeping::program(Some(SLICE)) };
+    begin();
+    true
+}
+
 /// What one busy loop observed.
 struct Spun {
     spins: u64,
@@ -488,21 +588,18 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     // Each stack comes from the port's guarded thread-stack array, so a thread that
     // overflows faults on its own guard page and the report names it, instead of quietly
     // corrupting the stack of whichever thread's slot is below.
-    let plan: [(extern "C" fn(usize) -> !, usize, u8, &'static str); 4] = [
+    let plan: [(extern "C" fn(usize) -> !, usize, u8, &'static str); THREAD_STACKS] = [
         (idle, 0, Priority::IDLE.level(), "idle"),
         (worker, 0, WORKER_PRIORITY, "worker A"),
         (worker, 1, WORKER_PRIORITY, "worker B"),
         (high, 0, HIGH_PRIORITY, "high"),
     ];
-    for (i, &(_, _, _, name)) in plan.iter().enumerate() {
-        let Some((_, top, size)) = arch::kspace::claim_thread_stack(name) else {
-            c.write_str("no guarded thread stack left");
-            // SAFETY: pairs with the `irq_save` above.
-            unsafe { Cpu::irq_restore(irq) };
-            return Check::Failed;
-        };
-        STACKS[i].0.store(top.raw(), Ordering::Relaxed);
-        STACKS[i].1.store(size, Ordering::Relaxed);
+    let names = plan.map(|(_, _, _, name)| name);
+    if claim_stacks(&names) != Some(0) {
+        c.write_str("no guarded thread stack left");
+        // SAFETY: pairs with the `irq_save` above.
+        unsafe { Cpu::irq_restore(irq) };
+        return Check::Failed;
     }
     let mut ids = [ThreadId::new(0); 4];
     for (i, (entry, arg, level, _)) in plan.into_iter().enumerate() {
@@ -516,6 +613,7 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
             }
         }
     }
+    SCHEDULER_BUILT.store(true, Ordering::Relaxed);
 
     let per_tick = calibrate();
     if per_tick == 0 {
@@ -593,7 +691,7 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
     let min_interrupts = WORKERS_STOP_AFTER.as_nanos() / SLICE.as_nanos() / 2;
     let sliced = interrupts >= min_interrupts;
 
-    write_usize(c, SLOTS - 1);
+    write_usize(c, DEMO_THREADS);
     c.write_str(" threads, ");
     write_usize(c, (SLICE.as_nanos() / 1_000_000) as usize);
     c.write_str(" ms slices: ");

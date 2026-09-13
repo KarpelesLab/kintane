@@ -16,9 +16,11 @@ mod demand;
 mod heap;
 mod kheap;
 mod lockcheck;
+mod persist;
 mod preempt;
 mod shared;
 mod space;
+mod stress;
 mod timekeeping;
 
 use core::cell::SyncUnsafeCell;
@@ -89,6 +91,8 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
         (live.tables.0, live.tables.1.saturating_sub(live.tables.0)),
         // The kernel heap lives on after boot, and its frames hold live objects.
         kheap::region(),
+        // So do the stress run's pools, in an image that has them.
+        stress::region(),
     ];
     let ok = selftest::run_all::<Cpu>(c, boot_arg, &reserved);
     if selftest::PRESENT {
@@ -108,7 +112,19 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // kernel address space, printed them, and discarded all four — so a W^X regression
     // printed FAILED and still exited as a pass. A check that cannot change the outcome
     // is a log line.
-    finish(ok && boot != Check::Failed && intact)
+    let verdict = ok && boot != Check::Failed && intact;
+
+    // A test image reports and stops. A stress image, and any image with no channel to
+    // report through, goes on: everything above assumed one masked boot thread and has
+    // finished, so from here the scheduler owns the CPU.
+    if kconfig::QEMU_EXIT && !kconfig::STRESS_TEST {
+        finish(verdict);
+    }
+    if !verdict {
+        c.write_str("\nbring-up failed; not starting the scheduler\n");
+        finish(false);
+    }
+    persist::run(c)
 }
 
 /// The kernel address space as installed, for checks made after bring-up.
@@ -462,7 +478,8 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(alloc)
         .and(heap::bring_up(c, &mut frames, &regions[..n]))
         .and(demand::check(c, &mut frames, live))
-        .and(kheap::install(c, &mut frames, &regions[..n]));
+        .and(kheap::install(c, &mut frames, &regions[..n]))
+        .and(stress::reserve(c, &mut frames, &regions[..n], live));
     (space, live)
 }
 

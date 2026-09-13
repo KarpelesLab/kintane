@@ -1,0 +1,92 @@
+# The Phase 2 soak: every subsystem at once, audited every second, on every tier-1
+# architecture. See docs/testing.md#3a-stress.
+#
+# Nightly, 30 minutes per preset. Dispatched by hand, any duration kbuild accepts
+# (90s, 10m, 24h). The 24-hour run the Phase 2 exit criterion names is a manual dispatch
+# with `24h`. GitHub-hosted runners stop a job at six hours, so that one needs a
+# self-hosted runner: set `runner` to its label. A hosted runner given `24h` would be
+# cancelled at hour six and report nothing about the other eighteen, which is worse than
+# not running it.
+#
+# A failed audit ends the guest with its failure code, and a hang is a heartbeat missing
+# for 30 seconds, which kbuild turns into a failure without waiting for the timeout. Each
+# preset runs in its own job, so one architecture failing does not hide the others.
+
+name: stress
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Guest time per preset (e.g. 10m, 2h, 24h)"
+        required: true
+        default: "30m"
+      runner:
+        description: "Runner label; runs past six hours need a self-hosted one"
+        required: true
+        default: "ubuntu-latest"
+      seed:
+        description: "STRESS_SEED, to replay a failing run's decisions"
+        required: true
+        default: "1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [x86_64-qemu, i686-qemu, aarch64-virt]
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    # The job's own budget: the longest duration a hosted runner allows. A self-hosted
+    # runner is not held to it by GitHub, and kbuild's timeout bounds the run anyway.
+    timeout-minutes: 4320
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-system-arm qemu-system-misc
+          qemu-system-x86_64 --version | head -1
+      - name: Build kbuild
+        run: cargo build --release --manifest-path kbuild/Cargo.toml
+      - name: Stress
+        env:
+          DURATION: ${{ github.event.inputs.duration || '30m' }}
+          SEED: ${{ github.event.inputs.seed || '1' }}
+        run: |
+          # Not -e: the log is printed whether or not the run passed.
+          set +e
+          ./kbuild/target/release/kbuild stress --preset "${{ matrix.preset }}" \
+            --duration "$DURATION" --set "STRESS_SEED=$SEED" > stress.log 2>&1
+          status=$?
+          # The console of a day's run is tens of megabytes; the job log gets the start and
+          # the end, and the whole of it is an artifact.
+          head -n 80 stress.log
+          echo "..."
+          tail -n 60 stress.log
+          exit $status
+      - name: Collect the console and QEMU's log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-${{ matrix.preset }}
+          path: |
+            stress.log
+            build/*/qemu.log
+            build/*/console.log
+            build/*/out/*.debug
+          if-no-files-found: ignore
+          retention-days: 14
