@@ -10,6 +10,8 @@
 // docs/coding-standards.md; this is the replacement it names.
 #![feature(sync_unsafe_cell)]
 
+mod space;
+
 
 use arch::Cpu;
 use boot_protocol::{MemoryKind, MemoryRegion};
@@ -210,6 +212,11 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
     write_usize(c, stats.free);
     c.write_str(" free");
 
+    kernel_space(c, &mut frames, &regions[..n]);
+    // Re-read: building the kernel space consumed frames for its tables, so the
+    // accounting check below has to compare against the books as they are now.
+    let stats = frames.stats();
+
     // Hand out a frame and give it back. Cheap, and it distinguishes "the allocator
     // was constructed" from "the allocator works".
     match frames.alloc_frame() {
@@ -226,6 +233,47 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
         }
         Err(_) => c.write_str("\n  alloc      exhausted"),
     }
+}
+
+/// The largest region of physical memory the kernel will address directly.
+///
+/// Capped rather than "all of it" because a 32-bit kernel has less address space than
+/// a large machine has RAM — the i686-large preset boots 5 GiB — and because the
+/// direct map is what makes a physical frame writable at all. A frame outside it
+/// cannot hold a page table, which `Frames::alloc_zeroed` reports rather than
+/// pretends about.
+const DIRECT_MAP_MAX: u64 = 1024 * 1024 * 1024;
+
+/// Build the kernel's own address space from the image's sections and check it.
+fn kernel_space(
+    c: &dyn EarlyConsole,
+    frames: &mut mm::phys::FrameAllocator<'_, Cpu>,
+    map: &[MemoryRegion],
+) {
+    c.write_str("\n  kspace     ");
+
+    let top = map
+        .iter()
+        .filter(|r| r.kind == MemoryKind::Usable as u32)
+        .map(|r| r.start + r.len)
+        .max()
+        .unwrap_or(0);
+    let len = top.min(DIRECT_MAP_MAX);
+    if len == 0 {
+        c.write_str("no usable memory");
+        return;
+    }
+
+    let direct = match mm::DirectMap::identity(len) {
+        Ok(d) => d,
+        Err(_) => {
+            c.write_str("direct map rejected");
+            return;
+        }
+    };
+
+    let ok = space::build_and_verify::<Cpu>(c, frames, direct, arch::image_sections());
+    c.write_str(if ok { " ok" } else { " FAILED" });
 }
 
 fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
