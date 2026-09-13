@@ -63,9 +63,9 @@
 //! by the interrupt selftest that runs earlier; this check does not run when that
 //! failed, and calibration fails rather than waits if no interrupt arrives.
 
-use core::cell::{SyncUnsafeCell, UnsafeCell};
+use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use arch::Cpu;
 use hal::{Arch, EarlyConsole, KernAddr};
@@ -114,24 +114,18 @@ const BOOT_PRIORITY: u8 = 10;
 const HIGH_PRIORITY: u8 = 8;
 const WORKER_PRIORITY: u8 = 4;
 
-/// Stack size for each spawned thread. Deep enough for an interrupt frame, the handler's
-/// Rust frames and the scheduler on top of a thread's own frames.
-const STACK_BYTES: usize = 16 * 1024;
-
-/// A thread stack in `.bss`. `align(16)` and a multiple-of-16 size put the top on the
-/// strictest alignment any port asks for, although `init` does not rely on it.
+/// The guarded stacks the scheduler's threads run on, `(top, size)`, claimed from the
+/// port's thread-stack array once, by `demonstrate`. A slot is reused by `spawn` after
+/// its previous thread is reaped, so a guard-page report names the slot's first owner
+/// rather than whichever later check is running on it.
 ///
-/// No guard page. Stacks with guard pages need the kernel address space to be live,
-/// which is separate work; until then these are like the #DF stack and the context
-/// switch selftest's stack.
-#[repr(C, align(16))]
-struct Stack(UnsafeCell<[u8; STACK_BYTES]>);
+/// Written only by boot with interrupts masked, before any thread is spawned on the slot.
+static STACKS: [(AtomicUsize, AtomicUsize); THREAD_STACKS] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; THREAD_STACKS];
 
-// SAFETY: never read or written from Rust, only its address is taken. Each stack is
-// handed to exactly one thread by `demonstrate`, which runs once (`STARTED`).
-unsafe impl Sync for Stack {}
-
-static STACKS: [Stack; 4] = [const { Stack(UnsafeCell::new([0; STACK_BYTES])) }; 4];
+/// How many guarded slots the scheduler holds. The port reserves eight; test modes that
+/// overflow a thread stack claim theirs after these.
+const THREAD_STACKS: usize = 4;
 
 /// The scheduler state: the thread table.
 struct Sched {
@@ -298,20 +292,24 @@ pub fn begin() {
     unsafe { arch::tick::enable_interrupts() };
 }
 
-/// Spawn a thread on `STACKS[stack]`. Called by boot, with interrupts masked, only for a
-/// stack whose previous thread has been reaped.
+/// Spawn a thread on guarded stack slot `stack`. Called by boot, with interrupts masked,
+/// only for a slot whose previous thread has been reaped.
 pub fn spawn(
     stack: usize,
     entry: extern "C" fn(usize) -> !,
     arg: usize,
     level: u8,
 ) -> Option<ThreadId> {
-    let stack = STACKS.get(stack)?;
-    let top = KernAddr::new(stack.0.get() as usize + STACK_BYTES);
+    let (top, size) = STACKS.get(stack)?;
+    let (top, size) = (top.load(Ordering::Relaxed), size.load(Ordering::Relaxed));
+    if top == 0 {
+        return None;
+    }
     // SAFETY: masked and on boot's thread, so this reference to the table is the only one.
-    // `top` is the end of a static 16 KiB stack. The caller guarantees no live thread
-    // uses it: either it was never handed out, or its thread exited and was reaped.
-    unsafe { (*threads()).spawn(entry, arg, priority(level), top, STACK_BYTES) }.ok()
+    // `top` and `size` describe a guarded slot claimed by `demonstrate` for the scheduler
+    // alone, mapped read-write. The caller guarantees no live thread uses it: either it was
+    // never handed out, or its thread exited and was reaped.
+    unsafe { (*threads()).spawn(entry, arg, priority(level), KernAddr::new(top), size) }.ok()
 }
 
 /// Free an exited thread's slot. `false` if it has not exited.
@@ -486,14 +484,28 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
 
     // Workers before `high`, so that `high` running first is the priority's doing and not
     // the queue order's.
-    let plan: [(extern "C" fn(usize) -> !, usize, u8); 4] = [
-        (idle, 0, Priority::IDLE.level()),
-        (worker, 0, WORKER_PRIORITY),
-        (worker, 1, WORKER_PRIORITY),
-        (high, 0, HIGH_PRIORITY),
+    //
+    // Each stack comes from the port's guarded thread-stack array, so a thread that
+    // overflows faults on its own guard page and the report names it, instead of quietly
+    // corrupting the stack of whichever thread's slot is below.
+    let plan: [(extern "C" fn(usize) -> !, usize, u8, &'static str); 4] = [
+        (idle, 0, Priority::IDLE.level(), "idle"),
+        (worker, 0, WORKER_PRIORITY, "worker A"),
+        (worker, 1, WORKER_PRIORITY, "worker B"),
+        (high, 0, HIGH_PRIORITY, "high"),
     ];
+    for (i, &(_, _, _, name)) in plan.iter().enumerate() {
+        let Some((_, top, size)) = arch::kspace::claim_thread_stack(name) else {
+            c.write_str("no guarded thread stack left");
+            // SAFETY: pairs with the `irq_save` above.
+            unsafe { Cpu::irq_restore(irq) };
+            return Check::Failed;
+        };
+        STACKS[i].0.store(top.raw(), Ordering::Relaxed);
+        STACKS[i].1.store(size, Ordering::Relaxed);
+    }
     let mut ids = [ThreadId::new(0); 4];
-    for (i, (entry, arg, level)) in plan.into_iter().enumerate() {
+    for (i, (entry, arg, level, _)) in plan.into_iter().enumerate() {
         match spawn(i, entry, arg, level) {
             Some(id) => ids[i] = id,
             None => {

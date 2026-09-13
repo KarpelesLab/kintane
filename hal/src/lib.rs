@@ -26,7 +26,7 @@ pub use addr::{AddrOverflow, KernAddr, PhysAddr, UserAddr};
 pub use clock::ClockSource;
 pub use context::{HasContextSwitch, ThreadEntry};
 pub use fault::{Access, PageFault, PageFaultHook};
-pub use paging::{HasPageTables, ImageSections, MapError, PageFlags, PageTableEntry};
+pub use paging::{HasPageTables, ImageSections, MapError, PageFlags, PageTableEntry, StackArray};
 
 /// Byte order of the target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

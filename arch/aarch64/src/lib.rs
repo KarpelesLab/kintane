@@ -333,6 +333,12 @@ pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
 /// range, because the stack must be mapped and there is one `data` range to say so in.
 /// The guard is therefore a hole inside it, named separately so the consumer can punch
 /// it back out; see [`hal::ImageSections::stack_guard`].
+/// Bytes per kernel thread stack slot: one guard page, then the stack.
+///
+/// A power of two, which [`hal::StackArray`] requires. `link.ld` reserves whole slots
+/// and asserts it agrees with this value.
+pub const THREAD_STACK_SLOT: u64 = 32 * 1024;
+
 pub fn image_sections() -> hal::ImageSections {
     unsafe extern "C" {
         static __text_start: u8;
@@ -343,6 +349,8 @@ pub fn image_sections() -> hal::ImageSections {
         static __data_end: u8;
         static __stack_guard_start: u8;
         static __stack_guard_end: u8;
+        static __thread_stacks_start: u8;
+        static __thread_stacks_end: u8;
     }
     /// Linker symbols mark positions; their address is the value and reading through
     /// one is meaningless. This is the only thing done with any of them.
@@ -354,6 +362,12 @@ pub fn image_sections() -> hal::ImageSections {
         rodata: (addr(&raw const __rodata_start), addr(&raw const __rodata_end)),
         data: (addr(&raw const __data_start), addr(&raw const __data_end)),
         stack_guard: (addr(&raw const __stack_guard_start), addr(&raw const __stack_guard_end)),
+        thread_stacks: hal::StackArray {
+            start: addr(&raw const __thread_stacks_start),
+            end: addr(&raw const __thread_stacks_end),
+            slot: THREAD_STACK_SLOT,
+            guard: <Aarch64 as hal::Arch>::PAGE_SIZE as u64,
+        },
     }
 }
 

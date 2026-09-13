@@ -5,6 +5,7 @@
 
 mod bios;
 mod build;
+mod buildid;
 mod cache;
 mod codegen;
 mod dwarf;
@@ -530,6 +531,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
 
     let linked = image.ok_or("no unit of kind `bin` was built; nothing to boot")?;
     let symbols = b.split_symbols(&linked)?;
+    let build_id = buildid::stamp(&b.tc.tool("llvm-objcopy")?, &linked, &symbols)?;
     let image = b.package(res.str("IMAGE_FORMAT"), &linked)?;
     // A BIOS disk wraps the packaged image rather than replacing it: the kernel on the
     // disk is byte for byte the one `-kernel` boots.
@@ -541,6 +543,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
     println!("  linked  {}", linked.display());
     println!("  symbols {}", symbols.display());
+    println!("  build   {build_id}");
     println!("  image   {} ({} bytes)", image.display(), size);
     Ok((image, res))
 }

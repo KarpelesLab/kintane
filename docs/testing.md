@@ -111,20 +111,37 @@ guest signalled success (qemu exit 33)
 After bring-up, and only if bring-up passed, the image overflows the boot stack. The
 exception path checks the faulting address against the guard page. That fault exits with
 success; any other fault exits with failure immediately, so a broken guard fails fast
-instead of timing out. Each port provokes and recognises the fault differently, and each
-difference is a limitation stated in its `kspace.rs`:
+instead of timing out. Each port recognises the fault differently, and each difference is
+stated in its `kspace.rs`:
 
-| Port | Provoked by | Passes when |
-|---|---|---|
-| x86_64 | unbounded recursion | #PF or #DF with CR2 in the guard page |
-| aarch64 | unbounded recursion | the synchronous vector diverts a frame that would land in the guard page, or a data abort with FAR in it whose frame is *above* the guard |
-| i686 | one store into the guard page | #PF with CR2 in the guard page. A real overflow triple-faults on this port |
+| Port | Passes when |
+|---|---|
+| x86_64 | #PF or #DF with CR2 in the guard page |
+| i686 | the same, with #DF reported from the double-fault task rather than an IST stack |
+| aarch64 | the synchronous vector diverts a frame that would touch the guard page, or a data abort with FAR in it whose frame is *above* the guard |
 
-Each verdict was falsified. With the guard page mapped, x86_64's recursion runs into
-`.rodata` and fails, and i686's store succeeds and fails. With aarch64's vector check
-removed, the report runs on a frame beneath the guard and fails.
+Two more modes use the same machinery:
 
-CI runs it on every preset, beside the ordinary boot.
+- **`THREAD_STACK_GUARD_TEST`** starts a kernel thread on a stack from the guarded
+  thread-stack array and overflows it. The run passes only if the fault is on *that* stack's
+  guard; a hit on the boot stack's guard, which is where an unguarded thread stack eventually
+  ends up, fails.
+- **`NULL_DEREF_TEST`** reads address zero and passes only if the fault is reported as a null
+  dereference. Page 0 is never mapped on any port.
+
+Each verdict was falsified, in every case by a mutation confirmed to have applied:
+
+| Mutation | What happened |
+|---|---|
+| Boot guard page mapped | x86_64's recursion runs into `.rodata` and fails; aarch64 fails |
+| aarch64 vector check removed | the report runs on a frame beneath the guard and fails |
+| i686 #DF back on an interrupt gate (selftest told to accept it) | both i686 presets triple-fault: QEMU exits 0, a failure. With the selftest intact, the banner reports `NO task gate` and the boot fails instead |
+| i686 double-fault task without `clts` | the report's first SSE instruction raises #NM, the #NM recursion runs through the task's stack, and the run triple-faults |
+| Thread stack guards not cut from the data | the kernel space is refused before it is installed (`thread stack guards mapped: 8`). With that check also removed, the overflow runs down through every slot: x86_64 triple-faults, i686 and aarch64 reach the boot stack's guard and fail as "not it" |
+| aarch64 vector ignores the thread-stack array | the thread overflow is reported from a frame beneath its guard and fails; the boot-stack test still passes |
+| Page 0 mapped | the kernel space is refused. With the check also removed, the null read succeeds and x86_64 and i686 fail |
+
+CI runs all three on every preset, beside the ordinary boot.
 
 ### 3. Boot and integration tests
 
@@ -424,6 +441,11 @@ is hard-capped by the 440 bytes the MBR allows.
   over synthetic stacks that are well formed, corrupt or looping. The live chain is
   checked on every boot (`backtrace  3 frames to null frame ok`): it must end at the null
   frame `_start` plants, with every return address inside `.text`.
+
+  Every backtrace begins with `bt build <id>`, the image's build ID, and `kbuild symbolize`
+  refuses a log whose ID is not its bundle's: decoded against another build's symbols, the
+  addresses would turn into names that look right and are not. CI decodes a crash log from
+  a release build against a debug build's bundle and requires the refusal.
 
   The `CRASH_TEST` configuration choice panics or takes an undefined instruction two
   calls deep. CI does both on all three architectures and requires the decoded report

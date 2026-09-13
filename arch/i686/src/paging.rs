@@ -320,6 +320,9 @@ impl HasPageTables for I686 {
         let Ok(base) = u32::try_from(root.raw()) else {
             return;
         };
+        // The double-fault task loads CR3 from its TSS, so it has to name these tables
+        // before they are live, or a double fault would switch to tables nobody runs on.
+        crate::tss::follow_root(base);
         // SAFETY: the caller guarantees `base` names a well formed PDPT that maps the
         // running code and stack. Loading CR3 flushes every non-global TLB entry and,
         // in PAE specifically, re-reads the four PDPTEs into the CPU's internal
@@ -362,7 +365,7 @@ impl HasPageTables for I686 {
 }
 
 /// CR3 as the CPU holds it, address bits and all.
-fn read_cr3() -> u32 {
+pub(crate) fn read_cr3() -> u32 {
     let v: u32;
     // SAFETY: reading a control register at ring 0 has no side effects.
     unsafe {

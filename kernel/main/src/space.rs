@@ -96,9 +96,13 @@ struct Segment {
     what: &'static str,
 }
 
-/// At most: below-image, text, rodata, data-before-guard, data-after-guard,
-/// above-image. The guard page is a hole rather than an entry.
-const MAX_SEGMENTS: usize = 8;
+/// At most: below-image, text, rodata, data-before-guard, data-after-guard, one run per
+/// thread stack, and above-image. Guard pages are holes rather than entries.
+const MAX_SEGMENTS: usize = 8 + MAX_THREAD_STACKS;
+
+/// Thread stacks the planner will cut guard pages for. A port that lays out more is
+/// refused, not silently left with unguarded stacks.
+const MAX_THREAD_STACKS: usize = 16;
 
 /// A kernel address space that passed verification and has not been installed yet.
 pub struct Verified<A: HasPageTables> {
@@ -313,10 +317,14 @@ fn plan(
 ) -> Result<usize, &'static str> {
     let dm_start = direct.phys_base().raw();
     let dm_end = dm_start + direct.len();
+    // Page zero is never mapped, so a null pointer faults on every port rather than
+    // reading whatever the machine keeps there. On a PC that is the real-mode interrupt
+    // vector table; nothing reads it after boot, and the frame allocator never hands it
+    // out (`LOW_MEMORY`). Starting the watermark above it is the whole mechanism.
     let mut p = Planner {
         out,
         n: 0,
-        watermark: 0,
+        watermark: page,
         page,
     };
 
@@ -341,21 +349,41 @@ fn plan(
     p.push(s.text.0, s.text.1, PageFlags::KERNEL_TEXT, "text");
     p.push(s.rodata.0, s.rodata.1, PageFlags::KERNEL_RODATA, "rodata");
 
-    // Data, minus the guard page. The guard is not mapped at all; that hole is the
-    // entire mechanism.
+    // Data, minus every guard page: the boot stack's and one per thread stack. A guard
+    // is not mapped at all; that hole is the entire mechanism. The holes are visited in
+    // address order, and each is rounded *inward*, so rounding can only make a hole
+    // smaller and never swallow a page of real data beside it.
+    let t = s.thread_stacks;
+    if t.count() > MAX_THREAD_STACKS {
+        return Err("more thread stacks than the planner cuts guards for");
+    }
+    let mut holes = [(0u64, 0u64); 1 + MAX_THREAD_STACKS];
+    let mut nh = 0;
     if s.has_stack_guard() {
-        let (g0, g1) = s.stack_guard;
-        // Rounded *inward*, so rounding can only make the hole smaller and never
-        // swallow a page of real data beside it.
-        let mask = page - 1;
+        holes[nh] = s.stack_guard;
+        nh += 1;
+    }
+    for i in 0..t.count() {
+        if let Some(g) = t.guard_range(i) {
+            holes[nh] = g;
+            nh += 1;
+        }
+    }
+    holes[..nh].sort_unstable();
+    let mask = page - 1;
+    let mut from = s.data.0;
+    for &(g0, g1) in &holes[..nh] {
         let g0 = g0.saturating_add(mask) & !mask;
         let g1 = g1 & !mask;
-        p.push(s.data.0, g0.min(s.data.1), PageFlags::KERNEL_DATA, "data");
+        if g1 <= g0 || g1 <= s.data.0 || g0 >= s.data.1 {
+            // Outside the data, as the x86_64 boot guard is, or less than a page.
+            continue;
+        }
+        p.push(from, g0, PageFlags::KERNEL_DATA, "data");
         p.hole_until(g1);
-        p.push(g1.max(s.data.0), s.data.1, PageFlags::KERNEL_DATA, "data above guard");
-    } else {
-        p.push(s.data.0, s.data.1, PageFlags::KERNEL_DATA, "data");
+        from = g1;
     }
+    p.push(from.max(s.data.0), s.data.1, PageFlags::KERNEL_DATA, "data");
 
     p.push(img_end, dm_end, PageFlags::KERNEL_DATA, "above image");
     Ok(p.n)
@@ -440,6 +468,43 @@ fn check<A: HasPageTables>(
     ok &= probe(s.rodata.0, PageFlags::READ, PageFlags::WRITE.union(exec_deny), "rodata");
     ok &= probe(s.data.0, PageFlags::WRITE, exec_deny, "data");
 
+    // Nor may page zero, so that a null dereference is a fault.
+    if space.translate(0).is_some() {
+        c.write_str("\n             page 0 is mapped, so a null pointer reads memory");
+        ok = false;
+    }
+
+    // Every thread stack's guard must not resolve, and the stack above it must. Counted
+    // rather than reported per slot: one wrong rule gets every slot wrong the same way.
+    let t = s.thread_stacks;
+    let (mut guards_mapped, mut stacks_unmapped) = (0, 0);
+    for i in 0..t.count() {
+        let (Some((g, _)), Some((bottom, top))) = (t.guard_range(i), t.stack_range(i)) else {
+            continue;
+        };
+        if virt_of(g).and_then(|v| space.translate(v)).is_some() {
+            guards_mapped += 1;
+        }
+        let writable = |a: u64| {
+            virt_of(a)
+                .and_then(|v| space.translate(v))
+                .is_some_and(|(_, f)| f.contains(PageFlags::WRITE))
+        };
+        if !writable(bottom) || !writable(top - 1) {
+            stacks_unmapped += 1;
+        }
+    }
+    if guards_mapped > 0 {
+        c.write_str("\n             thread stack guards mapped: ");
+        crate::write_usize(c, guards_mapped);
+        ok = false;
+    }
+    if stacks_unmapped > 0 {
+        c.write_str("\n             thread stacks not mapped writable: ");
+        crate::write_usize(c, stacks_unmapped);
+        ok = false;
+    }
+
     // Errors above end mid-line; the summary gets its own line after any of them, so a
     // failure reads as a list of problems followed by what was checked rather than
     // running the last permission string into the summary.
@@ -476,6 +541,11 @@ fn check<A: HasPageTables>(
     c.write_str(" rodata, ");
     write_kib(c, s.data.1 - s.data.0);
     c.write_str(" data");
+    if t.count() > 0 {
+        c.write_str(", ");
+        crate::write_usize(c, t.count());
+        c.write_str(" guarded thread stacks");
+    }
     ok
 }
 
@@ -509,12 +579,24 @@ pub fn check_live<A: HasPageTables>(
         c.write_str("live rodata is writable, ");
         ok = false;
     }
+    if at(0).is_some() {
+        c.write_str("live page 0 is MAPPED, ");
+        ok = false;
+    }
+    let t = s.thread_stacks;
+    let thread_guards_mapped = (0..t.count())
+        .filter_map(|i| t.guard_range(i))
+        .any(|(g, _)| at(g).is_some());
+    if thread_guards_mapped {
+        c.write_str("a live thread stack guard is MAPPED, ");
+        ok = false;
+    }
     if s.has_stack_guard() {
         if at(s.stack_guard.0).is_some() {
             c.write_str("live guard page is MAPPED");
             ok = false;
         } else {
-            c.write_str("guard page unmapped in the live tables");
+            c.write_str("guard pages and page 0 unmapped in the live tables");
         }
     } else {
         c.write_str("no guard page on this port");

@@ -190,6 +190,30 @@ config STACK_GUARD_TEST
         and reported" is a property of the running machine. Only the second
         is worth having; see docs/testing.md.
 
+config THREAD_STACK_GUARD_TEST
+    bool "Overflow a kernel thread's stack on purpose"
+    depends on QEMU_EXIT
+    default n
+    help
+        After bring-up, start a kernel thread on a stack from the guarded
+        thread-stack array and recurse until it reaches that stack's guard
+        page. The run passes only if the fault that ends it is on that guard:
+        a boot-stack guard hit, or a thread stack quietly overflowing into
+        the one below it, is a failure.
+
+        A test mode, never a production setting; see STACK_GUARD_TEST.
+
+config NULL_DEREF_TEST
+    bool "Read through a null pointer on purpose"
+    depends on QEMU_EXIT
+    default n
+    help
+        After bring-up, read address zero. Page 0 is never mapped in the
+        kernel's address space, so the read must fault, and the run passes
+        only if the fault is reported as a null dereference.
+
+        A test mode, never a production setting; see STACK_GUARD_TEST.
+
 # Crash on purpose once boot has finished, from a known nested function, so the
 # crash report can be checked end to end: the kernel prints raw return addresses,
 # and `kbuild symbolize` must name the function. A backtrace is only ever needed

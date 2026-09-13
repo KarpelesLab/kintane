@@ -318,7 +318,8 @@ The release packaging above is ahead of the code. What `kbuild build` writes to
   file the reproducibility check hashes.
 - `kintane.debug` — the symbol bundle: `llvm-objcopy --only-keep-debug` of the linked
   image. It holds the symbol table and DWARF and no code, and it is what
-  `kbuild symbolize` reads.
+  `kbuild symbolize` reads. It also carries the image's build ID, in a section of its own
+  (`.kintane.build-id`), because `--only-keep-debug` drops the loaded bytes the ID is in.
 - `kintane.mb32.elf` (x86_64) or `kintane.img.elf` (everything else) — the bootable
   image, `--strip-all`. It has no symbol table, and CI checks that.
 - `kinboot-bios.img` (x86 with `KINBOOT_BIOS=y`) — a raw MBR disk: `kinboot-bios`
@@ -328,6 +329,18 @@ The release packaging above is ahead of the code. What `kbuild build` writes to
   (`targets/i686-kinboot.json`) with its own `core`; see
   [bootloader.md](bootloader.md#build-integration).
 
+### The build ID
+
+After linking, kbuild stamps a build ID into the image (`kbuild/src/buildid.rs`). The ID
+is the first 20 bytes of a SHA-256 over the entry point and every loadable segment, with
+its own 20 bytes read as zero. So it cannot depend on itself, stamping twice changes
+nothing, and two clean builds of one tree stay byte-identical. The kernel reserves the
+bytes after a marker in `.rodata` (`lib/buildid`), kbuild refuses an image in which that
+marker does not occur exactly once, and the stamped file replaces the linked one by rename,
+so a linked image hard-linked from the cache is never edited in place. The ID is printed
+by the build (`build   <id>`), in the kernel's banner (`build id   <id>`) and at the head
+of every backtrace (`bt build <id>`).
+
 The kernel never reads its own symbols. A panic or fatal exception prints raw return
 addresses (`lib/unwind`), and decoding happens off the machine:
 
@@ -335,6 +348,7 @@ addresses (`lib/unwind`), and decoding happens off the machine:
 $ kbuild run --preset aarch64-virt --set CRASH_PANIC=y
 kernel panic: /kintane/kernel/main/src/crash.rs:25
 backtrace:
+  bt build 641308d39e08b37ccda0c5adea0867ede7cca800
   bt 0 0x0000000040209298
   bt 1 0x0000000040202b74
   ...
@@ -348,6 +362,19 @@ symbolized backtrace (build/aarch64-kintane/out/kintane.debug)
 `kbuild run` and `kbuild test --target` decode a backtrace automatically when the
 guest's console contains one, and keep the console in `build/<target>/console.log`.
 `kbuild symbolize` decodes that file, or any log given to it.
+
+Decoding refuses a log whose `bt build` ID is not the bundle's. A log from another build
+still decodes, into function names that look right and are not, and a warning about that
+is the kind nobody reads:
+
+```
+$ kbuild symbolize --preset x86_64-qemu old-console.log
+error: build ID mismatch: the log was printed by build 66efaee3…, but
+  build/x86_64-kintane/out/kintane.debug is build fec3ac6a…
+```
+
+A log with no ID, from before IDs existed or cut short, is decoded with a warning that it
+could not be checked.
 
 Function names come from the pinned `llvm-nm`, which demangles v0 symbols. File and
 line come from kbuild's own reader for `.debug_line`, because the `llvm-tools` component

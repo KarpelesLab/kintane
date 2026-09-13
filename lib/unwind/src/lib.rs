@@ -30,13 +30,16 @@
 //!
 //! ```text
 //! backtrace:
+//!   bt build 3f2a…(40 hex digits)
 //!   bt pc 0x0000000000104f2a
 //!   bt 0 0x0000000000103512
 //!   bt 1 0x00000000001034f0
 //!   bt end: null frame
 //! ```
 //!
-//! `pc` is an exact address: the instruction that faulted. The numbered entries are
+//! `build` is the image's build ID (`lib/buildid`), so a report can only be decoded against
+//! the symbols of the build that printed it. `pc` is an exact address: the instruction
+//! that faulted. The numbered entries are
 //! return addresses, one instruction past a call, and the symbolizer looks up the byte
 //! before each. The image carries no symbols. They are in the separate symbol bundle
 //! kbuild writes next to it, which is what lets a report from a stripped image be
@@ -249,11 +252,11 @@ impl Memory for Region {
 
 /// The stack regions of the image: its read-write data, less the guard page.
 ///
-/// Every stack the kernel has today is in there: the boot stack, the x86_64 `#DF`
-/// stack, and the context-switch selftest's thread stacks. The guard page is cut out
-/// because it is meant to be unmapped, and reading it would fault inside the fault
-/// report. What is left may be two pieces, and a walk is confined to the piece its
-/// first frame is in, so a chain cannot cross the guard in either direction.
+/// Every stack the kernel has outside the thread-stack array is in there: the boot
+/// stack, the x86_64 `#DF` stack, and the context-switch selftest's thread stacks. The
+/// guard page is cut out because it is meant to be unmapped, and reading it would fault
+/// inside the fault report. What is left may be two pieces. The thread-stack array is not
+/// cut out here; [`stack_bounds`] handles it.
 pub fn image_stacks(s: &ImageSections) -> [(usize, usize); 2] {
     let as_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
     let (lo, hi) = (as_usize(s.data.0), as_usize(s.data.1));
@@ -265,6 +268,46 @@ pub fn image_stacks(s: &ImageSections) -> [(usize, usize); 2] {
     [(lo, glo.max(lo)), (ghi.min(hi), hi)]
 }
 
+/// The one stack a walk starting at `fp` may read, as `[lo, hi)`.
+///
+/// A walk is confined to it, so a chain cannot cross a guard page in either direction.
+/// A frame pointer on a thread stack is confined to that slot's stack. Anywhere else in
+/// the data it is confined to the piece of [`image_stacks`] it is in, less the whole
+/// thread-stack array: the array's guard pages are unmapped too, and a corrupt chain on
+/// the boot stack that pointed into one would otherwise fault inside the report.
+pub fn stack_bounds(s: &ImageSections, fp: usize) -> Option<(usize, usize)> {
+    let as_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+    let t = &s.thread_stacks;
+    let fp64 = fp as u64;
+    if let Some(i) = t.slot_of(fp64) {
+        let (lo, hi) = t.stack_range(i)?;
+        return (lo..hi)
+            .contains(&fp64)
+            .then(|| (as_usize(lo), as_usize(hi)));
+    }
+    let (tlo, thi) = if t.count() > 0 {
+        (as_usize(t.start), as_usize(t.end))
+    } else {
+        (0, 0)
+    };
+    image_stacks(s)
+        .into_iter()
+        .filter(|(lo, hi)| (*lo..*hi).contains(&fp))
+        .map(|(lo, hi)| {
+            // The array is an interval inside the piece; keep the side `fp` is on.
+            if tlo < thi && tlo < hi && thi > lo {
+                if fp < tlo {
+                    (lo, tlo)
+                } else {
+                    (thi.max(lo), hi)
+                }
+            } else {
+                (lo, hi)
+            }
+        })
+        .find(|(lo, hi)| (*lo..*hi).contains(&fp))
+}
+
 /// Print a backtrace from frame pointer `fp`, confined to the image's stacks.
 ///
 /// `pc`, when given, is printed first as the exact faulting instruction. `skip` frames
@@ -272,7 +315,7 @@ pub fn image_stacks(s: &ImageSections) -> [(usize, usize); 2] {
 /// that a report was made.
 ///
 /// # Safety
-/// The regions `image_stacks(sections)` returns must be mapped and readable, which is
+/// The regions `stack_bounds(sections, _)` returns must be mapped and readable, which is
 /// the case for as long as the kernel's image is mapped at all.
 pub unsafe fn print(
     c: &dyn EarlyConsole,
@@ -282,16 +325,15 @@ pub unsafe fn print(
     pc: Option<usize>,
     skip: usize,
 ) {
-    c.write_str("\nbacktrace:\n");
+    c.write_str("\nbacktrace:\n  bt build ");
+    buildid::write(c);
+    c.write_str("\n");
     if let Some(pc) = pc {
         c.write_str("  bt pc ");
         write_addr(c, pc);
         c.write_str("\n");
     }
-    let Some(&(lo, hi)) = image_stacks(sections)
-        .iter()
-        .find(|(lo, hi)| (*lo..*hi).contains(&fp))
-    else {
+    let Some((lo, hi)) = stack_bounds(sections, fp) else {
         c.write_str("  bt end: frame pointer ");
         write_addr(c, fp);
         c.write_str(" is not in any known stack\n");
@@ -341,10 +383,7 @@ pub struct Chain {
 pub unsafe fn chain(layout: Layout, sections: &ImageSections, fp: usize) -> Chain {
     let as_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
     let text = as_usize(sections.text.0)..as_usize(sections.text.1);
-    let Some(&(lo, hi)) = image_stacks(sections)
-        .iter()
-        .find(|(lo, hi)| (*lo..*hi).contains(&fp))
-    else {
+    let Some((lo, hi)) = stack_bounds(sections, fp) else {
         return Chain {
             frames: 0,
             stop: Stop::OutsideStack,

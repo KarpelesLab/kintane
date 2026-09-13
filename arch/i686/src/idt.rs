@@ -30,14 +30,10 @@
 //! Reference: Intel SDM Vol. 3A, §6.11 (IDT descriptors) and figure 6-2 (32-bit gate
 //! format).
 //!
-//! Not done here: no gate uses a task gate. The 32-bit architecture offers one — a
-//! #DF task gate is the classic way to survive a stack overflow on i386, because the
-//! task switch loads a whole new ESP from a TSS — but it needs a TSS, a GDT this port
-//! owns at runtime, and hardware task switching that no other target has. The x86-64
-//! equivalent (an IST stack) is the shape the kernel wants long term, so #DF on i686
-//! stays on the faulting stack until per-CPU data exists and both ports can be done
-//! the same way. The consequence is stated plainly: a stack overflow on i686 still
-//! triple-faults.
+//! One gate is a *task* gate: #DF. A task gate names a TSS instead of a handler, and
+//! delivering through it loads a whole new `ESP` from that TSS before anything is pushed,
+//! which is the only way this architecture has to report a fault caused by a stack that
+//! can no longer be pushed to. `tss.rs` explains the rest.
 
 use core::cell::UnsafeCell;
 use core::mem::size_of;
@@ -134,6 +130,9 @@ struct Gate {
 /// get DPL 3 individually; the default stays 0.
 const PRESENT_DPL0_INTERRUPT32: u8 = 0x8E;
 
+/// Present, DPL 0, task gate (type `0b0101`). The offset fields are unused and zero.
+const PRESENT_DPL0_TASK: u8 = 0x85;
+
 impl Gate {
     const EMPTY: Gate = Gate {
         offset_low: 0,
@@ -198,6 +197,36 @@ pub unsafe fn set_gate(vector: u8, handler: EntryPoint) {
     if let Some(slot) = table.0.get_mut(usize::from(vector)) {
         *slot = Gate::new(handler.0, code_segment());
     }
+}
+
+/// Install a task gate for `vector`, switching to the TSS `tss_selector` names.
+///
+/// # Safety
+/// `tss_selector` must name an available TSS descriptor whose task is ready to run: a
+/// stack, `EIP`, segments and `CR3` all valid. The same timing contract as [`set_gate`].
+pub unsafe fn set_task_gate(vector: u8, tss_selector: u16) {
+    // SAFETY: as for `set_gate`: initialisation-time, masked, single writer.
+    let table = unsafe { &mut *IDT.0.get() };
+    if let Some(slot) = table.0.get_mut(usize::from(vector)) {
+        *slot = Gate {
+            offset_low: 0,
+            selector: tss_selector,
+            zero: 0,
+            flags: PRESENT_DPL0_TASK,
+            offset_high: 0,
+        };
+    }
+}
+
+/// The selector and flags byte of `vector`'s gate, read back from the table.
+pub fn gate(vector: u8) -> (u16, u8) {
+    // SAFETY: a read of a gate `set_gate`/`set_task_gate` wrote during initialisation;
+    // the table is frozen afterwards.
+    let table = unsafe { &*IDT.0.get() };
+    table
+        .0
+        .get(usize::from(vector))
+        .map_or((0, 0), |g| (g.selector, g.flags))
 }
 
 /// Load the table into the CPU's IDTR.
