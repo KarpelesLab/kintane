@@ -67,9 +67,26 @@
 //! same one the frame allocator is waiting for: build this range from the memory map
 //! instead of from a constant, once there is a device-tree parser to read it from.
 //!
-//! The whole image is mapped RW and executable at EL1. Splitting `.text`, `.rodata`
-//! and `.data` into separate permissions needs 4 KiB granularity over the image and
-//! belongs with the high-half move, not with the first switch.
+//! # Why the image is not left inside a 2 MiB block
+//!
+//! `link.ld` splits the image into `.text`, `.rodata` and a data region, page-aligned
+//! at every boundary, and reserves a guard page under the boot stack; `image_sections`
+//! reports them. All of that is expressed in units of 4 KiB — and a 2 MiB block cannot
+//! express any of it. One block covers the whole image here, so leaving the boot map as
+//! 512 blocks would mean the finest permission this port can state over its own
+//! instructions is "these two megabytes", which is the union of text, rodata, data,
+//! stack and guard: read, write and execute, everywhere.
+//!
+//! So [`aarch64_mmu_init`] walks back over the blocks the image occupies and replaces
+//! each with a table of 512 4 KiB pages naming the same frames with the same
+//! permissions. The boot map is unchanged in what it *permits* — it still grants RWX
+//! over the image, because applying W^X is the address-space builder's job and it needs
+//! a console to report a mistake, which does not exist yet. What changes is that the
+//! refinement is now *possible*: the builder can rewrite a leaf per page instead of
+//! failing with [`MapError::WouldSplit`] on a block it is not allowed to break apart.
+//!
+//! [`selftest`] checks this rather than assuming it — it walks the live tables and
+//! reports the level at which the image's first and last pages are mapped.
 //!
 //! Reference: Arm Architecture Reference Manual for A-profile, DDI 0487, D8.3
 //! ("Translation table descriptor formats"), D8.4 ("Memory access control"),
@@ -444,6 +461,21 @@ const TABLES_LEN: usize = T_SCRATCH + 4;
 /// device-tree parser, neither of which can run before the MMU does.
 static TABLES: [Page; TABLES_LEN] = [EMPTY; TABLES_LEN];
 
+/// How many 2 MiB blocks of the boot map are broken down into 4 KiB pages so that the
+/// image's section boundaries and its stack guard page can be expressed at all.
+///
+/// Four blocks is 8 MiB, against an image of some eighty kilobytes; the margin is for
+/// an instrumented build, not for a plan. An image that outgrows it is not a boot
+/// failure — the blocks past the fourth simply stay 2 MiB and stay RWX — but it is a
+/// silent loss of the split, which is why [`selftest`] checks the last page of the
+/// image rather than trusting this number.
+const IMAGE_TABLES_LEN: usize = 4;
+
+/// Level-0 tables refining the blocks the kernel image lives in. Separate from
+/// [`TABLES`] because they belong to the boot map and must never be handed to
+/// [`alloc_table`], which is the pool [`map_page`] draws from.
+static IMAGE_TABLES: [Page; IMAGE_TABLES_LEN] = [EMPTY; IMAGE_TABLES_LEN];
+
 /// The frame [`selftest`] aliases. Its contents mean nothing; that two virtual
 /// addresses reach the same bytes is the entire point.
 static ALIAS_FRAME: Page = EMPTY;
@@ -557,6 +589,40 @@ unsafe fn map_page(va: usize, pa: PhysAddr, flags: PageFlags) -> Result<(), MapE
     }
 }
 
+/// The level of the leaf that maps `va` in the live tables, or `None` if nothing does.
+///
+/// `translate` answers *whether* an address is mapped, by asking the hardware; this
+/// answers *how coarsely*, which the hardware will not tell you — `PAR_EL1` reports a
+/// physical address whether it came from a 4 KiB page or a 1 GiB block. The granularity
+/// is the thing a permission split depends on, so it is worth being able to see.
+///
+/// Read-only: it follows table descriptors this module wrote and never edits one.
+fn leaf_level(va: usize) -> Option<u8> {
+    let mut table = phys_to_ptr(Aarch64::root());
+    let mut level = <Aarch64 as HasMmu>::LEVELS - 1;
+    loop {
+        let index = level_index::<Aarch64>(va, level);
+        // SAFETY: `table` is the root register's value on the first pass and the
+        // address out of a table descriptor thereafter, so it names a live 512-entry
+        // table; `level_index` masks to `index_bits`, so `index` is below 512.
+        let e = unsafe { read_entry(table, index) };
+        if !e.is_present() {
+            return None;
+        }
+        if e.is_leaf(level) {
+            return Some(level);
+        }
+        if level == 0 {
+            // A level-0 descriptor that is present and not a leaf is malformed; nothing
+            // in this port writes one, and reporting "unmapped" beats descending into
+            // whatever address it holds.
+            return None;
+        }
+        table = phys_to_ptr(e.address());
+        level -= 1;
+    }
+}
+
 // --- bringing the MMU up --------------------------------------------------------
 
 /// `SCTLR_EL1.M`, `.C` and `.I`: translation, the data cache and the instruction cache.
@@ -606,12 +672,32 @@ pub unsafe extern "C" fn aarch64_mmu_init() {
     }
 
     let ram_ptr = phys_to_ptr(ram);
-    let block = 2 * 1024 * 1024u64;
     for i in 0..512u64 {
-        let pa = PhysAddr::new(RAM_BASE + i * block);
+        let pa = PhysAddr::new(RAM_BASE + i * BLOCK);
         // SAFETY: as above — `ram` is a zeroed static table, `i` is below 512, and
         // each block address is 2 MiB aligned by construction.
         unsafe { write_entry(ram_ptr, i as usize, Entry::leaf(pa, normal, 1)) };
+    }
+
+    // Now break the blocks the image sits in down into 4 KiB pages, mapping exactly
+    // the same frames with exactly the same permissions. Nothing about the map's
+    // meaning changes; what changes is that a later pass can say something different
+    // about one page of it. See the module comment.
+    for (n, table) in image_blocks().zip(IMAGE_TABLES.iter()) {
+        let leaves = phys_to_ptr(PhysAddr::new(page_addr(table)));
+        let base = RAM_BASE + n * BLOCK;
+        for j in 0..512u64 {
+            let pa = PhysAddr::new(base + j * <Aarch64 as Arch>::PAGE_SIZE as u64);
+            // SAFETY: `table` is a distinct zeroed static page not reachable from any
+            // other descriptor yet, `j` is below 512, and the address is 4 KiB aligned
+            // by construction. The MMU is still off, so nothing is walking this.
+            unsafe { write_entry(leaves, j as usize, Entry::leaf(pa, normal, 0)) };
+        }
+        let addr = PhysAddr::new(page_addr(table));
+        // SAFETY: as above. The block entry being overwritten described the same 2 MiB
+        // the table just filled describes, so no translation changes; the MMU is off,
+        // so there is nothing cached to invalidate.
+        unsafe { write_entry(ram_ptr, n as usize, Entry::table(addr, 1)) };
     }
 
     // SAFETY: the tables above are complete and describe the code, stack, static data
@@ -657,6 +743,23 @@ pub unsafe extern "C" fn aarch64_mmu_init() {
 /// Hardcoded for the same reason the PL011's address is, and with the same remedy: the
 /// device tree says where RAM is, and nothing can read it yet.
 const RAM_BASE: u64 = 0x4000_0000;
+
+/// Bytes one level-1 leaf maps — 2 MiB, the block size the RAM table is built from.
+const BLOCK: u64 = 2 * 1024 * 1024;
+
+/// Indices into the level-1 RAM table of the blocks the kernel image occupies.
+///
+/// Computed from the image's own extent rather than assumed to be one block, so that an
+/// image which eventually straddles a 2 MiB boundary gets both halves refined instead
+/// of half a split. Clamped to the table's 512 entries; a range whose start is past its
+/// end is empty and refines nothing, which is the right answer for an image linked
+/// outside RAM.
+fn image_blocks() -> core::ops::Range<u64> {
+    let (start, end) = crate::image_range();
+    let first = start.saturating_sub(RAM_BASE) / BLOCK;
+    let last = end.saturating_sub(RAM_BASE).div_ceil(BLOCK).min(512);
+    first..last
+}
 
 /// The `TCR_EL1` value for a 48-bit TTBR0 address space at a 4 KiB granule.
 fn tcr_el1() -> u64 {
@@ -778,6 +881,22 @@ pub fn selftest(c: &dyn EarlyConsole) -> bool {
     if !encoding_round_trips() {
         c.write_str(", encoding does not round-trip");
         return false;
+    }
+
+    // The image must be mapped one 4 KiB page at a time, or `image_sections`' section
+    // boundaries and its guard page describe something the tables cannot express. Both
+    // ends are checked because the refinement is per 2 MiB block and an image that grew
+    // past the tables reserved for it would lose only its tail.
+    let (img_start, img_end) = crate::image_range();
+    match (
+        leaf_level(img_start as usize),
+        leaf_level(img_end.saturating_sub(1) as usize),
+    ) {
+        (Some(0), Some(0)) => c.write_str(", image mapped at 4 KiB"),
+        _ => {
+            c.write_str(", image not mapped at 4 KiB");
+            return false;
+        }
     }
 
     let frame = PhysAddr::new(page_addr(&ALIAS_FRAME));

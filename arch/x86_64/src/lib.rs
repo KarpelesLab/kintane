@@ -171,12 +171,39 @@ pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
     paging::selftest(c)
 }
 
-/// The kernel image's sections.
+/// The kernel image's sections, as `link.ld` laid them out.
 ///
-/// Currently unsplit: this port maps its whole image one way. Splitting it needs
-/// section symbols in `link.ld`, and until then saying so through
-/// [`hal::ImageSections::unsplit`] is more honest than inventing boundaries.
+/// Every boundary here is page-aligned by the linker script, so no page carries the
+/// union of two sections' permissions — which is the only way the split is worth
+/// having. The guard page is a hole between `.rodata` and the boot stack that belongs
+/// to no output section; leaving it unmapped is what turns a stack overflow from a
+/// silent unmapping of the machine into a #PF reported on the double-fault IST.
+///
+/// `.data` and `.bss` are reported as one range because they are contiguous and want
+/// identical permissions; the linker keeps them adjacent so this stays true.
 pub fn image_sections() -> hal::ImageSections {
-    let (start, end) = image_range();
-    hal::ImageSections::unsplit(start, end)
+    unsafe extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+        static __rodata_start: u8;
+        static __rodata_end: u8;
+        static __data_start: u8;
+        static __data_end: u8;
+        static __stack_guard_start: u8;
+        static __stack_guard_end: u8;
+    }
+    // Addresses only, never reads: these symbols mark positions and have no value.
+    // `&raw const` rather than a reference for the same reason — there is no object
+    // here to borrow, and on the `.bss` and guard-page symbols there is not even a
+    // byte to point at.
+    let at = |p: *const u8| p as usize as u64;
+    hal::ImageSections {
+        text: (at(&raw const __text_start), at(&raw const __text_end)),
+        rodata: (at(&raw const __rodata_start), at(&raw const __rodata_end)),
+        data: (at(&raw const __data_start), at(&raw const __data_end)),
+        stack_guard: (
+            at(&raw const __stack_guard_start),
+            at(&raw const __stack_guard_end),
+        ),
+    }
 }

@@ -87,11 +87,14 @@ fn banner(boot_arg: u64) {
     c.write_str(if kconfig::MM_PAGED { "y" } else { "n" });
     c.write_str(" DEBUG=");
     c.write_str(if kconfig::DEBUG_BUILD { "y" } else { "n" });
-    memory(c, boot_arg);
-
+    // Before `memory`, because this is where the architecture turns on the features
+    // the kernel's own address space depends on — NXE among them. Building that space
+    // first produced data mappings with no NX, which the space's own check caught.
     c.write_str("\n  pagetable  ");
     let paging_ok = arch::paging_selftest(c);
     c.write_str(if paging_ok { " ok" } else { "" });
+
+    memory(c, boot_arg);
 
     c.write_str("\n  interrupts ");
     // The architecture brings up its own interrupt path; the image only reports the

@@ -20,6 +20,14 @@
 //! second far jump — so the two definitions must stay in step, and `gdt.rs` says so
 //! at its copy.
 //!
+//! The boot stack is not defined here. `link.ld` owns it, because the stack's position
+//! is the whole point: it is the first thing in the writable region, with a guard page
+//! immediately below it that belongs to no section and that the address space builder
+//! leaves unmapped. The page tables this file builds are now *above* the stack rather
+//! than directly below it, which is where an overflow used to land — see the layout
+//! comment in `link.ld` and the experiment recorded in `gdt.rs`. All this file needs is
+//! `__stack_top`, which the linker script defines.
+//!
 //! Written in AT&T syntax because `ljmp $sel, $off` is unambiguous there; LLVM's Intel
 //! far-jump syntax is fiddly enough to be worth avoiding in code that cannot be
 //! unit-tested.
@@ -40,7 +48,7 @@ core::arch::global_asm!(
 .globl _start
 _start:
     cli
-    movl $stack_top, %esp
+    movl $__stack_top, %esp
     movl %ebx, multiboot_info
 
     movl $pml4, %edi
@@ -96,7 +104,7 @@ long_mode_start:
     movw %ax, %fs
     movw %ax, %gs
 
-    movq $stack_top, %rsp
+    movq $__stack_top, %rsp
     xorq %rbp, %rbp
 
     movl multiboot_info, %edi
@@ -126,10 +134,14 @@ pd:
     .skip 4096
 multiboot_info:
     .skip 8
-.align 16
-stack_bottom:
+
+/* The boot stack. A section of its own, not part of .bss, because link.ld places it
+ * first in the writable region with a guard page below it — see the layout comment
+ * there. 16 KiB, a whole number of pages so that the guard page below is a whole page
+ * too; the linker owns `__stack_bottom` and `__stack_top`. */
+.section .stack, "aw", @nobits
+.align 4096
     .skip 16384
-stack_top:
 "#,
     options(att_syntax)
 );

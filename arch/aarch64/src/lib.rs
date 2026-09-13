@@ -315,12 +315,38 @@ pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
     paging::selftest(c)
 }
 
-/// The kernel image's sections.
+/// The kernel image's sections, from the symbols `link.ld` places around them.
 ///
-/// Currently unsplit: this port maps its whole image one way. Splitting it needs
-/// section symbols in `link.ld`, and until then saying so through
-/// [`hal::ImageSections::unsplit`] is more honest than inventing boundaries.
+/// Every boundary here is page-aligned, and the linker script asserts that it is.
+/// That is not tidiness: a section boundary inside a page forces that page to be
+/// mapped with the union of both neighbours' permissions, so a `.text` ending mid-page
+/// makes one page of the kernel writable *and* executable — the exact thing the split
+/// is for.
+///
+/// `data` deliberately spans `.data`, `.bss`, the guard page and the boot stack as one
+/// range, because the stack must be mapped and there is one `data` range to say so in.
+/// The guard is therefore a hole inside it, named separately so the consumer can punch
+/// it back out; see [`hal::ImageSections::stack_guard`].
 pub fn image_sections() -> hal::ImageSections {
-    let (start, end) = image_range();
-    hal::ImageSections::unsplit(start, end)
+    unsafe extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+        static __rodata_start: u8;
+        static __rodata_end: u8;
+        static __data_start: u8;
+        static __data_end: u8;
+        static __stack_guard_start: u8;
+        static __stack_guard_end: u8;
+    }
+    /// Linker symbols mark positions; their address is the value and reading through
+    /// one is meaningless. This is the only thing done with any of them.
+    fn addr(sym: *const u8) -> u64 {
+        sym as usize as u64
+    }
+    hal::ImageSections {
+        text: (addr(&raw const __text_start), addr(&raw const __text_end)),
+        rodata: (addr(&raw const __rodata_start), addr(&raw const __rodata_end)),
+        data: (addr(&raw const __data_start), addr(&raw const __data_end)),
+        stack_guard: (addr(&raw const __stack_guard_start), addr(&raw const __stack_guard_end)),
+    }
 }

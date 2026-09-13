@@ -2,11 +2,43 @@
  *
  * Linked at 1 MiB, the lowest address a multiboot loader will place a kernel above
  * the legacy low-memory region. The multiboot header must land in the first 8 KiB of
- * the file, which placing it first guarantees.
+ * the file, which putting it at the very front of .text guarantees.
  *
  * This is deliberately a low-half identity-mapped layout for Phase 0. Moving the
  * kernel to the high half is Phase 1 work, and it changes the code model in
  * targets/x86_64-kintane.json from "small" to "kernel".
+ *
+ * ## Why every boundary is page-aligned
+ *
+ * The symbols below are what `image_sections()` reports and what the kernel address
+ * space builder maps: .text read + execute, .rodata read-only, .data + .bss read +
+ * write + no-execute. A section boundary in the middle of a page would force that
+ * page to carry the union of both neighbours' permissions — a writable page holding
+ * the tail of .text, or an executable one holding the head of .rodata — which is
+ * exactly the thing the split exists to prevent. So each region is padded out to a
+ * page at both ends and the padding is dead space nobody addresses.
+ *
+ * ## The layout, low to high, and why it is in this order
+ *
+ *     .text        read + execute
+ *     .rodata      read-only
+ *     [guard]      unmapped, in no section
+ *     .stack       the boot stack, first thing in the writable region
+ *     .data        }
+ *     .bss         } everything else writable, including the early page tables
+ *
+ * The boot stack grows *down*, so what sits immediately below `__stack_bottom` is
+ * what a stack overflow destroys. It used to be `pml4`/`pdpt`/`pd` — the live page
+ * tables — which meant an overflow unmapped the machine, including the IST stack the
+ * double-fault handler needs, and the run died in an endless #PF/#DF alternation with
+ * no output at all. gdt.rs records that experiment.
+ *
+ * Now the page tables are above the stack, in .bss, and below the stack is a page
+ * that belongs to no section and that the address space builder leaves unmapped. The
+ * first push past the end of the stack faults on a page that was never mapped, #DF is
+ * delivered on its IST, and the overflow is reported instead of being fatal.
+ * .rodata sits below the guard page, so even a frame large enough to step over the
+ * guard entirely lands on read-only memory rather than on anything load-bearing.
  */
 
 ENTRY(_start)
@@ -15,30 +47,67 @@ SECTIONS {
     . = 1M;
     __kernel_start = .;
 
-    .boot : ALIGN(8) {
-        KEEP(*(.multiboot_header))
-    }
-
     .text : ALIGN(4K) {
+        __text_start = .;
+        /* First in the image so the header lands well inside the 8 KiB the multiboot
+         * specification allows it. It is read-only data in an executable region,
+         * which costs nothing and saves a page of its own. */
+        KEEP(*(.multiboot_header))
+        . = ALIGN(16);
         KEEP(*(.text.boot))
         *(.text .text.*)
+        . = ALIGN(4K);
+        __text_end = .;
     }
 
     .rodata : ALIGN(4K) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        . = ALIGN(4K);
+        __rodata_end = .;
+    }
+
+    /* The guard page: a hole between two output sections, so it is inside none of
+     * them and `image_sections()` can report it as land that must stay unmapped. */
+    . = ALIGN(4K);
+    __stack_guard_start = .;
+    . = . + 4K;
+    __stack_guard_end = .;
+
+    /* The boot stack, first thing in the writable region so that the only thing below
+     * it is the guard page. `boot.rs` reserves the bytes; the alignment on both sides
+     * is here, because a stack whose bottom is not a page boundary shares a page with
+     * whatever precedes it and the guard stops being a boundary. */
+    .stack (NOLOAD) : ALIGN(4K) {
+        __data_start = .;
+        __stack_bottom = .;
+        KEEP(*(.stack))
+        . = ALIGN(4K);
+        __stack_top = .;
     }
 
     .data : ALIGN(4K) {
         *(.data .data.*)
+        /* Named rather than left to orphan placement. `.got` carries SHF_WRITE, so
+         * the linker ranks it with the writable sections and would drop it next to
+         * the nearest match — which, in this layout, is the guard page hole. A
+         * section that lands *there* is one the address space builder will refuse to
+         * map, discovered as a fault rather than as a link error. It is a few bytes
+         * of link-time-resolved addresses in a non-PIE image; the writable region is
+         * where a writable input section belongs. */
+        *(.got .got.plt)
+        *(.data.rel.ro .data.rel.ro.*)
     }
 
-    .bss : ALIGN(4K) {
+    .bss (NOLOAD) : ALIGN(4K) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(4K);
         __bss_end = .;
     }
 
+    __data_end = .;
     __kernel_end = .;
 
     /DISCARD/ : {

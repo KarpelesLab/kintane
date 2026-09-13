@@ -62,19 +62,24 @@
 //!    is the mechanism working, and the control confirming it is the IST that made the
 //!    difference.
 //!
-//! 2. **A genuine unbounded recursion off the boot stack**, which does *not* produce a
-//!    clean report, for a reason worth recording. `boot.rs` puts `pml4`, `pdpt` and
-//!    `pd` in `.bss` immediately *below* `stack_bottom`, and there is no guard page
-//!    because there is no page-table machinery to build one with. So an overflowing
-//!    stack walks straight into the page tables the machine is running on and unmaps
-//!    everything, including this file's IST stack, which is in the same `.bss`. The
-//!    run ends in an endless #PF/#DF alternation rather than a report.
+//! 2. **A genuine unbounded recursion off the boot stack**, which at the time did *not*
+//!    produce a clean report, for a reason worth recording. `boot.rs` then put `pml4`,
+//!    `pdpt` and `pd` in `.bss` immediately *below* `stack_bottom`, and there was no
+//!    guard page. So an overflowing stack walked straight into the page tables the
+//!    machine was running on and unmapped everything, including this file's IST stack,
+//!    which is in the same `.bss`. The run ended in an endless #PF/#DF alternation
+//!    rather than a report.
 //!
-//! The IST is therefore necessary and not sufficient. What makes a stack overflow
-//! *diagnosable* rather than merely survivable is a guard page below each stack, so
-//! that the overflow faults at a boundary instead of eating whatever is underneath —
-//! and that needs the kernel address space work in Phase 2. Experiment 1 is precisely
-//! what experiment 2 would look like if that guard page existed.
+//! The IST was therefore necessary and not sufficient. What makes a stack overflow
+//! *diagnosable* rather than merely survivable is a guard page below the stack, so that
+//! the overflow faults at a boundary instead of eating whatever is underneath.
+//!
+//! That half now exists. `link.ld` puts the boot stack first in the writable region
+//! with a page below it that belongs to no output section, reported through
+//! `image_sections()` as `stack_guard` and left unmapped by the kernel address space
+//! builder; the page tables moved above the stack, into `.bss`. An overflow's first
+//! push past `__stack_bottom` now lands on an unmapped page and this file's IST carries
+//! the report — which is to say experiment 2 has been turned into experiment 1.
 //!
 //! ## Per-CPU
 //!
@@ -146,8 +151,13 @@ unsafe impl Sync for Stack {}
 
 /// Backing store for the double-fault stack.
 ///
-/// No guard page below it, because there is no page-table machinery to build one with
-/// yet — see the note in `interrupt.rs` about what that costs.
+/// Still no guard page below *this* one. The boot stack has one — `link.ld` places it
+/// and `image_sections()` reports it — but this stack is an ordinary `.bss` static
+/// surrounded by other `.bss` statics, and carving a hole around it means the linker
+/// script placing it too, which is the shape a per-CPU stack allocator will want
+/// anyway. Overflowing the double-fault stack is a triple fault either way; a guard
+/// page would turn it into a #PF the handler cannot service, which is not obviously
+/// better. Revisit when there is more than one CPU and stacks stop being statics.
 static DF_STACK: Stack = Stack(UnsafeCell::new([0; DF_STACK_BYTES]));
 
 /// The 64-bit task state segment.

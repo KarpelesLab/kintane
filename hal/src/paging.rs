@@ -76,8 +76,19 @@ impl PageFlags {
     pub const fn from_bits_truncate(bits: u16) -> PageFlags {
         PageFlags(bits & 0x7F)
     }
+    /// Whether **every** bit of `other` is present.
     pub const fn contains(self, other: PageFlags) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// Whether **any** bit of `other` is present.
+    ///
+    /// The one to reach for when asking "is anything here that should not be". Using
+    /// `contains` for that reads the same and means the opposite: a probe denying
+    /// `WRITE | EXECUTE` passes on a page that is merely executable, because it does
+    /// not hold *both*.
+    pub const fn intersects(self, other: PageFlags) -> bool {
+        self.0 & other.0 != 0
     }
     pub const fn union(self, other: PageFlags) -> PageFlags {
         PageFlags(self.0 | other.0)
@@ -85,6 +96,10 @@ impl PageFlags {
     pub const fn without(self, other: PageFlags) -> PageFlags {
         PageFlags(self.0 & !other.0)
     }
+
+    /// Every flag, for tests that need a full mask.
+    #[doc(hidden)]
+    pub const ALL_TEST: PageFlags = PageFlags(0x7F);
 
     /// Kernel code: readable and executable, never writable.
     pub const KERNEL_TEXT: PageFlags = PageFlags(1 | (1 << 2));
@@ -335,6 +350,24 @@ mod tests {
         );
         assert!(!PageFlags::KERNEL_RODATA.contains(PageFlags::WRITE));
         assert!(!PageFlags::KERNEL_RODATA.contains(PageFlags::EXECUTE));
+    }
+
+    #[test]
+    fn contains_and_intersects_are_not_the_same_question() {
+        // This distinction was a live bug: a W^X check denying WRITE|EXECUTE used
+        // `contains`, so it passed on a page that was executable-but-not-writable —
+        // which is exactly the case it existed to catch. `contains` asks "all of
+        // these", `intersects` asks "any of these".
+        let rx = PageFlags::READ | PageFlags::EXECUTE;
+        let forbidden = PageFlags::WRITE | PageFlags::EXECUTE;
+
+        assert!(!rx.contains(forbidden), "rx lacks WRITE, so not all of them");
+        assert!(rx.intersects(forbidden), "but it does have EXECUTE");
+
+        // The read-only page the check should accept.
+        let ro = PageFlags::READ;
+        assert!(!ro.intersects(forbidden));
+        assert!(!PageFlags::empty().intersects(PageFlags::ALL_TEST));
     }
 
     #[test]

@@ -15,12 +15,13 @@
 //!    kernel at EL1 unless it was given `virtualization=on`, in which case the same
 //!    image lands at EL2 instead. That is a machine-configuration detail, not an
 //!    architecture one, so the code handles both rather than asserting one.
-//! 3. **Zero `.bss`, then take a stack.** In that order: the boot stack lives in
-//!    `.bss`, so zeroing after switching to it would erase the frames underneath us.
-//!    Nothing before the stack switch needs a stack — the descent to EL1 goes
-//!    through system registers and `eret`, and the zeroing loop uses registers only.
-//!    The translation tables also live in `.bss`, so the zeroing is what makes every
-//!    descriptor start out invalid.
+//! 3. **Zero `.bss`, then take a stack.** Nothing before the stack switch needs a
+//!    stack — the descent to EL1 goes through system registers and `eret`, and the
+//!    zeroing loop uses registers only. The translation tables live in `.bss`, so the
+//!    zeroing is what makes every descriptor start out invalid. The stack itself is
+//!    not in `.bss`: it sits above a guard page in its own `.stack` section (see
+//!    `link.ld`), and is therefore neither zeroed nor adjacent to anything an overflow
+//!    could quietly corrupt.
 //!
 //! Register state on entry is whatever QEMU left. Its ELF path is documented as
 //! "assume that raw images are Linux kernels and ELF images are not", so unlike the
@@ -111,8 +112,9 @@ _start:
     b       .Lzero_bss
 .Lbss_done:
 
-    // The stack lives in .bss and is therefore now zero. SP must be 16-byte aligned
-    // on aarch64 whenever it is used as a base address, which __stack_top is.
+    // SP must be 16-byte aligned on aarch64 whenever it is used as a base address,
+    // which __stack_top is — the linker puts the stack on a page boundary. Its contents
+    // are whatever the loader left; a stack slot is written before it is read.
     adrp    x0, __stack_top
     add     x0, x0, :lo12:__stack_top
     mov     sp, x0
@@ -137,8 +139,19 @@ _start:
     wfi
     b       .Lhang
 
-.section .bss, "aw", @nobits
-.balign 16
+// The boot stack, in a section of its own so that link.ld can put a guard page
+// directly beneath it. Were it left in .bss it would sit wherever the linker chose,
+// with the translation tables — also .bss — as likely as not immediately below, and an
+// overflow would rewrite the page tables instead of faulting. `nobits`, so the 16 KiB
+// costs nothing in the image; `.balign 4096` so the bottom of the stack is the page
+// boundary the guard ends on.
+.section .stack, "aw", @nobits
+.balign 4096
+// Global, not because anything links against them, but because link.ld's ASSERTs do:
+// a linker-script expression can only name a global symbol, and those assertions are
+// what stops the guard page and the stack drifting into each other unnoticed.
+.globl __stack_bottom
+.globl __stack_top
 __stack_bottom:
     .skip 16384
 __stack_top:

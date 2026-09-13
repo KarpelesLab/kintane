@@ -1,0 +1,33 @@
+# Formatting is not a thing to have opinions about. `docs/coding-standards.md` says
+# "No discussion; the time is better spent elsewhere", and this file is what makes
+# that true — it existed only in that sentence until now, which meant every author was
+# quietly having the discussion with themselves.
+#
+# Deliberately close to rustfmt's defaults. Every setting below is one the default
+# gets wrong for a kernel, and nothing is here for taste.
+
+# The column limit the coding standards state. rustfmt's default is 100 too, but
+# stating it means a future default change does not silently reformat the tree.
+max_width = 100
+
+# rustfmt's default wraps a function call at 60 columns even when the line would fit
+# in 100, which splits short `unsafe { asm!(...) }` blocks across three lines for no
+# reason. Kernel code is dense with those.
+fn_call_width = 80
+
+# Comments carry most of the reasoning in this codebase — the `// SAFETY:` blocks in
+# particular are load-bearing. Wrapping them to the same limit as code keeps a long
+# explanation from running off the edge, and normalising `/*...*/` to `//` keeps one
+# style in files that mix assembly and Rust.
+wrap_comments = true
+comment_width = 100
+normalize_comments = true
+
+# Group and sort imports. A merge that adds a `use` in a different place than another
+# merge removed one is a conflict nobody needs to read.
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+
+# Explicit, because the default differs between editions and this tree pins an edition
+# in toolchain.toml rather than per-crate.
+edition = "2024"

@@ -297,7 +297,9 @@ fn check<A: HasPageTables>(
     let probe = |addr: u64, want: PageFlags, deny: PageFlags, what: &'static str| -> bool {
         let Some(v) = virt_of(addr) else { return false };
         match space.translate(v) {
-            Some((_, f)) if f.contains(want) && !f.contains(deny) => true,
+            // `intersects`, not `contains`: the question is whether *anything*
+            // forbidden is present, not whether all of it is.
+            Some((_, f)) if f.contains(want) && !f.intersects(deny) => true,
             Some((_, f)) => {
                 c.write_str("\n             ");
                 c.write_str(what);
