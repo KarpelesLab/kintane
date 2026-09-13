@@ -43,6 +43,7 @@ mod boot;
 pub mod clock;
 pub mod context;
 mod exception;
+pub mod fault;
 mod idt;
 pub mod interrupt;
 pub mod kspace;

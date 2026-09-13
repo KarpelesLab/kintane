@@ -275,6 +275,13 @@ impl HasPageTables for I686 {
         nx_enabled()
     }
 
+    fn root_load_caches(level: u8) -> bool {
+        // The PDPT, level 2. Its four entries are loaded into the CPU with CR3 and not
+        // walked again (SDM Vol. 3A, 4.4.1), so a new page directory under it is not
+        // seen until CR3 is reloaded.
+        level == 2
+    }
+
     type Entry = Entry;
 
     fn index_bits(level: u8) -> u8 {

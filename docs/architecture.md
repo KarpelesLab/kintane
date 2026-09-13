@@ -119,7 +119,7 @@ correctly:
 | Port | Enforcement observed after the switch |
 |---|---|
 | x86_64 | `CR0.WP` and `EFER.NXE` read live; a write to `.rodata` takes #PF (err 0x03) and a call into `.data` takes #PF (err 0x11), both through the expected-fault trap, with the permission restored afterwards |
-| i686 | `CR0.WP` read live and NX reported. No fault probe: the #PF handler has no expected-fault path yet |
+| i686 | `CR0.WP` read live and NX reported. No fault probe yet. The #PF handler can now return, but only for faults the kernel's page fault hook resolves; there is no expected-fault trap |
 | aarch64 | `SCTLR_EL1.M` read live; `AT S1E1W` reports a permission fault on `.text` and `.rodata`; `AT S1E1R` reports a translation fault on the guard page |
 
 The frames holding the live tables are handed to anything else that builds a frame pool
@@ -138,6 +138,70 @@ gate has no IST, and this port has no #DF task gate. The guard page is unmapped 
 of it is reported, but an overflow that exhausts the stack cannot be reported yet.
 `STACK_GUARD_TEST` exercises all of this; see
 [testing.md](testing.md#expected-faults-the-stack-guard-test).
+
+#### Regions, demand paging and copy-on-write (`mm::vm`)
+
+`mm::paged` changes tables. `mm::vm` decides what they should say, and decides it lazily.
+
+- **Regions.** An address space has a sorted, fixed-capacity region map. Each region has a
+  start, a length, the permissions it grants at most, a backing, and whether huge pages are
+  allowed. The capacity is fixed for two reasons. Layering: `kalloc` depends on `mm`, so the
+  map cannot allocate. And the fault path consults the map, so allocating there would mean
+  allocating inside a fault handler.
+- **Backing.** Anonymous regions are zeroed on first touch. Physical regions map a fixed range
+  at matching offsets and never allocate or free its frames. There is no separate VM object
+  with a page list yet: the page tables record which anonymous pages exist, and a small
+  caller-provided table counts mappings of frames shared more than once. That covers anonymous
+  memory in one space and copy-on-write between a few. Swap, file backing and pages that exist
+  while unmapped need a real object, and they arrive with the first thing that needs them.
+- **Faults.** `Vm::fault(addr, access)` finds the region and checks the access against it.
+  Then:
+  - A hole gets a zeroed frame, or a zeroed 2 MiB block when the region allows huge pages, the
+    block fits inside the region, and a contiguous aligned run is available. Otherwise it gets
+    a base page.
+  - A write to a read-only anonymous page copies the page if its frame is shared, and makes
+    it writable in place if not.
+  - A leaf that already permits the access is spurious, and the TLB is flushed.
+  - Everything else is an error, and nothing was changed.
+- **Out of memory.** Running out during a fault returns frames and prunes any tables it
+  allocated.
+- **Copy-on-write sharing.** `cow_share` splits huge leaves first, so share counts are always
+  per base page. It then maps every page read-only on both sides. It is all or nothing: a
+  failure part-way unmaps what it mapped and restores the source's write permission.
+- **`protect`.** It splits regions and huge leaves at its edges. Granting write does not make a
+  shared page writable; the next write copies it.
+- **Checking.** `Vm::audit` checks the invariants against the live tables. The one that matters
+  most is that no writable leaf maps a shared frame.
+
+**On the machine.** Each port decodes its page-fault syndrome into a `hal::fault::PageFault`
+and offers it to a hook the kernel registers (`arch::fault::set_page_fault_hook`). On x86 that
+is CR2 and the #PF error code. On aarch64 it is FAR and ESR, for same-EL translation and
+permission faults only. A fault the hook declines still reaches the fatal report, so the
+guard page, which no region covers, is exactly as fatal as before. The boot `demand` line
+reserves regions in an unmapped 1 GiB window and simply touches them. It requires:
+
+- a frame per first touch, and none for a second;
+- zero bytes, on frames deliberately dirtied first;
+- a write to either side of a share copying only that page;
+- a 2 MiB leaf over one contiguous block;
+- no spurious faults;
+- the frame allocator back at its starting count after release.
+
+**Where a missing TLB flush hides.** Replacing a leaf always invalidates it. The flush that
+matters is the one `cow_share` issues when it makes a writable page read-only. A CPU still
+holding the writable translation writes straight into the shared frame, and nothing faults to
+say so. The boot check writes the source pages just before sharing so that translation is
+cached. Without the flush it fails on both x86 ports. Under QEMU's TCG on aarch64 the stale
+translation was not kept, so there the omission went unobserved. The forgiving direction,
+read-only to writable, only refaults: the resolver reports a spurious fault and does a full
+flush. For that reason the boot check requires zero spurious faults instead of tolerating
+them.
+
+32-bit PAE adds a trap. The four PDPT entries are copied into the CPU when CR3 is loaded, so a
+new page directory under them is invisible to `invlpg`. `HasPageTables::root_load_caches`
+lets i686 say so, and the walker then reloads CR3 after filling or clearing such an entry.
+QEMU's TCG does not model that cache, so this follows the SDM and is not observable under
+emulation.
 
 ### `kalloc` — allocation
 

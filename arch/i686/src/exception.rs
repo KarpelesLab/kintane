@@ -108,7 +108,13 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptFrame, code: u3
 }
 
 /// #PF, vector 14. CR2 holds the address that faulted; the error code says why.
-pub extern "x86-interrupt" fn page_fault(frame: InterruptFrame, code: u32) -> ! {
+///
+/// Returns only when the kernel's page fault hook resolved the fault (see `fault.rs`);
+/// the faulting instruction then re-executes. Everything else is as fatal as before.
+pub extern "x86-interrupt" fn page_fault(frame: InterruptFrame, code: u32) {
+    if crate::fault::route(cr2(), code) {
+        return;
+    }
     fatal(Some(14), Some(code), &frame)
 }
 

@@ -74,11 +74,14 @@ pub type DivergingHandler = extern "x86-interrupt" fn(InterruptFrame) -> !;
 /// The code is 32 bits here and 64 on x86-64: the CPU pushes one stack word, and a
 /// stack word is the pointer width.
 pub type HandlerWithCode = extern "x86-interrupt" fn(InterruptFrame, u32) -> !;
+/// An entry point for a vector that pushes an error code and may return: #PF, when the
+/// kernel resolves the fault. The `x86-interrupt` ABI discards the code before `iret`.
+pub type ResumableHandlerWithCode = extern "x86-interrupt" fn(InterruptFrame, u32);
 
 /// The address of an interrupt entry point, with its ABI shape already checked.
 ///
 /// The constructor names are the whole point: an entry point can only reach
-/// [`set_gate`] through one of the three, and each takes a specific function-pointer
+/// [`set_gate`] through one of these, and each takes a specific function-pointer
 /// type, so a handler whose signature does not match what its vector pushes is a
 /// compile error rather than a wild `iret`.
 #[derive(Clone, Copy)]
@@ -98,6 +101,11 @@ impl EntryPoint {
 
     /// A handler for a vector that pushes an error code.
     pub fn with_code(f: HandlerWithCode) -> EntryPoint {
+        EntryPoint(f as usize)
+    }
+
+    /// A handler for a vector that pushes an error code, which may return.
+    pub fn with_code_resumable(f: ResumableHandlerWithCode) -> EntryPoint {
         EntryPoint(f as usize)
     }
 }

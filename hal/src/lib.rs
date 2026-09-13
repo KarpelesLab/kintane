@@ -14,6 +14,7 @@
 pub mod addr;
 pub mod clock;
 pub mod context;
+pub mod fault;
 pub mod paging;
 
 // Mock architectures for host-side testing. Gated at the module boundary, which is
@@ -24,6 +25,7 @@ pub mod mock;
 pub use addr::{AddrOverflow, KernAddr, PhysAddr, UserAddr};
 pub use clock::ClockSource;
 pub use context::{HasContextSwitch, ThreadEntry};
+pub use fault::{Access, PageFault, PageFaultHook};
 pub use paging::{HasPageTables, ImageSections, MapError, PageFlags, PageTableEntry};
 
 /// Byte order of the target.

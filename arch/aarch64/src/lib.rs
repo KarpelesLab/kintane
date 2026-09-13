@@ -11,6 +11,7 @@ mod boot;
 pub mod clock;
 pub mod context;
 pub mod exception;
+pub mod fault;
 pub mod gic;
 pub mod irq;
 pub mod kspace;

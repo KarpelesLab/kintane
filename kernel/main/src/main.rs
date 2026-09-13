@@ -12,6 +12,7 @@
 
 mod clock;
 mod crash;
+mod demand;
 mod heap;
 mod kheap;
 mod lockcheck;
@@ -418,6 +419,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
     let space = space
         .and(alloc)
         .and(heap::bring_up(c, &mut frames, &regions[..n]))
+        .and(demand::check(c, &mut frames, live))
         .and(kheap::install(c, &mut frames, &regions[..n]));
     (space, live)
 }
