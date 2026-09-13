@@ -86,10 +86,16 @@ pub(crate) fn dispatch() {
     // Bounded rather than `while let`: a source that is never quieted by its handler
     // would otherwise spin here forever with interrupts masked, which is
     // indistinguishable from a hang. Anything still pending is taken on the next entry.
+    let mut ticked = false;
     for _ in 0..MAX_PER_ENTRY {
-        let Some(irq) = chip.claim() else { return };
-        handle(irq);
+        let Some(irq) = chip.claim() else { break };
+        ticked |= handle(irq);
         chip.eoi(irq);
+    }
+    // After the loop, so every interrupt claimed on this entry has had its EOI before
+    // the hook can switch threads. See `tick`.
+    if ticked {
+        crate::tick::run_hook();
     }
 }
 
@@ -97,18 +103,24 @@ pub(crate) fn dispatch() {
 /// code a chance to run again.
 const MAX_PER_ENTRY: u32 = 16;
 
-fn handle(irq: IrqNumber) {
+/// Handle one claimed interrupt. Returns whether it was a timer tick.
+fn handle(irq: IrqNumber) -> bool {
     if irq.0 == crate::timer::PPI {
         // The timer's condition is level-sensitive: without this the line stays
         // asserted, EOI re-delivers immediately, and the machine never leaves the
-        // handler. Re-arming rather than stopping is what a real tick does; Phase 0
-        // wants exactly one.
-        crate::timer::stop();
+        // handler. Re-arming moves the deadline into the future, which deasserts it as
+        // surely as stopping does. The interrupt selftest wants exactly one tick; the
+        // scheduler tick wants them to keep coming.
+        match crate::tick::period() {
+            0 => crate::timer::stop(),
+            period => crate::timer::arm(period),
+        }
         TIMER_TICKS.fetch_add(1, Ordering::Release);
-        return;
+        return true;
     }
 
     // No handler. It has already been claimed, so it will be acknowledged by the
     // caller and will not be redelivered; a source nobody owns should not have been
     // enabled, and in Phase 0 nothing can enable one.
+    false
 }

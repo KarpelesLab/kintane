@@ -14,6 +14,7 @@ pub mod gic;
 pub mod irq;
 pub mod paging;
 pub mod serial;
+pub mod tick;
 pub mod timer;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};

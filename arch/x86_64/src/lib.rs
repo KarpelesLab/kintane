@@ -23,6 +23,7 @@ pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod serial;
+pub mod tick;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};

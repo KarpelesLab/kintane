@@ -11,6 +11,7 @@
 #![feature(sync_unsafe_cell)]
 
 mod clock;
+mod preempt;
 mod space;
 
 use core::cell::SyncUnsafeCell;
@@ -147,6 +148,16 @@ fn banner(boot_arg: u64) -> Check {
     // After interrupts, because the check waits through timer interrupts.
     c.write_str("\n  clock      ");
     let clock = clock::check(c);
+    c.write_str("\n  preempt    ");
+    // Built on both of the above, so it runs only when both passed. Their failures
+    // already gate the verdict, and a scheduler check on a broken switch or a silent
+    // timer would hang rather than report.
+    let preempt = if irq_ok && switch_ok {
+        preempt::demonstrate(c)
+    } else {
+        c.write_str("skipped: needs working interrupts and context switch");
+        Check::Skipped
+    };
 
     c.write_str("\n\nreached kmain\n");
     Check::from_ok(paging_ok)
@@ -154,6 +165,7 @@ fn banner(boot_arg: u64) -> Check {
         .and(Check::from_ok(irq_ok))
         .and(Check::from_ok(switch_ok))
         .and(clock)
+        .and(preempt)
 }
 
 /// Room for the loader's memory map. QEMU reports a handful of regions; real

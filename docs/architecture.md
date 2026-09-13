@@ -194,6 +194,58 @@ Pluggable policy behind a trait, with the config selecting one or more:
 Per-CPU data is a `HasSmp`-gated abstraction; a uniprocessor build resolves
 `per_cpu!(X)` to a plain static with no indirection.
 
+#### What exists today
+
+The fixed-priority scheduler runs on x86_64, i686 and aarch64, on one CPU. It is three
+pieces, split where the knowledge actually is:
+
+- **`kernel/sched`** is the policy: 32 priority levels, round robin within a level,
+  and the highest runnable level always wins. It depends on nothing.
+- **`hal::HasContextSwitch`**, implemented in each `arch/<name>/context.rs`, is the
+  mechanism: save the callee-saved registers, load another thread's.
+- **`kernel/thread`** binds the two into a thread table with four checked invariants.
+  The operations that switch (`yield_now`, `block`, `exit`) take a raw table pointer
+  and do their bookkeeping under a reference that ends *before* the switch. A thread
+  is suspended in the middle of such a call, and the thread that resumes calls into the
+  same table; with `&mut self` that is two live exclusive references to one object.
+
+**Preemption is `yield_now` called from the timer interrupt.** Each port's `tick`
+module runs a periodic timer (the PIT on x86, the generic timer re-armed from its own
+interrupt on aarch64) and calls one registered `fn()` after acknowledging each tick.
+`arch` cannot depend on the scheduler, so the scheduler registers the hook. The switch
+happens inside the interrupt handler. The interrupted thread's whole trap frame stays
+on its own stack, and it resumes, much later, by returning through that handler. Three
+conditions make this sound, and each port's `tick` module states them:
+
+1. **EOI before the hook.** Otherwise the 8259A's in-service bit, or the GIC's running
+   priority, stays set while the thread that raised it is suspended, and the next thread
+   never receives a tick. The in-kernel check below catches exactly this. With the EOI
+   moved after the hook, round robin and priority *still looked correct*, because the
+   preempted thread eventually resumes and acknowledges. The only symptom was a worker
+   that saw no tick for fifty ticks' worth of spinning.
+2. **The trap frame lives on the thread's stack.** No IST on the timer gate on x86_64.
+   On aarch64, `ELR_EL1` and `SPSR_EL1` are banked per exception level, so they are
+   saved into the frame, not left in the register. On i686 the `x86-interrupt` prologue
+   saves the XMM registers as well, which was confirmed in the disassembly because the
+   kernel runs with SSE.
+3. **Interrupts are masked for every table access**, by the CPU in the handler and
+   explicitly in thread code. That is the Phase 2 exclusion on one CPU. A new thread
+   starts masked, because a switch always happens masked, and unmasking is its first act.
+
+The idle thread runs at priority 0 and waits for an interrupt with a race-free
+check-then-halt (`sti; hlt` on x86, `wfi` then unmask on aarch64).
+
+Every boot proves this with a verdict-gated check (`kernel/main/src/preempt.rs`). Two
+threads spin without ever yielding and must interleave. A higher-priority thread spawned
+after them must run first, and must preempt them on the tick that wakes it. Every
+thread must keep receiving ticks, and idle must halt. Disabling the preemption call, the
+EOI ordering, the threads' unmasking, the priority, or idle's halt each makes the boot
+fail within seconds instead of hanging.
+
+Not yet: thread stacks are static `.bss` arrays with no guard page, sleeping is a tick
+count, not a timer subsystem with deadlines, and nothing but the demonstration creates
+threads.
+
 ## Boot flow
 
 ```

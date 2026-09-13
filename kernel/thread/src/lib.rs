@@ -15,6 +15,23 @@
 //!
 //! [`Threads::check`] asserts all four, and every test calls it after every operation.
 //!
+//! # Why the switching operations take a raw pointer
+//!
+//! [`Threads::yield_now`], [`Threads::block`] and [`Threads::exit`] take `*mut Self`, not
+//! `&mut self`. The first draft took `&mut self`, and that was fine against the mock,
+//! whose switch returns at once. It stopped being fine when preemption made it real.
+//! A thread that switches away is suspended *inside* the call, still holding its
+//! `&mut self`. The thread that resumes then makes its own call on the same table and
+//! creates a second `&mut` while the first is still live. Two live exclusive references
+//! to one table break Rust's aliasing rules, and the optimiser relies on those rules.
+//! Masking interrupts changes nothing here, because the rule concerns references, not
+//! concurrency.
+//!
+//! So each operation is split in two. The bookkeeping runs under a `&mut self` that ends
+//! before anything switches and yields a private `Switch` naming two slots. The switch
+//! is then made through pointers projected from the raw table pointer, so no reference
+//! is live across it, and a resumed thread reads nothing through the table it held.
+//!
 //! # Single CPU, interrupts masked
 //!
 //! This is the Phase 2 scheduler: one CPU, and the caller masks interrupts around every
@@ -83,6 +100,18 @@ pub struct Threads<A: HasContextSwitch, const N: usize> {
     runq: RunQueue<N>,
     current: usize,
     next_id: u32,
+}
+
+/// A switch the table has recorded and not yet made: the slot to save into, and the slot
+/// to resume.
+///
+/// Private and consumed only by `Threads::perform`. Once the bookkeeping has run, the
+/// table already names `to` as running, so a switch planned and never made would leave
+/// the table describing a thread that is not on the CPU.
+#[must_use]
+struct Switch {
+    from: usize,
+    to: usize,
 }
 
 impl<A: HasContextSwitch, const N: usize> Threads<A, N> {
@@ -185,10 +214,29 @@ impl<A: HasContextSwitch, const N: usize> Threads<A, N> {
     ///
     /// Returns without switching when nothing else is runnable — yielding to yourself is
     /// not a switch, and must not become one (invariant 4).
-    pub fn yield_now(&mut self) -> Result<(), Error> {
+    ///
+    /// This is also the whole of preemption. A timer interrupt that calls it switches
+    /// exactly when a voluntary yield would: to a peer at the same level, which is round
+    /// robin, or to a higher level that something has just woken.
+    ///
+    /// # Safety
+    /// See [`Threads::perform`]'s contract, which every switching operation shares.
+    #[allow(unsafe_code)]
+    pub unsafe fn yield_now(table: *mut Self) -> Result<(), Error> {
+        // SAFETY: the caller guarantees `table` is valid and unaliased by any live
+        // reference; this `&mut` ends at the end of the statement.
+        if let Some(sw) = unsafe { (*table).plan_yield() }? {
+            // SAFETY: `sw` was just planned on this table, and the caller's contract is
+            // `perform`'s.
+            unsafe { Self::perform(table, sw) };
+        }
+        Ok(())
+    }
+
+    fn plan_yield(&mut self) -> Result<Option<Switch>, Error> {
         let cur = self.meta[self.current].ok_or(Error::NoSuchThread)?;
         let Some((next_id, _)) = self.runq.peek() else {
-            return Ok(());
+            return Ok(None);
         };
         // Fixed priority: a lower-priority thread does not get the CPU merely because the
         // current one offered it.
@@ -198,23 +246,35 @@ impl<A: HasContextSwitch, const N: usize> Threads<A, N> {
             .map(|m| m.priority)
             .ok_or(Error::NoSuchThread)?;
         if next_prio < cur.priority {
-            return Ok(());
+            return Ok(None);
         }
 
         self.set_state(self.current, State::Ready);
         self.runq
             .enqueue(cur.id, cur.priority)
             .map_err(|_| Error::QueueFull)?;
-        self.switch_to_next()
+        self.plan_next().map(Some)
     }
 
     /// Take the current thread off the CPU until something wakes it.
-    pub fn block(&mut self) -> Result<(), Error> {
+    ///
+    /// # Safety
+    /// See [`Threads::perform`].
+    #[allow(unsafe_code)]
+    pub unsafe fn block(table: *mut Self) -> Result<(), Error> {
+        // SAFETY: as in `yield_now`.
+        let sw = unsafe { (*table).plan_block() }?;
+        // SAFETY: as in `yield_now`.
+        unsafe { Self::perform(table, sw) };
+        Ok(())
+    }
+
+    fn plan_block(&mut self) -> Result<Switch, Error> {
         if self.runq.is_empty() {
             return Err(Error::NothingRunnable);
         }
         self.set_state(self.current, State::Blocked);
-        self.switch_to_next()
+        self.plan_next()
     }
 
     /// Make a blocked thread runnable again.
@@ -233,15 +293,27 @@ impl<A: HasContextSwitch, const N: usize> Threads<A, N> {
 
     /// End the current thread and run another.
     ///
-    /// On a real machine this never returns: nothing switches back to an exited thread.
-    /// It is not typed `-> !` here only so the bookkeeping can be tested against a mock
-    /// context switch, which does return.
-    pub fn exit(&mut self) -> Result<(), Error> {
+    /// On a real machine a successful exit never returns: nothing switches back to an
+    /// exited thread. It is not typed `-> !` here only so the bookkeeping can be tested
+    /// against a mock context switch, which does return.
+    ///
+    /// # Safety
+    /// See [`Threads::perform`].
+    #[allow(unsafe_code)]
+    pub unsafe fn exit(table: *mut Self) -> Result<(), Error> {
+        // SAFETY: as in `yield_now`.
+        let sw = unsafe { (*table).plan_exit() }?;
+        // SAFETY: as in `yield_now`.
+        unsafe { Self::perform(table, sw) };
+        Ok(())
+    }
+
+    fn plan_exit(&mut self) -> Result<Switch, Error> {
         if self.runq.is_empty() {
             return Err(Error::NothingRunnable);
         }
         self.set_state(self.current, State::Exited);
-        self.switch_to_next()
+        self.plan_next()
     }
 
     /// Free an exited thread's slot so it can be reused.
@@ -267,9 +339,8 @@ impl<A: HasContextSwitch, const N: usize> Threads<A, N> {
         }
     }
 
-    /// Pick the next thread, mark it running, and switch to it.
-    #[allow(unsafe_code)]
-    fn switch_to_next(&mut self) -> Result<(), Error> {
+    /// Pick the next thread, mark it running, and say which switch that requires.
+    fn plan_next(&mut self) -> Result<Switch, Error> {
         let (next_id, _) = self.runq.pick_next().ok_or(Error::NothingRunnable)?;
         let next = self.slot_of_id(next_id)?;
         let prev = self.current;
@@ -291,19 +362,39 @@ impl<A: HasContextSwitch, const N: usize> Threads<A, N> {
             // one. So it refuses, and says so.
             return Err(Error::InvariantBroken);
         }
+        Ok(Switch {
+            from: prev,
+            to: next,
+        })
+    }
 
-        let base = self.contexts.as_mut_ptr();
-        // SAFETY: `prev` and `next` are distinct indices within `contexts` (checked just
-        // above), so the pointers do not alias, and neither was produced from a
-        // reference that is still live. Both contexts belong to threads in this table:
-        // `next` was queued, so it was prepared by `init` or saved by an earlier switch
-        // and is not running. The caller masks interrupts, as `switch` requires.
+    /// Make a switch the bookkeeping has already recorded.
+    ///
+    /// # Safety
+    /// The contract every switching operation shares:
+    ///
+    /// * `table` is valid for reads and writes, and no reference into the table is live while this
+    ///   runs. The table is still in use by whichever thread resumes.
+    /// * Interrupts are masked, as [`HasContextSwitch::switch`] requires. That makes this callable
+    ///   from a timer interrupt, which already runs masked.
+    /// * Every context in the table belongs to a thread whose stack is still valid, which `spawn`'s
+    ///   contract provides.
+    #[allow(unsafe_code)]
+    unsafe fn perform(table: *mut Self, sw: Switch) {
+        // A projection through the raw pointer, not `(*table).contexts`, which would
+        // create a reference to the array. `from` and `to` are derived from the table
+        // pointer itself, so no borrow that later ends can invalidate them.
+        // SAFETY: the caller guarantees `table` is valid, so the field place is too.
+        let base = unsafe { (&raw mut (*table).contexts).cast::<A::Context>() };
+        // SAFETY: `from` and `to` are distinct indices below `N` (`plan_next` refuses a
+        // self-switch), so the two pointers are in bounds and do not alias. `to` was
+        // queued, so its context was prepared by `init` or saved by an earlier switch,
+        // and it is not running. The caller masks interrupts.
         unsafe {
-            let from = base.add(prev);
-            let to = base.add(next).cast_const();
+            let from = base.add(sw.from);
+            let to = base.add(sw.to).cast_const();
             A::switch(from, to);
         }
-        Ok(())
     }
 
     /// Verify the table's invariants. `Ok` means all hold; `Err` names the first broken.
@@ -353,6 +444,24 @@ mod tests {
         Priority::new(n).unwrap()
     }
 
+    // The switching operations take a raw pointer (see the module comment). Against the
+    // mock the switch returns at once, and the `&mut` each helper receives is the only
+    // reference to the table for the duration of the call, so the contract holds.
+    fn yield_now<const N: usize>(t: &mut Threads<MockFull, N>) -> Result<(), Error> {
+        // SAFETY: see above.
+        unsafe { Threads::yield_now(t) }
+    }
+
+    fn block<const N: usize>(t: &mut Threads<MockFull, N>) -> Result<(), Error> {
+        // SAFETY: see above.
+        unsafe { Threads::block(t) }
+    }
+
+    fn exit<const N: usize>(t: &mut Threads<MockFull, N>) -> Result<(), Error> {
+        // SAFETY: see above.
+        unsafe { Threads::exit(t) }
+    }
+
     const STACK: KernAddr = KernAddr::new(0x10_0000);
 
     /// Spawn with the argument doubling as the mock context's tag, so `last_switch`
@@ -387,7 +496,7 @@ mod tests {
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
         let before = SWITCHES.load(Ordering::SeqCst);
-        t.yield_now().unwrap();
+        yield_now(&mut t).unwrap();
         assert_eq!(t.current(), a);
         assert_eq!(t.state(ThreadId::new(0)), Some(State::Ready));
         assert_eq!(last_switch().1, 11, "the resumed context belongs to thread a");
@@ -400,7 +509,7 @@ mod tests {
         // Invariant 4: a thread must never be switched to itself.
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let before = SWITCHES.load(Ordering::SeqCst);
-        t.yield_now().unwrap();
+        yield_now(&mut t).unwrap();
         assert_eq!(t.current(), ThreadId::new(0));
         assert_eq!(SWITCHES.load(Ordering::SeqCst), before, "no switch happened");
         t.check().unwrap();
@@ -410,7 +519,7 @@ mod tests {
     fn a_lower_priority_thread_does_not_get_a_yielded_cpu() {
         let mut t: Threads<MockFull, 8> = Threads::new(p(9));
         spawn(&mut t, 11, 2);
-        t.yield_now().unwrap();
+        yield_now(&mut t).unwrap();
         assert_eq!(t.current(), ThreadId::new(0), "fixed priority: the high thread keeps it");
         t.check().unwrap();
     }
@@ -423,7 +532,7 @@ mod tests {
         let boot = ThreadId::new(0);
         let mut order = [ThreadId::new(99); 6];
         for slot in order.iter_mut() {
-            t.yield_now().unwrap();
+            yield_now(&mut t).unwrap();
             *slot = t.current();
             t.check().unwrap();
         }
@@ -434,19 +543,19 @@ mod tests {
     fn a_blocked_thread_leaves_the_queue_and_is_not_resumed_until_woken() {
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
-        t.block().unwrap();
+        block(&mut t).unwrap();
         assert_eq!(t.current(), a);
         assert_eq!(t.state(ThreadId::new(0)), Some(State::Blocked));
         t.check().unwrap();
 
         // Yielding cannot bring a blocked thread back.
-        t.yield_now().unwrap();
+        yield_now(&mut t).unwrap();
         assert_eq!(t.current(), a);
         t.check().unwrap();
 
         t.wake(ThreadId::new(0)).unwrap();
         assert_eq!(t.state(ThreadId::new(0)), Some(State::Ready));
-        t.yield_now().unwrap();
+        yield_now(&mut t).unwrap();
         assert_eq!(t.current(), ThreadId::new(0));
         t.check().unwrap();
     }
@@ -456,7 +565,7 @@ mod tests {
         // Switching to nothing would resume an empty context. On a machine the idle
         // thread prevents this; here it must be an error, not a jump.
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
-        assert_eq!(t.block(), Err(Error::NothingRunnable));
+        assert_eq!(block(&mut t), Err(Error::NothingRunnable));
         assert_eq!(t.state(ThreadId::new(0)), Some(State::Running), "nothing changed");
         t.check().unwrap();
     }
@@ -476,14 +585,14 @@ mod tests {
     fn an_exited_thread_is_never_resumed_and_can_be_reaped() {
         let mut t: Threads<MockFull, 8> = Threads::new(p(5));
         let a = spawn(&mut t, 11, 5);
-        t.yield_now().unwrap(); // now running a
-        t.exit().unwrap();
+        yield_now(&mut t).unwrap(); // now running a
+        exit(&mut t).unwrap();
         assert_eq!(t.current(), ThreadId::new(0));
         assert_eq!(t.state(a), Some(State::Exited));
         t.check().unwrap();
 
         for _ in 0..5 {
-            t.yield_now().unwrap();
+            yield_now(&mut t).unwrap();
             assert_ne!(t.current(), a, "an exited thread must never run again");
         }
 
@@ -527,7 +636,7 @@ mod tests {
 
         let before = SWITCHES.load(Ordering::SeqCst);
         // `block` picks the head of the queue, which is the running thread itself.
-        assert_eq!(t.block(), Err(Error::InvariantBroken));
+        assert_eq!(block(&mut t), Err(Error::InvariantBroken));
         assert_eq!(SWITCHES.load(Ordering::SeqCst), before, "no self-switch was attempted");
     }
 
@@ -546,8 +655,8 @@ mod tests {
         // the same class of bug kobject's handle generations prevent.
         let mut t: Threads<MockFull, 2> = Threads::new(p(5));
         let a = unsafe { t.spawn(never, 1, p(5), STACK, SIZE) }.unwrap();
-        t.yield_now().unwrap();
-        t.exit().unwrap();
+        yield_now(&mut t).unwrap();
+        exit(&mut t).unwrap();
         t.reap(a).unwrap();
         let b = unsafe { t.spawn(never, 2, p(5), STACK, SIZE) }.unwrap();
         assert_ne!(a, b, "the slot is reused, the identity is not");
@@ -582,13 +691,13 @@ mod tests {
                     }
                     res.map(|_| ())
                 }
-                1 => t.yield_now(),
-                2 => t.block(),
+                1 => yield_now(&mut t),
+                2 => block(&mut t),
                 3 => match spawned[(r >> 16) as usize % 32] {
                     Some(id) => t.wake(id),
                     None => Ok(()),
                 },
-                4 => t.exit(),
+                4 => exit(&mut t),
                 _ => match spawned[(r >> 24) as usize % 32] {
                     Some(id) => t.reap(id),
                     None => Ok(()),

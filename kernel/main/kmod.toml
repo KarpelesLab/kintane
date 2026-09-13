@@ -8,4 +8,4 @@ layer = "kernel"
 # configuration selects one. The image names the role, never the machine or the
 # loader.
 [deps]
-units = ["hal", "arch", "boot_protocol", "bootinfo", "mm", "selftest", "time"]
+units = ["hal", "arch", "boot_protocol", "bootinfo", "mm", "selftest", "time", "sched", "thread"]
