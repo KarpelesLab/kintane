@@ -86,6 +86,46 @@ impl EarlyConsole for Serial {
     }
 }
 
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Write `v` as `0x` followed by `digits` hex digits, least significant last.
+///
+/// Formatting for the console, on paths where `core::fmt` is not wanted: the fault
+/// reporter runs inside an exception handler, where the formatting machinery's own
+/// panics and unwinds would be a fault inside a fault.
+///
+/// Takes a `u32` where the x86-64 port takes a `u64`, because every value this port
+/// prints through it — a linear address, a control register, an error code — is one
+/// machine word wide. The 36-bit physical addresses that make this target interesting
+/// are printed by `kernel/main`, which has its own wide formatter.
+pub(crate) fn write_hex(c: &dyn EarlyConsole, v: u32, digits: usize) {
+    let mut buf = [0u8; 10];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let n = if digits > 8 { 8 } else { digits };
+    for i in 0..n {
+        let shift = (n - 1 - i) * 4;
+        buf[2 + i] = HEX[((v >> shift) & 0xf) as usize];
+    }
+    c.write_bytes(&buf[..2 + n]);
+}
+
+/// Write `v` in decimal.
+pub(crate) fn write_dec(c: &dyn EarlyConsole, mut v: u32) {
+    if v == 0 {
+        c.write_bytes(b"0");
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    c.write_bytes(&buf[i..]);
+}
+
 // SAFETY: `Serial` holds no state; concurrent writers can interleave bytes but
 // cannot corrupt anything. Ordering becomes a real concern when SMP arrives, and the
 // console gains a lock then, alongside the lock types themselves.

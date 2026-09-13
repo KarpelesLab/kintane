@@ -19,9 +19,48 @@
 //! There is none, and that is deliberate. Everything a handler touches is an atomic
 //! or a port. A lock taken in an interrupt handler must be a lock that no interrupted
 //! code can hold, which is a property that has to be designed rather than hoped for;
-//! the lock types and the per-CPU data they need do not exist yet, so the rule for
-//! Phase 0 is that the interrupt path allocates nothing, locks nothing, and calls
-//! nothing that can fault.
+//! the lock types and the per-CPU data they need do not exist yet, so the rule here is
+//! that the interrupt path allocates nothing, locks nothing, and calls nothing that
+//! can fault.
+//!
+//! ## SSE in the interrupt path
+//!
+//! This target builds with SSE enabled — it has no choice; see
+//! `docs/targets.md#i686` — so the question the x86-64 port never has to ask is live
+//! here: what happens to XMM state when a handler runs?
+//!
+//! The answer is that LLVM's `x86_intrcc` convention treats *every* register as
+//! callee-saved, XMM included when the subtarget has SSE, and the prologue spills
+//! exactly those an individual handler disturbs. So nothing is lost across an
+//! interrupt even though the handlers are ordinary Rust functions whose calls clobber
+//! XMM by the SysV rules. The kernel does not have to save FPU state by hand here, and
+//! `HasFpu::FpuState` staying `()` until Phase 2 is about *context switching* between
+//! tasks, not about interrupt entry.
+//!
+//! The part that would have been a real bug is alignment. A 32-bit interrupt entry
+//! pushes twelve bytes onto a stack of whatever alignment the interrupted code had, and
+//! a 16-byte SSE spill to a misaligned slot is #GP — the kind of failure that happens
+//! on some interrupts and not others. This was verified against the generated code
+//! rather than assumed. Every `x86_intrcc` prologue in the image does, in order:
+//!
+//! ```text
+//!     push %ebp; mov %esp, %ebp     ; frame pointer at the CPU-pushed frame
+//!     push ...                      ; the GPRs this handler disturbs
+//!     and  $-0x10, %esp             ; realign for anything it calls
+//!     movups %xmm7, -0x28(%ebp)     ; ...XMM spilled *unaligned*, relative to ebp
+//!     cld
+//! ```
+//!
+//! So the callee gets an aligned stack (which is what lets the `movaps` LLVM uses to
+//! zero a buffer inside `fatal` be legal), while the spill slots themselves — which
+//! hang off the unaligned `ebp` — are written with the unaligned form. Both halves are
+//! necessary and LLVM gets both right; the reason to write it down is that neither is
+//! obvious from the source, and a future change to the target's feature string would
+//! change the generated code silently.
+//!
+//! The same prologue issues `cld`, so a handler cannot inherit a set direction flag
+//! from interrupted code. What is *not* handled is x87: no kernel code uses it, and
+//! when userspace arrives its state becomes entry-path work rather than an assumption.
 //!
 //! ## What the selftest proves
 //!
@@ -30,23 +69,16 @@
 //! handler returning is itself observable) and a hardware interrupt (the PIT on
 //! IRQ 0). Each reports a counter the handler incremented. If the counter did not
 //! move, the selftest fails — it never concludes success from the absence of a crash.
-//!
-//! A third line reports the #DF stack, and is deliberately weaker: it reads the task
-//! register and the TSS back out of the hardware, which catches a TSS that was built
-//! and never loaded, but it cannot *demonstrate* the stack switch because doing so
-//! means double-faulting and a double fault does not return. That demonstration was
-//! done once, by hand, against a throwaway build; `gdt.rs` records what it showed and
-//! what it did not.
 
 use crate::serial::{write_dec, write_hex};
-use crate::{X86_64, exception, gdt, idt, pic, pit};
+use crate::{I686, exception, idt, pic, pit};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal::{Arch, EarlyConsole, IrqChip, IrqNumber};
 
 /// Install plain (no error code) handlers for a list of vectors.
 ///
 /// The compile-time assertion is the point: a handler whose signature disagrees with
-/// what the CPU pushes reads the frame eight bytes off and `iret`s to nowhere, and
+/// what the CPU pushes reads the frame one stack word off and `iret`s to nowhere, and
 /// that is a failure nobody wants to debug at runtime.
 macro_rules! reserved_gates {
     ($($v:literal),* $(,)?) => {$(
@@ -96,6 +128,13 @@ pub fn irq_chip() -> &'static dyn IrqChip {
 }
 
 /// Timer ticks observed since boot. Written only by the IRQ 0 handler.
+///
+/// 64 bits on a 32-bit machine, which costs a `cmpxchg8b` loop per tick rather than a
+/// single `lock incl`. Deliberate: a 32-bit tick counter wraps in 49 days at 1 kHz,
+/// and a clock that silently restarts is a worse bug than a handful of cycles is a
+/// cost. If the tick handler ever becomes hot enough for this to matter, the answer is
+/// a per-CPU 32-bit counter folded into a 64-bit one outside the interrupt path, not a
+/// narrower clock.
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Set once [`init`] has run, so a second call cannot re-enter the ICW sequence.
@@ -165,16 +204,6 @@ pub fn init() {
         return;
     }
 
-    // The TSS first, because a gate is about to name one of its stacks. Order matters
-    // only in one direction — a gate with an IST index is harmless until the vector is
-    // delivered — but the CPU must have the task register loaded before anything can
-    // double-fault, and "before the IDT exists" is the earliest such point.
-    // SAFETY: `gdt::init` wants to run once, with interrupts masked, before any gate
-    // naming an IST index can be delivered. The `READY` flag above makes it once, the
-    // caller's contract makes it masked, and no vector can be delivered at all until
-    // `idt::load` below.
-    unsafe { gdt::init() };
-
     // Every gate written before the table is loaded, with interrupts masked by the
     // caller's contract: no delivery can observe a partially built table.
     // SAFETY: each entry point below is an `extern "x86-interrupt"` function whose
@@ -190,14 +219,7 @@ pub fn init() {
         idt::set_gate(0, idt::EntryPoint::diverging(exception::divide_error));
         idt::set_gate(3, idt::EntryPoint::plain(exception::breakpoint));
         idt::set_gate(6, idt::EntryPoint::diverging(exception::invalid_opcode));
-        // #DF is the one gate that does not run on the stack it was raised from: the
-        // stack is the thing most likely to have caused it. `gdt::init` has already
-        // filled that slot and loaded the task register.
-        idt::set_gate_on_ist(
-            8,
-            idt::EntryPoint::with_code(exception::double_fault),
-            gdt::DF_IST_INDEX,
-        );
+        idt::set_gate(8, idt::EntryPoint::with_code(exception::double_fault));
         idt::set_gate(
             13,
             idt::EntryPoint::with_code(exception::general_protection),
@@ -215,7 +237,10 @@ pub fn init() {
         irq_gates!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 
         // Everything above the PIC's range. Nothing raises these today; a delivery
-        // means something we do not model, and it says so rather than vanishing.
+        // means something we do not model, and it says so rather than vanishing. On a
+        // BIOS-booted machine that includes the firmware's own software interrupts —
+        // vector 0x10, 0x13 and friends are real-mode BIOS services, and reaching one
+        // from protected mode is a bug that should name itself.
         let mut v: u16 = u16::from(pic::VECTOR_BASE) + u16::from(pic::LINES);
         while v < 256 {
             idt::set_gate(v as u8, idt::EntryPoint::diverging(exception::unexpected));
@@ -238,52 +263,21 @@ pub fn init() {
 pub fn selftest(c: &dyn EarlyConsole) -> bool {
     // We are called from `kmain` with interrupts masked, but say so rather than
     // assume it: everything up to the deliberate `sti` below must be uninterruptible.
-    let _masked = X86_64::irq_save();
+    let _masked = I686::irq_save();
 
     init();
 
     c.write_str("IDT 256 gates, ");
     c.write_str(CHIP.name());
     c.write_str(" on vectors ");
-    write_dec(c, u64::from(pic::VECTOR_BASE));
+    write_dec(c, u32::from(pic::VECTOR_BASE));
     c.write_str("..");
-    write_dec(c, u64::from(pic::VECTOR_BASE) + u64::from(pic::LINES));
+    write_dec(c, u32::from(pic::VECTOR_BASE) + u32::from(pic::LINES));
 
     let bp_ok = check_breakpoint(c);
     let irq_ok = check_timer(c);
-    let df_ok = report_df_stack(c);
 
-    bp_ok && irq_ok && df_ok
-}
-
-/// Report that #DF has a stack of its own, reading the state back from the hardware.
-///
-/// Not a test — the only way to test it is to double-fault, and that is fatal by
-/// architecture — but not an assertion either. The task register is read with `str`
-/// and the stack pointer out of the TSS, so what is printed is what the CPU will
-/// actually do on delivery rather than what this code asked for. The failure this
-/// catches is the realistic one: a TSS built but never loaded, which looks identical
-/// to a working setup right up until the double fault.
-fn report_df_stack(c: &dyn EarlyConsole) -> bool {
-    let tr = gdt::task_register();
-    let top = gdt::df_stack_top();
-    let ok = tr == gdt::TSS_SELECTOR && top != 0;
-
-    c.write_str("\n             #DF  ");
-    if !ok {
-        c.write_str("NO dedicated stack (tr ");
-        write_hex(c, u64::from(tr), 4);
-        c.write_str(")");
-        return false;
-    }
-    c.write_str("on IST");
-    write_dec(c, u64::from(gdt::DF_IST_INDEX));
-    c.write_str(", stack top ");
-    write_hex(c, top, 16);
-    c.write_str(" (tr ");
-    write_hex(c, u64::from(tr), 4);
-    c.write_str(")");
-    true
+    bp_ok && irq_ok
 }
 
 /// Raise #BP and confirm the handler ran and execution continued past it.
@@ -302,9 +296,9 @@ fn check_breakpoint(c: &dyn EarlyConsole) -> bool {
         c.write_str("taken and resumed");
     } else {
         c.write_str("NOT taken (counter ");
-        write_dec(c, u64::from(before));
+        write_dec(c, before);
         c.write_str(" -> ");
-        write_dec(c, u64::from(after));
+        write_dec(c, after);
         c.write_str(")");
     }
     ok
@@ -351,23 +345,44 @@ fn check_timer(c: &dyn EarlyConsole) -> bool {
 
     c.write_str("\n             IRQ0 ");
     if ticks < REQUIRED_TICKS {
-        write_dec(c, ticks);
+        write_dec64(c, ticks);
         c.write_str(" of ");
-        write_dec(c, REQUIRED_TICKS);
+        write_dec64(c, REQUIRED_TICKS);
         c.write_str(" ticks after ");
-        write_dec(c, spins);
+        write_dec64(c, spins);
         c.write_str(" spins");
         return false;
     }
-    write_dec(c, ticks);
+    write_dec64(c, ticks);
     c.write_str(" ticks at ");
-    write_dec(c, u64::from(TEST_HZ));
+    write_dec(c, TEST_HZ);
     c.write_str(" Hz (vector ");
-    write_hex(c, u64::from(pic::VECTOR_BASE), 2);
+    write_hex(c, u32::from(pic::VECTOR_BASE), 2);
     c.write_str(", divisor ");
-    write_dec(c, u64::from(divisor));
+    write_dec(c, u32::from(divisor));
     c.write_str(", ");
-    write_dec(c, spins);
+    write_dec64(c, spins);
     c.write_str(" spins)");
     true
+}
+
+/// Write a 64-bit count in decimal.
+///
+/// Separate from `serial::write_dec`, which takes the machine's native width: the
+/// tick and spin counters are the only 64-bit quantities this port prints, and paying
+/// for 64-bit division on every hex digit elsewhere to avoid one function would be the
+/// wrong trade on a 32-bit target.
+fn write_dec64(c: &dyn EarlyConsole, mut v: u64) {
+    if v == 0 {
+        c.write_bytes(b"0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    c.write_bytes(&buf[i..]);
 }

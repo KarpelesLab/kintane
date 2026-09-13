@@ -10,7 +10,30 @@ demonstrable — something boots, something passes, something fits in a budget �
 |---|---|
 | 0 — Build system and first boot | **done** |
 | 1 — The portability spine | **substantially done** — see below |
-| 2 onward | not started |
+| 2 — Core kernel | in progress |
+| 3 onward | not started |
+
+### Phase 2, so far
+
+Landed: `kernel/sync` (capability-selected locks), `kernel/kalloc` (fallible heap over
+the frame allocator), `kernel/kobject` (rights, handle tables, refcounting), the
+in-kernel test suite, i686 interrupt support, and a TSS with an IST stack for `#DF` on
+x86_64.
+
+**A finding worth carrying forward: an IST is necessary for diagnosing a stack
+overflow and is not sufficient.** With `#DF` given its own stack, a deliberately
+corrupted `RSP` produces a clean fault report — and a control build with the IST index
+set back to 0, changing nothing else, produces no output at all, which is what
+isolates the IST as the cause. But a *genuine* unbounded recursion still does not
+report: the boot stack has no guard page, so the overflow walks straight into the page
+tables that sit below it in `.bss`, unmaps the machine including the IST stack itself,
+and ends in an endless `#PF`/`#DF` alternation. **What makes a stack overflow
+diagnosable is a guard page**, which needs the address-space work this phase is for.
+
+Also worth recording, because it was invisible: the `#DF` stack first landed in
+`.rodata`, because an immutable zeroed static is const data. Harmless under today's
+boot map — 2 MiB pages, writable, no NX — and a triple fault the moment real page
+protections exist, in the one handler whose entire purpose is not to triple-fault.
 
 ### Phase 1, as it actually stands
 
@@ -42,10 +65,6 @@ Not done, and deliberately named rather than quietly folded into "done":
 
 - **No page table manipulation or kernel address space.** The frame allocator exists;
   building mappings on top of it does not. Phase 2.
-- **No i686 interrupt support.** That port boots and reports memory but has no IDT.
-- **No TSS on x86_64**, so `#DF` has no IST: a stack overflow double-faults and then
-  triple-faults while pushing the frame. Needs a GDT entry, and belongs with per-CPU
-  data.
 - **The GIC drivers are in `arch/aarch64/`**, not `drivers/irqchip/` where
   [architecture.md](architecture.md) says they belong, because `arch` may not depend
   on the `device` layer and nothing else would reference them yet. They move when the

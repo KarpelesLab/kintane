@@ -13,6 +13,13 @@
 //! 4. Load a GDT with a 64-bit code segment and far-jump to reload `CS`. Until that
 //!    jump the CPU is in 32-bit compatibility mode.
 //!
+//! The GDT below is the bootstrap one and stops being the live table early: `gdt.rs`
+//! replaces it during interrupt bring-up with a table that also describes a TSS, so
+//! that #DF can be given a stack of its own. It keeps the code descriptor at the same
+//! index with the same bits, which is what lets the replacement happen without a
+//! second far jump — so the two definitions must stay in step, and `gdt.rs` says so
+//! at its copy.
+//!
 //! Written in AT&T syntax because `ljmp $sel, $off` is unambiguous there; LLVM's Intel
 //! far-jump syntax is fiddly enough to be worth avoiding in code that cannot be
 //! unit-tested.

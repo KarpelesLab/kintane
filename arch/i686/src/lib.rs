@@ -9,10 +9,29 @@
 //! physical address here is 36 bits behind a 32-bit `usize`, so `PhysAddr::to_usize`
 //! genuinely fails on this target and nowhere else in tier 1. See
 //! `docs/targets.md#i686` and `hal/src/addr.rs`.
+//!
+//! Interrupt support lives in `idt`, `exception`, `pic`, `pit` and `interrupt`, and is
+//! the same shape as `arch/x86_64`'s without being the same code: the descriptor
+//! format and the pushed frame are genuinely different, and the two devices are
+//! duplicated because the two `arch` crates are separate units that may not depend on
+//! each other. The one gap this port has and x86-64 does not is a dedicated #DF stack;
+//! `idt.rs` records why.
 
+// IDT entry points. The calling convention differs from every other ABI on the
+// machine — the CPU has already pushed a frame the callee must `iret` from, and the
+// callee owns every register — so it cannot be expressed as a normal `extern`. There
+// is no stable alternative short of hand-written assembly trampolines for 256
+// vectors. Listed in toolchain.toml's permitted unstable surface, for this target as
+// well as x86_64.
+#![feature(abi_x86_interrupt)]
 #![no_std]
 
 mod boot;
+mod exception;
+mod idt;
+pub mod interrupt;
+pub mod pic;
+pub mod pit;
 pub mod serial;
 
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};
@@ -149,8 +168,7 @@ pub fn exit_emulator(ok: bool) -> ! {
 /// port. Returns `true` when the path is demonstrably live: a handler ran and
 /// control returned.
 pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    interrupt::selftest(c)
 }
 
 /// The physical range the kernel image occupies, as `[start, end)`.

@@ -14,6 +14,7 @@
 
 mod boot;
 mod exception;
+mod gdt;
 mod idt;
 pub mod interrupt;
 pub mod pic;

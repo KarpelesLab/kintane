@@ -1,0 +1,13 @@
+[unit]
+name = "kalloc"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+# `mm` supplies the physical frames and the shared `AllocError`; `hal` supplies the
+# page size, the address types, and the mock architectures the host tests run
+# against. Nothing here names an architecture, and nothing here names the boot
+# protocol: the memory map is `mm`'s input, not ours — we take frames, not regions.
+[deps]
+units = ["hal", "mm"]
