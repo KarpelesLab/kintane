@@ -1,0 +1,11 @@
+[unit]
+name = "selftest"
+kind = "lib"
+root = "src/lib.rs"
+layer = "subsystem"
+
+[deps]
+units = ["hal", "boot_protocol", "bootinfo", "mm"]
+
+[config]
+requires = "INKERNEL_TESTS"

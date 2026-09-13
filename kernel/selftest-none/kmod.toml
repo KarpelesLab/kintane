@@ -1,0 +1,14 @@
+# The no-op provider of `selftest`, used in every build that is not a test image.
+# A provider pair rather than a cfg inside kmain: the test code is then not merely
+# unreachable in a production image, it is not compiled into it.
+[unit]
+name = "selftest"
+kind = "lib"
+root = "src/lib.rs"
+layer = "subsystem"
+
+[deps]
+units = ["hal"]
+
+[config]
+requires = "!INKERNEL_TESTS"

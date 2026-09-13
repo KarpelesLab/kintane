@@ -127,6 +127,25 @@ jobs:
           done
           exit $fail
 
+      - name: In-kernel tests on every preset
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in config/presets/*.preset; do
+            name=$(basename "$p" .preset)
+            echo "::group::in-kernel tests $name"
+            # Tests that cannot run on the host: real atomics, real interrupt
+            # masking, and the frame allocator over the machine's actual memory map.
+            if ./kbuild/target/release/kbuild test --target --preset "$name" --timeout 60; then
+              echo "in-kernel ok: $name"
+            else
+              echo "::error title=in-kernel tests failed::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       # A failure that cannot be investigated from CI output alone is itself a
       # harness bug, so the exception traces and images are kept.
       - name: Collect failure artifacts

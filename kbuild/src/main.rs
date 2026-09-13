@@ -30,7 +30,9 @@ COMMANDS:
     toolchain            verify the pinned toolchain in toolchain.toml
     config               resolve a configuration and write .config
     build                build the kernel image
-    test                 run host tests against the mock architectures
+    test [--host|--target]
+                         run tests: on the host against the mocks (default),
+                         or in-kernel under QEMU on the real architecture
     lint                 check the in-tree rules rustc cannot express
     run                  build, then boot under QEMU
     clean                remove build outputs (the cache is kept)
@@ -59,7 +61,9 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone)]
 struct Opts {
+    in_kernel: bool,
     only: Option<String>,
     preset: Option<String>,
     sets: Vec<(String, String)>,
@@ -69,6 +73,7 @@ struct Opts {
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts {
+        in_kernel: false,
         only: None,
         preset: None,
         sets: Vec::new(),
@@ -100,12 +105,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 i += 1;
                 o.only = Some(args.get(i).ok_or("--only needs a name")?.clone());
             }
-            // The host is the only test environment for now; in-kernel tests under
-            // QEMU are Phase 2, when there is a kernel worth testing in place.
-            "--host" => {}
-            "--target" => {
-                return Err("in-kernel tests are not implemented yet; only --host".into())
-            }
+            "--host" => o.in_kernel = false,
+            "--target" => o.in_kernel = true,
             "-v" | "--verbose" => o.verbose = true,
             other => return Err(format!("unknown option `{other}`")),
         }
@@ -150,17 +151,35 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "build" => {
             do_build(&root, &opts).map(|_| ())
         }
+        "test" if opts.in_kernel => {
+            // A test image: the real selftest provider is linked in, and the guest's
+            // exit status is the verdict. Console output is for a human reading a
+            // failure, never for the harness to parse.
+            let mut topts = opts.clone();
+            topts.sets.push(("QEMU_EXIT".into(), "y".into()));
+            topts.sets.push(("INKERNEL_TESTS".into(), "y".into()));
+            let (image, res) = do_build(&root, &topts)?;
+            let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
+            let m = qemu::machine_for(&res, &image, &log)?;
+            let outcome = qemu::run(&m, opts.timeout)?;
+            match outcome.code {
+                Some(c) if outcome.passed => {
+                    println!("\n\x1b[32min-kernel tests passed\x1b[0m (qemu exit {c})");
+                    Ok(())
+                }
+                Some(c) => Err(format!(
+                    "in-kernel tests failed: guest exited {c}, expected {}\n  \
+                     the failing checks are in the console output above",
+                    m.success_code
+                )),
+                None => Err("QEMU was terminated by a signal".into()),
+            }
+        }
         "test" => {
             let tc = toolchain::verify(&root)?;
             // Host tests exist to run against the mocks, so the mock architectures
             // are compiled in regardless of what the preset says.
-            let mut topts = Opts {
-                only: opts.only.clone(),
-                preset: opts.preset.clone(),
-                sets: opts.sets.clone(),
-                verbose: opts.verbose,
-                timeout: opts.timeout,
-            };
+            let mut topts = opts.clone();
             topts.sets.push(("MOCK_ARCH".into(), "y".into()));
             let (table, res) = configure(&root, &topts)?;
             let generated = codegen::emit(&table, &res, &root.join("build/host/gen"))?;

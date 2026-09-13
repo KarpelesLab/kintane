@@ -32,8 +32,22 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     unsafe { arch::EARLY.init() };
 
     banner(boot_arg);
+    let c = &arch::EARLY;
 
-    finish(true)
+    // In a production image this is the no-op provider and folds away entirely; the
+    // test image gets the real one. Which is linked is a configuration question, so
+    // there is no cfg here.
+    let (img_start, img_end) = arch::image_range();
+    let reserved = [
+        (0, LOW_MEMORY),
+        (img_start, img_end.saturating_sub(img_start)),
+    ];
+    let ok = selftest::run_all::<Cpu>(c, boot_arg, &reserved);
+    if selftest::PRESENT {
+        c.write_str("\n");
+    }
+
+    finish(ok)
 }
 
 // How the kernel stops depends on the configuration, so the choice is made once, at

@@ -108,3 +108,17 @@ config MOCK_ARCH
         traits in software so that subsystems can be tested on the host
         against several different hardware profiles. Never enabled in a
         kernel image; `kbuild test --host` turns it on.
+
+config INKERNEL_TESTS
+    bool "In-kernel test suite"
+    depends on QEMU_EXIT
+    default n
+    help
+        Compile and run tests that must execute on the real architecture:
+        atomics, interrupt masking, exception entry, and the frame allocator
+        over the machine's actual memory map. Host tests against the mock
+        architectures cover everything that does not need real hardware;
+        this covers what is left.
+
+        Requires a result channel, since the verdict is the guest's exit
+        status rather than console output a harness would have to scrape.
