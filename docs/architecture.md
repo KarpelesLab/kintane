@@ -111,10 +111,11 @@ inputs, verifies them, installs them, and checks them again through the live roo
 - **Device windows**, from `platform::device_windows()`. Neither of the other two
   inputs describes a device. A device left out of the map is a fault on its first
   register access after the switch, and on aarch64, where the console is MMIO, that
-  fault has nowhere to print. On aarch64 the windows are exactly what the drivers bound
-  from the device tree claimed (see [`device`](#device--the-device-framework)); x86 needs
-  none today, because its devices are I/O ports, and passes the architecture's empty list
-  through.
+  fault has nowhere to print. On every port the windows are exactly what the bound
+  drivers claimed (see [`device`](#device--the-device-framework)): on aarch64 from the
+  device tree, and on x86 from ACPI. The PC's console, PIC and PIT are I/O ports, which
+  no page table governs; its windows are the I/O APIC, the local APIC and, on q35, the
+  256 MiB PCI Express configuration window.
 
 Nothing is installed unless every mapping reads back with the intended permissions, the
 guard page reads back unmapped, and the loader's boot data is reachable. After the switch
@@ -389,8 +390,36 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
     raw specifier cells; turning cells into a line number is the controller driver's job.
   - `stdout-path` resolves through `/aliases`, and `clocks` walks each provider's
     `#clock-cells`.
-  - Not yet: `interrupt-map` nexuses (reported as an error), `interrupts-extended`, and
-    ACPI and PCIe enumeration.
+  - Not yet: `interrupt-map` nexuses (reported as an error) and `interrupts-extended`.
+  - Nodes from other enumerators go through `tree::Builder`. Such a node's `Origin`
+    borrows the record that describes it (a `pci::Function` or a `table::Described`), and
+    its name, `compatible` list and register windows are that record's. Windows are CPU
+    addresses the enumerator already read, so `mmio()` skips the `ranges` walk. Binding,
+    claims and parent order work exactly as for device-tree nodes. Their interrupts are
+    not modelled yet.
+- **PCI.** `device::pci` enumerates buses through a `ConfigSpace` the platform provides,
+  and is host-tested against a model bus whose BARs behave like hardware.
+  - Buses are walked breadth first from the segment's first, following bridges, each bus
+    at most once, so misprogrammed bus numbers cannot loop the walk. Function 1 and up
+    are probed only when function 0 says the device is multi-function.
+  - BARs are sized with memory and I/O decoding switched off, except on host bridges, as
+    Linux does. 32- and 64-bit memory BARs, prefetchable ones and 16- and 32-bit I/O BARs
+    are all handled. The command register is written without its status half, whose bits
+    clear when written with ones. `verify_restored` checks afterwards that every BAR and
+    decode bit reads what it read before.
+  - A function's `compatible` list follows the Open Firmware PCI binding, most specific
+    first: `pciVVVV,DDDD`, `pciclass,CCSSPP`, `pciclass,CCSS`. A chip driver and a class
+    driver bind by the same rule as a device-tree driver.
+  - Not yet: resource assignment (BARs are read as firmware left them), INTx routing
+    (needs `_PRT`), capabilities and MSI, segments other than 0.
+- **ACPI.** `boot/acpi` parses the RSDP, RSDT/XSDT, MADT, MCFG and the FADT's PM timer
+  and reset register. There is no `unsafe`: physical memory is read through a trait.
+  Every table's length is capped and its checksum checked before any field is read. A
+  malformed MADT entry ends the walk with an error naming its offset, and an unknown
+  entry type is skipped. Host tests run against the complete table sets of q35 and pc
+  under SeaBIOS and q35 under OVMF (see `boot/acpi/src/testdata/capture.sh`). They check
+  that every single-byte change to any table is rejected, that every truncation is an
+  error, and that fuzzed tables with valid checksums never panic.
 - **Binding.** The node's own `compatible` list decides specificity: its first entry that
   any driver knows wins. A disabled node binds nothing.
 - **Resources.** An MMIO window or an interrupt is claimed through the probe token and
@@ -408,14 +437,46 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
     interrupt path still knows only its timer.
 - **Drivers.** `drivers/irqchip/gic` holds GICv2 and GICv3, moved out of `arch/aarch64`.
   `drivers/serial/pl011` takes its window and its baud divisors from the tree.
-- **Platform.** `kernel/platform/fdt` is the one unit that sees both the drivers and the
-  architecture. It is layer `kernel`, because only the image may name `arch`. The PC ports
-  get `kernel/platform/none`.
+- **Platform.** A platform is the one unit that sees both the drivers and the
+  architecture. It is layer `kernel`, because only the image may name `arch`.
+  `kernel/platform/fdt` serves aarch64 and `kernel/platform/acpi` the PC ports, and
+  `kernel/platform/none` is left for a port with nothing to enumerate.
 
-Boot on aarch64 departs from the diagram below in one place: devices are enumerated
-**before** the kernel address space is built, because that space maps exactly the windows
-the bound drivers claimed. Discovery runs on the boot identity map, which covers every
-device, and ends by installing the GIC as the interrupt path's controller.
+On a PC, `platform/acpi` does the following, before the kernel address space exists:
+
+1. **Finds the RSDP.** It comes from `kinboot-efi` through the boot protocol, or from a
+   scan of the EBDA and the BIOS area.
+2. **Records the MADT.** Processors become `cpu@N` nodes under `cpus`. The local APIC and
+   each I/O APIC become nodes with their register windows.
+3. **Records each MCFG segment** as a `pci-host-ecam-generic` node, the same binding the
+   hardware has in a device tree.
+4. **Enumerates PCI**, through ECAM on q35 or configuration mechanism #1 on pc, and puts
+   every function under its host node or its bridge.
+5. **Binds placeholder drivers** that claim the APIC and ECAM windows and drive nothing.
+   Claiming them now is what gets them mapped, so the SMP work starts from a mapped
+   window instead of a constant.
+
+x86_64's boot identity map was widened from 1 GiB to 4 GiB for this, so that discovery
+reaches the MMIO hole below 4 GiB. Discovery also moved ahead of the paging check, whose
+tables map only the first gigabyte. On those tables, discovery read RAM aliases where the
+ECAM window should be, and found 32 functions, all of vendor zero.
+
+With `QEMU_PCI_TEST_DEVICE`, which every x86 preset sets, discovery also checks what
+QEMU's machines are:
+
+- the host bridge at `00:00.0` is the Q35 MCH when there is an MCFG, and the i440FX
+  otherwise;
+- the MADT lists exactly `QEMU_CPUS` enabled processors (two);
+- `pci-testdev` is found behind the bridge kbuild adds, with its 4 KiB memory BAR and
+  256-byte I/O BAR sized exactly.
+
+A failure prints why and keeps the kernel address space from being installed, as on
+aarch64.
+
+Boot departs from the diagram below in one place: devices are enumerated **before** the
+kernel address space is built, because that space maps exactly the windows the bound
+drivers claimed. Discovery runs on the boot identity map, which covers every device. On
+aarch64 it ends by installing the GIC as the interrupt path's controller.
 
 It refuses to go further, printing why, when the tree and the running kernel disagree:
 
@@ -591,7 +652,7 @@ kintane/
 │   ├── sched/
 │   ├── time/
 │   ├── ipc/
-│   ├── platform/        per-firmware glue: binds drivers, hands the arch its devices
+│   ├── platform/        per-firmware glue (fdt, acpi): binds drivers, hands the arch its devices
 │   └── main/            the linked kernel image
 ├── drivers/
 │   ├── irqchip/

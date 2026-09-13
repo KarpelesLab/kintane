@@ -1,0 +1,534 @@
+//! PCI and PCI Express enumeration.
+//!
+//! PCI is a bus the kernel discovers by asking it. Every function has a 256-byte (PCI)
+//! or 4 KiB (PCI Express) configuration space. What changes between machines is how that
+//! space is reached: through memory-mapped ECAM windows the MCFG table describes, or
+//! through the two I/O ports of configuration mechanism #1 on a PC that predates them.
+//! That difference is [`ConfigSpace`], implemented by the platform. Everything above it
+//! is here, generic, and host-tested against a model bus:
+//!
+//! - [`enumerate`] walks buses from the segment's first, every device and, for multi-function
+//!   devices, every function, and follows bridges to the buses behind them.
+//! - Each function's identity is read: vendor, device, class, subsystem, interrupt pin and line.
+//! - Each base address register is sized without being left disturbed.
+//! - A [`Function`] records what was found, including a `compatible` list so the device model binds
+//!   PCI drivers the same way it binds device-tree drivers.
+//!
+//! # `compatible` for a function
+//!
+//! A PCI function carries no strings, so they are made the way the Open Firmware PCI bus
+//! binding (IEEE 1275, as Linux's `of_pci` reads it) makes them, most specific first:
+//! `pciVVVV,DDDD`, then `pciclass,CCSSPP`, then `pciclass,CCSS`. A driver for one chip
+//! lists the first form; a driver for every AHCI controller lists `pciclass,010601`.
+//!
+//! # Sizing a BAR without disturbing it
+//!
+//! A BAR's size is learned by writing all ones to it and reading back which bits stuck.
+//! For that moment the device decodes at a nonsense address, so memory and I/O decoding
+//! are turned off in the command register first and restored afterwards, along with the
+//! BAR's original value. Host bridges are the exception, as they are in Linux: turning off
+//! a host bridge's decoding can take the path to every other device with it.
+//! [`Function::original_bars`] keeps the values read before sizing, and [`verify_restored`]
+//! checks that configuration space still holds them. The kernel runs that check once
+//! enumeration is done, because a BAR left at all ones works until a driver maps it.
+//!
+//! # What is not here
+//!
+//! Resource assignment: BARs are read as firmware assigned them. Interrupt routing: the
+//! interrupt pin is recorded, and mapping it to a system interrupt needs the ACPI `_PRT`
+//! or the device tree's `interrupt-map`, neither of which is interpreted yet.
+//! Capabilities, MSI, and hot-plug.
+
+use core::fmt;
+
+use crate::text::Text;
+
+/// Where a function is: bus, device and function number, within one segment.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Address {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+}
+
+impl Address {
+    pub const fn new(bus: u8, device: u8, function: u8) -> Address {
+        Address {
+            bus,
+            device,
+            function,
+        }
+    }
+}
+
+impl fmt::Debug for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:02x}:{:02x}.{:x}", self.bus, self.device, self.function)
+    }
+}
+
+/// Access to configuration space.
+///
+/// Reads and writes are 32 bits wide at offsets that are multiples of four, which is the
+/// one width every mechanism supports. Narrower fields are taken from the 32-bit value.
+pub trait ConfigSpace {
+    /// The 32-bit register at `offset` of `at`. A function that does not exist reads as
+    /// all ones, as the hardware reports it.
+    fn read(&self, at: Address, offset: u16) -> u32;
+
+    fn write(&self, at: Address, offset: u16, value: u32);
+}
+
+/// Configuration space offsets (PCI Local Bus Specification 3.0, §6.1).
+mod reg {
+    pub const ID: u16 = 0x00;
+    pub const COMMAND: u16 = 0x04;
+    pub const CLASS: u16 = 0x08;
+    pub const HEADER: u16 = 0x0c;
+    pub const BAR0: u16 = 0x10;
+    /// Type 1 header: primary, secondary and subordinate bus numbers.
+    pub const BUS_NUMBERS: u16 = 0x18;
+    /// Type 0 header: subsystem vendor and subsystem ID.
+    pub const SUBSYSTEM: u16 = 0x2c;
+    pub const INTERRUPT: u16 = 0x3c;
+
+    pub const COMMAND_IO: u32 = 1 << 0;
+    pub const COMMAND_MEMORY: u32 = 1 << 1;
+}
+
+/// The class code of a host bridge, `06/00`.
+pub const CLASS_HOST_BRIDGE: (u8, u8) = (0x06, 0x00);
+
+/// What a base address register decodes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bar {
+    /// Not implemented, or the upper half of the 64-bit BAR before it.
+    None,
+    Memory {
+        base: u64,
+        size: u64,
+        prefetchable: bool,
+        /// A 64-bit BAR, which also uses the next register.
+        wide: bool,
+    },
+    Io {
+        base: u32,
+        size: u32,
+    },
+}
+
+/// The bus numbers behind a bridge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BusRange {
+    pub secondary: u8,
+    pub subordinate: u8,
+}
+
+/// One function, as enumeration found it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Function {
+    pub address: Address,
+    pub vendor: u16,
+    pub device: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub prog_if: u8,
+    pub revision: u8,
+    /// The header layout: 0 for an endpoint, 1 for a PCI-to-PCI bridge, 2 for CardBus.
+    pub header_type: u8,
+    /// Zero for a bridge, which has no subsystem fields.
+    pub subsystem_vendor: u16,
+    pub subsystem: u16,
+    /// 1 to 4 for INTA# to INTD#, 0 for none.
+    pub interrupt_pin: u8,
+    /// What firmware wrote into the line register. Advisory: meaningful only on the
+    /// interrupt controller firmware routed it for.
+    pub interrupt_line: u8,
+    pub bars: [Bar; 6],
+    /// The buses behind this function, when it is a bridge.
+    pub bridge: Option<BusRange>,
+    /// The index, in the same enumeration's output, of the bridge this function is
+    /// behind. `None` on the segment's first bus.
+    pub parent: Option<u16>,
+    /// The command register and BARs as they read before sizing.
+    original_command: u16,
+    original_bars: [u32; 6],
+    name: Text<8>,
+    compatible: Text<48>,
+}
+
+impl Function {
+    /// An unused slot, for sizing the caller's storage.
+    pub const EMPTY: Function = Function {
+        address: Address::new(0, 0, 0),
+        vendor: 0xffff,
+        device: 0xffff,
+        class: 0,
+        subclass: 0,
+        prog_if: 0,
+        revision: 0,
+        header_type: 0,
+        subsystem_vendor: 0,
+        subsystem: 0,
+        interrupt_pin: 0,
+        interrupt_line: 0,
+        bars: [Bar::None; 6],
+        bridge: None,
+        parent: None,
+        original_command: 0,
+        original_bars: [0; 6],
+        name: Text::EMPTY,
+        compatible: Text::EMPTY,
+    };
+
+    /// `bb:dd.f`.
+    pub fn name(&self) -> &[u8] {
+        self.name.as_bytes()
+    }
+
+    /// The `compatible` list: see the module documentation.
+    pub fn compatible(&self) -> &[u8] {
+        self.compatible.as_bytes()
+    }
+
+    pub fn is_host_bridge(&self) -> bool {
+        (self.class, self.subclass) == CLASS_HOST_BRIDGE
+    }
+
+    /// The BAR registers as they read before sizing.
+    pub fn original_bars(&self) -> &[u32] {
+        self.original_bars
+            .get(..bar_count(self.header_type))
+            .unwrap_or(&[])
+    }
+
+    /// The `index`th memory BAR with an assigned base, as a CPU physical `(base, size)`.
+    /// I/O BARs are not memory and are not counted.
+    pub fn memory_bar(&self, index: usize) -> Option<(u64, u64)> {
+        self.bars
+            .iter()
+            .filter_map(|b| match *b {
+                Bar::Memory { base, size, .. } if base != 0 => Some((base, size)),
+                _ => None,
+            })
+            .nth(index)
+    }
+}
+
+/// Why enumeration stopped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Error {
+    /// More functions than the caller's storage holds.
+    TooManyFunctions { capacity: usize },
+    /// A name or `compatible` list did not fit its buffer.
+    Text,
+}
+
+/// Why [`verify_restored`] failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Disturbed {
+    Command {
+        at: Address,
+        was: u16,
+        now: u16,
+    },
+    Bar {
+        at: Address,
+        index: usize,
+        was: u32,
+        now: u32,
+    },
+}
+
+/// How many BARs a header layout has.
+fn bar_count(header_type: u8) -> usize {
+    match header_type {
+        0 => 6,
+        1 => 2,
+        _ => 0,
+    }
+}
+
+/// Every function on buses `first..=last`, reached from `first` and through bridges,
+/// written to `out`. Returns how many.
+///
+/// Buses are visited breadth first, so a bridge always precedes the functions behind it
+/// and [`Function::parent`] always names an earlier entry. A bus is visited at most once,
+/// whatever bridges claim, so misprogrammed bus numbers cannot loop the walk, and a
+/// bridge whose secondary bus is outside `first..=last` is recorded but not followed.
+///
+/// # Errors
+/// [`Error::TooManyFunctions`] when `out` fills: a partial enumeration is not a machine to
+/// bind drivers against.
+pub fn enumerate(
+    cfg: &impl ConfigSpace,
+    first: u8,
+    last: u8,
+    out: &mut [Function],
+) -> Result<usize, Error> {
+    let mut queue = BusQueue::new(first, last);
+    queue.push(first, None);
+
+    let mut n = 0usize;
+    // Bounded: each bus is queued at most once, and there are 256.
+    while let Some((bus, parent)) = queue.pop() {
+        for device in 0..32 {
+            let at = Address::new(bus, device, 0);
+            if vendor(cfg, at) == 0xffff {
+                continue;
+            }
+            let multifunction = cfg.read(at, reg::HEADER) >> 16 & 0x80 != 0;
+            let functions = if multifunction { 8 } else { 1 };
+            for function in 0..functions {
+                let at = Address::new(bus, device, function);
+                if vendor(cfg, at) == 0xffff {
+                    continue;
+                }
+                let capacity = out.len();
+                let slot = out.get_mut(n).ok_or(Error::TooManyFunctions { capacity })?;
+                *slot = read_function(cfg, at, parent)?;
+                if let Some(range) = slot.bridge {
+                    queue.push(range.secondary, u16::try_from(n).ok());
+                }
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// Buses still to walk, each at most once.
+struct BusQueue {
+    first: u8,
+    last: u8,
+    visited: [u64; 4],
+    entries: [(u8, Option<u16>); 256],
+    head: usize,
+    tail: usize,
+}
+
+impl BusQueue {
+    fn new(first: u8, last: u8) -> BusQueue {
+        BusQueue {
+            first,
+            last,
+            visited: [0; 4],
+            entries: [(0, None); 256],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    /// Queue `bus`, reached through the function at index `parent`, unless it is outside
+    /// the segment or has been queued before.
+    fn push(&mut self, bus: u8, parent: Option<u16>) {
+        if !(self.first..=self.last).contains(&bus) {
+            return;
+        }
+        let (word, bit) = (usize::from(bus) / 64, u32::from(bus) % 64);
+        let (Some(seen), Some(slot)) =
+            (self.visited.get_mut(word), self.entries.get_mut(self.tail))
+        else {
+            return;
+        };
+        if *seen & (1 << bit) != 0 {
+            return;
+        }
+        *seen |= 1 << bit;
+        *slot = (bus, parent);
+        self.tail += 1;
+    }
+
+    fn pop(&mut self) -> Option<(u8, Option<u16>)> {
+        if self.head >= self.tail {
+            return None;
+        }
+        let next = *self.entries.get(self.head)?;
+        self.head += 1;
+        Some(next)
+    }
+}
+
+/// Check that configuration space still holds what enumeration read before sizing.
+pub fn verify_restored(cfg: &impl ConfigSpace, functions: &[Function]) -> Result<(), Disturbed> {
+    for f in functions {
+        // Only the decode bits are compared: the rest of the command register is the
+        // driver's, and nothing has been bound yet, but status-changing bits are not what
+        // sizing touches.
+        let decode = (reg::COMMAND_IO | reg::COMMAND_MEMORY) as u16;
+        let now = cfg.read(f.address, reg::COMMAND) as u16;
+        if now & decode != f.original_command & decode {
+            return Err(Disturbed::Command {
+                at: f.address,
+                was: f.original_command,
+                now,
+            });
+        }
+        for (index, &was) in f.original_bars().iter().enumerate() {
+            let now = cfg.read(f.address, reg::BAR0 + 4 * index as u16);
+            if now != was {
+                return Err(Disturbed::Bar {
+                    at: f.address,
+                    index,
+                    was,
+                    now,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn vendor(cfg: &impl ConfigSpace, at: Address) -> u16 {
+    cfg.read(at, reg::ID) as u16
+}
+
+fn read_function(
+    cfg: &impl ConfigSpace,
+    at: Address,
+    parent: Option<u16>,
+) -> Result<Function, Error> {
+    let id = cfg.read(at, reg::ID);
+    let class = cfg.read(at, reg::CLASS);
+    let header = cfg.read(at, reg::HEADER);
+    let header_type = (header >> 16) as u8 & 0x7f;
+    let interrupt = cfg.read(at, reg::INTERRUPT);
+    let (vendor, device) = (id as u16, (id >> 16) as u16);
+    let (class_code, subclass, prog_if, revision) =
+        ((class >> 24) as u8, (class >> 16) as u8, (class >> 8) as u8, class as u8);
+    let (subsystem_vendor, subsystem) = if header_type == 0 {
+        let s = cfg.read(at, reg::SUBSYSTEM);
+        (s as u16, (s >> 16) as u16)
+    } else {
+        (0, 0)
+    };
+    let bridge = (header_type == 1).then(|| {
+        let buses = cfg.read(at, reg::BUS_NUMBERS);
+        BusRange {
+            secondary: (buses >> 8) as u8,
+            subordinate: (buses >> 16) as u8,
+        }
+    });
+
+    let count = bar_count(header_type);
+    let mut original_bars = [0u32; 6];
+    for (i, slot) in original_bars.iter_mut().enumerate().take(count) {
+        *slot = cfg.read(at, reg::BAR0 + 4 * i as u16);
+    }
+    let original_command = cfg.read(at, reg::COMMAND) as u16;
+    let bars =
+        size_bars(cfg, at, count, &original_bars, (class_code, subclass) != CLASS_HOST_BRIDGE);
+
+    let name = Text::format(format_args!("{at:?}")).ok_or(Error::Text)?;
+    let compatible = Text::format(format_args!(
+        "pci{vendor:04x},{device:04x}\0pciclass,{class_code:02x}{subclass:02x}{prog_if:02x}\0\
+         pciclass,{class_code:02x}{subclass:02x}\0"
+    ))
+    .ok_or(Error::Text)?;
+
+    Ok(Function {
+        address: at,
+        vendor,
+        device,
+        class: class_code,
+        subclass,
+        prog_if,
+        revision,
+        header_type,
+        subsystem_vendor,
+        subsystem,
+        interrupt_pin: (interrupt >> 8) as u8,
+        interrupt_line: interrupt as u8,
+        bars,
+        bridge,
+        parent,
+        original_command,
+        original_bars,
+        name,
+        compatible,
+    })
+}
+
+/// Size the first `count` BARs of `at`, restoring each and the command register.
+fn size_bars(
+    cfg: &impl ConfigSpace,
+    at: Address,
+    count: usize,
+    original: &[u32; 6],
+    quiesce: bool,
+) -> [Bar; 6] {
+    let mut bars = [Bar::None; 6];
+    if count == 0 {
+        return bars;
+    }
+    let command = cfg.read(at, reg::COMMAND);
+    // Status is the register's upper half and its bits clear when written with ones, so
+    // the write carries only the command half.
+    let decode_off = command & 0xffff & !(reg::COMMAND_IO | reg::COMMAND_MEMORY);
+    if quiesce {
+        cfg.write(at, reg::COMMAND, decode_off);
+    }
+
+    let mut i = 0;
+    // Bounded: advances by one or two registers a pass.
+    while i < count {
+        let offset = reg::BAR0 + 4 * i as u16;
+        let was = original.get(i).copied().unwrap_or(0);
+        cfg.write(at, offset, 0xffff_ffff);
+        let low = cfg.read(at, offset);
+        cfg.write(at, offset, was);
+
+        if was & 1 != 0 {
+            // I/O. A 16-bit decoder leaves the upper half zero; the size is only over the
+            // bits it implements.
+            let mask = low & !0x3;
+            if mask != 0 {
+                let implemented = if mask >> 16 == 0 {
+                    mask | 0xffff_0000
+                } else {
+                    mask
+                };
+                if let Some(slot) = bars.get_mut(i) {
+                    *slot = Bar::Io {
+                        base: was & !0x3,
+                        size: (!implemented).wrapping_add(1),
+                    };
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        let wide = (was >> 1) & 0x3 == 0x2 && i + 1 < count;
+        let prefetchable = was & 0x8 != 0;
+        let (high_was, high) = if wide {
+            let high_offset = offset + 4;
+            let high_was = original.get(i + 1).copied().unwrap_or(0);
+            cfg.write(at, high_offset, 0xffff_ffff);
+            let high = cfg.read(at, high_offset);
+            cfg.write(at, high_offset, high_was);
+            (high_was, high)
+        } else {
+            // A 32-bit BAR decodes nothing above four gigabytes.
+            (0, 0xffff_ffff)
+        };
+        let mask = (u64::from(high) << 32) | u64::from(low & !0xf);
+        let base = (u64::from(high_was) << 32) | u64::from(was & !0xf);
+        if low & !0xf != 0 || (wide && high != 0) {
+            if let Some(slot) = bars.get_mut(i) {
+                *slot = Bar::Memory {
+                    base,
+                    size: (!mask).wrapping_add(1),
+                    prefetchable,
+                    wide,
+                };
+            }
+        }
+        i += if wide { 2 } else { 1 };
+    }
+
+    if quiesce {
+        cfg.write(at, reg::COMMAND, command & 0xffff);
+    }
+    bars
+}

@@ -1,0 +1,16 @@
+# The ACPI table parser: RSDP, RSDT/XSDT, MADT, MCFG and the FADT fields the kernel reads.
+#
+# The PC's counterpart to `boot/fdt`, and like it pure byte-slice parsing with no
+# `unsafe`: reading physical memory is the caller's job, behind a trait, which is what
+# lets the host tests run against tables QEMU's firmware really built. No
+# `config.requires`: ACPI also describes arm64 servers, and the parser has no reason to
+# know which machine it is on.
+[unit]
+name = "acpi"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "hal"
+
+[deps]
+units = []

@@ -198,6 +198,26 @@ for everyday work. The two differ only in how the kernel is entered and where it
 memory map comes from, and a kernel built for the loader fails its boot check if the
 handover is missing — a lost `rdi` must not read as "no memory map on this port".
 
+Every x86 row also gets two CPUs (`QEMU_CPUS`) and, with `QEMU_PCI_TEST_DEVICE`, a
+`pci-testdev` behind a bridge: a PCI Express root port on q35, a PCI-to-PCI bridge on pc.
+The kernel starts only one CPU, and nothing drives the test device. They exist so that
+device discovery has something to be wrong about:
+
+- the MADT must list exactly two enabled processors;
+- enumeration must follow the bridge to find the device;
+- its BARs must size to exactly 4 KiB of memory and 256 bytes of I/O;
+- the host bridge at `00:00.0` must be the chipset the machine type implies.
+
+Discovery also re-reads every BAR it sized and fails the boot if any reads differently.
+Each of these was falsified by mutation; see the device model in
+[architecture.md](architecture.md#device--the-device-framework).
+
+The ACPI parser's host tests read the firmware's tables from three of these machines,
+captured without booting anything: `boot/acpi/src/testdata/capture.sh` starts the
+machine with no kernel, lets the firmware build its tables and fail to find a boot
+device, saves guest memory through the QEMU monitor, and extracts the RSDP and every
+table it reaches.
+
 QEMU also ships system emulators for `m68k`, `sparc`, `sh4`, `mips`, `alpha`, `hppa`,
 and `ppc` — every architecture in the
 [tier-3 long tail](targets.md#tier-3-and-the-long-tail). A contributed port can have CI

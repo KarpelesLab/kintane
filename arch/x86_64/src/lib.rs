@@ -23,6 +23,7 @@ mod idt;
 pub mod interrupt;
 pub mod kspace;
 pub mod paging;
+pub mod pc;
 pub mod pic;
 pub mod pit;
 pub mod serial;

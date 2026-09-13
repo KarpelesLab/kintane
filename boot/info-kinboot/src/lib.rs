@@ -81,6 +81,33 @@ pub fn regions_from(address: u64, bytes: &[u8], out: &mut [MemoryRegion]) -> Res
     Ok(n + 1)
 }
 
+/// The physical address of the ACPI RSDP the loader recorded, if it recorded one.
+///
+/// # Safety
+/// As [`memory_regions`].
+pub unsafe fn acpi_rsdp(boot_arg: u64) -> Option<u64> {
+    if boot_arg == 0 {
+        return None;
+    }
+    let base = usize::try_from(boot_arg).ok()?;
+    // SAFETY: the caller guarantees the header is readable; see `memory_regions`.
+    let head: [u8; tags::HEADER_SIZE] = unsafe {
+        core::ptr::read_unaligned(core::ptr::with_exposed_provenance::<[u8; tags::HEADER_SIZE]>(
+            base,
+        ))
+    };
+    let total = tags::header(&head).ok()?.total_size();
+    if total > MAX_BOOT_INFO_BYTES || base.checked_add(total)? > isize::MAX.unsigned_abs() {
+        return None;
+    }
+    // SAFETY: as in `memory_regions`: a valid header, a capped length checked not to wrap,
+    // and a slice that does not outlive this call.
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(core::ptr::with_exposed_provenance::<u8>(base), total)
+    };
+    tags::parse(bytes).ok()?.acpi_rsdp().ok()?
+}
+
 fn translate(e: boot_protocol::Error) -> Error {
     match e {
         boot_protocol::Error::BadMagic => Error::NoLoader,

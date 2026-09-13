@@ -6,10 +6,26 @@
 //! addresses, which interrupts, which controller — are answered on demand from those
 //! slices, with every cell count checked.
 //!
-//! ACPI and PCIe do not exist yet. They are why this is a separate representation
-//! rather than a thin wrapper over `boot/fdt`'s token stream: a driver binds to a
-//! node and claims its resources, and should not learn which firmware table the node
-//! came from.
+//! It is a separate representation rather than a thin wrapper over `boot/fdt`'s token
+//! stream because the device tree is only one of the enumerators. A driver binds to a
+//! node and claims its resources, and should not learn which firmware described the
+//! node.
+//!
+//! # Nodes from somewhere other than a device tree
+//!
+//! PCI enumeration and firmware tables such as ACPI's MADT produce nodes too, through
+//! [`Builder`]. Such a node's [`Origin`] borrows the record that describes it, a
+//! [`crate::pci::Function`] or a [`crate::table::Described`], and its name and
+//! `compatible` list are that record's. Its register windows are CPU physical addresses
+//! the enumerator already read: a BAR, a MADT address. So [`DeviceTree::mmio`] returns
+//! them without the `ranges` walk, which only means something for a device tree.
+//! Everything else is the same. Binding goes by `compatible`, claims go through the
+//! same ledger, and a parent precedes its children, so a function behind a PCI bridge is
+//! the bridge node's child.
+//!
+//! Interrupts of such nodes are not modelled yet. A PCI function's pin is in its record;
+//! turning it into a controller input needs the ACPI `_PRT` or an `interrupt-map`, and
+//! [`DeviceTree::interrupt`] reports no entry rather than guess.
 //!
 //! # Cell counts
 //!
@@ -35,6 +51,9 @@
 //! error rather than an MMIO window at physical zero.
 
 use fdt::{Fdt, Token};
+
+use crate::pci::Function;
+use crate::table::Described;
 
 /// The deepest nesting a tree may have. `boot/fdt` enforces the same limit while
 /// validating, so a tree it accepted always fits.
@@ -117,6 +136,19 @@ pub struct Node<'a> {
     clock_cells: Cell,
     interrupt_controller: bool,
     interrupt_map: bool,
+    origin: Origin<'a>,
+}
+
+/// Which enumerator produced a node, and the record it borrows when that was not a
+/// device tree.
+#[derive(Clone, Copy, Debug)]
+pub enum Origin<'a> {
+    /// A device-tree node: every property the model reads is a slice of the blob.
+    DeviceTree,
+    /// A function PCI enumeration found.
+    Pci(&'a Function),
+    /// A device a firmware table describes.
+    Table(&'a Described),
 }
 
 impl<'a> Node<'a> {
@@ -141,7 +173,13 @@ impl<'a> Node<'a> {
         clock_cells: Cell::Absent,
         interrupt_controller: false,
         interrupt_map: false,
+        origin: Origin::DeviceTree,
     };
+
+    /// Which enumerator produced this node.
+    pub fn origin(&self) -> Origin<'a> {
+        self.origin
+    }
 
     /// The node name, unit address included: `pl011@9000000`. Empty for the root.
     pub fn name(&self) -> &'a [u8] {
@@ -290,6 +328,8 @@ pub enum Error {
     InterruptNexus { node: NodeId, nexus: NodeId },
     /// The interrupt parent does not say it is an interrupt controller.
     NotAnInterruptController { node: NodeId, parent: NodeId },
+    /// A [`Builder`] was asked to add a node under one it has not added.
+    UnknownParent { parent: NodeId },
 }
 
 impl From<fdt::Error> for Error {
@@ -299,9 +339,92 @@ impl From<fdt::Error> for Error {
 }
 
 /// A device tree's nodes, built once and read thereafter.
+///
+/// Called a tree whichever enumerator filled it: it is the machine's device hierarchy,
+/// and a flattened device tree is one way of being told it.
 pub struct DeviceTree<'a, 's> {
-    fdt: Fdt<'a>,
+    /// The blob, when the nodes came from one. Only aliases need it.
+    fdt: Option<Fdt<'a>>,
     nodes: &'s [Node<'a>],
+}
+
+/// Builds a tree from enumerators other than a device tree: PCI, firmware tables.
+///
+/// Nodes are added parent first, as [`DeviceTree::build`] stores them, so every question
+/// that walks up the tree works the same on the result.
+pub struct Builder<'a, 's> {
+    nodes: &'s mut [Node<'a>],
+    len: usize,
+}
+
+impl<'a, 's> Builder<'a, 's> {
+    /// Start a tree in `storage`, with an empty root.
+    ///
+    /// # Errors
+    /// [`Error::TooManyNodes`] when `storage` cannot hold even the root.
+    pub fn new(storage: &'s mut [Node<'a>]) -> Result<Builder<'a, 's>, Error> {
+        let capacity = storage.len();
+        let root = storage
+            .first_mut()
+            .ok_or(Error::TooManyNodes { capacity })?;
+        *root = Node::EMPTY;
+        Ok(Builder {
+            nodes: storage,
+            len: 1,
+        })
+    }
+
+    /// Add a node under `parent`. `name` and `compatible` are usually the record's own.
+    ///
+    /// # Errors
+    /// [`Error::UnknownParent`] for a parent this builder has not added, and
+    /// [`Error::TooManyNodes`] when the storage is full.
+    pub fn add(
+        &mut self,
+        parent: NodeId,
+        name: &'a [u8],
+        compatible: &'a [u8],
+        origin: Origin<'a>,
+    ) -> Result<NodeId, Error> {
+        if parent.index() >= self.len {
+            return Err(Error::UnknownParent { parent });
+        }
+        let capacity = self.nodes.len().min(usize::from(u16::MAX));
+        let index = u16::try_from(self.len)
+            .ok()
+            .filter(|&i| usize::from(i) < capacity)
+            .ok_or(Error::TooManyNodes { capacity })?;
+        let slot = self
+            .nodes
+            .get_mut(self.len)
+            .ok_or(Error::TooManyNodes { capacity })?;
+        *slot = Node {
+            name,
+            parent: Some(parent),
+            compatible,
+            origin,
+            ..Node::EMPTY
+        };
+        self.len += 1;
+        Ok(NodeId(index))
+    }
+
+    /// How many nodes have been added, the root included.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn finish(self) -> DeviceTree<'a, 's> {
+        let nodes: &'s [Node<'a>] = self.nodes;
+        DeviceTree {
+            fdt: None,
+            nodes: nodes.get(..self.len).unwrap_or(&[]),
+        }
+    }
 }
 
 impl<'a, 's> DeviceTree<'a, 's> {
@@ -363,7 +486,10 @@ impl<'a, 's> DeviceTree<'a, 's> {
         }
 
         let nodes = storage.get(..n).unwrap_or(&[]);
-        Ok(DeviceTree { fdt: *fdt, nodes })
+        Ok(DeviceTree {
+            fdt: Some(*fdt),
+            nodes,
+        })
     }
 
     /// Every node, in tree order.
@@ -424,7 +550,7 @@ impl<'a, 's> DeviceTree<'a, 's> {
     /// structure block, which is already known to be well-formed.
     fn alias(&self, name: &[u8]) -> Option<NodeId> {
         let mut in_aliases = false;
-        for token in self.fdt.tokens() {
+        for token in self.fdt.as_ref()?.tokens() {
             match token.ok()? {
                 Token::BeginNode { name: n, depth, .. } => {
                     in_aliases = depth == 2 && n == b"aliases";
@@ -493,18 +619,42 @@ impl<'a, 's> DeviceTree<'a, 's> {
         Ok((reg, ac, entry))
     }
 
-    /// How many `reg` entries `id` has. Zero when it has none or they cannot be read.
+    /// How many register windows `id` has: `reg` entries for a device-tree node, assigned
+    /// memory BARs for a PCI function, the record's windows for a described device. Zero
+    /// when it has none or they cannot be read.
     pub fn mmio_count(&self, id: NodeId) -> usize {
-        self.reg_entries(id)
-            .map(|(reg, _, entry)| reg.len() / entry)
-            .unwrap_or(0)
+        match self.node(id).origin {
+            Origin::DeviceTree => self
+                .reg_entries(id)
+                .map(|(reg, _, entry)| reg.len() / entry)
+                .unwrap_or(0),
+            Origin::Pci(f) => (0..6).take_while(|&i| f.memory_bar(i).is_some()).count(),
+            Origin::Table(d) => d.windows().len(),
+        }
     }
 
-    /// The `index`th `reg` entry of `id`, as a CPU physical `(address, length)`.
+    /// The `index`th register window of `id`, as a CPU physical `(address, length)`.
+    ///
+    /// For a device-tree node that is its `index`th `reg` entry, translated up through
+    /// the ancestors' `ranges`. For a PCI function it is the `index`th memory BAR that
+    /// firmware assigned, I/O BARs not counted; for a described device, its record's
+    /// `index`th window.
     ///
     /// # Errors
     /// Whatever makes the entry uninterpretable or invisible to the CPU; see [`Error`].
     pub fn mmio(&self, id: NodeId, index: usize) -> Result<(u64, u64), Error> {
+        let window = match self.node(id).origin {
+            Origin::DeviceTree => None,
+            Origin::Pci(f) => Some(f.memory_bar(index)),
+            Origin::Table(d) => Some(d.windows().get(index).copied()),
+        };
+        if let Some(window) = window {
+            let (phys, len) = window.ok_or(Error::NoSuchEntry { node: id, index })?;
+            if phys.checked_add(len).is_none() {
+                return Err(Error::RegionOverflow { node: id });
+            }
+            return Ok((phys, len));
+        }
         let (reg, ac, entry) = self.reg_entries(id)?;
         let raw = reg
             .chunks_exact(entry)

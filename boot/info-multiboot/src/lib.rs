@@ -28,6 +28,15 @@ pub enum Error {
 /// How this platform learns its memory layout, for the banner.
 pub const SOURCE: &str = "multiboot";
 
+/// The ACPI RSDP a loader recorded. Multiboot 1 has no field for one, so always `None`,
+/// and the platform finds it by scanning the BIOS areas instead.
+///
+/// # Safety
+/// None required; `unsafe` so every `bootinfo` provider has one signature.
+pub unsafe fn acpi_rsdp(_boot_arg: u64) -> Option<u64> {
+    None
+}
+
 /// Fill `out` with the memory map the loader provided, returning how many regions
 /// were written.
 ///

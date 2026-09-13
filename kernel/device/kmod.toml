@@ -3,9 +3,11 @@
 #
 # Layer `device`, below `drivers/` in spirit though not in rank: drivers are also
 # layer `device` and depend on this. It reads the flattened device tree through
-# `boot/fdt` and nothing else — ACPI and PCIe will enumerate into the same nodes from
-# their own units. No `config.requires`: a device tree describes aarch64, RISC-V and
-# most ARM boards, and the model is pure enough to be host-tested under any preset.
+# `boot/fdt`, and enumerates PCI itself through a configuration-space trait; firmware
+# tables such as ACPI are parsed by a platform and handed in as records, so the model
+# depends on no table format. No `config.requires`: a device tree describes aarch64,
+# RISC-V and most ARM boards, PCI is on every kind of machine, and the model is pure
+# enough to be host-tested under any preset.
 [unit]
 name = "device"
 kind = "lib"

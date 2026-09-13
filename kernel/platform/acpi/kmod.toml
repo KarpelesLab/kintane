@@ -1,0 +1,17 @@
+# The `platform` provider for PCs: ACPI tables and PCI enumeration into the device model.
+#
+# Layer `kernel` for the same reason as `platform/fdt`: it reads firmware through the
+# device model and binds drivers, which the architecture may not depend on, and it
+# needs the architecture's port I/O and boot identity map, which only the kernel image
+# may name.
+[unit]
+name = "platform"
+kind = "lib"
+root = "src/lib.rs"
+layer = "kernel"
+
+[deps]
+units = ["hal", "arch", "bootinfo", "device", "acpi"]
+
+[config]
+requires = "ARCH_X86_64 || ARCH_I686"

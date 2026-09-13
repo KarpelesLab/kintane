@@ -1,7 +1,8 @@
-# The `platform` provider for ports with nothing to enumerate yet: the PC ports, whose
-# console, timer and interrupt controller sit at fixed I/O ports the architecture
-# drives directly. The device windows are still the architecture's, passed through, so
-# kmain asks `platform` on every port and never learns which kind it has.
+# The `platform` provider for ports with nothing to enumerate yet. Today that is no port:
+# aarch64 has `platform/fdt` and the PCs have `platform/acpi`. It stays for the next
+# architecture, whose first boot should not need a device model. The device windows are
+# the architecture's, passed through, so kmain asks `platform` on every port and never
+# learns which kind it has.
 #
 # The condition must exclude every architecture another provider claims.
 [unit]
@@ -14,4 +15,4 @@ layer = "kernel"
 units = ["hal", "arch"]
 
 [config]
-requires = "!ARCH_AARCH64"
+requires = "!(ARCH_AARCH64 || ARCH_X86_64 || ARCH_I686)"

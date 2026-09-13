@@ -206,16 +206,12 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     c.write_str(if kconfig::MM_PAGED { "y" } else { "n" });
     c.write_str(" DEBUG=");
     c.write_str(if kconfig::DEBUG_BUILD { "y" } else { "n" });
-    // Before `memory`, because this is where the architecture turns on the features
-    // the kernel's own address space depends on — NXE among them. Building that space
-    // first produced data mappings with no NX, which the space's own check caught.
-    c.write_str("\n  pagetable  ");
-    let paging_ok = arch::paging_selftest(c);
-    c.write_str(if paging_ok { " ok" } else { "" });
-
     // Before `memory`, because the kernel's address space maps the device windows the
     // drivers found here claim, and before interrupts, because this is where the
-    // interrupt controller is bound.
+    // interrupt controller is bound. Before `pagetable` too, because that check leaves
+    // its own tables installed, which identity-map only the first gigabyte: discovery on
+    // a PC reads the PCI Express window and the APICs just below 4 GiB, and on those
+    // tables it read RAM aliases instead, as 32 functions all of vendor zero.
     c.write_str("\n  devices    ");
     // SAFETY: once, with interrupts masked, on the boot identity map, with `boot_arg` as
     // the boot code passed it — `discover`'s contract on every provider.
@@ -223,6 +219,13 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         None => Check::Skipped,
         Some(ok) => Check::from_ok(ok),
     };
+
+    // Before `memory`, because this is where the architecture turns on the features
+    // the kernel's own address space depends on — NXE among them. Building that space
+    // first produced data mappings with no NX, which the space's own check caught.
+    c.write_str("\n  pagetable  ");
+    let paging_ok = arch::paging_selftest(c);
+    c.write_str(if paging_ok { " ok" } else { "" });
 
     let (mem, live) = memory(c, boot_arg);
 
