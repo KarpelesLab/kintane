@@ -153,7 +153,15 @@ pub trait PageTableEntry: Copy + Sized + Send + Sync + 'static {
     /// Intermediate entries are deliberately permissive on architectures where
     /// permissions intersect down the tree: restricting here would silently cap every
     /// leaf beneath, and the leaf is where the intent is expressed.
-    fn table(table: PhysAddr) -> Self;
+    ///
+    /// Takes the level because one architecture needs it, and that architecture is
+    /// the reason this parameter exists. A 32-bit PAE PDPT entry has **only** the
+    /// present bit and the two cache bits — bits 1 and 2 are reserved, and setting
+    /// them faults on the write to CR3 — while the page directory entry one level
+    /// down needs exactly those bits set or every leaf beneath it is read-only and
+    /// supervisor-only. There is no single encoding that is correct at both levels,
+    /// so there cannot be a single answer without the level.
+    fn table(table: PhysAddr, level: u8) -> Self;
 
     /// An entry mapping `frame` with `flags` at `level`.
     fn leaf(frame: PhysAddr, flags: PageFlags, level: u8) -> Self;

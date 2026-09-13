@@ -229,7 +229,7 @@ impl<A: HasPageTables> AddressSpace<A> {
             let e = self.read(table, idx)?;
             table = if !e.is_present() {
                 let new = frames.alloc_zeroed()?;
-                self.write(table, idx, A::Entry::table(new))?;
+                self.write(table, idx, A::Entry::table(new, l))?;
                 new
             } else if e.is_leaf(l) {
                 // A huge page already covers this address. Replacing it would unmap
@@ -244,6 +244,14 @@ impl<A: HasPageTables> AddressSpace<A> {
         let idx = level_index::<A>(virt, level);
         if self.read(table, idx)?.is_present() {
             return Err(MapError::AlreadyMapped);
+        }
+        // `PageTableEntry::leaf` has no error channel, so an address too wide for the
+        // architecture's entry encoding would be silently truncated into a mapping
+        // pointing somewhere else entirely. Checked once here rather than in each
+        // port, where three implementations would be three chances to mask instead of
+        // report.
+        if phys.truncate(A::PHYS_ADDR_BITS).1 {
+            return Err(MapError::BadPhysAddr);
         }
         self.write(table, idx, A::Entry::leaf(phys, flags, level))?;
         Ok(())

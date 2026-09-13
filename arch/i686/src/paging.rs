@@ -226,14 +226,17 @@ impl PageTableEntry for Entry {
         }
         f
     }
-
-    /// An entry naming the next-level table at `table`.
+    /// A PDPT entry (level 2) carries the present bit and the cache bits and nothing
+    /// else — bits 1 and 2 are reserved there and setting them faults on the write to
+    /// CR3 — while a page directory entry (level 1) needs R/W and U/S set or every
+    /// leaf beneath it is capped read-only and supervisor-only.
     ///
-    /// **Encoded for level 1.** See the module comment: the trait gives no level, and
-    /// the PDPT needs a different encoding. Use [`Entry::table_at`] when the level is
-    /// known, which on this target it always is.
-    fn table(table: PhysAddr) -> Entry {
-        Entry::table_at(table, 1)
+    /// This port is why `table` takes a level at all. Before it did, the only
+    /// possible implementation returned the level-1 encoding unconditionally, and a
+    /// shared walker writing that into a PDPT slot produced a root that #GPs the
+    /// instant it is installed.
+    fn table(table: PhysAddr, level: u8) -> Entry {
+        Entry::table_at(table, level)
     }
 
     fn leaf(frame: PhysAddr, flags: PageFlags, level: u8) -> Entry {

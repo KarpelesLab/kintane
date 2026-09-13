@@ -198,7 +198,7 @@ impl PageTableEntry for Entry {
         f
     }
 
-    fn table(table: PhysAddr) -> Self {
+    fn table(table: PhysAddr, _level: u8) -> Self {
         // Permissive on purpose, and on x86 that is not merely a convention: the
         // effective permission of a translation is the AND of every level, so clearing
         // R/W or U/S here would cap every leaf beneath this entry and the leaf's own
@@ -641,7 +641,7 @@ fn map(
             Table::from_phys(entry.address())
         } else {
             let fresh = alloc_table().ok_or(MapError::OutOfFrames)?;
-            table.set(index, Entry::table(fresh.phys()));
+            table.set(index, Entry::table(fresh.phys(), level));
             fresh
         };
         level = level.saturating_sub(1);

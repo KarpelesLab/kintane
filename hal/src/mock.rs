@@ -152,7 +152,7 @@ impl PageTableEntry for MockEntry {
     fn flags(self, _level: u8) -> PageFlags {
         PageFlags::from_bits_truncate(((self.0 & M_FLAG_MASK) >> M_FLAG_SHIFT) as u16)
     }
-    fn table(table: PhysAddr) -> Self {
+    fn table(table: PhysAddr, _level: u8) -> Self {
         MockEntry((table.raw() & M_ADDR_MASK) | M_PRESENT)
     }
     fn leaf(frame: PhysAddr, flags: PageFlags, _level: u8) -> Self {

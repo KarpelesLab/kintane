@@ -340,6 +340,20 @@ fn a_physical_address_beyond_the_pointer_width_round_trips() {
 }
 
 #[test]
+fn a_physical_address_too_wide_for_the_architecture_is_refused() {
+    // `PageTableEntry::leaf` has no error channel, so without this check the address
+    // would be silently truncated by the port and the mapping would point somewhere
+    // else entirely — present, plausible, and wrong.
+    let (mut mem, mut space) = setup(64);
+    let too_wide = PhysAddr::new(1u64 << MockFull::PHYS_ADDR_BITS);
+    assert_eq!(
+        space.map(V, too_wide, PAGE, PageFlags::KERNEL_DATA, &mut mem),
+        Err(MapError::BadPhysAddr)
+    );
+    assert_eq!(space.translate(V), None, "and nothing was left behind");
+}
+
+#[test]
 fn mapping_several_pages_covers_all_of_them() {
     let (mut mem, mut space) = setup(64);
     let n = 5;

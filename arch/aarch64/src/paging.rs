@@ -213,7 +213,7 @@ impl PageTableEntry for Entry {
         f
     }
 
-    fn table(table: PhysAddr) -> Self {
+    fn table(table: PhysAddr, _level: u8) -> Self {
         debug_assert!(table.is_aligned(<Aarch64 as Arch>::PAGE_SIZE as u64));
         // All four of NSTable, APTable, UXNTable and PXNTable left clear: permissions
         // on AArch64 intersect down the tree, so restricting here would cap every leaf
@@ -543,7 +543,7 @@ unsafe fn map_page(va: usize, pa: PhysAddr, flags: PageFlags) -> Result<(), MapE
             let addr = PhysAddr::new(page_addr(fresh));
             // SAFETY: as above; the table is statically allocated, zeroed, and not yet
             // referenced by anything.
-            unsafe { write_entry(table, index, Entry::table(addr)) };
+            unsafe { write_entry(table, index, Entry::table(addr, level)) };
             addr
         } else if e.is_leaf(level) {
             // Splitting a block is the shared walker's job, not this one's.
@@ -597,12 +597,12 @@ pub unsafe extern "C" fn aarch64_mmu_init() {
     // walking them; and this runs on the only CPU that is out of its parking loop.
     unsafe {
         // The low 512 GiB of the address space hangs off entry 0 of the root.
-        write_entry(root, 0, Entry::table(low));
+        write_entry(root, 0, Entry::table(low, 3));
         // One 1 GiB Device block covering every MMIO window on this machine.
         write_entry(phys_to_ptr(low), 0, Entry::leaf(PhysAddr::new(0), device, 2));
         // RAM gets 2 MiB blocks rather than a second 1 GiB block, because the
         // permission split the image needs later is a refinement of these.
-        write_entry(phys_to_ptr(low), 1, Entry::table(ram));
+        write_entry(phys_to_ptr(low), 1, Entry::table(ram, 2));
     }
 
     let ram_ptr = phys_to_ptr(ram);
@@ -891,12 +891,15 @@ fn encoding_round_trips() -> bool {
 
     // A table descriptor is not a leaf at any level where it can appear, and it is
     // permissive, because AArch64 intersects permissions down the tree.
-    let t = Entry::table(frame);
     for level in 1..=3u8 {
+        let t = Entry::table(frame, level);
         if !t.is_present() || t.is_leaf(level) || t.address() != frame {
             return false;
         }
     }
+
+    // Built at a non-leaf level, which is where a table descriptor belongs.
+    let t = Entry::table(frame, 2);
     let permissive = PageFlags::KERNEL_DATA | PageFlags::EXECUTE | PageFlags::USER;
     if t.flags(2) != permissive {
         return false;
