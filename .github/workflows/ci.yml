@@ -88,6 +88,24 @@ jobs:
           done < <(git ls-files '*.rs')
           exit $fail
 
+  # Host tests run against a host `core`, which has every atomic, so they cannot show
+  # that a unit compiles for a machine without compare-and-swap. This can. Core is built
+  # from the pinned toolchain's rust-src, so no extra rustup targets are needed.
+  portability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - run: cargo build --release --manifest-path kbuild/Cargo.toml
+      - run: ./kbuild/target/release/kbuild portability
+
   # The rule that makes the portability claim checkable rather than aspirational:
   # cfg selects modules and crates, never lines inside one.
   lint:

@@ -40,11 +40,13 @@
 //! whole argument of `docs/portability.md` in four lines of code.
 
 use core::cell::UnsafeCell;
+#[cfg(target_has_atomic = "8")]
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+#[cfg(target_has_atomic = "8")]
 use hal::{Arch, HasCas};
 
 use crate::UniProcessor;
@@ -101,10 +103,13 @@ mod sealed {
 
 /// One-time initialisation with compare-and-swap: the racers are other CPUs, and a
 /// caller that loses waits for them.
+#[cfg(target_has_atomic = "8")]
 pub struct CasGate<A>(PhantomData<fn() -> A>);
 
+#[cfg(target_has_atomic = "8")]
 impl<A: Arch + HasCas> sealed::Sealed for CasGate<A> {}
 
+#[cfg(target_has_atomic = "8")]
 impl<A: Arch + HasCas> OnceGate for CasGate<A> {
     /// Nothing: with CAS, holding the claim is the `RUNNING` state itself.
     type Claimed = ();
@@ -313,6 +318,7 @@ impl<T, G: OnceGate> Drop for Once<T, G> {
 }
 
 /// [`Once`] on a machine with compare-and-swap, where several CPUs may race.
+#[cfg(target_has_atomic = "8")]
 pub type CasOnce<T, A> = Once<T, CasGate<A>>;
 
 /// [`Once`] on a uniprocessor with no compare-and-swap, where the initialiser runs

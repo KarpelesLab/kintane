@@ -18,7 +18,7 @@ pub struct Build {
     pub tc: Toolchain,
     #[allow(dead_code)] // carried for diagnostics and future per-target logic
     pub target_name: String,
-    pub target_json: PathBuf,
+    pub target: Target,
     pub out: PathBuf,
     pub gen_dir: PathBuf,
     pub cache: Cache,
@@ -28,7 +28,38 @@ pub struct Build {
     /// Linker script for `bin` units, from the configuration rather than hardcoded
     /// in a manifest, so the generic kernel unit never names an architecture.
     pub link_script: Option<PathBuf>,
+    /// Kernel units only; `core` is the toolchain's code and its warnings are not ours.
+    pub deny_warnings: bool,
     pub verbose: bool,
+}
+
+/// What `--target` names.
+pub enum Target {
+    /// One of our specifications in `targets/`. Its contents are part of every cache key.
+    Spec(PathBuf),
+    /// A target built into the pinned rustc, named by triple. Its definition is part of
+    /// the toolchain, so the toolchain identity already covers it. Used only by the
+    /// portability check: images are always built from a specification we control.
+    Builtin(String),
+}
+
+impl Target {
+    fn arg(&self) -> String {
+        match self {
+            Target::Spec(p) => p.display().to_string(),
+            Target::Builtin(t) => t.clone(),
+        }
+    }
+
+    fn key(&self, kb: &mut KeyBuilder) -> Result<(), String> {
+        match self {
+            Target::Spec(p) => kb.file(p).map(|_| ()),
+            Target::Builtin(t) => {
+                kb.field("builtin-target", t);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Where a built unit's artifact ended up, and the cache key that produced it.
@@ -47,7 +78,7 @@ impl Build {
             "-Z".into(),
             "unstable-options".into(),
             "--target".into(),
-            self.target_json.display().to_string(),
+            self.target.arg(),
             "-C".into(),
             "panic=abort".into(),
             "-C".into(),
@@ -114,7 +145,7 @@ impl Build {
 
         let mut kb = KeyBuilder::new(&self.tc.identity());
         kb.field("unit", "core").args(&args);
-        kb.file(&self.target_json)?;
+        self.target.key(&mut kb)?;
         // core's source is part of the pinned toolchain, so its identity covers it.
         let key = kb.finish();
 
@@ -154,6 +185,10 @@ impl Build {
             args.push(c.clone());
         }
         args.extend(self.check_cfgs.iter().cloned());
+        if self.deny_warnings {
+            args.push("-D".into());
+            args.push("warnings".into());
+        }
 
         // Every dependency named explicitly; nothing transitive is visible.
         for name in dep_order(unit, deps) {
@@ -194,7 +229,7 @@ impl Build {
         kb.field("unit", &unit.name)
             .field("layer", &unit.layer)
             .args(&args);
-        kb.file(&self.target_json)?;
+        self.target.key(&mut kb)?;
         if unit.kind == Kind::Bin {
             if let Some(script) = &self.link_script {
                 kb.file(script)?;

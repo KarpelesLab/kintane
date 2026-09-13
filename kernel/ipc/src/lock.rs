@@ -43,8 +43,12 @@
 
 use core::marker::PhantomData;
 
-use hal::{Arch, HasCas, UniProcessor};
-use sync::{IrqLock, SpinLock};
+use hal::UniProcessor;
+#[cfg(target_has_atomic = "32")]
+use hal::{Arch, HasCas};
+use sync::IrqLock;
+#[cfg(target_has_atomic = "32")]
+use sync::SpinLock;
 
 /// A way of protecting a value, selected by architecture capability.
 ///
@@ -71,10 +75,13 @@ mod sealed {
 }
 
 /// Ticket spinlock, taken with interrupts masked. Any machine with compare-and-swap.
+#[cfg(target_has_atomic = "32")]
 pub struct Spin<A>(PhantomData<fn() -> A>);
 
+#[cfg(target_has_atomic = "32")]
 impl<A: Arch + HasCas> sealed::Sealed for Spin<A> {}
 
+#[cfg(target_has_atomic = "32")]
 impl<A: Arch + HasCas> LockFamily for Spin<A> {
     type Lock<T: Send> = SpinLock<T, A>;
 

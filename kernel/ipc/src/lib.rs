@@ -156,4 +156,6 @@ pub mod lock;
 mod tests;
 
 pub use channel::{Channel, ENDPOINT_RIGHTS, Error, Received, Side, Status, Transfer};
-pub use lock::{Irq, LockFamily, Spin};
+#[cfg(target_has_atomic = "32")]
+pub use lock::Spin;
+pub use lock::{Irq, LockFamily};

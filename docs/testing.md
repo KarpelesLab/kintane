@@ -34,6 +34,14 @@ pub struct MockTiny;
 acquired a hardware requirement**, which is exactly what we want to find out on a
 laptop in a second rather than on a board in an hour.
 
+What the mocks cannot show is whether the code **compiles** for the machine a profile
+imitates. Host tests build against the host's `core`, and the host has every atomic.
+`MockTiny` therefore has no CAS as a trait, but its tests compile against a library
+that has `compare_exchange`. `kbuild portability` covers that half. It compiles every
+host-testable unit for built-in rustc targets that lack what the mocks only pretend to
+lack: `riscv32i` has no atomics and `riscv32imac` has no 64-bit ones. See
+[portability.md](portability.md#where-a-bound-is-not-enough).
+
 The convention is that a test body is generic over `A: Arch` and instantiated once per
 profile, which shows up in the output as paired `_full` / `_tiny` results. The frame
 allocator's 65 tests are 33 scenarios run twice.
@@ -287,7 +295,8 @@ The configuration space is too large to enumerate, so we sample it deliberately:
 A change may not land unless:
 
 1. Every tier-1 target builds, every preset.
-2. Host tests pass.
+2. Host tests pass, and every host-testable unit compiles for the machines no port
+   covers yet (`kbuild portability`).
 3. In-kernel tests pass under QEMU for every tier-1 target.
 4. Boot tests pass for every preset, including `gic-version` 2 and 3 on aarch64 and
    both `-smp 1` and multi-CPU where supported.

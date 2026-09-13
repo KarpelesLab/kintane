@@ -97,6 +97,7 @@
 
 pub mod irq;
 pub mod once;
+#[cfg(target_has_atomic = "32")]
 pub mod spin;
 
 #[cfg(test)]
@@ -109,5 +110,8 @@ mod testing;
 /// so nothing else in this unit changed when it moved.
 pub use hal::UniProcessor;
 pub use irq::{IrqGuard, IrqLock, IrqLockGuard};
-pub use once::{CasGate, CasOnce, Claim, IrqGate, IrqOnce, Once, OnceGate};
+#[cfg(target_has_atomic = "8")]
+pub use once::{CasGate, CasOnce};
+pub use once::{Claim, IrqGate, IrqOnce, Once, OnceGate};
+#[cfg(target_has_atomic = "32")]
 pub use spin::{SpinGuard, SpinIrqGuard, SpinLock};

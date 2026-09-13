@@ -191,6 +191,8 @@ kbuild image [--format elf|bin|uki|uimage]  package a bootable artifact
 kbuild symbols                            extract the separate debug-symbol bundle
 kbuild run [--machine M]                  boot the image under QEMU
 kbuild test [--host|--target]             run the test suites
+kbuild lint                               cfg-in-body and the other rules rustc cannot express
+kbuild portability                        compile host-testable units for rv32i, rv32imac, thumbv7m
 kbuild size [--compare REF]               size report, optionally vs a baseline
 kbuild sdk                                produce a module SDK for this config
 ```

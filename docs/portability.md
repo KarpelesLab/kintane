@@ -147,6 +147,49 @@ uniprocessor-only build selects `IrqLock`. The choice is made once, in one place
 against a trait bound, rather than as an `#ifdef CONFIG_SMP` inside every lock
 acquisition.
 
+### Where a bound is not enough
+
+The claim above, that code for a missing capability "is never instantiated", is
+true, and it was once read as more than it says. Never instantiated is not the same
+as never compiled. Rust type-checks a generic body where it is *defined*, against the
+target's own `core`. So this does not build for an rv32i core, even though nothing
+implements `HasCas` there and nothing calls `try_lock`:
+
+```rust
+pub fn try_lock<A: Arch + HasCas>(flag: &AtomicU32) -> bool {
+    flag.compare_exchange(0, 1, Acquire, Relaxed).is_ok()
+    // error[E0599]: no method named `compare_exchange` found
+}
+```
+
+A bound can rule out a *caller*. It cannot remove a body that names something the
+target does not have. The line falls here:
+
+- **Methods of our own traits** are fine behind a bound. `A::map_page` exists on every
+  target as a trait item, so a body that calls it type-checks everywhere and is only
+  unusable where no `A` satisfies the bound. That covers the MMU example above and
+  almost every capability.
+- **Items the compiler provides only on some targets** need `cfg`. The case that
+  matters today is atomics: `compare_exchange` and `fetch_add` do not exist without
+  CAS, and `AtomicU64` does not exist without 64-bit atomics. Those items are gated
+  with `#[cfg(target_has_atomic = "8" | "32" | "64")]`. That is the compiler's own
+  knowledge of the target, so it cannot disagree with it.
+
+This is still within the `cfg` rule below, which is why it is a correction and not a
+new exception. The gate goes on a whole item: `CasGate`, `SpinLock`, `Refcount`,
+`ObjectIds`. The bound stays as well, because it says the same thing to readers and
+to callers. Code that merely *creates* objects takes `impl kobject::IdSource` instead
+of `&ObjectIds`, so it does not inherit a 64-bit atomic from the allocator it happens
+to use.
+
+This went unnoticed through two phases because nothing could show it. The host has
+every atomic, so `MockTiny` — a machine with no CAS — compiles against a `core` that
+has CAS. The code `sync`, `kobject` and `ipc` had then did not build for either
+no-MMU tier-1 target: rv32imac fails on `AtomicU64` alone. `kbuild portability` now
+compiles every host-testable unit, with warnings denied, for `riscv32i` (no atomics),
+`riscv32imac` (no 64-bit atomics) and `thumbv7m`. It fails if the gating is removed
+from either of two items, which was checked by removing it.
+
 ## Where `cfg` is still allowed
 
 Monomorphization cannot do everything. We do use `cfg`, under one rule:

@@ -255,7 +255,7 @@ pub fn run(
 }
 
 /// Depth-first over `unit`'s dependencies, appending each before the unit itself.
-fn collect_deps<'a>(unit: &'a Unit, all: &'a [Unit], out: &mut Vec<&'a Unit>) {
+pub fn collect_deps<'a>(unit: &'a Unit, all: &'a [Unit], out: &mut Vec<&'a Unit>) {
     for d in &unit.deps {
         if let Some(dep) = all.iter().find(|u| &u.name == d) {
             if !out.iter().any(|u| u.name == dep.name) {

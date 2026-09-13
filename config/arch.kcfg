@@ -34,6 +34,12 @@ config ARCH_HAS_CAS
         The target has atomic compare-and-swap at machine word width.
         Without it, lock-free data structures are not offered at all.
 
+        This records the port's claim. Source code does not gate atomics
+        on it: an atomic method that the target lacks is a compile error
+        even inside a function that is never called, so atomics are gated
+        with `#[cfg(target_has_atomic = "N")]`, which is the compiler's own
+        knowledge of the target. `kbuild portability` checks that gating.
+
 config ARCH_HAS_COHERENT_DMA
     bool
     readonly
@@ -76,8 +82,13 @@ choice ARCH
     config ARCH_ARMV7M
         bool "ARMv7-M (Cortex-M, no MMU)"
         select ARCH_HAS_MPU
+        # LDREX/STREX. ARMv6-M (Cortex-M0) has no exclusive access and
+        # would be a separate choice without this select.
+        select ARCH_HAS_CAS
 
     config ARCH_RISCV32
         bool "RISC-V 32-bit (no MMU)"
+        # Assumes the A extension (LR/SC). An rv32i core without it has no
+        # CAS; the portability check compiles for one to keep that possible.
         select ARCH_HAS_CAS
 endchoice

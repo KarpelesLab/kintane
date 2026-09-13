@@ -22,7 +22,12 @@
 pub mod handle;
 pub mod rights;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(target_has_atomic = "32")]
+use core::sync::atomic::AtomicU32;
+#[cfg(target_has_atomic = "64")]
+use core::sync::atomic::AtomicU64;
+#[cfg(any(target_has_atomic = "32", target_has_atomic = "64"))]
+use core::sync::atomic::Ordering;
 
 pub use handle::{Handle, HandleTable};
 pub use rights::Rights;
@@ -44,6 +49,18 @@ impl ObjectId {
     }
 }
 
+/// Anything that hands out object identities.
+///
+/// Code that creates objects takes this rather than [`ObjectIds`], so it does not inherit
+/// the allocator's requirements. [`ObjectIds`] needs a 64-bit atomic counter, which rv32imac
+/// does not have and rv32i has no atomics of any width; a lock-protected source for those
+/// machines arrives with the object store, and nothing that creates objects has to change.
+///
+/// Every implementation must never return the same identity twice.
+pub trait IdSource {
+    fn next(&self) -> ObjectId;
+}
+
 /// Hands out object identities.
 ///
 /// Monotonic and never reused. Recycling identities would reintroduce, at the object
@@ -51,14 +68,19 @@ impl ObjectId {
 /// a handle slot, an identity may be held by another machine by the time it is
 /// reused. 2^64 identities at a billion per second is longer than the hardware will
 /// last.
+///
+/// Absent on machines without 64-bit atomics; see [`IdSource`].
+#[cfg(target_has_atomic = "64")]
 pub struct ObjectIds(AtomicU64);
 
+#[cfg(target_has_atomic = "64")]
 impl Default for ObjectIds {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(target_has_atomic = "64")]
 impl ObjectIds {
     pub const fn new() -> Self {
         // Zero is never issued, so a zeroed field is never a valid identity.
@@ -67,6 +89,13 @@ impl ObjectIds {
 
     pub fn next(&self) -> ObjectId {
         ObjectId(self.0.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+#[cfg(target_has_atomic = "64")]
+impl IdSource for ObjectIds {
+    fn next(&self) -> ObjectId {
+        ObjectIds::next(self)
     }
 }
 
@@ -125,6 +154,10 @@ impl ObjectType {
 ///   count reaching zero.
 /// * The last releaser issues an `Acquire` fence before destroying, pairing with every other
 ///   releaser's `Release` so their writes are visible to the destructor.
+///
+/// Absent on machines without 32-bit compare-and-swap, where a count lives under the
+/// object's lock instead.
+#[cfg(target_has_atomic = "32")]
 pub struct Refcount(AtomicU32);
 
 /// Why a reference could not be taken.
@@ -137,6 +170,7 @@ pub enum RefError {
     TooManyRefs,
 }
 
+#[cfg(target_has_atomic = "32")]
 impl Refcount {
     /// A new object, held by its creator.
     pub const fn one() -> Refcount {

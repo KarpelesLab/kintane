@@ -10,6 +10,7 @@ mod graph;
 mod hosttest;
 mod kcfg;
 mod lint;
+mod portable;
 mod qemu;
 mod sha256;
 mod toml;
@@ -35,6 +36,8 @@ COMMANDS:
                          run tests: on the host against the mocks (default),
                          or in-kernel under QEMU on the real architecture
     lint                 check the in-tree rules rustc cannot express
+    portability          compile the hardware-independent units for machines
+                         without a port yet (no atomics, no 64-bit atomics, no MMU)
     run                  build, then boot under QEMU
     clean                remove build outputs (the cache is kept)
 
@@ -229,6 +232,29 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             }
             Err(format!("{} cfg-in-body violation(s)", violations.len()))
         }
+        "portability" => {
+            let tc = toolchain::verify(&root)?;
+            let mut failed = 0;
+            for machine in portable::MACHINES {
+                println!("\n\x1b[36m{}\x1b[0m  {}", machine.triple, machine.why);
+                let mut mopts = opts.clone();
+                for (k, v) in machine.config {
+                    mopts.sets.push((k.to_string(), v.to_string()));
+                }
+                let (table, res) = resolve_config(&root, &mopts)?;
+                let r = portable::check(&root, tc.clone(), machine, &table, &res, opts.verbose)?;
+                for (unit, why) in &r.broken {
+                    eprintln!("  \x1b[31m{unit} does not build\x1b[0m: {why}\n");
+                }
+                println!("  {} of {} units build", r.checked - r.broken.len(), r.checked);
+                failed += r.broken.len();
+            }
+            if failed > 0 {
+                return Err(format!("{failed} unit build(s) failed the portability check"));
+            }
+            println!("\nportability ok");
+            Ok(())
+        }
         "clean" => {
             let dir = root.join("build");
             if dir.exists() {
@@ -270,6 +296,18 @@ fn find_root() -> Result<PathBuf, String> {
 }
 
 fn configure(root: &Path, opts: &Opts) -> Result<(kcfg::SymbolTable, kcfg::Resolution), String> {
+    let (table, res) = resolve_config(root, opts)?;
+    codegen::write_dotconfig(&table, &res, &root.join(".config"))?;
+    Ok((table, res))
+}
+
+/// Resolve a configuration without recording it in `.config` — for commands that build
+/// configurations nobody asked to keep, so a portability check does not leave the tree
+/// configured for a machine the user never selected.
+fn resolve_config(
+    root: &Path,
+    opts: &Opts,
+) -> Result<(kcfg::SymbolTable, kcfg::Resolution), String> {
     let entry = root.join("config/main.kcfg");
     let table = kcfg::parse::parse_tree(&entry).map_err(|e| e.to_string())?;
 
@@ -303,8 +341,6 @@ fn configure(root: &Path, opts: &Opts) -> Result<(kcfg::SymbolTable, kcfg::Resol
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-
-    codegen::write_dotconfig(&table, &res, &root.join(".config"))?;
     Ok((table, res))
 }
 
@@ -347,7 +383,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         root: root.to_path_buf(),
         tc,
         target_name: target_name.clone(),
-        target_json,
+        target: build::Target::Spec(target_json),
         out: out.clone(),
         gen_dir,
         cache: cache::Cache::new(root.join("build/cache"))?,
@@ -362,6 +398,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
             let s = res.str("LINKER_SCRIPT");
             (!s.is_empty()).then(|| root.join(s))
         },
+        deny_warnings: false,
         verbose: opts.verbose,
     };
 

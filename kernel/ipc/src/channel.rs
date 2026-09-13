@@ -4,7 +4,7 @@
 //! all-or-nothing.
 
 use kobject::handle::{self, Entry, Handle, HandleTable};
-use kobject::{ObjectId, ObjectIds, ObjectType, Rights};
+use kobject::{IdSource, ObjectId, ObjectType, Rights};
 
 use crate::inbox::Inbox;
 use crate::lock::LockFamily;
@@ -179,7 +179,7 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
     /// give it back with [`Channel::release`]; an entry that is simply dropped holds its
     /// endpoint open for ever, and the peer will never observe closure.
     #[must_use = "each entry is an endpoint reference that must be installed or released"]
-    pub fn new(ids: &ObjectIds, rights: Rights) -> (Self, [Entry; 2]) {
+    pub fn new(ids: &impl IdSource, rights: Rights) -> (Self, [Entry; 2]) {
         let a = ids.next();
         let b = ids.next();
         let end = || End {
