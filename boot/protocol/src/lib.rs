@@ -12,7 +12,7 @@
 //! know, and a loader may omit tags a kernel does not need. See
 //! `docs/bootloader.md#the-boot-protocol`.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub const MAGIC: u64 = 0x4b_49_4e_54_41_4e_45_00; // "KINTANE\0"
 
@@ -69,7 +69,7 @@ pub enum MemoryKind {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryRegion {
     pub start: u64,
     pub len: u64,

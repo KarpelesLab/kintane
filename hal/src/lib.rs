@@ -9,7 +9,7 @@
 //! states it in its signature and simply does not exist on targets that lack it.
 //! See `docs/portability.md` — this is the central idea of the project.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod addr;
 

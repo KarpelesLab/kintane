@@ -1,0 +1,11 @@
+[unit]
+name = "multiboot"
+kind = "lib"
+root = "src/lib.rs"
+layer = "hal"
+
+[deps]
+units = ["boot_protocol"]
+
+[config]
+requires = "ARCH_X86_64 || ARCH_I686"
