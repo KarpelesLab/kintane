@@ -21,18 +21,22 @@ Code that does not touch hardware is compiled for the **host** target and tested
 ordinary Rust test tooling, against a mock architecture:
 
 ```rust
-pub struct MockArch;
+/// MMU, SMP, atomics, coherent DMA, floating point. A 4096-byte page.
+pub struct MockFull;
 
-impl Arch for MockArch { /* deterministic, instrumented */ }
-impl HasMmu for MockArch {
-    type PageTable = SoftwarePageTable;   // a real page table walker in a HashMap
-    /* ... */
-}
+/// Memory protection regions but no translation, one CPU, no compare-and-swap.
+/// A 256-byte page, so anything that hardcoded 4096 shows up.
+pub struct MockTiny;
 ```
 
-Several mock architectures exist, each with a different capability set, so the same
-subsystem test runs against "MMU + SMP + CAS" and against "no MMU, no CAS" and the
-differences are caught on a laptop in a second rather than in an emulator in a minute.
+`MockTiny` implements none of `HasMmu`, `HasSmp`, `HasCas`, `HasCoherentDma` or
+`HasFpu`. **Code that compiles against one profile and not the other has silently
+acquired a hardware requirement**, which is exactly what we want to find out on a
+laptop in a second rather than on a board in an hour.
+
+The convention is that a test body is generic over `A: Arch` and instantiated once per
+profile, which shows up in the output as paired `_full` / `_tiny` results. The frame
+allocator's 65 tests are 33 scenarios run twice.
 
 This is the largest payoff of the trait-based portability design and it is worth
 protecting: **a subsystem that cannot be tested against `MockArch` has a design
@@ -156,12 +160,18 @@ QEMU — it first requests a state dump through the monitor, so a hang produces 
 rather than silence:
 
 ```
--no-reboot -no-shutdown -d int,mmu,guest_errors -D qemu.log
+-no-reboot -d int,guest_errors -D qemu.log
 ```
 
 `-no-reboot` matters more than it looks: without it a triple fault reboots and the
 kernel starts again, turning a crash into an infinite loop that reads as a timeout.
 With it, the crash is the failure, with the fault visible in `qemu.log`.
+
+Note the absence of `-no-shutdown`, which an earlier draft of this document
+recommended alongside it. It is not a companion to `-no-reboot`: it keeps QEMU alive
+across a guest shutdown, which suppresses `isa-debug-exit` and turns **every passing
+test into a timeout**. It cost a debugging cycle to find, and it is the kind of flag
+that looks obviously right.
 
 ### Determinism and replay
 
