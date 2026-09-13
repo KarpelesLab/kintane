@@ -83,6 +83,51 @@ pub unsafe fn start(hz: u32) -> u32 {
     (freq / u64::from(period)) as u32
 }
 
+/// Enable the timer's interrupt as a one-shot, without arming it. Returns the longest
+/// delay one arming can cover, in nanoseconds, or 0 if there is no interrupt controller
+/// or counter frequency.
+///
+/// One-shot is the generic timer's own shape, so this only means "do not re-arm from
+/// the interrupt": the handler stops the timer, and the hook arms the next deadline.
+/// The limit is `CNTP_TVAL_EL0`'s 32 bits of counter ticks, 4.29 s at QEMU's 1 GHz.
+///
+/// # Safety
+/// As [`start`].
+pub unsafe fn start_oneshot() -> u64 {
+    let Some(chip) = irq::chip() else { return 0 };
+    let freq = timer::frequency();
+    if freq == 0 {
+        return 0;
+    }
+    PERIOD.store(0, Ordering::Release);
+    chip.enable(IrqNumber(timer::PPI));
+    ticks_to_ns(u64::from(u32::MAX), freq)
+}
+
+/// Raise one timer interrupt `ns` nanoseconds from now, replacing any deadline already
+/// armed. Delays beyond what [`start_oneshot`] returned are cut to it, and the caller
+/// re-arms from the interrupt. Rounded up to a whole counter tick, so never early.
+///
+/// # Safety
+/// IRQs must be masked, so the handler cannot run between the two timer writes.
+pub unsafe fn arm_ns(ns: u64) {
+    const NS: u64 = 1_000_000_000;
+    let freq = timer::frequency();
+    // Whole seconds and the remainder apart, so nothing overflows for any counter rate
+    // below 18 GHz and no 128-bit division, which `compiler_builtins` does not provide,
+    // is emitted.
+    let ticks = (ns / NS)
+        .saturating_mul(freq)
+        .saturating_add(((ns % NS) * freq).div_ceil(NS));
+    timer::arm(ticks.clamp(1, u64::from(u32::MAX)) as u32);
+}
+
+/// `ticks` counter ticks in nanoseconds, rounded down. Exact for any `ticks` up to
+/// `u32::MAX`, whose product with 10^9 fits a u64.
+fn ticks_to_ns(ticks: u64, freq: u64) -> u64 {
+    ticks.saturating_mul(1_000_000_000) / freq
+}
+
 /// Stop the timer and disable its interrupt.
 pub fn stop() {
     PERIOD.store(0, Ordering::Release);

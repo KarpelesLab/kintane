@@ -157,6 +157,41 @@ also carries a context — GFP-like flags for *may this sleep*, *must this be DM
 addressable*, *which NUMA node* — because those questions are unavoidable and hiding
 them in a global has caused real bugs elsewhere.
 
+#### The kernel heap, as it exists today
+
+`kernel/main/src/kheap.rs` owns one `kalloc::Heap` for the life of the kernel, so any
+thread can reach it. Its memory is a fixed run of 512 frames taken from the machine's
+frame allocator at boot. From then on a second frame allocator manages that run and
+knows nothing else. 128 of the frames are the buddy allocator's, and the arena grows
+from the rest. Everything the heap holds is therefore inside one range the kernel can
+name, and the in-kernel suite, which builds its own frame pool from the loader's map,
+is told to keep out of it.
+
+One lock of the kernel's lock family (`sync::Spin<Cpu>`, class `kernel.heap`) covers
+the heap and its frames together. The family masks interrupts while held, so on one
+CPU the timer interrupt never finds the lock held by the thread it interrupted.
+Allocating from interrupt context is therefore safe, with two rules:
+
+- A request that says it may sleep (`AllocContext::KERNEL`) is refused with
+  `MaySleepInInterrupt`.
+- An interrupt-context request never grows the heap.
+
+The interrupt extent is marked explicitly by the tick hook (`kheap::irq_enter`/
+`irq_exit`), and ends before the hook switches threads.
+
+`KBox<T>` is the owning pointer. `try_new(value, ctx)` gives the value back on failure,
+and dropping the box frees it. There is no `#[global_allocator]`, for three reasons:
+
+- `GlobalAlloc` signals failure with a null pointer, which `alloc`'s everyday API turns
+  into a call that does not return.
+- It cannot carry an allocation context.
+- `alloc` is not built.
+
+The boot check `kheap mt` runs three non-yielding threads that allocate, fill, check and
+free across preemptions while the timer interrupt allocates too. It requires no
+corruption, no leak, atomic requests from the interrupt served, and may-sleep requests
+from the interrupt refused.
+
 ### `sync` — synchronization
 
 Lock types are selected by architecture capability, not by `#ifdef`:
@@ -218,6 +253,22 @@ whoever owns the tick, which is the scheduler working with the interrupt control
 Wall-clock time is an offset added on top of the monotonic clock, and does not exist
 yet.
 
+The kernel's one clock and one timer queue live in `kernel/main/src/timekeeping.rs`,
+each behind its own lock of the kernel's lock family (`time.clock`, `time.timers`).
+The two locks are never held together. Nothing ticks. Each port's `tick` module offers
+a one-shot timer (`start_oneshot`, `arm_ns`), and `timekeeping::program` arms it for
+the earliest timer, or for the end of a time slice when the scheduler says a thread is
+waiting for the CPU. How far one arming reaches is a fact about the hardware:
+
+- **Arm generic timer:** 32 bits of counter ticks, 4.29 s at QEMU's 1 GHz. A 500 ms idle
+  period takes one interrupt.
+- **x86 PIT (mode 0):** 16 bits, 54.9 ms. The same idle period takes nine interrupts,
+  where a 10 ms tick would take fifty. The PIT is the interim one-shot, and the local
+  APIC timer, which has a 32-bit count and a divider, replaces it with the APIC driver.
+
+The boot check `tickless` measures exactly this, and fails if an idle period takes more
+interrupts than the hardware's reach requires.
+
 The boot banner's `clock` line checks the real counter on each port. It times ten
 timer interrupts of known period with the clock, and fails if the two disagree by
 more than a wide margin, or if the counter steps backwards.
@@ -263,8 +314,13 @@ pieces, split where the knowledge actually is:
   same table; with `&mut self` that is two live exclusive references to one object.
 
 **Preemption is `yield_now` called from the timer interrupt.** Each port's `tick`
-module runs a periodic timer (the PIT on x86, the generic timer re-armed from its own
-interrupt on aarch64) and calls one registered `fn()` after acknowledging each tick.
+module drives a one-shot timer (PIT mode 0 on x86, the generic timer on aarch64) and
+calls one registered `fn()` after acknowledging each interrupt. The hook wakes the
+threads whose timers expired, arms the next interrupt, and yields. The next interrupt
+is the earliest timer, or the end of a 10 ms slice if `Threads::contended` says a
+ready thread would take the CPU at the next yield. A thread about to sleep arms a
+slice, because it cannot see who runs next. Idle arms for the earliest timer alone
+before it halts.
 `arch` cannot depend on the scheduler, so the scheduler registers the hook. The switch
 happens inside the interrupt handler. The interrupted thread's whole trap frame stays
 on its own stack, and it resumes, much later, by returning through that handler. Three
@@ -295,9 +351,27 @@ thread must keep receiving ticks, and idle must halt. Disabling the preemption c
 EOI ordering, the threads' unmasking, the priority, or idle's halt each makes the boot
 fail within seconds instead of hanging.
 
-Not yet: thread stacks are static `.bss` arrays with no guard page, sleeping is a tick
-count, not a timer subsystem with deadlines, and nothing but the demonstration creates
-threads.
+Threads sleep with `preempt::sleep_until(Instant)`, which arms a one-shot timer on the
+kernel's timer queue and blocks. The expiring timer's interrupt wakes the thread. After
+the preemption check, the same scheduler runs the shared-state checks
+(`kernel/main/src/shared.rs`):
+
+- **sleep:** three sleepers wake in deadline order, never early, and at most three slices
+  late.
+- **kheap mt:** the heap under preemption.
+- **tickless:** interrupts during an idle period are bounded by the hardware's one-shot
+  reach, not the slice.
+- **lockdep:** in debug builds every boot prints what lock-order checking found and fails
+  on any violation. `LOCKDEP_ABBA_TEST` makes two threads take two locks in opposite
+  orders, and passes only if exactly that inversion was reported.
+
+Not yet:
+
+- Thread stacks are static `.bss` arrays with no guard page.
+- The scheduler lives only for the duration of the boot checks. After them `kmain`
+  stops the timer and runs the in-kernel suite and the test modes on the boot thread
+  alone, which those modes still assume.
+- Nothing but the checks creates threads.
 
 ## Boot flow
 

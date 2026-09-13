@@ -68,6 +68,44 @@ pub unsafe fn start(hz: u32) -> u32 {
     pit::INPUT_HZ / effective
 }
 
+/// Start the timer as a one-shot and unmask its line, without arming it. Returns the
+/// longest delay one arming can cover, in nanoseconds: 54.9 ms, all the 8254's 16-bit
+/// counter holds.
+///
+/// That limit is why the PIT is an interim one-shot timer. An idle period longer than
+/// it takes one interrupt per 54.9 ms rather than one in total. The local APIC timer
+/// has a 32-bit count and a divider and removes the limit. It comes with the APIC
+/// driver, which also owns the interrupt path this port still routes through the 8259A.
+///
+/// # Safety
+/// As [`start`].
+pub unsafe fn start_oneshot() -> u64 {
+    interrupt::init();
+    interrupt::irq_chip().enable(interrupt::TIMER_IRQ);
+    count_to_ns(pit::MAX_COUNT)
+}
+
+/// Raise one timer interrupt `ns` nanoseconds from now, replacing any deadline already
+/// armed. Delays beyond what [`start_oneshot`] returned are cut to it, and the caller
+/// re-arms from the interrupt. Rounded up to the counter's 838 ns resolution, so the
+/// interrupt is never early.
+///
+/// # Safety
+/// Interrupts must be masked, and no one else may be programming the PIT.
+pub unsafe fn arm_ns(ns: u64) {
+    // Clamped before multiplying: 55 ms times 1.19 MHz is far inside a u64, and the
+    // clamp keeps an absurd `ns` from overflowing.
+    let ns = ns.min(count_to_ns(pit::MAX_COUNT));
+    let count = (ns * u64::from(pit::INPUT_HZ)).div_ceil(1_000_000_000);
+    // SAFETY: forwarded; the caller's contract.
+    unsafe { pit::start_oneshot(count as u32) };
+}
+
+/// The delay `count` input cycles make, in nanoseconds, rounded down.
+fn count_to_ns(count: u32) -> u64 {
+    u64::from(count) * 1_000_000_000 / u64::from(pit::INPUT_HZ)
+}
+
 /// Mask the timer line. Ticks already pending are not delivered.
 pub fn stop() {
     interrupt::irq_chip().disable(interrupt::TIMER_IRQ);

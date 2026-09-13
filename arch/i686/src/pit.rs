@@ -35,6 +35,19 @@ pub const INPUT_HZ: u32 = 1_193_182;
 /// about, and this is a test.
 const CMD_CHANNEL0_RATE: u8 = 0x34;
 
+/// Command byte: channel 0, low byte then high byte, mode 0, binary counting.
+///
+/// Mode 0 is "interrupt on terminal count": writing the command drives the output low,
+/// the counter counts down once from the value written, and the output rises when it
+/// reaches zero and stays high. The rising edge is one interrupt, and nothing follows
+/// it until the next write. That is a one-shot timer, which is what a tickless kernel
+/// programs.
+const CMD_CHANNEL0_ONESHOT: u8 = 0x30;
+
+/// The largest count channel 0 holds. Written as 0, since a 16-bit register cannot
+/// hold 65536 itself.
+pub const MAX_COUNT: u32 = 0x1_0000;
+
 /// Start channel 0 ticking at approximately `hz`, returning the divisor programmed.
 ///
 /// The rate is approximate because the divisor is an integer: the caller gets the
@@ -66,4 +79,24 @@ pub unsafe fn start_periodic(hz: u32) -> u16 {
         outb(CHANNEL0, (divisor >> 8) as u8);
     }
     divisor
+}
+
+/// Raise IRQ 0 once, `count` input cycles from now, clamped to `1..=MAX_COUNT`.
+///
+/// A write in mode 0 restarts the count, so calling this again before the interrupt
+/// replaces the deadline instead of adding a second one.
+///
+/// # Safety
+/// As [`start_periodic`].
+pub unsafe fn start_oneshot(count: u32) {
+    let count = count.clamp(1, MAX_COUNT);
+    // 65536 is written as 0; see `MAX_COUNT`.
+    let reload = (count & 0xffff) as u16;
+    // SAFETY: as in `start_periodic`: the command selects two-byte access, and the two
+    // writes that follow are one reload value that nothing else may split.
+    unsafe {
+        outb(COMMAND, CMD_CHANNEL0_ONESHOT);
+        outb(CHANNEL0, (reload & 0xff) as u8);
+        outb(CHANNEL0, (reload >> 8) as u8);
+    }
 }

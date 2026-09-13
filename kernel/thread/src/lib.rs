@@ -153,6 +153,23 @@ impl<A: HasContextSwitch, const N: usize> Threads<A, N> {
         self.runq.len()
     }
 
+    /// Whether a yield now would switch: some ready thread has at least the running
+    /// thread's priority.
+    ///
+    /// What a tickless scheduler asks before it arms a time slice. A thread alone at the
+    /// top priority needs no slice, because nothing is waiting for its CPU, and arming
+    /// one anyway turns tickless back into periodic.
+    pub fn contended(&self) -> bool {
+        let Some(cur) = self.meta[self.current] else {
+            return false;
+        };
+        self.runq
+            .peek()
+            .and_then(|(id, _)| self.index_of(id))
+            .and_then(|i| self.meta[i])
+            .is_some_and(|next| next.priority >= cur.priority)
+    }
+
     fn index_of(&self, id: ThreadId) -> Option<usize> {
         self.meta.iter().position(|m| m.is_some_and(|m| m.id == id))
     }
@@ -502,6 +519,24 @@ mod tests {
         assert_eq!(last_switch().1, 11, "the resumed context belongs to thread a");
         assert!(SWITCHES.load(Ordering::SeqCst) > before);
         t.check().unwrap();
+    }
+
+    #[test]
+    fn contended_means_a_yield_would_switch() {
+        let mut t: Threads<MockFull, 8> = Threads::new(p(5));
+        assert!(!t.contended(), "nothing else exists");
+        spawn(&mut t, 11, 4);
+        assert!(!t.contended(), "a lower priority does not contend");
+        let before = SWITCHES.load(Ordering::SeqCst);
+        yield_now(&mut t).unwrap();
+        assert_eq!(SWITCHES.load(Ordering::SeqCst), before, "and a yield agrees");
+        spawn(&mut t, 12, 5);
+        assert!(t.contended(), "a peer at the same level contends");
+        spawn(&mut t, 13, 6);
+        assert!(t.contended(), "so does a higher level");
+        yield_now(&mut t).unwrap();
+        assert_eq!(last_switch().1, 13, "and a yield switches, to the highest");
+        assert!(!t.contended(), "everything still ready is below it");
     }
 
     #[test]

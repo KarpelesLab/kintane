@@ -13,12 +13,20 @@
 mod clock;
 mod crash;
 mod heap;
+mod kheap;
+mod lockcheck;
 mod preempt;
+mod shared;
 mod space;
+mod timekeeping;
 
 use core::cell::SyncUnsafeCell;
 
 use arch::Cpu;
+
+/// The lock family for state the whole kernel shares. Named once, here, because the image
+/// is the one place allowed to name the architecture. See `sync::family`.
+type Locks = sync::Spin<Cpu>;
 use boot_protocol::{MemoryKind, MemoryRegion};
 use hal::{Arch, EarlyConsole, HasMmu, HasPageTables};
 use mm::phys::{FrameAllocator, bitmap_bytes};
@@ -63,6 +71,8 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
         (0, LOW_MEMORY),
         (img_start, img_end.saturating_sub(img_start)),
         (live.tables.0, live.tables.1.saturating_sub(live.tables.0)),
+        // The kernel heap lives on after boot, and its frames hold live objects.
+        kheap::region(),
     ];
     let ok = selftest::run_all::<Cpu>(c, boot_arg, &reserved);
     if selftest::PRESENT {
@@ -217,6 +227,10 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     c.write_str("\n  backtrace  ");
     let backtrace_ok = backtrace_check(c);
 
+    // Last, so it sees every lock the checks above took.
+    c.write_str("\n  lockdep    ");
+    let lockdep = lockcheck::verdict(c);
+
     c.write_str("\n\nreached kmain\n");
     let verdict = Check::from_ok(paging_ok)
         .and(mem)
@@ -224,7 +238,8 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(Check::from_ok(switch_ok))
         .and(clock)
         .and(preempt)
-        .and(Check::from_ok(backtrace_ok));
+        .and(Check::from_ok(backtrace_ok))
+        .and(lockdep);
     (verdict, live)
 }
 
@@ -402,7 +417,8 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
 
     let space = space
         .and(alloc)
-        .and(heap::bring_up(c, &mut frames, &regions[..n]));
+        .and(heap::bring_up(c, &mut frames, &regions[..n]))
+        .and(kheap::install(c, &mut frames, &regions[..n]));
     (space, live)
 }
 

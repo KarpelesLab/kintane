@@ -98,6 +98,18 @@ config DEBUG_LOCKDEP
         the deadlock to happen. Recursion stops the CPU. When off, locks carry
         no class and pay nothing. See kernel/sync/src/lockdep.rs.
 
+config LOCKDEP_ABBA_TEST
+    bool "Take two locks in opposite orders on purpose"
+    depends on DEBUG_LOCKDEP
+    default n
+    help
+        After the scheduler checks, two kernel threads take two locks in
+        opposite orders, one after the other, so nothing deadlocks. The boot
+        verdict then passes only if lock-order checking reported exactly that
+        inversion. Without this, a checker that recorded nothing would pass
+        every boot. A test mode, never a production setting: the kernel it
+        builds has a lock-order bug on purpose.
+
 config QEMU_EXIT
     bool "Guest-initiated emulator exit"
     depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64

@@ -5,10 +5,9 @@
 //! multi-page block from the buddy allocator over a run of frames. Each is written and
 //! read back, then freed, and the buddy run is returned.
 //!
-//! The heap does not outlive this function yet. Keeping one needs a lock around it and a
-//! place for it to live, and both belong to whatever first allocates for real. What is
-//! kept is the arena's frames, which the arena never returns; the banner line says how
-//! many.
+//! This heap does not outlive the function. The one that does is `kheap`, installed
+//! right after it, over frames of its own. What is kept from this one is the arena's
+//! frames, which the arena never returns; the banner line says how many.
 
 use core::alloc::Layout;
 use core::cell::SyncUnsafeCell;
