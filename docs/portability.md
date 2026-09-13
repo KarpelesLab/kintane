@@ -251,6 +251,33 @@ Honesty about the downsides, so they are not discovered later:
 
 ## Test of the thesis
 
+### What has actually been demonstrated
+
+Phase 1 put both halves of the split under test rather than leaving them as argument.
+
+**The dynamic half.** One aarch64 kernel image — the same binary, confirmed by md5
+rather than by looking at it — boots and takes timer interrupts under `gic-version=2`
+and `gic-version=3`, and also under the machine default, `gic-version=max`,
+`gic-version=4` with virtualization enabled, and on `cortex-a53` and `cortex-a57`.
+The GIC driver is chosen at runtime from the hardware's own ID register, behind
+`dyn IrqChip`. This is the case the type system genuinely cannot handle, and it works.
+
+**The static half.** x86_64, i686 and aarch64 boot from one unmodified `kernel/main`,
+with paging depth (4, 3 and 4 levels), page size and physical address width all read
+from the architecture's associated constants. The frame allocator is written once,
+generic over `A: Arch`, and its tests run against two mock profiles with different
+page sizes.
+
+**A cost worth recording.** The rule that adding an architecture touches nothing
+outside `arch/`, `targets/` and `config/` holds — but only after a one-time change
+that the rule itself did not predict. The kernel image had to stop naming a specific
+architecture crate, which meant the build system had to let several units *provide*
+one name and let the configuration select among them. The rule was true for the third
+architecture and not for the second, and that distinction is the kind of thing a
+roadmap tends to lose.
+
+### Keeping it true
+
 The claim is only credible if it is checked continuously. The rule:
 
 > Every merge builds every tier-1 target. Adding a target must not require touching

@@ -9,8 +9,48 @@ demonstrable — something boots, something passes, something fits in a budget �
 | Phase | State |
 |---|---|
 | 0 — Build system and first boot | **done** |
-| 1 — The portability spine | in progress |
+| 1 — The portability spine | **substantially done** — see below |
 | 2 onward | not started |
+
+### Phase 1, as it actually stands
+
+Done: the `Arch` and capability trait family; x86_64, i686 and aarch64 ports, all
+three booting from one unmodified `kernel/main`; distinct `PhysAddr`/`KernAddr`/
+`UserAddr`; a physical frame allocator written once and generic over the
+architecture; exception and interrupt entry on x86_64 and aarch64; `MockFull` and
+`MockTiny` with a host test runner; the `cfg_in_body` and layering lints; and CI
+building and booting every preset.
+
+**The central claim is demonstrated rather than asserted.** One aarch64 image —
+verified by md5, not by inspection — takes timer interrupts under GICv2 *and* GICv3,
+selected at runtime, plus `gic-version=max`, `gic-version=4` with virtualization, and
+several CPU models. That is the static-architecture/dynamic-devices split in
+[portability.md](portability.md#static-architecture-dynamic-devices) working.
+
+The exit criterion said adding an architecture must touch nothing outside `arch/`,
+`targets/` and `config/`. That holds **now**, but was not free: the first additional
+architecture also forced `kernel/main` to stop naming a specific one, and forced
+kbuild to allow several units to *provide* a name so the configuration could pick.
+Both were one-time costs, and the third architecture did land within the rule.
+
+Not done, and deliberately named rather than quietly folded into "done":
+
+- **No in-kernel test suite.** `kbuild test` runs host tests only; `--target` reports
+  that in-kernel tests are unimplemented. They belong with Phase 2, when there is a
+  kernel worth testing from inside.
+- **No page table manipulation or kernel address space.** The frame allocator exists;
+  building mappings on top of it does not. Phase 2.
+- **No i686 interrupt support.** That port boots and reports memory but has no IDT.
+- **No TSS on x86_64**, so `#DF` has no IST: a stack overflow double-faults and then
+  triple-faults while pushing the frame. Needs a GDT entry, and belongs with per-CPU
+  data.
+- **The GIC drivers are in `arch/aarch64/`**, not `drivers/irqchip/` where
+  [architecture.md](architecture.md) says they belong, because `arch` may not depend
+  on the `device` layer and nothing else would reference them yet. They move when the
+  device framework can register and find them.
+- **GIC detection reads `GICD_PIDR2`**, which reports the IP revision rather than the
+  programming model — a GICv3 with `GICD_CTLR.ARE == 0` is legitimately a GICv2 and
+  still reports 3. The real answer is the device tree's compatible string.
 
 **Phase 0 closed** with `kbuild run --preset x86_64-qemu` building an x86_64 kernel
 from source, booting it under QEMU, and exiting on the guest's own signal (exit 33,
