@@ -1,0 +1,426 @@
+//! The stress run: every subsystem at once, for as long as asked, audited every second.
+//!
+//! Built with `STRESS_TEST`. After bring-up, [`crate::persist`] hands the CPU to the
+//! scheduler and boot becomes the auditor. Seven workload threads run at mixed
+//! priorities:
+//!
+//! | workload | priority | does |
+//! |---|---|---|
+//! | sleep | 8 | sleeps to random deadlines and checks it woke neither early nor very late |
+//! | pages | 6 | buddy page churn on a pool of its own, filling and checking every block |
+//! | vm | 5 | demand paging, copy-on-write sharing and huge pages on a kernel `Vm` |
+//! | heap A, heap B | 4 | kernel heap churn under seeded fault injection, never yielding |
+//! | ping, pong | 4 | a channel round trip that moves a handle there and back |
+//!
+//! Fixed priority starves whatever sits below a thread that never blocks, so every
+//! workload above the lowest level blocks on each iteration, and the busy ones share the
+//! lowest level and take turns by the slice.
+//!
+//! # The audit
+//!
+//! Every [`AUDIT_EVERY`] of guest time the auditor asks every workload to stop at its
+//! next checkpoint. A checkpoint is a point where the workload holds nothing another
+//! check could miscount: the heap threads have freed their blocks, the page thread its
+//! pages, the channel threads have no message in flight. The vm thread stops either with
+//! its regions still mapped and shared, which is what `Vm::audit` is worth running on,
+//! or with everything released, which is when its frame pool must be full again. A
+//! workload that does not reach a checkpoint within [`PARK_WITHIN`] fails the audit, and
+//! so does one that made no progress since the last audit. With every workload stopped,
+//! the auditor checks:
+//!
+//! - **heap**: bytes in use are back at the baseline, and every failure the heap reports is one a
+//!   workload saw and handled;
+//! - **channel**: each side holds exactly the handles it should, and nothing is queued;
+//! - **vm**: `Vm::audit`, and a full frame pool when nothing is mapped;
+//! - **pages**: the buddy allocator's invariants, and every page free;
+//! - **threads**: `Threads::check`, and nothing the scheduler recorded as broken;
+//! - **locks**: no lock-order violation, in a build that checks.
+//!
+//! Then it lets them go and prints a heartbeat. `kbuild stress` watches for that line: a
+//! run that stops printing it has hung, whatever the reason. A failed audit exits the
+//! emulator with a failure at once. After `STRESS_SECONDS` the last audit is the final
+//! one, and a pass exits with success.
+
+mod heap;
+mod ipc;
+mod pages;
+mod sleep;
+mod vm;
+
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+use arch::Cpu;
+use boot_protocol::MemoryRegion;
+use hal::{Arch, EarlyConsole};
+use mm::phys::FrameAllocator;
+use time::{Duration, Instant};
+
+use crate::preempt::{self, sleep_until};
+use crate::{Check, Live, finish, timekeeping, write_usize};
+
+/// How often the auditor stops everything and checks.
+const AUDIT_EVERY: Duration = Duration::from_nanos(1_000_000_000);
+
+/// How long a workload has to reach a checkpoint once asked. The slowest is the sleeper,
+/// whose longest sleep is 50 ms; the rest reach one within an iteration.
+const PARK_WITHIN: Duration = Duration::from_nanos(3_000_000_000);
+
+/// While parked, a workload sleeps this long between looks at the request.
+const PARKED_NAP: Duration = Duration::from_nanos(1_000_000);
+
+/// The workloads, as indices into the per-workload tables.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Workload {
+    HeapA,
+    HeapB,
+    Ping,
+    Pong,
+    Sleep,
+    Vm,
+    Pages,
+}
+
+const WORKLOADS: usize = 7;
+
+const NAMES: [&str; WORKLOADS] = ["heap A", "heap B", "ping", "pong", "sleep", "vm", "pages"];
+
+/// Where a parked workload stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Parked {
+    /// Not parked.
+    Running = 0,
+    /// Stopped holding whatever it holds mid-iteration.
+    Holding = 1,
+    /// Stopped holding nothing.
+    Empty = 2,
+}
+
+/// Set by the auditor to ask every workload to stop at its next checkpoint.
+static PARK: AtomicBool = AtomicBool::new(false);
+
+static PARKED: [AtomicU8; WORKLOADS] = [const { AtomicU8::new(Parked::Running as u8) }; WORKLOADS];
+
+/// Iterations each workload completed.
+static PROGRESS: [AtomicU64; WORKLOADS] = [const { AtomicU64::new(0) }; WORKLOADS];
+
+/// The first thing each workload found wrong, as a `&'static str`'s pointer and length.
+/// Null while nothing has.
+static FAILURE: [(AtomicPtr<u8>, AtomicUsize); WORKLOADS] =
+    [const { (AtomicPtr::new(core::ptr::null_mut()), AtomicUsize::new(0)) }; WORKLOADS];
+
+/// Record that `w` found something wrong. The first report per workload is kept; the
+/// auditor fails the run on its next audit.
+pub fn fail(w: Workload, what: &'static str) {
+    let (ptr, len) = &FAILURE[w as usize];
+    if ptr
+        .compare_exchange(
+            core::ptr::null_mut(),
+            what.as_ptr().cast_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        len.store(what.len(), Ordering::Release);
+    }
+}
+
+fn failure(w: usize) -> Option<&'static str> {
+    let (ptr, len) = &FAILURE[w];
+    let p = ptr.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `fail` stored the pointer and length of a `&'static str`, the pointer
+    // first and the length right after; a zero length read in between is a valid empty
+    // string, and a torn read is otherwise impossible because each is set once.
+    let bytes = unsafe { core::slice::from_raw_parts(p.cast_const(), len.load(Ordering::Acquire)) };
+    core::str::from_utf8(bytes).ok()
+}
+
+/// Count one completed iteration of `w`.
+pub fn progress(w: Workload) {
+    PROGRESS[w as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether the auditor is asking workloads to stop.
+pub fn park_requested() -> bool {
+    PARK.load(Ordering::Relaxed)
+}
+
+/// A checkpoint: if the auditor asked, stop here, reporting where, until it is done.
+pub fn checkpoint(w: Workload, state: Parked) {
+    if !park_requested() {
+        return;
+    }
+    PARKED[w as usize].store(state as u8, Ordering::Relaxed);
+    while park_requested() {
+        sleep_until(timekeeping::now().saturating_add(PARKED_NAP));
+    }
+    PARKED[w as usize].store(Parked::Running as u8, Ordering::Relaxed);
+}
+
+/// Where `w` is parked.
+pub fn parked(w: Workload) -> Parked {
+    match PARKED[w as usize].load(Ordering::Relaxed) {
+        1 => Parked::Holding,
+        2 => Parked::Empty,
+        _ => Parked::Running,
+    }
+}
+
+/// A seeded xorshift generator. Each workload has its own, from `STRESS_SEED`.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(stream: u64) -> Rng {
+        let seed = (kconfig::STRESS_SEED as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(stream.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        Rng(if seed == 0 { 1 } else { seed })
+    }
+
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// A value in `0..n`, or 0 for an empty range.
+    pub fn below(&mut self, n: u64) -> u64 {
+        if n == 0 { 0 } else { self.next() % n }
+    }
+}
+
+/// Take the stress run's frame pools from the boot allocator. Nothing, and `Passed`,
+/// without `STRESS_TEST`.
+pub fn reserve(
+    c: &dyn EarlyConsole,
+    frames: &mut FrameAllocator<'_, Cpu>,
+    map: &[MemoryRegion],
+    live: Live,
+) -> Check {
+    if !kconfig::STRESS_TEST {
+        return Check::Passed;
+    }
+    c.write_str("\n  stress     ");
+    let Some(direct) = live.direct else {
+        c.write_str("no kernel address space to page in");
+        return Check::Failed;
+    };
+    let Some(pages) = pages::reserve(frames, map) else {
+        c.write_str("no run of frames for the page pool");
+        return Check::Failed;
+    };
+    let Some(vm_pool) = vm::reserve(frames, direct) else {
+        c.write_str("no run of frames for the vm pool");
+        return Check::Failed;
+    };
+    write_usize(c, pages);
+    c.write_str(" pages for buddy churn, ");
+    write_usize(c, vm_pool);
+    c.write_str(" frames for demand paging ok");
+    Check::Passed
+}
+
+/// The physical runs [`reserve`] took, for the in-kernel suite to keep out of. One run
+/// covering both pools, `(0, 0)` when there are none.
+pub fn region() -> (u64, u64) {
+    let (a, b) = (pages::region(), vm::region());
+    match (a.1, b.1) {
+        (0, _) => b,
+        (_, 0) => a,
+        _ => {
+            let lo = a.0.min(b.0);
+            let hi = (a.0 + a.1).max(b.0 + b.1);
+            (lo, hi - lo)
+        }
+    }
+}
+
+/// Whether every workload has parked.
+fn all_parked() -> bool {
+    PARKED
+        .iter()
+        .all(|p| p.load(Ordering::Relaxed) != Parked::Running as u8)
+}
+
+/// End the run with a failure, saying why.
+fn audit_failed(c: &dyn EarlyConsole, seconds: u64, what: &str, detail: &str) -> ! {
+    c.write_str("\nstress AUDIT FAILED at ");
+    write_usize(c, seconds as usize);
+    c.write_str(" s: ");
+    c.write_str(what);
+    if !detail.is_empty() {
+        c.write_str(": ");
+        c.write_str(detail);
+    }
+    c.write_str("\n");
+    finish(false)
+}
+
+/// The auditor, on the boot thread. Never returns: it ends the run.
+pub fn run(c: &dyn EarlyConsole) -> ! {
+    c.write_str("stress: ");
+    write_usize(c, kconfig::STRESS_SECONDS);
+    c.write_str(" s, seed ");
+    write_usize(c, kconfig::STRESS_SEED);
+    c.write_str("\n");
+
+    if let Err(what) = start() {
+        audit_failed(c, 0, "could not start", what);
+    }
+
+    let start = timekeeping::now();
+    let end = start.saturating_add(Duration::from_nanos(
+        (kconfig::STRESS_SECONDS as u64).saturating_mul(1_000_000_000),
+    ));
+    let mut last = [0u64; WORKLOADS];
+    let mut next = start;
+    let mut audits = 0u64;
+    loop {
+        next = next.saturating_add(AUDIT_EVERY);
+        sleep_until(next.min(end));
+        let now = timekeeping::now();
+        let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;
+
+        PARK.store(true, Ordering::Relaxed);
+        let deadline = now.saturating_add(PARK_WITHIN);
+        while !all_parked() && timekeeping::now() < deadline {
+            sleep_until(timekeeping::now().saturating_add(PARKED_NAP));
+        }
+        if let Some(w) = (0..WORKLOADS).find(|&w| PARKED[w].load(Ordering::Relaxed) == 0) {
+            audit_failed(c, seconds, "a workload did not reach a checkpoint", NAMES[w]);
+        }
+        audit(c, seconds, &mut last);
+        audits += 1;
+        PARK.store(false, Ordering::Relaxed);
+
+        heartbeat(c, seconds, audits);
+        if now >= end {
+            c.write_str("stress passed: ");
+            write_usize(c, audits as usize);
+            c.write_str(" audits over ");
+            write_usize(c, seconds as usize);
+            c.write_str(" s\n");
+            finish(true);
+        }
+    }
+}
+
+/// Set every workload up and spawn its thread.
+fn start() -> Result<(), &'static str> {
+    heap::setup()?;
+    ipc::setup()?;
+    pages::setup()?;
+    vm::setup()?;
+
+    // Idle keeps the first of the scheduler's stacks. The other three the boot checks
+    // used are free again; four more come from the port's array.
+    let extra = preempt::claim_stacks(&["heap B", "sleep", "vm", "pages"])
+        .ok_or("not enough guarded thread stacks")?;
+    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS] = [
+        (heap::worker, 0, 4, 1),
+        (heap::worker, 1, 4, extra),
+        (ipc::ping, 0, 4, 2),
+        (ipc::pong, 0, 4, 3),
+        (sleep::worker, 0, 8, extra + 1),
+        (vm::worker, 0, 5, extra + 2),
+        (pages::worker, 0, 6, extra + 3),
+    ];
+    let irq = Cpu::irq_save();
+    let spawned = plan
+        .iter()
+        .all(|&(entry, arg, level, stack)| preempt::spawn(stack, entry, arg, level).is_some());
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { Cpu::irq_restore(irq) };
+    if spawned {
+        Ok(())
+    } else {
+        Err("a workload thread was refused")
+    }
+}
+
+/// Check everything, with every workload parked. Ends the run on the first failure.
+fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
+    for (w, name) in NAMES.iter().enumerate() {
+        if let Some(what) = failure(w) {
+            c.write_str("\nstress: ");
+            c.write_str(name);
+            audit_failed(c, seconds, "a workload found something wrong", what);
+        }
+        let now = PROGRESS[w].load(Ordering::Relaxed);
+        if now == last[w] {
+            audit_failed(c, seconds, "a workload made no progress since the last audit", name);
+        }
+        last[w] = now;
+    }
+    if let Err(what) = heap::audit() {
+        audit_failed(c, seconds, "kernel heap", what);
+    }
+    if let Err(what) = ipc::audit() {
+        audit_failed(c, seconds, "channel", what);
+    }
+    if let Err(what) = vm::audit(parked(Workload::Vm)) {
+        audit_failed(c, seconds, "vm", what);
+    }
+    if let Err(what) = pages::audit() {
+        audit_failed(c, seconds, "buddy pages", what);
+    }
+    if !preempt::table_ok() {
+        audit_failed(c, seconds, "thread table", "an invariant does not hold");
+    }
+    if preempt::broken() != 0 {
+        preempt::report_broken(c);
+        audit_failed(c, seconds, "scheduler", "something went wrong in a switch");
+    }
+    if sync::lockdep::ENABLED {
+        let report = sync::lockdep::report::<Cpu>();
+        if report.count != 0 {
+            crate::lockcheck::verdict(c);
+            audit_failed(c, seconds, "lock order", "a violation was recorded");
+        }
+    }
+}
+
+fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
+    let p = |w: Workload| PROGRESS[w as usize].load(Ordering::Relaxed) as usize;
+    c.write_str("stress heartbeat ");
+    write_usize(c, seconds as usize);
+    c.write_str("/");
+    write_usize(c, kconfig::STRESS_SECONDS);
+    c.write_str(" s: heap ");
+    write_usize(c, p(Workload::HeapA) + p(Workload::HeapB));
+    c.write_str(" (refused ");
+    write_usize(c, heap::refused() as usize);
+    c.write_str("), ipc ");
+    write_usize(c, p(Workload::Ping));
+    c.write_str(", sleeps ");
+    write_usize(c, p(Workload::Sleep));
+    c.write_str(" (latest +");
+    write_usize(c, (sleep::worst_late().as_nanos() / 1_000) as usize);
+    c.write_str(" us), vm ");
+    write_usize(c, p(Workload::Vm));
+    c.write_str(" (faults ");
+    write_usize(c, vm::faults() as usize);
+    c.write_str(", copies ");
+    write_usize(c, vm::copies() as usize);
+    c.write_str(", huge ");
+    write_usize(c, vm::huge() as usize);
+    c.write_str("), pages ");
+    write_usize(c, p(Workload::Pages));
+    c.write_str(", audits ");
+    write_usize(c, audits as usize);
+    c.write_str(" ok\n");
+}
+
+/// `now` plus `ms` milliseconds.
+pub fn after_ms(ms: u64) -> Instant {
+    timekeeping::now().saturating_add(Duration::from_nanos(ms.saturating_mul(1_000_000)))
+}
+
+/// The architecture's page size, for workloads sizing blocks in pages.
+pub const PAGE: usize = <Cpu as Arch>::PAGE_SIZE;

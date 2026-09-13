@@ -311,6 +311,7 @@ kbuild run [--machine M]                  boot the image under QEMU
 kbuild test [--host|--target]             run the test suites
 kbuild lint                               cfg-in-body and the other rules rustc cannot express
 kbuild portability                        compile host-testable units for rv32i, rv32imac, thumbv7m
+kbuild stress --duration 10m              run the stress image, killing it if its heartbeat stops
 kbuild size --preset P [--compare REF|FILE] [--save FILE] [--update-baseline]
                                           sections and per-crate sizes, against the preset's
                                           SIZE_BUDGET_KIB and a baseline report

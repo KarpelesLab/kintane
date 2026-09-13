@@ -221,6 +221,102 @@ Gaps are loud rather than silent: an unimplemented syscall returns `-ENOSYS` and
 its name, and CI enables the option making that fatal, so a missing syscall is a named
 failure instead of a program behaving oddly.
 
+### 3a. Stress
+
+The Phase 2 exit criterion is a kernel that survives 24 hours of concurrent work on
+every tier-1 architecture, with allocation failure injected. `kbuild stress` is that
+run:
+
+```
+$ kbuild stress --preset aarch64-virt --duration 10m
+stress heartbeat 600/600 s: heap 19811696 (refused 1239506), ipc 104967, sleeps 22725
+  (latest +31871 us), vm 210144 (faults 2153987, copies 420290, huge 52537), pages 262773,
+  audits 600 ok
+stress passed: 600 audits over 600 s
+```
+
+It builds the image with `STRESS_TEST`, which requires `QEMU_EXIT` and selects
+`KALLOC_FAULT_INJECT`, and `STRESS_SECONDS` set from `--duration`. After a clean
+bring-up the kernel hands the CPU to the scheduler for good (see
+[architecture.md](architecture.md)), and boot becomes an auditor over seven workload
+threads at mixed priorities (`kernel/main/src/stress.rs`):
+
+- **heap** — kernel heap churn from two threads, with one request in 32 failed on purpose from a
+  seeded injector;
+- **ipc** — a channel ping-pong that moves a handle there and back on every round trip;
+- **sleep** — sleeps to random deadlines, which must never wake early;
+- **vm** — demand paging, copy-on-write sharing and 2 MiB pages on a kernel `Vm`;
+- **pages** — buddy allocator churn on a pool of its own.
+
+Every second of guest time the auditor stops every workload at a checkpoint, where it
+holds nothing that would make the books inexact, and checks them:
+
+- the heap's bytes in use are back at their baseline;
+- the heap's failure count equals the refusals the workloads handled;
+- channel handle counts are exact and nothing is queued;
+- `Vm::audit` passes, and the vm frame pool is full when nothing is mapped;
+- `Buddy::check` passes, with every page free;
+- `Threads::check` passes, and nothing was recorded as broken;
+- no lock-order violation;
+- every workload made progress since the last audit.
+
+A failed audit prints `stress AUDIT FAILED` and exits with the failure code. A workload
+that cannot reach a checkpoint within three seconds is a failure too. Each audit ends
+with a `stress heartbeat` line, and the last one with success.
+
+**The heartbeat is read, the verdict is not.** A thread spinning with interrupts masked
+stops the auditor with it, and a stopped guest cannot reach the exit port. So `kbuild
+stress` kills a guest whose heartbeat is missing for 30 seconds, or that has not printed
+its first one within 180 seconds of starting. It reports that as a hang. That is the
+only place the harness looks at console output, and it looks only for the absence of a
+line. A pass is still only the exit code. The run also drops QEMU's per-interrupt log,
+which a day of timer interrupts would grow past any disk.
+
+**What each check was shown to catch**, by breaking the code and watching the run fail:
+
+| Mutation | Result |
+|---|---|
+| One held heap block leaked after an injected refusal | audit failed at 1 s: heap bytes not back at baseline |
+| The sleep workload keeps parking but stops sleeping | "made no progress since the last audit: sleep" at 3 s |
+| The page workload spins with interrupts masked | killed by the watchdog: no heartbeat for 30 s |
+| Pong keeps one extra handle | "pong's table does not hold exactly its endpoint" |
+| One vm pool frame leaked once | "frames are missing from the pool with nothing mapped" at the first empty checkpoint |
+
+**What it found on its first long run.** x86_64 and i686 passed 600 audits. aarch64 went
+silent after 109 audits, with no report, and the watchdog killed it. Three runs
+reproduced it, at 156, 191 and 406 seconds. `info registers` on QEMU's monitor at the
+hang showed a CPU that was running, but only in the interrupt path: GIC claim and EOI,
+the counter read, and `arm_ns`.
+
+The cause was `CNTP_TVAL_EL0`. It holds 32 bits, but as a **signed** value, and the port
+allowed arming up to `u32::MAX` ticks. The scheduler arms the full reach whenever the
+timer queue is empty and no thread is waiting, which happens for an instant while the
+auditor runs. A deadline more than 2.15 s ahead sign-extended into the past, fired at
+once, and was re-armed identically from the interrupt, so the CPU took timer interrupts
+and nothing else.
+
+No boot check could see it, because none armed more than half a second. The fix limits
+one arming to `i32::MAX` ticks. The boot's tickless check now also arms the full reach
+and requires no interrupt for 20 ms. The first version of that check restored the boot
+thread's masked interrupt state, so the early interrupt could never be taken, and it
+passed with the bug in place. The second takes the interrupt but kept the scheduler's
+hook, which re-armed the same deadline, so the bug became a hang again. The third
+unmasks explicitly and removes the hook while it watches, and it reports FAILED on the
+unsigned limit.
+
+Every merge runs a 20-second stress smoke on each tier-1 architecture, which keeps the
+image building and passing its first audits. A nightly workflow
+(`.github/workflows/stress.yml`) runs 30 minutes per tier-1 preset,
+and takes a duration input when dispatched by hand. The 24-hour run is that dispatch
+with `24h`. GitHub-hosted runners cap a job at six hours, so it needs a self-hosted
+runner; the workflow says so rather than letting the job be cancelled at hour six.
+
+What this level does not cover yet: more than one CPU, userspace, devices beyond the
+timer and the console, and fault injection outside the kernel heap. The heap injector
+also leaves out the buddy-page site, because a refused page block falls back to an arena
+that reclaims only in last-in-first-out order. Injecting there would exhaust the arena by
+design (`kernel/main/src/stress/heap.rs`).
+
 ### 4. Hardware — deferred
 
 Not "cancelled". See [The hardware debt](#the-hardware-debt) for what deferring it

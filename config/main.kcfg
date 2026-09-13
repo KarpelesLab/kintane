@@ -333,6 +333,41 @@ config NULL_DEREF_TEST
 
         A test mode, never a production setting; see STACK_GUARD_TEST.
 
+config STRESS_TEST
+    bool "Run the stress workload after bring-up"
+    depends on QEMU_EXIT && MM_PAGED
+    select KALLOC_FAULT_INJECT
+    default n
+    help
+        After a clean bring-up, hand the CPU to the scheduler and run mixed
+        workloads for STRESS_SECONDS of guest time: heap churn under seeded
+        fault injection, channel ping-pong moving handles, sleeps to random
+        deadlines, demand paging with copy-on-write, and buddy page churn.
+        An auditor thread stops the workloads at checkpoints every second,
+        checks the books of each subsystem and that every workload made
+        progress, and prints a heartbeat line `kbuild stress` watches. Any
+        failed audit ends the run with a failure; the end of the time is a
+        final audit and a success. See docs/testing.md.
+
+        A test mode, never a production setting: it injects allocation
+        failures into the kernel heap on purpose.
+
+config STRESS_SECONDS
+    int "Stress run length (seconds of guest time)"
+    depends on STRESS_TEST
+    range 1 604800
+    default 60
+
+config STRESS_SEED
+    int "Stress run seed"
+    depends on STRESS_TEST
+    range 1 2147483647
+    default 1
+    help
+        Seeds the heap's fault injector and every workload's random choices,
+        so a failing run can be replayed with the same sequence of decisions.
+        Thread interleaving still depends on timing, which no seed controls.
+
 # Crash on purpose once boot has finished, from a known nested function, so the
 # crash report can be checked end to end: the kernel prints raw return addresses,
 # and `kbuild symbolize` must name the function. A backtrace is only ever needed

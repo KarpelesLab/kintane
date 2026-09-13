@@ -380,7 +380,7 @@ a one-shot timer (`start_oneshot`, `arm_ns`), and `timekeeping::program` arms it
 the earliest timer, or for the end of a time slice when the scheduler says a thread is
 waiting for the CPU. How far one arming reaches is a fact about the hardware:
 
-- **Arm generic timer:** 32 bits of counter ticks, 4.29 s at QEMU's 1 GHz. A 500 ms idle
+- **Arm generic timer:** a signed 32-bit count of ticks, 2.15 s at QEMU's 1 GHz. A 500 ms idle
   period takes one interrupt.
 - **x86 PIT (mode 0):** 16 bits, 54.9 ms. The same idle period takes nine interrupts,
   where a 10 ms tick would take fifty. The PIT is the interim one-shot, and the local
@@ -612,14 +612,41 @@ the preemption check, the same scheduler runs the shared-state checks
   on any violation. `LOCKDEP_ABBA_TEST` makes two threads take two locks in opposite
   orders, and passes only if exactly that inversion was reported.
 
+#### The scheduler's lifetime
+
+The scheduler runs twice, on one thread table. The boot checks run it and then stop the
+timer. What `kmain` does next assumes one thread with interrupts masked:
+
+- the in-kernel suite, which builds its own frame pool over memory the loader reported
+  free;
+- the test modes that end the run from a fault handler;
+- a deliberate crash.
+
+Those stay on the boot thread rather than becoming threads, because each either ends
+the run or needs the machine not to change underneath it. A guard-page test has to be
+the thing that faults.
+
+Once they are done, `kmain` decides what the image does next:
+
+- **A test image** (`QEMU_EXIT`) reports its verdict and stops, as before.
+- **Any other image** calls `persist::run`, provided bring-up passed. That calls
+  `preempt::resume`, which re-enables the one-shot timer with the scheduler's hook and
+  unmasks. Boot is then one thread among the others, at the priority the checks gave
+  it, and idle is still in the table.
+  - A normal image then has boot sleep, printing `uptime N s` every ten seconds. That
+    is how a boot with no result channel shows it did not just halt.
+  - A `STRESS_TEST` image makes boot the stress auditor instead
+    ([testing.md](testing.md#3a-stress)).
+
+A failed bring-up never starts the scheduler: it halts, or exits with the failure.
+
 Not yet:
 
 - A stack is never given back to the port when its thread exits; the scheduler reuses
-  its four claimed slots.
-- The scheduler lives only for the duration of the boot checks. After them `kmain`
-  stops the timer and runs the in-kernel suite and the test modes on the boot thread
-  alone, which those modes still assume.
-- Nothing but the checks creates threads.
+  the slots it claimed. The ports reserve eight: the boot checks claim four, and the
+  stress run four more.
+- Nothing creates threads except the checks and the stress run.
+- Boot keeps its boot-check priority for good, which is above every stress workload.
 
 ### SMP
 

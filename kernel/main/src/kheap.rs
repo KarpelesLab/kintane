@@ -329,6 +329,23 @@ pub fn stats() -> Option<HeapStats> {
     with_heap(|k| Ok(k.heap.stats())).ok()
 }
 
+/// Replace the heap's fault-injection policy. `false` before [`install`]. A policy only
+/// fails anything in a build with `KALLOC_FAULT_INJECT`; see `kalloc::inject`.
+#[cfg_attr(
+    not(CONFIG_MM_PAGED),
+    expect(
+        dead_code,
+        reason = "used only by the stress run, which needs MM_PAGED"
+    )
+)]
+pub fn set_injector(inject: kalloc::Injector) -> bool {
+    with_heap(|k| {
+        k.heap.set_injector(inject);
+        Ok(())
+    })
+    .is_ok()
+}
+
 /// An owned `T` in the kernel heap.
 ///
 /// The kernel's `Box`: construction is fallible and says what context it is in, and

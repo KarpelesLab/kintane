@@ -13,7 +13,7 @@
 //! first: the earliest timer, or the end of the running thread's time slice when
 //! another thread is waiting for the CPU. An idle CPU with one sleeper 500 ms away
 //! takes one interrupt at 500 ms, not one every slice. The hardware bounds how far one
-//! arming reaches: 54.9 ms for the x86 PIT, 4.29 s for the Arm generic timer at 1 GHz.
+//! arming reaches: 54.9 ms for the x86 PIT, 2.15 s for the Arm generic timer at 1 GHz.
 //! A deadline further away than that costs one interrupt per arming, and the hook
 //! re-arms. [`Clock::max_idle`] bounds it as well, so a wrapping counter is always read
 //! in time.

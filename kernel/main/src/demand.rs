@@ -167,10 +167,11 @@ fn free_frames() -> usize {
     edit(|_, frames| frames.alloc.stats().free).unwrap_or(0)
 }
 
-/// Frames for the `Vm`, from the boot frame allocator.
-struct KernelFrames<'a> {
-    alloc: &'a mut FrameAllocator<'static, Cpu>,
-    direct: DirectMap,
+/// Frames for a `Vm`, from a frame allocator reached through the direct map. The boot
+/// check uses the boot allocator; the stress workload, its own pool.
+pub(crate) struct KernelFrames<'a> {
+    pub(crate) alloc: &'a mut FrameAllocator<'static, Cpu>,
+    pub(crate) direct: DirectMap,
 }
 
 impl KernelFrames<'_> {
@@ -268,7 +269,7 @@ fn poke(addr: usize, v: u8) {
 /// Not "above every device window": on a PC the APICs sit just below 4 GiB, and above
 /// them there is no gigabyte left in a 32-bit address space, which is how the i686 check
 /// failed when x86 discovery began claiming them.
-fn window(direct: DirectMap) -> Option<usize> {
+pub(crate) fn window(direct: DirectMap) -> Option<usize> {
     const GIB: u64 = 1 << 30;
     let (_, img_end) = arch::image_range();
     let low = (direct.virt_base().raw() as u64 + direct.len()).max(img_end);

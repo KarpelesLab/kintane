@@ -385,6 +385,25 @@ jobs:
           cat build/mismatch.txt
           grep -q "build ID mismatch" build/mismatch.txt
 
+      # The long run is nightly (stress.yml). This keeps the stress image building and
+      # passing its first audits on every merge, so the nightly run is never the first to
+      # find that it no longer compiles.
+      - name: Stress smoke on every tier-1 architecture
+        run: |
+          set -euo pipefail
+          fail=0
+          for name in x86_64-qemu i686-qemu aarch64-virt; do
+            echo "::group::stress $name"
+            if ./kbuild/target/release/kbuild stress --preset "$name" --duration 20s; then
+              echo "stress ok: $name"
+            else
+              echo "::error title=stress failed::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       # A failure that cannot be investigated from CI output alone is itself a
       # harness bug, so the exception traces and images are kept.
       - name: Collect failure artifacts

@@ -21,6 +21,7 @@ mod qemu;
 mod randconfig;
 mod sha256;
 mod size;
+mod stress;
 mod symbolize;
 mod toml;
 mod toolchain;
@@ -54,6 +55,9 @@ COMMANDS:
     portability          compile the hardware-independent units for machines
                          without a port yet (no atomics, no 64-bit atomics, no MMU)
     run                  build, then boot under QEMU
+    stress --duration <len>
+                         build a stress image and run it for <len> of guest time
+                         (e.g. 90s, 10m, 24h), failing if its heartbeat stops
     symbolize [log]      decode the backtrace in a guest console log against the
                          symbol bundle (default: the last `run` or `test --target`)
     clean                remove build outputs (the cache is kept)
@@ -110,6 +114,8 @@ struct Opts {
     compare: Option<String>,
     save: Option<String>,
     update_baseline: bool,
+    /// `stress`: seconds of guest time to run for.
+    duration: Option<u64>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -127,6 +133,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         compare: None,
         save: None,
         update_baseline: false,
+        duration: None,
     };
     let mut random = false;
     let mut seed: Option<u64> = None;
@@ -150,6 +157,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     .ok_or("--timeout needs seconds")?
                     .parse()
                     .map_err(|_| "--timeout expects a number")?;
+            }
+            "--duration" => {
+                i += 1;
+                let d = args.get(i).ok_or("--duration needs a length, e.g. 10m")?;
+                o.duration = Some(stress::parse_duration(d)?);
             }
             "--only" => {
                 i += 1;
@@ -251,7 +263,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             let (image, res) = do_build(&root, &topts)?;
             let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
             let m = qemu::machine_for(&res, &image, &log)?;
-            let outcome = boot(&root, &res, &m, opts.timeout)?;
+            let outcome = boot(&root, &res, &m, opts.timeout, None)?;
             match outcome.code {
                 Some(c) if outcome.passed => {
                     println!("\n\x1b[32min-kernel tests passed\x1b[0m (qemu exit {c})");
@@ -296,7 +308,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
             let m = qemu::machine_for(&res, &image, &log)?;
             println!("\n\x1b[36mbooting\x1b[0m {} {}\n", m.binary, m.args.join(" "));
-            let outcome = boot(&root, &res, &m, opts.timeout)
+            let outcome = boot(&root, &res, &m, opts.timeout, None)
                 .map_err(|e| format!("{e}\n  exception trace: {}", log.display()))?;
             println!();
             match outcome.code {
@@ -309,6 +321,34 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                      exception trace: {}",
                     m.success_code,
                     log.display()
+                )),
+                None => Err("QEMU was terminated by a signal".into()),
+            }
+        }
+        "stress" => {
+            let seconds = opts
+                .duration
+                .ok_or("stress needs --duration, e.g. --duration 10m")?;
+            let mut sopts = opts.clone();
+            sopts.sets.push(("QEMU_EXIT".into(), "y".into()));
+            sopts.sets.push(("STRESS_TEST".into(), "y".into()));
+            sopts
+                .sets
+                .push(("STRESS_SECONDS".into(), seconds.to_string()));
+            let (image, res) = do_build(&root, &sopts)?;
+            let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
+            let m = stress::quiet(qemu::machine_for(&res, &image, &log)?);
+            println!("\n\x1b[36mstress\x1b[0m {seconds}s: {} {}\n", m.binary, m.args.join(" "));
+            let outcome = boot(&root, &res, &m, stress::timeout(seconds), Some(stress::watch()))?;
+            match outcome.code {
+                Some(c) if outcome.passed => {
+                    println!("\n\x1b[32mstress passed\x1b[0m (qemu exit {c})");
+                    Ok(())
+                }
+                Some(c) => Err(format!(
+                    "stress failed: guest exited {c}, expected {}\n  \
+                     the failed audit is in the console output above",
+                    m.success_code
                 )),
                 None => Err("QEMU was terminated by a signal".into()),
             }
@@ -591,9 +631,10 @@ fn boot(
     res: &kcfg::Resolution,
     m: &qemu::Machine,
     timeout: u64,
+    watch: Option<qemu::Watch>,
 ) -> Result<qemu::Outcome, String> {
     let dir = root.join("build").join(res.str("TARGET"));
-    let outcome = qemu::run(m, timeout)?;
+    let outcome = qemu::run_watched(m, timeout, watch)?;
     let console = dir.join("console.log");
     std::fs::write(&console, &outcome.console)
         .map_err(|e| format!("{}: {e}", console.display()))?;
@@ -609,6 +650,9 @@ fn boot(
         }
     }
 
+    if let Some(why) = &outcome.hung {
+        return Err(format!("killed by the heartbeat watchdog: {why}"));
+    }
     if outcome.timed_out {
         return Err(format!("timed out after {timeout}s with no exit signal from the guest"));
     }
