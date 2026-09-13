@@ -11,7 +11,11 @@
 //!    makes the CPU refuse a write to `.rodata` and a fetch from `.data` in the live tables.
 //! 3. **What a stack overflow looks like.** The guard page is unmapped, so an overflow faults on
 //!    it. [`after_fault_report`] recognises that address in a fault report and says so, and
-//!    [`provoke_guard_fault`] overflows the boot stack on purpose, for the harness.
+//!    [`provoke_guard_fault`] overflows the boot stack on purpose, for the harness. Kernel thread
+//!    stacks come from [`claim_thread_stack`], each with a guard page of its own, and an overflow
+//!    of one is reported with the slot and the thread it was claimed for.
+//! 4. **What a null dereference looks like.** Page 0 is left unmapped, so a read through a null
+//!    pointer faults, and the report names it as one rather than as a fault at a small address.
 //!
 //! ## The #DF path is the one that gets exercised
 //!
@@ -23,10 +27,10 @@
 //! output. The report now names the guard page from the IST stack.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use hal::paging::DeviceWindow;
-use hal::{Arch, EarlyConsole};
+use hal::{Arch, EarlyConsole, HasContextSwitch, KernAddr};
 
 use crate::X86_64;
 use crate::paging::{self, CR0_WP, EFER, EFER_NXE, NO_EXECUTE, WRITABLE};
@@ -183,12 +187,6 @@ fn data_refuses_fetch(c: &dyn EarlyConsole, data: (u64, u64)) -> bool {
 // The guard page
 // ---------------------------------------------------------------------------
 
-/// Set when [`provoke_guard_fault`] is overflowing the stack on purpose.
-///
-/// A plain flag is enough. It is set once, from the only running context, and read only
-/// from a fault handler that context caused.
-static EXPECTING: AtomicBool = AtomicBool::new(false);
-
 /// Whether `addr` is inside the boot stack's guard page.
 fn in_guard(addr: u64) -> bool {
     let (start, end) = crate::image_sections().stack_guard;
@@ -197,28 +195,44 @@ fn in_guard(addr: u64) -> bool {
 
 /// Called by the exception reporter after it has printed a fatal fault.
 ///
-/// A page fault or double fault whose CR2 is in the guard page is a stack overflow, and
-/// the report says so, because "#PF at some address in the kernel image" is a much less
-/// useful sentence. While a guard fault is being provoked this is also the verdict: the
-/// run passes only if the fault is that one, and anything else fails at once instead of
-/// waiting for a timeout.
+/// A page fault or double fault whose CR2 is in a guard page is a stack overflow, and
+/// the report says whose, because "#PF at some address in the kernel image" is a much
+/// less useful sentence. A page fault in page 0 is a null dereference. While a fault is
+/// being provoked this is also the verdict: the run passes only if the fault is the one
+/// expected, and anything else fails at once instead of waiting for a timeout.
 pub(crate) fn after_fault_report(c: &dyn EarlyConsole, vector: Option<u8>, cr2: u64) {
-    let guard = matches!(vector, Some(8) | Some(14)) && in_guard(cr2);
-    if guard {
-        c.write_str("\nstack overflow: cr2 is in the guard page below the boot stack");
-        if vector == Some(8) {
-            c.write_str(", reported from the #DF IST stack");
+    let overflow = matches!(vector, Some(8) | Some(14));
+    let hit = if overflow && in_guard(cr2) {
+        Hit::BootGuard
+    } else if let Some(slot) = crate::image_sections().thread_stacks.guard_hit(cr2) {
+        if overflow {
+            Hit::ThreadGuard(slot)
+        } else {
+            Hit::Nothing
         }
+    } else if vector == Some(14) && cr2 < X86_64::PAGE_SIZE as u64 {
+        Hit::Null
+    } else {
+        Hit::Nothing
+    };
+    match hit {
+        Hit::BootGuard => {
+            c.write_str("\nstack overflow: cr2 is in the guard page below the boot stack")
+        }
+        Hit::ThreadGuard(slot) => {
+            c.write_str("\nstack overflow: cr2 is in the guard page below ");
+            write_slot(c, slot);
+        }
+        Hit::Null => c.write_str("\nnull dereference: cr2 is in page 0, which is never mapped"),
+        Hit::Nothing => {}
+    }
+    if matches!(hit, Hit::BootGuard | Hit::ThreadGuard(_)) && vector == Some(8) {
+        c.write_str(", reported from the #DF IST stack");
+    }
+    if hit != Hit::Nothing {
         c.write_str("\n");
     }
-    if EXPECTING.load(Ordering::Relaxed) {
-        c.write_str(if guard {
-            "expected guard page fault: observed\n"
-        } else {
-            "expected guard page fault: this fault is not it\n"
-        });
-        conclude(guard)
-    }
+    verdict(c, hit);
 }
 
 /// Overflow the boot stack until it reaches the guard page.
@@ -227,7 +241,7 @@ pub(crate) fn after_fault_report(c: &dyn EarlyConsole, vector: Option<u8>, cr2: 
 /// the exception path concludes the run; see [`after_fault_report`]. If it ever did return
 /// the guard page protected nothing, and that is reported as a failure.
 pub fn provoke_guard_fault() -> ! {
-    EXPECTING.store(true, Ordering::SeqCst);
+    EXPECTING.store(EXPECT_BOOT_GUARD, Ordering::SeqCst);
     let depth = descend(0);
     let _ = depth;
     conclude(false)
@@ -243,6 +257,152 @@ pub fn provoke_guard_fault() -> ! {
 fn descend(n: u64) -> u64 {
     let frame = core::hint::black_box([n; 16]);
     descend(core::hint::black_box(n.wrapping_add(1))).wrapping_add(frame[15])
+}
+
+// ---------------------------------------------------------------------------
+// Kernel thread stacks, and what a fault report says about them
+// ---------------------------------------------------------------------------
+
+/// Slots handed out so far. A stack is never given back: nothing that exits returns its
+/// stack yet, and a slot a suspended thread may still be using must not be reissued.
+static CLAIMED: AtomicUsize = AtomicUsize::new(0);
+
+/// Most slots a fault report can name the owner of. The planner in `kernel/main` refuses
+/// more thread stacks than this anyway.
+const NAMED_SLOTS: usize = 16;
+
+/// Who each slot was claimed for, for the report.
+struct Owners(UnsafeCell<[&'static str; NAMED_SLOTS]>);
+
+// SAFETY: a slot's entry is written once, by `claim_thread_stack`, before the slot is
+// returned and so before any thread can run on it. The fault reporter only reads, and an
+// entry it reads has either been written or is still the initial `""`.
+unsafe impl Sync for Owners {}
+
+static OWNERS: Owners = Owners(UnsafeCell::new([""; NAMED_SLOTS]));
+
+/// A kernel thread stack with an unmapped guard page below it, claimed for `owner`.
+///
+/// Returns `(slot, top, size)`. `None` once every slot the linker reserved is taken.
+/// The stack is mapped read-write by the kernel address space, and the page below
+/// `top - size` is not, so an overflow faults and the report names `owner`.
+pub fn claim_thread_stack(owner: &'static str) -> Option<(usize, KernAddr, usize)> {
+    let t = crate::image_sections().thread_stacks;
+    let slot = CLAIMED
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < t.count().min(NAMED_SLOTS)).then_some(n + 1)
+        })
+        .ok()?;
+    let (bottom, top) = t.stack_range(slot)?;
+    // SAFETY: see `Owners`: this slot was just claimed, so nothing runs on it yet and no
+    // other writer exists for its entry.
+    unsafe { (*OWNERS.0.get())[slot] = owner };
+    Some((slot, KernAddr::new(top as usize), (top - bottom) as usize))
+}
+
+/// The owner a slot was claimed for, or `""`.
+fn owner_of(slot: usize) -> &'static str {
+    // SAFETY: a read of a `&'static str` written before the slot's thread could run.
+    unsafe { (*OWNERS.0.get()).get(slot).copied().unwrap_or("") }
+}
+
+/// `thread stack N (owner)`.
+fn write_slot(c: &dyn EarlyConsole, slot: usize) {
+    c.write_str("thread stack ");
+    let digits = [b'0' + (slot / 10 % 10) as u8, b'0' + (slot % 10) as u8];
+    c.write_bytes(if slot < 10 { &digits[1..] } else { &digits });
+    let owner = owner_of(slot);
+    if !owner.is_empty() {
+        c.write_str(" (");
+        c.write_str(owner);
+        c.write_str(")");
+    }
+}
+
+/// What a faulting address turned out to be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    Nothing,
+    BootGuard,
+    ThreadGuard(usize),
+    Null,
+}
+
+/// What a provoked fault must turn out to be, while one is being provoked. One of the
+/// `EXPECT_*` values below.
+///
+/// A plain flag is enough. It is set once, from the only running context, and read only
+/// from a fault handler that context caused.
+static EXPECTING: AtomicU8 = AtomicU8::new(EXPECT_NOTHING);
+
+const EXPECT_NOTHING: u8 = 0;
+const EXPECT_BOOT_GUARD: u8 = 1;
+const EXPECT_THREAD_GUARD: u8 = 2;
+const EXPECT_NULL: u8 = 3;
+
+/// The run's verdict while a fault is expected: pass on the expected kind, fail on any
+/// other fault, at once rather than by timeout.
+fn verdict(c: &dyn EarlyConsole, hit: Hit) {
+    let want = EXPECTING.load(Ordering::Relaxed);
+    if want == EXPECT_NOTHING {
+        return;
+    }
+    let (ok, what) = match want {
+        EXPECT_BOOT_GUARD => (hit == Hit::BootGuard, "guard page fault"),
+        EXPECT_THREAD_GUARD => (matches!(hit, Hit::ThreadGuard(_)), "thread stack guard fault"),
+        _ => (hit == Hit::Null, "null dereference"),
+    };
+    c.write_str("expected ");
+    c.write_str(what);
+    c.write_str(if ok {
+        ": observed\n"
+    } else {
+        ": this fault is not it\n"
+    });
+    conclude(ok)
+}
+
+/// Run a thread on a guarded stack that recurses until it reaches its guard page.
+///
+/// Does not return: the exception path concludes the run, and passes it only if the fault
+/// is on that thread stack's guard. If the recursion ever returned, the guard protected
+/// nothing, and the thread reports that as a failure.
+pub fn provoke_thread_guard_fault() -> ! {
+    let Some((_, top, _)) = claim_thread_stack("stack guard test") else {
+        crate::serial::EARLY.write_str("no thread stack to overflow\n");
+        conclude(false)
+    };
+    EXPECTING.store(EXPECT_THREAD_GUARD, Ordering::SeqCst);
+    let mut boot = <X86_64 as HasContextSwitch>::Context::default();
+    let mut thread = <X86_64 as HasContextSwitch>::Context::default();
+    // SAFETY: `top` is the top of a stack slot claimed just now, mapped read-write and used
+    // by nothing else. `boot` is a local of this function, which never returns, so it
+    // outlives the switch. Nothing switches back.
+    unsafe {
+        <X86_64 as HasContextSwitch>::init(&mut thread, top, overflow_thread, 0);
+        <X86_64 as HasContextSwitch>::switch(&mut boot, &thread);
+    }
+    conclude(false)
+}
+
+/// The thread [`provoke_thread_guard_fault`] starts.
+extern "C" fn overflow_thread(_: usize) -> ! {
+    let depth = descend(0);
+    let _ = depth;
+    conclude(false)
+}
+
+/// Read address zero, and conclude the run from the fault that must follow.
+pub fn provoke_null_dereference() -> ! {
+    EXPECTING.store(EXPECT_NULL, Ordering::SeqCst);
+    // Through `black_box`, so the compiler cannot see a null pointer and replace the read
+    // with a trap of its own choosing: the point is what the MMU does with it.
+    let at = core::hint::black_box(0usize) as *const u8;
+    // SAFETY: expected to fault, and the fault handler does not return: it concludes the
+    // run. If the read completes, page 0 is mapped, which is the failure reported below.
+    let byte = unsafe { at.read_volatile() };
+    let _ = byte;
+    conclude(false)
 }
 
 /// End the run with a verdict.

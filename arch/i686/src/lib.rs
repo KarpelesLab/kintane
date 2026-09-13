@@ -20,8 +20,8 @@
 //! the same shape as `arch/x86_64`'s without being the same code: the descriptor
 //! format and the pushed frame are genuinely different, and the two devices are
 //! duplicated because the two `arch` crates are separate units that may not depend on
-//! each other. The one gap this port has and x86-64 does not is a dedicated #DF stack;
-//! `idt.rs` records why.
+//! each other. #DF is where the two genuinely diverge: x86-64 gives it an IST stack, and
+//! this port, whose gates have no IST field, gives it a task gate (`tss`).
 //!
 //! `context` implements `hal::context`. Its module comment records a measurement that
 //! matters beyond the switch: for this target's LLVM triple the compiler assumes only a
@@ -51,6 +51,7 @@ pub mod pic;
 pub mod pit;
 pub mod serial;
 pub mod tick;
+mod tss;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};
@@ -244,6 +245,12 @@ pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
 /// only the "no-write" half there. The sections are still split — the split is what
 /// makes `.text` read-only — but a W^X claim for this port holds fully on one of the
 /// two CI configurations and half on the other.
+/// Bytes per kernel thread stack slot: one guard page, then the stack.
+///
+/// A power of two, which [`hal::StackArray`] requires. `link.ld` reserves whole slots
+/// and asserts it agrees with this value.
+pub const THREAD_STACK_SLOT: u64 = 32 * 1024;
+
 pub fn image_sections() -> hal::ImageSections {
     unsafe extern "C" {
         static __text_start: u8;
@@ -254,6 +261,8 @@ pub fn image_sections() -> hal::ImageSections {
         static __data_end: u8;
         static __stack_guard_start: u8;
         static __stack_guard_end: u8;
+        static __thread_stacks_start: u8;
+        static __thread_stacks_end: u8;
     }
     // Taking addresses of linker symbols, never reading through them: the symbols mark
     // positions and have no value of their own.
@@ -263,6 +272,12 @@ pub fn image_sections() -> hal::ImageSections {
         rodata: (at(&raw const __rodata_start), at(&raw const __rodata_end)),
         data: (at(&raw const __data_start), at(&raw const __data_end)),
         stack_guard: (at(&raw const __stack_guard_start), at(&raw const __stack_guard_end)),
+        thread_stacks: hal::StackArray {
+            start: at(&raw const __thread_stacks_start),
+            end: at(&raw const __thread_stacks_end),
+            slot: THREAD_STACK_SLOT,
+            guard: <I686 as hal::Arch>::PAGE_SIZE as u64,
+        },
     }
 }
 

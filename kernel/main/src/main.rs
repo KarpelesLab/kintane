@@ -49,6 +49,20 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
         c.write_str("\n  overflowing the boot stack into its guard page\n");
         arch::kspace::provoke_guard_fault();
     }
+    if kconfig::THREAD_STACK_GUARD_TEST {
+        if boot == Check::Failed {
+            finish(false);
+        }
+        c.write_str("\n  overflowing a kernel thread's stack into its guard page\n");
+        arch::kspace::provoke_thread_guard_fault();
+    }
+    if kconfig::NULL_DEREF_TEST {
+        if boot == Check::Failed {
+            finish(false);
+        }
+        c.write_str("\n  reading through a null pointer\n");
+        arch::kspace::provoke_null_dereference();
+    }
 
     // In a production image this is the no-op provider and folds away entirely; the
     // test image gets the real one. Which is linked is a configuration question, so
@@ -163,7 +177,9 @@ fn finish(_ok: bool) -> ! {
 fn banner(boot_arg: u64) -> (Check, Live) {
     let c = &arch::EARLY;
     c.write_str("\nKinTane\n");
-    c.write_str("  arch       ");
+    c.write_str("  build id   ");
+    buildid::write(c);
+    c.write_str("\n  arch       ");
     c.write_str(Cpu::NAME);
     c.write_str("\n  page size  ");
     write_usize(c, Cpu::PAGE_SIZE);

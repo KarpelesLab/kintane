@@ -234,6 +234,108 @@ pub struct ImageSections {
     ///
     /// `(0, 0)` means the port has not carved one out yet.
     pub stack_guard: (u64, u64),
+    /// Kernel thread stacks, each above a guard page of its own. Inside `data`, with
+    /// every guard page punched back out of it the way `stack_guard` is.
+    ///
+    /// [`StackArray::NONE`] means the port has not laid any out.
+    pub thread_stacks: StackArray,
+}
+
+/// A run of equal-sized kernel thread stacks, each with an unmapped guard page below it.
+///
+/// The boot stack's guard page protects one stack. A kernel thread's stack overflowing
+/// into the next thread's stack does not fault and does not report; it corrupts a
+/// suspended thread, which fails later and somewhere else. So each stack gets a slot of
+/// its own: a guard page at the bottom, then the stack.
+///
+/// ```text
+///   start                                                          end
+///   | guard | stack 0      | guard | stack 1      | ... | guard | stack n-1 |
+///   |<-------- slot ------->|
+/// ```
+///
+/// The slot size is a power of two. That is not tidiness: aarch64's exception entry has to
+/// decide whether an exception frame would land in *some* guard page before it may touch
+/// the stack, in a handful of instructions and two scratch registers, and a mask is the
+/// only test that fits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StackArray {
+    /// First byte of the first slot.
+    pub start: u64,
+    /// One past the last byte of the last slot.
+    pub end: u64,
+    /// Bytes per slot, guard included. A power of two, or the array is treated as empty.
+    pub slot: u64,
+    /// Bytes of guard at the bottom of each slot. Less than `slot`.
+    pub guard: u64,
+}
+
+impl StackArray {
+    /// No thread stacks laid out.
+    pub const NONE: StackArray = StackArray {
+        start: 0,
+        end: 0,
+        slot: 0,
+        guard: 0,
+    };
+
+    /// Whether the geometry describes at least one usable stack.
+    pub const fn is_valid(&self) -> bool {
+        self.slot.is_power_of_two() && self.guard < self.slot && self.end > self.start
+    }
+
+    /// How many whole slots fit.
+    pub const fn count(&self) -> usize {
+        if !self.is_valid() {
+            return 0;
+        }
+        // A shift, not a division: `slot` is a power of two, and u64 division on a
+        // 32-bit target is a runtime-library call.
+        ((self.end - self.start) >> self.slot.trailing_zeros()) as usize
+    }
+
+    /// `[start, end)` of slot `i`, guard included.
+    const fn slot_range(&self, i: usize) -> Option<(u64, u64)> {
+        if i >= self.count() {
+            return None;
+        }
+        let lo = self.start + ((i as u64) << self.slot.trailing_zeros());
+        Some((lo, lo + self.slot))
+    }
+
+    /// The guard page of slot `i`, as `[start, end)`.
+    pub const fn guard_range(&self, i: usize) -> Option<(u64, u64)> {
+        match self.slot_range(i) {
+            Some((lo, _)) => Some((lo, lo + self.guard)),
+            None => None,
+        }
+    }
+
+    /// The usable stack of slot `i`, as `[bottom, top)`.
+    pub const fn stack_range(&self, i: usize) -> Option<(u64, u64)> {
+        match self.slot_range(i) {
+            Some((lo, hi)) => Some((lo + self.guard, hi)),
+            None => None,
+        }
+    }
+
+    /// The slot `addr` falls in, guard or stack.
+    pub const fn slot_of(&self, addr: u64) -> Option<usize> {
+        if addr < self.start || !self.is_valid() {
+            return None;
+        }
+        let i = ((addr - self.start) >> self.slot.trailing_zeros()) as usize;
+        if i < self.count() { Some(i) } else { None }
+    }
+
+    /// The slot whose guard page `addr` is in. `None` for an address on a stack, or
+    /// outside the array.
+    pub const fn guard_hit(&self, addr: u64) -> Option<usize> {
+        match self.slot_of(addr) {
+            Some(i) if (addr - self.start) & (self.slot - 1) < self.guard => Some(i),
+            _ => None,
+        }
+    }
 }
 
 impl ImageSections {
@@ -249,6 +351,7 @@ impl ImageSections {
             rodata: (0, 0),
             data: (0, 0),
             stack_guard: (0, 0),
+            thread_stacks: StackArray::NONE,
         }
     }
 
@@ -411,6 +514,59 @@ mod tests {
         assert!(f.contains(PageFlags::USER));
         assert!(!f.without(PageFlags::USER).contains(PageFlags::USER));
         assert!(f.without(PageFlags::USER).contains(PageFlags::WRITE));
+    }
+
+    /// Three 32 KiB slots, 4 KiB of guard each, starting at 0x10_0000.
+    const STACKS: StackArray = StackArray {
+        start: 0x10_0000,
+        end: 0x10_0000 + 3 * 0x8000,
+        slot: 0x8000,
+        guard: 0x1000,
+    };
+
+    #[test]
+    fn stack_array_geometry() {
+        assert_eq!(STACKS.count(), 3);
+        assert_eq!(STACKS.guard_range(0), Some((0x10_0000, 0x10_1000)));
+        assert_eq!(STACKS.stack_range(0), Some((0x10_1000, 0x10_8000)));
+        assert_eq!(STACKS.guard_range(2), Some((0x11_0000, 0x11_1000)));
+        assert_eq!(STACKS.stack_range(2), Some((0x11_1000, 0x11_8000)));
+        assert_eq!(STACKS.stack_range(3), None);
+        assert_eq!(StackArray::NONE.count(), 0);
+        assert_eq!(StackArray::NONE.guard_hit(0), None);
+    }
+
+    #[test]
+    fn a_guard_hit_names_its_slot_and_a_stack_address_is_not_one() {
+        // The first and last byte of each guard, and the bytes either side of it.
+        assert_eq!(STACKS.guard_hit(0x10_0000), Some(0));
+        assert_eq!(STACKS.guard_hit(0x10_0fff), Some(0));
+        assert_eq!(STACKS.guard_hit(0x10_1000), None, "bottom byte of stack 0");
+        assert_eq!(STACKS.guard_hit(0x10_7fff), None, "top byte of stack 0");
+        assert_eq!(STACKS.guard_hit(0x10_8000), Some(1));
+        assert_eq!(STACKS.guard_hit(0x11_0fff), Some(2));
+        // Outside the array on both sides.
+        assert_eq!(STACKS.guard_hit(0x0f_ffff), None);
+        assert_eq!(STACKS.guard_hit(0x11_8000), None);
+        assert_eq!(STACKS.slot_of(0x11_7fff), Some(2));
+        assert_eq!(STACKS.slot_of(0x11_8000), None);
+    }
+
+    #[test]
+    fn a_slot_that_is_not_a_power_of_two_describes_nothing() {
+        // The exception-entry test on aarch64 is a mask, so a geometry it cannot test
+        // must not be treated as one that works.
+        let odd = StackArray {
+            slot: 0x5000,
+            ..STACKS
+        };
+        assert_eq!(odd.count(), 0);
+        assert_eq!(odd.guard_hit(0x10_0000), None);
+        let all_guard = StackArray {
+            guard: 0x8000,
+            ..STACKS
+        };
+        assert_eq!(all_guard.count(), 0);
     }
 
     #[test]

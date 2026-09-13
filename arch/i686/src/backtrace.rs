@@ -37,6 +37,17 @@ pub fn print(c: &dyn EarlyConsole, pc: Option<usize>, skip: usize) {
     }
 }
 
+/// Print a backtrace of an interrupted context: `pc` and the chain from `fp`.
+///
+/// For the double-fault task, which runs on a stack of its own and reads the interrupted
+/// registers out of a TSS, so its own frame pointer leads nowhere useful.
+pub fn print_from(c: &dyn EarlyConsole, pc: usize, fp: usize) {
+    // SAFETY: as for `print`. The walk is confined to whichever stack `fp` is on.
+    unsafe {
+        unwind::print(c, LAYOUT, &crate::image_sections(), fp, Some(pc), 0);
+    }
+}
+
 /// Walk this call chain without printing, for the boot check.
 #[inline(never)]
 pub fn chain() -> unwind::Chain {

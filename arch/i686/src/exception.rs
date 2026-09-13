@@ -89,17 +89,48 @@ pub extern "x86-interrupt" fn invalid_opcode(frame: InterruptFrame) -> ! {
     fatal(Some(6), None, &frame)
 }
 
-/// #DF, vector 8. Fatal by architecture: `iret` from a double fault is undefined.
+/// The state a task switch saved when #DF interrupted it.
+pub(crate) struct Interrupted {
+    pub eip: u32,
+    pub cs: u32,
+    pub eflags: u32,
+    pub esp: u32,
+    pub ebp: u32,
+}
+
+/// #DF, vector 8, reported by the double-fault task. Fatal by architecture.
 ///
-/// The error code is always zero; it is printed anyway so the report format does not
-/// change shape between vectors.
+/// There is no interrupt-gate handler for #DF. The gate is a task gate (`tss.rs`), so this
+/// runs on the double-fault task's own stack with the interrupted state read out of the
+/// TSS the switch saved it into. That is what lets it report a double fault caused by a
+/// stack that cannot be pushed to, and it is also why this report can print `esp`, which
+/// the other vectors' reports cannot: the switch saved it.
 ///
-/// This handler runs on the faulting stack, because this port has no TSS and 32-bit
-/// gates have no IST field. If the reason for the double fault was that the stack is
-/// unusable, the CPU triple-faults pushing this frame and nothing below is reached.
-/// That is a real gap, stated rather than hidden; see the note in `idt.rs`.
-pub extern "x86-interrupt" fn double_fault(frame: InterruptFrame, code: u32) -> ! {
-    fatal(Some(8), Some(code), &frame)
+/// The backtrace is walked from the interrupted `ebp`, on the stack that faulted, confined
+/// to that stack's bounds as every walk is.
+pub(crate) fn double_fault_task(code: u32, at: Interrupted) -> ! {
+    let c: &dyn EarlyConsole = &EARLY;
+    c.write_str("\n\n*** cpu exception ");
+    write_hex(c, 8, 2);
+    c.write_str(" ");
+    c.write_str(name(8));
+    c.write_str("\n    error  ");
+    write_hex(c, code, 8);
+    c.write_str("\n    cr2    ");
+    write_hex(c, cr2(), 8);
+    c.write_str("\n    eip    ");
+    write_hex(c, at.eip, 8);
+    c.write_str("\n    cs     ");
+    write_hex(c, at.cs, 4);
+    c.write_str("\n    eflags ");
+    write_hex(c, at.eflags, 8);
+    c.write_str("\n    esp    ");
+    write_hex(c, at.esp, 8);
+    c.write_str("\n    via    the #DF task gate\n");
+    crate::backtrace::print_from(c, at.eip as usize, at.ebp as usize);
+    crate::kspace::after_fault_report(c, Some(8), cr2(), true);
+    c.write_str("\nhalted.\n");
+    crate::I686::halt()
 }
 
 /// #GP, vector 13. The error code is the selector at fault, or zero.
@@ -168,7 +199,7 @@ fn fatal(vector: Option<u8>, code: Option<u32>, frame: &InterruptFrame) -> ! {
     write_hex(c, frame.eflags, 8);
     c.write_str("\n");
     crate::backtrace::print(c, Some(frame.eip as usize), crate::backtrace::EXCEPTION_FRAMES);
-    crate::kspace::after_fault_report(c, vector, cr2());
+    crate::kspace::after_fault_report(c, vector, cr2(), false);
     c.write_str("\nhalted.\n");
 
     crate::I686::halt()

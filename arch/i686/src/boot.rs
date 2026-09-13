@@ -41,10 +41,10 @@
 //!
 //! They are now in sections of their own, `.bss.boot_tables` and `.stack`, and
 //! `link.ld` puts the tables at the bottom of `.bss`, the stack at the top of the
-//! image, and an unmapped guard page between them. That page is the only means this
-//! port has of *detecting* an overflow: a 32-bit gate descriptor has no IST field (see
-//! `idt.rs`), so `#DF` cannot be given a stack of its own here and an overflow that is
-//! not caught at the guard is caught nowhere.
+//! image, and an unmapped guard page between them. That page is how this port *detects*
+//! an overflow. Reporting one is the double-fault task's job (`tss.rs`): a 32-bit gate
+//! descriptor has no IST field, so `#DF` is a task gate, which switches to a stack of its
+//! own without pushing anything on the one that overflowed.
 //!
 //! The guard is not enforced by the map this file builds, which uses 2 MiB leaves and
 //! cannot express a 4 KiB hole; it becomes real when the kernel installs the address

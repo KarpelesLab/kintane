@@ -212,6 +212,29 @@ jobs:
           done
           exit $fail
 
+      - name: Thread stack guard and null dereference on every preset
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in config/presets/*.preset; do
+            name=$(basename "$p" .preset)
+            # A kernel thread overflows its own stack and must fault on that stack's guard,
+            # not the boot stack's and not in the stack below. Then a read of address zero
+            # must fault and be reported as a null dereference.
+            for mode in THREAD_STACK_GUARD_TEST NULL_DEREF_TEST; do
+              echo "::group::$mode $name"
+              if ./kbuild/target/release/kbuild run --preset "$name" \
+                  --set QEMU_EXIT=y --set "$mode=y" --timeout 60; then
+                echo "$mode ok: $name"
+              else
+                echo "::error title=$mode failed::preset $name"
+                fail=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit $fail
+
       # A backtrace is read only after something has gone wrong, which is the worst time
       # to learn it stopped decoding. Each architecture crashes on purpose, once by panic
       # and once by fault, and the decoded report must name the functions it came from.
@@ -257,6 +280,25 @@ jobs:
             fi
           done
           exit $fail
+
+      # The build ID is what stops a log from being decoded against the wrong build's
+      # symbols, into names that look right. So decode a log against a different build and
+      # require the refusal: a crash log from a debug build, symbols from a release one.
+      - name: A log from another build is refused
+        run: |
+          set -uo pipefail
+          ./kbuild/target/release/kbuild run --preset x86_64-qemu --set CRASH_PANIC=y \
+            --set DEBUG_BUILD=n --timeout 20 > /dev/null 2>&1
+          cp build/x86_64-kintane/console.log build/other-build.log
+          ./kbuild/target/release/kbuild build --preset x86_64-qemu --set CRASH_PANIC=y \
+            --set DEBUG_BUILD=y
+          if ./kbuild/target/release/kbuild symbolize --preset x86_64-qemu \
+              build/other-build.log > build/mismatch.txt 2>&1; then
+            echo "::error title=build ID not checked::a log from another build was decoded"
+            exit 1
+          fi
+          cat build/mismatch.txt
+          grep -q "build ID mismatch" build/mismatch.txt
 
       # A failure that cannot be investigated from CI output alone is itself a
       # harness bug, so the exception traces and images are kept.

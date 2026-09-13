@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 
-use hal::ImageSections;
+use hal::{ImageSections, StackArray};
 
 use crate::*;
 
@@ -211,6 +211,7 @@ fn stacks_exclude_a_guard_inside_the_data() {
         rodata: (0x2000, 0x3000),
         data: (0x3000, 0x9000),
         stack_guard: (0x5000, 0x6000),
+        thread_stacks: StackArray::NONE,
     };
     assert_eq!(image_stacks(&s), [(0x3000, 0x5000), (0x6000, 0x9000)]);
 }
@@ -223,9 +224,47 @@ fn stacks_keep_all_data_when_the_guard_is_outside_it() {
         rodata: (0x2000, 0x3000),
         data: (0x4000, 0x9000),
         stack_guard: (0x3000, 0x4000),
+        thread_stacks: StackArray::NONE,
     };
     assert_eq!(image_stacks(&s)[0], (0x4000, 0x9000));
     assert_eq!(image_stacks(&s)[1], (0, 0));
+}
+
+/// i686 and aarch64 layout with a thread-stack array above the boot stack: data, guard,
+/// boot stack, then two 0x2000 slots of one guard page and one stack page each.
+fn with_thread_stacks() -> ImageSections {
+    ImageSections {
+        text: (0x1000, 0x2000),
+        rodata: (0x2000, 0x3000),
+        data: (0x3000, 0xb000),
+        stack_guard: (0x5000, 0x6000),
+        thread_stacks: StackArray {
+            start: 0x7000,
+            end: 0xb000,
+            slot: 0x2000,
+            guard: 0x1000,
+        },
+    }
+}
+
+#[test]
+fn a_thread_stack_walk_is_confined_to_its_own_slot() {
+    let s = with_thread_stacks();
+    assert_eq!(stack_bounds(&s, 0x8800), Some((0x8000, 0x9000)));
+    assert_eq!(stack_bounds(&s, 0xa000), Some((0xa000, 0xb000)));
+    // In a guard page: nothing there is readable, so there is nowhere to walk.
+    assert_eq!(stack_bounds(&s, 0x7800), None);
+    assert_eq!(stack_bounds(&s, 0x9000), None);
+}
+
+#[test]
+fn the_boot_stack_piece_stops_short_of_the_thread_stacks() {
+    let s = with_thread_stacks();
+    // The boot stack above its guard is bounded below the array, whose guards are
+    // unmapped too.
+    assert_eq!(stack_bounds(&s, 0x6800), Some((0x6000, 0x7000)));
+    assert_eq!(stack_bounds(&s, 0x3800), Some((0x3000, 0x5000)));
+    assert_eq!(stack_bounds(&s, 0x5800), None, "the boot guard itself");
 }
 
 #[test]

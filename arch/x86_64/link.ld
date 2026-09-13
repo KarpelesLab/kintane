@@ -43,6 +43,11 @@
 
 ENTRY(_start)
 
+/* See `.thread_stacks` below. */
+THREAD_STACK_SLOT = 32K;
+THREAD_STACK_SLOTS = 8;
+
+
 SECTIONS {
     . = 1M;
     __kernel_start = .;
@@ -62,6 +67,8 @@ SECTIONS {
 
     .rodata : ALIGN(4K) {
         __rodata_start = .;
+        /* The build ID kbuild stamps after linking; see lib/buildid. */
+        KEEP(*(.kintane_build_id))
         *(.rodata .rodata.*)
         . = ALIGN(4K);
         __rodata_end = .;
@@ -107,6 +114,19 @@ SECTIONS {
         __bss_end = .;
     }
 
+    /* Kernel thread stacks: THREAD_STACK_SLOTS slots of THREAD_STACK_SLOT bytes, each a
+     * guard page followed by the stack. Only the run is reserved here. The slot
+     * geometry is `THREAD_STACK_SLOT` in `src/lib.rs`, and the address-space builder
+     * leaves the bottom page of every slot unmapped, so a thread that overflows its
+     * stack faults instead of writing into the stack of the thread below it. Last in
+     * the writable run, so a slot's guard page is never the only thing between two
+     * unrelated sections. */
+    .thread_stacks (NOLOAD) : ALIGN(4K) {
+        __thread_stacks_start = .;
+        . += THREAD_STACK_SLOTS * THREAD_STACK_SLOT;
+        __thread_stacks_end = .;
+    }
+
     __data_end = .;
     __kernel_end = .;
 
@@ -116,3 +136,9 @@ SECTIONS {
         *(.comment)
     }
 }
+
+/* The Rust side computes the slot count by shifting, and aarch64's exception entry tests
+ * for a guard hit with a mask. Both need whole, page-aligned, power-of-two slots. */
+ASSERT(THREAD_STACK_SLOT == 32K, "THREAD_STACK_SLOT disagrees with src/lib.rs")
+ASSERT(__thread_stacks_start % 4K == 0, "__thread_stacks_start is not page-aligned")
+ASSERT((__thread_stacks_end - __thread_stacks_start) % THREAD_STACK_SLOT == 0, "thread stacks are not whole slots")

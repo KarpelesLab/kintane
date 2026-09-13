@@ -105,7 +105,9 @@ inputs, verifies them, installs them, and checks them again through the live roo
   page tables themselves live.
 - **The image**, from `image_sections()`: `.text` read-execute, `.rodata` read-only,
   data and stacks read-write and never executable. A one-page hole below the boot stack
-  is left unmapped. That hole is the stack guard.
+  is left unmapped. That hole is the stack guard. So is the bottom page of every slot in
+  the kernel thread-stack array (below), and so is page 0, on every port, so that a null
+  pointer faults instead of reading the real-mode interrupt vector table.
 - **Device windows**, from `arch::kspace::device_windows()`. Neither of the other two
   inputs describes a device. A device left out of the map is a fault on its first
   register access after the switch, and on aarch64, where the console is MMIO, that
@@ -128,16 +130,33 @@ first such pool, and the live tables are walked again after it runs. On x86 an o
 entry goes unnoticed while the TLB still holds the old translation, so without that second
 walk the corruption would surface much later, somewhere else.
 
-**What a stack overflow does now.** On x86_64 an overflow of the boot stack faults on the
-guard page. The #PF cannot be pushed onto the exhausted stack, so #DF is raised and runs on
-its IST stack, and the report names the guard page. On aarch64 the synchronous vector
-checks, before touching memory, whether its own frame would land in the guard page. If it
-would, it switches to a reserved stack. Otherwise the frame would go beneath the guard and
-overwrite `.bss` to print the report. On i686 a real overflow still triple-faults: a 32-bit
-gate has no IST, and this port has no #DF task gate. The guard page is unmapped and a touch
-of it is reported, but an overflow that exhausts the stack cannot be reported yet.
-`STACK_GUARD_TEST` exercises all of this; see
-[testing.md](testing.md#expected-faults-the-stack-guard-test).
+**Kernel thread stacks.** Each port's `link.ld` reserves a run of 32 KiB slots after the
+boot stack, and `hal::StackArray` describes them: a guard page at the bottom of each slot,
+then a 28 KiB stack. Threads take their stacks from `arch::kspace::claim_thread_stack`,
+which records who each slot is for, so an overflow report names the thread. Without this, a
+thread that overflowed wrote into the stack of the thread whose slot was below, which
+corrupts a suspended thread and fails later, somewhere else. The slot size is a power of
+two for a reason: aarch64's exception entry has to decide whether a frame would land in
+*some* guard page with two scratch registers and no stack, and a mask is the test that fits.
+
+**What a stack overflow does now.** On every port, an overflow of the boot stack or of a
+thread stack faults on that stack's guard page and is reported by name:
+
+- **x86_64.** The #PF cannot be pushed onto the exhausted stack, so #DF is raised and runs on its
+  IST stack.
+- **i686.** A 32-bit gate has no IST, so #DF is a *task gate* (`arch/i686/src/tss.rs`): the CPU
+  switches to a task with its own stack and `CR3` without pushing anything on the broken one, and
+  that task reads the interrupted `EIP`, `ESP` and `EBP` out of the TSS the switch saved them into.
+  A hardware task switch sets `CR0.TS`, and this target emits SSE for ordinary code, so the task's
+  first instruction is `clts`; without it the report's first `movaps` raises #NM and the recursion
+  that follows destroys the task's stack.
+- **aarch64.** The synchronous vector checks, before touching memory, whether its own frame would
+  touch the boot stack's guard page or any thread stack's. If it would, it switches to a reserved
+  stack. Otherwise the frame would go beneath the guard, onto `.bss` or onto the stack of the
+  thread below, to print the report.
+
+`STACK_GUARD_TEST`, `THREAD_STACK_GUARD_TEST` and `NULL_DEREF_TEST` exercise all of this;
+see [testing.md](testing.md#expected-faults-the-stack-guard-test).
 
 ### `kalloc` — allocation
 
@@ -295,9 +314,10 @@ thread must keep receiving ticks, and idle must halt. Disabling the preemption c
 EOI ordering, the threads' unmasking, the priority, or idle's halt each makes the boot
 fail within seconds instead of hanging.
 
-Not yet: thread stacks are static `.bss` arrays with no guard page, sleeping is a tick
-count, not a timer subsystem with deadlines, and nothing but the demonstration creates
-threads.
+Thread stacks come from the guarded thread-stack array described under memory, so a thread
+that overflows faults on its own guard page. Not yet: a stack is never given back when its
+thread exits, sleeping is a tick count, not a timer subsystem with deadlines, and nothing but
+the demonstration creates threads.
 
 ## Boot flow
 

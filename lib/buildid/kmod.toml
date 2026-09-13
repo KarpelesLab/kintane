@@ -1,0 +1,10 @@
+[unit]
+name = "buildid"
+kind = "lib"
+root = "src/lib.rs"
+# `hal`, because the backtrace printer in `unwind` names the build in every crash report,
+# and `unwind` is itself at `hal` so the architecture's fault reporters can reach it.
+layer = "hal"
+
+[deps]
+units = ["hal"]

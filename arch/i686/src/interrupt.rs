@@ -75,7 +75,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal::{Arch, EarlyConsole, IrqChip, IrqNumber};
 
 use crate::serial::{write_dec, write_hex};
-use crate::{I686, exception, idt, pic, pit, tick};
+use crate::{I686, exception, idt, pic, pit, tick, tss};
 
 /// Install plain (no error code) handlers for a list of vectors.
 ///
@@ -226,7 +226,10 @@ pub fn init() {
         idt::set_gate(0, idt::EntryPoint::diverging(exception::divide_error));
         idt::set_gate(3, idt::EntryPoint::plain(exception::breakpoint));
         idt::set_gate(6, idt::EntryPoint::diverging(exception::invalid_opcode));
-        idt::set_gate(8, idt::EntryPoint::with_code(exception::double_fault));
+        // #DF through a task gate, so it has a stack of its own; see `tss.rs`. The task
+        // must be ready before the gate can be delivered through.
+        tss::init();
+        idt::set_task_gate(8, tss::DF_TSS_SELECTOR);
         idt::set_gate(13, idt::EntryPoint::with_code(exception::general_protection));
         idt::set_gate(14, idt::EntryPoint::with_code(exception::page_fault));
 
@@ -278,8 +281,46 @@ pub fn selftest(c: &dyn EarlyConsole) -> bool {
 
     let bp_ok = check_breakpoint(c);
     let irq_ok = check_timer(c);
+    let df_ok = report_df_task(c);
 
-    bp_ok && irq_ok
+    bp_ok && irq_ok && df_ok
+}
+
+/// Confirm the double-fault task is wired, as far as that can be seen without a double
+/// fault: `TR` names the main TSS, gate 8 is a task gate to the double-fault TSS, and that
+/// task has a stack and the tables the CPU is running on.
+///
+/// The last one is the failure worth catching: a task left on the boot-time `CR3` works
+/// right up until the tables it names are gone.
+fn report_df_task(c: &dyn EarlyConsole) -> bool {
+    let tr = tss::task_register();
+    let (selector, flags) = idt::gate(8);
+    let (stack, cr3) = tss::df_task();
+    let live = crate::paging::read_cr3();
+    c.write_str("\n             #DF  ");
+    let wired =
+        tr == tss::MAIN_TSS_SELECTOR && selector == tss::DF_TSS_SELECTOR && flags & 0x1f == 0x05;
+    if !wired {
+        c.write_str("NO task gate (tr ");
+        write_hex(c, u32::from(tr), 4);
+        c.write_str(", gate 8 ");
+        write_hex(c, u32::from(selector), 4);
+        c.write_str(")");
+        return false;
+    }
+    c.write_str("task gate to tss ");
+    write_hex(c, u32::from(selector), 4);
+    c.write_str(", stack top ");
+    write_hex(c, stack, 8);
+    c.write_str(if cr3 == live {
+        ", cr3 follows the live root"
+    } else {
+        ", cr3 STALE"
+    });
+    c.write_str(" (tr ");
+    write_hex(c, u32::from(tr), 4);
+    c.write_str(")");
+    stack != 0 && cr3 == live
 }
 
 /// Raise #BP and confirm the handler ran and execution continued past it.

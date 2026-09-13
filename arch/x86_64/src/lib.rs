@@ -186,6 +186,12 @@ pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
 ///
 /// `.data` and `.bss` are reported as one range because they are contiguous and want
 /// identical permissions; the linker keeps them adjacent so this stays true.
+/// Bytes per kernel thread stack slot: one guard page, then the stack.
+///
+/// A power of two, which [`hal::StackArray`] requires. `link.ld` reserves whole slots
+/// and asserts it agrees with this value.
+pub const THREAD_STACK_SLOT: u64 = 32 * 1024;
+
 pub fn image_sections() -> hal::ImageSections {
     unsafe extern "C" {
         static __text_start: u8;
@@ -196,6 +202,8 @@ pub fn image_sections() -> hal::ImageSections {
         static __data_end: u8;
         static __stack_guard_start: u8;
         static __stack_guard_end: u8;
+        static __thread_stacks_start: u8;
+        static __thread_stacks_end: u8;
     }
     // Addresses only, never reads: these symbols mark positions and have no value.
     // `&raw const` rather than a reference for the same reason — there is no object
@@ -207,6 +215,12 @@ pub fn image_sections() -> hal::ImageSections {
         rodata: (at(&raw const __rodata_start), at(&raw const __rodata_end)),
         data: (at(&raw const __data_start), at(&raw const __data_end)),
         stack_guard: (at(&raw const __stack_guard_start), at(&raw const __stack_guard_end)),
+        thread_stacks: hal::StackArray {
+            start: at(&raw const __thread_stacks_start),
+            end: at(&raw const __thread_stacks_end),
+            slot: THREAD_STACK_SLOT,
+            guard: <X86_64 as hal::Arch>::PAGE_SIZE as u64,
+        },
     }
 }
 

@@ -8,4 +8,4 @@ host-tests = true
 layer = "hal"
 
 [deps]
-units = ["hal"]
+units = ["hal", "buildid"]

@@ -57,27 +57,30 @@ core::arch::global_asm!(
 .endm
 
 // The synchronous entry for the stack the kernel runs on, which is the one entry that can
-// be reached *because* that stack overflowed. Before opening a frame it checks, touching
-// no memory, whether the frame would land in the boot stack's guard page. If it would,
-// the store below faults, the next exception opens its frame 0x120 lower, beneath the
-// guard, and succeeds there — on top of `.bss`. So it goes to the overflow path in
-// `kspace.rs` instead, which runs on a stack of its own. The two EL0 thread-pointer
-// registers are scratch: nothing runs at EL0, so nothing reads them.
+// be reached *because* that stack overflowed. The test is too long for a vector slot, so
+// the slot only branches to it; see `__sync_spx_entry` below.
 .macro VECTOR_SYNC_SPX index
-    msr     tpidrro_el0, x0
-    msr     tpidr_el0, x1
-    sub     x0, sp, #0x120
-    and     x0, x0, #0xfffffffffffff000
+    b       __sync_spx_entry
+    .balign 0x80
+.endm
+
+// Branch to 9f if the address in x0 is in a guard page: the boot stack's, or the bottom
+// page of any slot in the thread-stack array. Touches no memory. Clobbers x0 and x1.
+.macro GUARD_TEST
+    bic     x0, x0, #0xfff
     adrp    x1, __stack_guard_start
     cmp     x0, x1
-    mrs     x1, tpidr_el0
-    mrs     x0, tpidrro_el0
-    b.eq    __kspace_stack_overflow
-    sub     sp, sp, #0x120
-    str     x0, [sp, #0x00]
-    mov     x0, #\index
-    b       __exc_common
-    .balign 0x80
+    b.eq    9f
+    adrp    x1, __thread_stacks_end
+    cmp     x0, x1
+    b.hs    1f
+    adrp    x1, __thread_stacks_start
+    subs    x0, x0, x1
+    b.lo    1f
+    and     x0, x0, #{slot_mask}
+    cmp     x0, #{guard}
+    b.lo    9f
+1:
 .endm
 
 .section .text.vectors, "ax"
@@ -100,6 +103,35 @@ __exception_vectors:
     VECTOR 13           // lower EL, AArch32: IRQ
     VECTOR 14           // lower EL, AArch32: FIQ
     VECTOR 15           // lower EL, AArch32: SError
+
+// Before opening a frame, check, touching no memory, whether the frame would touch a guard
+// page. If it would, the store faults, the next exception opens its frame 0x120 lower,
+// beneath the guard, and succeeds there: on top of `.bss` below the boot stack, or on top
+// of the stack of the thread whose slot is below. So it goes to the overflow path in
+// `kspace.rs` instead, which runs on a stack of its own.
+//
+// Two addresses are tested. The frame's bottom, `sp - 0x120`, catches a frame that would
+// open inside a guard. `sp - 1` catches a stack pointer that is already in one, whose
+// frame would open below it. A guard page is larger than a frame, so between them nothing
+// the frame writes can be in a guard page unnoticed. The two EL0 thread-pointer registers
+// are scratch: nothing runs at EL0, so nothing reads them.
+__sync_spx_entry:
+    msr     tpidrro_el0, x0
+    msr     tpidr_el0, x1
+    sub     x0, sp, #0x120
+    GUARD_TEST
+    sub     x0, sp, #1
+    GUARD_TEST
+    mrs     x1, tpidr_el0
+    mrs     x0, tpidrro_el0
+    sub     sp, sp, #0x120
+    str     x0, [sp, #0x00]
+    mov     x0, #4
+    b       __exc_common
+9:
+    mrs     x1, tpidr_el0
+    mrs     x0, tpidrro_el0
+    b       __kspace_stack_overflow
 
 // x0 holds the vector index; the frame is open and x0's original value is in it.
 // The offsets below are the layout of `TrapFrame` and the two must change together.
@@ -155,7 +187,9 @@ __exc_common:
     ldp     x0, x1, [sp, #0x00]
     add     sp, sp, #0x120
     eret
-"#
+"#,
+    slot_mask = const crate::THREAD_STACK_SLOT - 1,
+    guard = const <crate::Aarch64 as hal::Arch>::PAGE_SIZE,
 );
 
 /// Register state saved by `__exc_common`, in the order it writes it.

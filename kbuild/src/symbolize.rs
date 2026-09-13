@@ -15,10 +15,15 @@
 //! and that instruction can belong to the next line or, after a call that never returns,
 //! to the next function entirely. So it is looked up one byte earlier, which lands inside
 //! the call. `pc` is the faulting instruction itself and is looked up as it is.
+//!
+//! Before any of that, the log's `bt build` ID must be the bundle's. Addresses decoded
+//! against another build's symbols still decode, into names that look right and are not,
+//! so a mismatch is refused rather than decoded with a warning nobody reads.
 
 use std::path::Path;
 use std::process::Command;
 
+use crate::buildid;
 use crate::dwarf::{Elf, LineTable};
 
 /// One backtrace entry found in a log.
@@ -123,6 +128,8 @@ pub struct Symbols {
     remap: &'static str,
     /// Hex digits in an address of this image, for printing.
     digits: usize,
+    /// The build ID the bundle was recorded with, in hex, if it has one.
+    build_id: Option<String>,
 }
 
 impl Symbols {
@@ -147,6 +154,7 @@ impl Symbols {
             lines,
             remap: "/kintane/",
             digits: if elf.is64 { 16 } else { 8 },
+            build_id: elf.section(buildid::BUNDLE_SECTION).map(crate::sha256::hex),
         })
     }
 
@@ -169,6 +177,39 @@ impl Symbols {
     }
 }
 
+/// Refuse to decode a log against a bundle from a different build.
+///
+/// A log with no ID, or a bundle with none, cannot be checked; that is said out loud and
+/// decoding goes ahead, because the alternative is a report nobody can read. A log that
+/// names an ID the bundle does not have is refused outright.
+pub fn check_build(
+    log_ids: &[String],
+    bundle_id: Option<&str>,
+    bundle: &Path,
+) -> Result<(), String> {
+    let Some(bundle_id) = bundle_id else {
+        eprintln!(
+            "\x1b[33mwarning\x1b[0m: {} records no build ID; cannot confirm the log is from this build",
+            bundle.display()
+        );
+        return Ok(());
+    };
+    if log_ids.is_empty() {
+        eprintln!(
+            "\x1b[33mwarning\x1b[0m: the log names no build ID; cannot confirm it is from build {bundle_id}"
+        );
+        return Ok(());
+    }
+    match log_ids.iter().find(|id| id.as_str() != bundle_id) {
+        None => Ok(()),
+        Some(other) => Err(format!(
+            "build ID mismatch: the log was printed by build {other}, but {} is build {bundle_id}\n  \
+             its addresses would decode into the wrong names; decode it against that build's bundle",
+            bundle.display()
+        )),
+    }
+}
+
 /// Every backtrace entry in `log`, in order.
 pub fn entries(log: &str) -> Vec<Entry> {
     log.lines().filter_map(parse_line).collect()
@@ -181,6 +222,7 @@ pub fn report(log: &str, bundle: &Path, nm: &Path) -> Result<usize, String> {
         return Ok(0);
     }
     let syms = Symbols::load(bundle, nm)?;
+    check_build(&buildid::in_log(log), syms.build_id.as_deref(), bundle)?;
     println!("\n\x1b[36msymbolized backtrace\x1b[0m ({})", bundle.display());
     for e in &found {
         let label = match e.frame {
@@ -226,6 +268,19 @@ reached kmain
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_log_from_another_build_is_refused() {
+        let bundle = Path::new("kintane.debug");
+        let this = "aa".repeat(20);
+        let other = "bb".repeat(20);
+        assert!(check_build(&[this.clone()], Some(&this), bundle).is_ok());
+        let err = check_build(&[this.clone(), other.clone()], Some(&this), bundle).unwrap_err();
+        assert!(err.contains("mismatch") && err.contains(&other), "{err}");
+        // Nothing to compare: decoded, with a warning.
+        assert!(check_build(&[], Some(&this), bundle).is_ok());
+        assert!(check_build(&[other], None, bundle).is_ok());
     }
 
     #[test]
