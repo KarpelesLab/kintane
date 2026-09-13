@@ -2,6 +2,7 @@
 name = "boot_protocol"
 kind = "lib"
 root = "src/lib.rs"
+host-tests = true
 layer = "hal"
 
 [deps]

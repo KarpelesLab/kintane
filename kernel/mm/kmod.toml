@@ -2,6 +2,7 @@
 name = "mm"
 kind = "lib"
 root = "src/lib.rs"
+host-tests = true
 layer = "core"
 
 # `boot_protocol` is a hal-layer unit: the memory map is an input to this

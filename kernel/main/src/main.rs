@@ -27,14 +27,23 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
 
     banner(boot_arg);
 
-    #[cfg(CONFIG_QEMU_EXIT)]
-    {
-        // The result channel the test protocol uses: a real exit status rather than
-        // console output for a harness to scrape. See docs/testing.md.
-        arch::exit_emulator(true);
-    }
+    finish(true)
+}
 
-    #[cfg(not(CONFIG_QEMU_EXIT))]
+// How the kernel stops depends on the configuration, so the choice is made once, at
+// module level, where `cfg` belongs. Writing it as two `cfg`s inside `kmain` was the
+// first thing `kbuild lint` caught — in this file, which is a fair indication that
+// the rule needs a checker rather than good intentions.
+
+/// Stop, reporting the outcome through the emulator's result channel.
+#[cfg(CONFIG_QEMU_EXIT)]
+fn finish(ok: bool) -> ! {
+    arch::exit_emulator(ok)
+}
+
+/// Stop. A production image has no channel to report through and simply halts.
+#[cfg(not(CONFIG_QEMU_EXIT))]
+fn finish(_ok: bool) -> ! {
     Cpu::halt()
 }
 
@@ -105,10 +114,5 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         c.write_str("<no location>");
     }
     c.write_str("\n");
-
-    #[cfg(CONFIG_QEMU_EXIT)]
-    arch::exit_emulator(false);
-
-    #[cfg(not(CONFIG_QEMU_EXIT))]
-    Cpu::halt()
+    finish(false)
 }

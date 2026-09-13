@@ -39,13 +39,35 @@ jobs:
       - name: Verify the pin
         run: ./kbuild/target/release/kbuild toolchain
 
-  # Host tests: kbuild's own suite. The kernel's host tests join this once
-  # `kbuild test --host` exists.
+  # Host tests: kbuild's own suite, plus every kernel unit that declares
+  # `host-tests = true` — run against both mock architecture profiles.
   host-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --manifest-path kbuild/Cargo.toml
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - name: kbuild's own tests
+        run: cargo test --manifest-path kbuild/Cargo.toml
+      - name: Build kbuild
+        run: cargo build --release --manifest-path kbuild/Cargo.toml
+      - name: Kernel host tests
+        run: ./kbuild/target/release/kbuild test --preset x86_64-qemu
+
+  # The rule that makes the portability claim checkable rather than aspirational:
+  # cfg selects modules and crates, never lines inside one.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --manifest-path kbuild/Cargo.toml
+      - run: ./kbuild/target/release/kbuild lint
 
   # Every tier-1 target, every preset, every merge.
   build-and-boot:

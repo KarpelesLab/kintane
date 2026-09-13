@@ -2,6 +2,7 @@
 name = "hal"
 kind = "lib"
 root = "src/lib.rs"
+host-tests = true
 layer = "hal"
 
 [deps]

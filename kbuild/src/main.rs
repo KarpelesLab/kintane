@@ -7,7 +7,9 @@ mod build;
 mod cache;
 mod codegen;
 mod graph;
+mod hosttest;
 mod kcfg;
+mod lint;
 mod qemu;
 mod sha256;
 mod toml;
@@ -28,6 +30,8 @@ COMMANDS:
     toolchain            verify the pinned toolchain in toolchain.toml
     config               resolve a configuration and write .config
     build                build the kernel image
+    test                 run host tests against the mock architectures
+    lint                 check the in-tree rules rustc cannot express
     run                  build, then boot under QEMU
     clean                remove build outputs (the cache is kept)
 
@@ -36,6 +40,7 @@ OPTIONS:
     --set SYM=VALUE      override one symbol (repeatable)
     --verbose, -v        show each rustc invocation
     --timeout <secs>     QEMU timeout for `run` (default 30)
+    --only <name>        `test`: only units whose name contains <name>
 ";
 
 fn main() -> ExitCode {
@@ -55,6 +60,7 @@ fn main() -> ExitCode {
 }
 
 struct Opts {
+    only: Option<String>,
     preset: Option<String>,
     sets: Vec<(String, String)>,
     verbose: bool,
@@ -63,6 +69,7 @@ struct Opts {
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts {
+        only: None,
         preset: None,
         sets: Vec::new(),
         verbose: false,
@@ -88,6 +95,16 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     .ok_or("--timeout needs seconds")?
                     .parse()
                     .map_err(|_| "--timeout expects a number")?;
+            }
+            "--only" => {
+                i += 1;
+                o.only = Some(args.get(i).ok_or("--only needs a name")?.clone());
+            }
+            // The host is the only test environment for now; in-kernel tests under
+            // QEMU are Phase 2, when there is a kernel worth testing in place.
+            "--host" => {}
+            "--target" => {
+                return Err("in-kernel tests are not implemented yet; only --host".into())
             }
             "-v" | "--verbose" => o.verbose = true,
             other => return Err(format!("unknown option `{other}`")),
@@ -133,6 +150,38 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "build" => {
             do_build(&root, &opts).map(|_| ())
         }
+        "test" => {
+            let tc = toolchain::verify(&root)?;
+            // Host tests exist to run against the mocks, so the mock architectures
+            // are compiled in regardless of what the preset says.
+            let mut topts = Opts {
+                only: opts.only.clone(),
+                preset: opts.preset.clone(),
+                sets: opts.sets.clone(),
+                verbose: opts.verbose,
+                timeout: opts.timeout,
+            };
+            topts.sets.push(("MOCK_ARCH".into(), "y".into()));
+            let (table, res) = configure(&root, &topts)?;
+            let generated = codegen::emit(&table, &res, &root.join("build/host/gen"))?;
+            let ordered = graph::plan(graph::discover(&root)?, &res)?;
+            let s = hosttest::run(
+                &root,
+                &tc,
+                &generated,
+                &ordered,
+                opts.only.as_deref(),
+                opts.verbose,
+            )?;
+            println!(
+                "\n{} unit(s): \x1b[32m{} passed\x1b[0m, {} failed",
+                s.units, s.passed, s.failed
+            );
+            if s.failed > 0 {
+                return Err(format!("{} unit(s) had failing tests", s.failed));
+            }
+            Ok(())
+        }
         "run" => {
             let (image, res) = do_build(&root, &opts)?;
             let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
@@ -155,6 +204,20 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                 )),
                 None => Err("QEMU was terminated by a signal".into()),
             }
+        }
+        "lint" => {
+            let violations = lint::check_tree(&root)?;
+            if violations.is_empty() {
+                println!("lint ok: no `cfg` inside a function body or a type's fields");
+                return Ok(());
+            }
+            for v in &violations {
+                eprintln!("{v}\n");
+            }
+            Err(format!(
+                "{} cfg-in-body violation(s)",
+                violations.len()
+            ))
         }
         "clean" => {
             let dir = root.join("build");

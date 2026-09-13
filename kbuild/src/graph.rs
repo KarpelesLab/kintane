@@ -41,6 +41,9 @@ pub struct Unit {
     pub requires: Option<expr::Expr>,
     /// Extra rustc arguments, used sparingly (linker scripts, mostly).
     pub rustflags: Vec<String>,
+    /// Whether this unit's tests can run on the host against a mock architecture.
+    /// Opting in is a claim that the code needs no real hardware.
+    pub host_tests: bool,
     pub manifest: PathBuf,
 }
 
@@ -133,6 +136,10 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
         layer,
         requires,
         rustflags: v.str_array("unit.rustflags"),
+        host_tests: v
+            .get_path("unit.host-tests")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
         dir,
         manifest: manifest.to_path_buf(),
     })
@@ -278,6 +285,7 @@ mod tests {
             layer: layer.into(),
             requires: None,
             rustflags: vec![],
+            host_tests: false,
             manifest: PathBuf::from("kmod.toml"),
         }
     }
