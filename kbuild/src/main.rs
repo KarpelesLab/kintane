@@ -18,6 +18,7 @@ mod lint;
 mod menuconfig;
 mod portable;
 mod qemu;
+mod qemu_armv7m;
 mod randconfig;
 mod sha256;
 mod size;
@@ -704,7 +705,9 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         cache: cache::Cache::new(root.join("build/cache"))?,
         cfgs: generated.cfgs,
         check_cfgs: generated.check_cfgs,
-        opt_level: if res.is_on("DEBUG_BUILD") {
+        opt_level: if res.is_on("OPTIMIZE_FOR_SIZE") {
+            "z".into()
+        } else if res.is_on("DEBUG_BUILD") {
             "1".into()
         } else {
             "2".into()

@@ -1,0 +1,12 @@
+# armv7m (Cortex-M3) on QEMU's `mps2-an385`, executing in place: the Phase 4 small
+# target.
+#
+# No MMU, so the memory model resolves to MM_FLAT; the board's memory map comes from
+# config/boards/mps2-an385.kcfg, fixed at build time, since nothing starts this kernel
+# but the core's own reset. QEMU_EXIT is ARM semihosting, as on aarch64, and must stay
+# off in anything that ships: BKPT with no debugger attached is a HardFault.
+ARCH_ARMV7M=y
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+SIZE_BUDGET_KIB=560

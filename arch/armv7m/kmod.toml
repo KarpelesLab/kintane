@@ -1,0 +1,11 @@
+[unit]
+name = "arch"
+kind = "lib"
+root = "src/lib.rs"
+layer = "arch"
+
+[deps]
+units = ["hal", "unwind"]
+
+[config]
+requires = "ARCH_ARMV7M"

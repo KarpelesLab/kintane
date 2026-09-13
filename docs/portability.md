@@ -381,6 +381,57 @@ unmasks interrupts on this port no longer claims `nomem`. The aarch64 and x86 po
 atomics for their counters and passed. They carry the same claim, and whether it can
 bite them is not yet checked.
 
+### The second small target: ARMv7-M
+
+riscv32 left a question: were its misses the price of the first no-MMU port, or of every
+port? ARMv7-M (a Cortex-M3 on `mps2-an385`, executing in place, with an MPU) was the
+re-test. It passes the same list riscv32 does, plus MPU-enforced guards and W^X, and the
+MMU checks report Skipped:
+
+- the boot banner, the flat allocator, the kernel heap;
+- interrupts, the context switch, preemption, sleep, tickless idle, lock order;
+- all 35 in-kernel checks, and crash decoding by panic and by fault.
+
+**`kernel/main`, `kernel/sched`, `kernel/thread`, `hal` and `lib/unwind` needed no change
+at all.** The memory-model seam riscv32 paid for held. Thumb's frame record is aarch64's
+at half the word size, which `unwind::Layout::frame_record(4)` already described. What
+this port did touch outside `arch/`, `targets/` and `config/`:
+
+- **A new `bootinfo` provider, and one line in another's selection.** `boot/info-board` is
+  the build-time memory map (below). It is new, but `boot/info-none/kmod.toml`'s
+  `requires` had to learn to step aside for it. That is the second port to edit that
+  line. Providers that exclude each other by listing every other architecture make
+  every new platform a change to the providers it does not use; they should be selected
+  by a symbol each architecture's configuration sets instead.
+- **The Arm run-time ABI, in `lib/builtins`.** LLVM calls `__aeabi_memclr4`, `__aeabi_memcpy`,
+  `__aeabi_uldivmod` and, at opt-level `z`, `__aeabi_llsl` on 32-bit Arm, not the C names
+  the crate provided. That is a cost of the architecture family, not of this port: an
+  ARMv7-A port would link against the same new file. It also found a trap in the crate
+  itself. Neither calling `memset` from `__aeabi_memclr` nor writing the loop out avoided
+  a call to itself: LLVM lowered both to `__aeabi_memclr`, and the first zeroed array
+  recursed until the stack ran out. The crate is now `#![no_builtins]`.
+- **The symbolizer, in `kbuild/src/symbolize.rs`.** Return addresses into Thumb code carry
+  the interworking bit, so "one byte before the return address" was the instruction
+  after the call again. Every never-returning call in a panic's backtrace was attributed
+  to the next function. The tool was wrong for every Thumb target, not this one.
+- **Harness.** `kbuild/src/qemu_armv7m.rs` for the machine, and an `OPTIMIZE_FOR_SIZE`
+  symbol kbuild maps to opt-level `z` for the size work.
+
+So the rule held for kernel code and failed, again, for the parts of the build that
+stand in for a toolchain's runtime and a debugger's conventions. Those are shared by
+every port and had only been exercised on three instruction sets.
+
+**Where the context-switch contract does not fit.** `HasContextSwitch::switch` is a
+function call made wherever the scheduler runs, and every other port runs the
+scheduler's hook inside the timer interrupt. On ARMv7-M, handler mode and the active
+exception are core state that only an exception return restores. A switch made inside a
+handler would resume the other thread still in handler mode, with interrupts of equal
+priority blocked. The port does not change the trait. It uses PendSV to reach thread
+mode: the timer's handler pends PendSV, PendSV builds a second exception frame that
+returns to a trampoline, the trampoline runs the hook as a thread would, and a second
+PendSV returns through the original frame. `arch/armv7m/src/preempt.rs` has the
+details, including why a tick that lands during that return must not be dropped.
+
 ### Keeping it true
 
 The claim is only credible if it is checked continuously. The rule:

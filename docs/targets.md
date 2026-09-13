@@ -102,6 +102,69 @@ test protocol standardizes on it rather than on console scraping.
 lower bound of the configuration system. If the config system cannot produce a kernel
 that fits here, it is not a configuration system.
 
+**As built** (the `armv7m-mps2` preset, `targets/armv7m-kintane.json`, derived from the
+built-in `thumbv7m-none-eabi`):
+
+- **Boot.** A vector table at address 0 and a reset handler that copies `.data` from its
+  load address in code memory, zeroes `.bss`, and moves thread mode onto the process stack.
+  Handlers keep the main stack. The memory map comes from the board description at build
+  time (`boot/info-board`); nothing starts the kernel but the core's reset.
+- **Console and timers.**
+  - The console is the CMSDK APB UART0.
+  - SysTick is the clock, running full 24-bit laps counted by its exception.
+  - APB timer 0 is the scheduler's one-shot.
+- **Context switch.** It saves `r4`–`r11`, `sp` and `lr`. Preemption reaches thread mode
+  through PendSV before the hook runs; see
+  [portability.md](portability.md#the-second-small-target-armv7-m).
+- **MPU.** All eight regions:
+  - code memory read-only and executable;
+  - RAM and PSRAM read-write and never executable;
+  - no access to the page below the boot stack;
+  - no access to an 8 KiB guard at the bottom of each thread-stack slot, using subregions.
+
+  The interrupt selftest proves each guard faults and `.rodata` refuses a write. A real
+  overflow of the boot stack, run as a mutation, is reported with the guard named even
+  though the core could not stack the exception.
+- **Capabilities.** It implements `Arch`, `HasMpu`, `HasCas` (`LDREX`/`STREX`),
+  `UniProcessor` and `HasContextSwitch`.
+- **What passes.**
+  - The whole boot banner, including preemption, sleep and tickless idle.
+  - All 35 in-kernel checks.
+  - Crash decoding by panic and by fault, and the lock-order ABBA test and safe mode.
+
+  The MMU checks report Skipped.
+
+**Size**, against the roadmap's 64 KiB, from `kbuild size` (flash is `.text`, `.rodata`
+and `.data`'s load copy, each page-aligned by `link.ld`):
+
+| Configuration | `.text` | `.rodata` | `.data` | Flash | RAM (`.bss` + stacks) |
+|---|---|---|---|---|---|
+| `armv7m-mps2` preset (debug, test channel) | 92 KiB | 12 KiB | 3.7 KiB | 108 KiB | 324 KiB |
+| release (`DEBUG_BUILD=n`, `QEMU_EXIT=n`), opt-level 2 | 80 KiB | 12 KiB | 2.9 KiB | 95 KiB | 324 KiB |
+| release, `OPTIMIZE_FOR_SIZE=y` (opt-level `z`) | 48 KiB | 12 KiB | 2.9 KiB | 63 KiB | 324 KiB |
+
+So a release image optimised for size fits 64 KiB of flash, with 1 KiB to spare, and
+5 KiB of it is page padding: `.text` uses 45.7 KiB of its 48 and `.rodata` 9.7 of its 12. A release image with the test exit channel also boots and passes every banner
+check at opt-level `z`. RAM is not in the budget yet and is the real problem:
+`.thread_stacks` is 256 KiB, eight 32 KiB slots, and `.bss` is 40 KiB, most of it the
+frame allocator's 32 KiB bitmap store (`FRAME_BITMAP_KIB`). Concrete paths to a
+64 KiB machine, not taken this round:
+
+- **Thread stacks** sized for a small target: fewer and smaller slots from configuration
+  rather than `link.ld` constants.
+- **The bitmap store** sized from the board's memory: 20 MiB at 4 KiB pages needs 1.3 KiB,
+  not 32.
+- **Section padding.** No page alignment of `.text`/`.rodata` on a target whose MPU
+  regions are not page-granular: 5 KiB.
+- **The boot checks.** `kernel/main` is 12 KiB of `.text` at opt-level `z`, and most of it
+  is the boot banner's demonstrations: preemption, sleep, the heap under threads, the flat
+  allocator. They are compiled into every image, test channel or not.
+- **Formatting.** `core`'s formatting reached through `panic!` messages is most of the 5 KiB
+  of `core`.
+
+The addresses of the UART, timer 0, and the 25 MHz clocks are the AN385's constants, as
+riscv32's are `virt`'s; `config/boards/mps2-an385.kcfg` names them.
+
 ### `riscv32` — rv32imac, no MMU
 
 The second no-MMU target, and the one that catches architecture assumptions that

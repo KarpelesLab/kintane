@@ -18,9 +18,15 @@
 #![no_std]
 #![feature(compiler_builtins)]
 #![compiler_builtins]
+// Without this LLVM may recognise the byte loops below as the library calls they
+// implement. For `memset` itself it knows not to; for the Arm run-time ABI's names it
+// does not, and `__aeabi_memclr` compiled into a call to itself (see `aeabi.rs`).
+#![no_builtins]
 #![feature(rustc_attrs)]
 #![allow(internal_features)]
 
+#[cfg(target_arch = "arm")]
+mod aeabi;
 #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
 mod probestack;
 #[cfg(target_os = "uefi")]

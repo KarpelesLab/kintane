@@ -63,6 +63,9 @@ jobs:
       # `bootinfo` from boot/info-kinboot exists only in the UEFI configuration.
       - name: Host tests of the kinboot handover
         run: ./kbuild/target/release/kbuild test --preset x86_64-efi --only bootinfo
+      # And boot/info-board, the build-time memory map, exists only on a described board.
+      - name: Host tests of the board description
+        run: ./kbuild/target/release/kbuild test --preset armv7m-mps2 --only bootinfo
 
   # "No discussion; the time is better spent elsewhere" — docs/coding-standards.md.
   # A formatting rule nobody enforces is a rule every author negotiates privately, which
@@ -330,12 +333,13 @@ jobs:
           host=$($rustc -vV | sed -n 's/^host: //p')
           nm="$($rustc --print sysroot)/lib/rustlib/$host/bin/llvm-nm"
           fail=0
-          for name in x86_64-qemu i686-qemu aarch64-virt riscv32-virt; do
+          for name in x86_64-qemu i686-qemu aarch64-virt riscv32-virt armv7m-mps2; do
             case $name in
               x86_64-qemu) image=build/x86_64-kintane/out/kintane.mb32.elf ;;
               i686-qemu) image=build/i686-kintane/out/kintane.img.elf ;;
               aarch64-virt) image=build/aarch64-kintane/out/kintane.img.elf ;;
               riscv32-virt) image=build/riscv32-kintane/out/kintane.img.elf ;;
+              armv7m-mps2) image=build/armv7m-kintane/out/kintane.img.elf ;;
             esac
             for crash in PANIC:kintane::crash::nested_panic FAULT:arch::backtrace::undefined_instruction; do
               kind=${crash%%:*}

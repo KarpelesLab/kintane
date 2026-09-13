@@ -16,6 +16,11 @@
 //! to the next function entirely. So it is looked up one byte earlier, which lands inside
 //! the call. `pc` is the faulting instruction itself and is looked up as it is.
 //!
+//! On 32-bit Arm a return address into Thumb code has its low bit set, as an interworking
+//! marker rather than part of the address. One byte before it is then the instruction
+//! after the call again, and a panic's backtrace named the function after each
+//! never-returning call. So for an Arm image the marker is cleared first.
+//!
 //! Before any of that, the log's `bt build` ID must be the bundle's. Addresses decoded
 //! against another build's symbols still decode, into names that look right and are not,
 //! so a mismatch is refused rather than decoded with a warning nobody reads.
@@ -35,14 +40,19 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The address whose line explains this entry.
-    fn lookup_addr(&self) -> u64 {
+    /// The address whose line explains this entry. `thumb` for a 32-bit Arm image, whose
+    /// return addresses carry the Thumb bit.
+    fn lookup_addr(&self, thumb: bool) -> u64 {
         match self.frame {
             None => self.addr,
+            Some(_) if thumb => (self.addr & !1).saturating_sub(1),
             Some(_) => self.addr.saturating_sub(1),
         }
     }
 }
+
+/// `EM_ARM`, the ELF machine number of 32-bit Arm.
+const EM_ARM: u16 = 40;
 
 /// Parse one console line as a backtrace entry, if it is one.
 ///
@@ -130,12 +140,21 @@ pub struct Symbols {
     digits: usize,
     /// The build ID the bundle was recorded with, in hex, if it has one.
     build_id: Option<String>,
+    /// A 32-bit Arm image, whose return addresses carry the Thumb bit.
+    thumb: bool,
 }
 
 impl Symbols {
     pub fn load(bundle: &Path, nm: &Path) -> Result<Symbols, String> {
         let data = std::fs::read(bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
         let elf = Elf::parse(&data).map_err(|e| format!("{}: {e}", bundle.display()))?;
+        let machine = data.get(18..20).map(|b| {
+            if elf.little {
+                u16::from_le_bytes([b[0], b[1]])
+            } else {
+                u16::from_be_bytes([b[0], b[1]])
+            }
+        });
         let lines = LineTable::from_elf(&elf).map_err(|e| format!("{}: {e}", bundle.display()))?;
         let out = Command::new(nm)
             .args(["--defined-only", "-n", "-S", "-C"])
@@ -155,12 +174,13 @@ impl Symbols {
             remap: "/kintane/",
             digits: if elf.is64 { 16 } else { 8 },
             build_id: elf.section(buildid::BUNDLE_SECTION).map(crate::sha256::hex),
+            thumb: machine == Some(EM_ARM),
         })
     }
 
     /// `function+0xoff  file:line`, as much of it as is known.
     pub fn describe(&self, e: &Entry) -> String {
-        let at = e.lookup_addr();
+        let at = e.lookup_addr(self.thumb);
         let func = match function_at(&self.syms, at) {
             // The offset of the printed address, which is what a disassembly shows,
             // rather than of the byte that was looked up.
@@ -287,8 +307,16 @@ reached kmain
     fn return_addresses_are_looked_up_one_byte_back() {
         let pc = parse_line("bt pc 0x1000").unwrap();
         let ra = parse_line("bt 0 0x1000").unwrap();
-        assert_eq!(pc.lookup_addr(), 0x1000);
-        assert_eq!(ra.lookup_addr(), 0x0fff);
+        assert_eq!(pc.lookup_addr(false), 0x1000);
+        assert_eq!(ra.lookup_addr(false), 0x0fff);
+        // A Thumb return address one past a 4-byte BL at 0x0ffc: the marker cleared, then
+        // one byte back, lands in the BL, not on the instruction after it.
+        let thumb_ra = Entry {
+            frame: Some(0),
+            addr: 0x1001,
+        };
+        assert_eq!(thumb_ra.lookup_addr(true), 0x0fff);
+        assert_eq!(pc.lookup_addr(true), 0x1000);
     }
 
     #[test]

@@ -92,3 +92,5 @@ choice ARCH
         # CAS; the portability check compiles for one to keep that possible.
         select ARCH_HAS_CAS
 endchoice
+
+source "board.kcfg"

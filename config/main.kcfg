@@ -13,6 +13,7 @@ config TARGET
     default "aarch64-kintane" if ARCH_AARCH64
     default "i686-kintane" if ARCH_I686
     default "riscv32-kintane" if ARCH_RISCV32
+    default "armv7m-kintane" if ARCH_ARMV7M
     default ""
     help
         Name of the target specification under targets/.
@@ -24,6 +25,7 @@ config LINKER_SCRIPT
     default "arch/aarch64/link.ld" if ARCH_AARCH64
     default "arch/i686/link.ld" if ARCH_I686
     default "arch/riscv32/link.ld" if ARCH_RISCV32
+    default "arch/armv7m/link.ld" if ARCH_ARMV7M
     default ""
 
 # --- memory model -----------------------------------------------------------
@@ -75,6 +77,16 @@ config DEBUG_BUILD
         lock-order checking. Separate from debug symbols, which are always
         produced and always shipped separately.
 
+config OPTIMIZE_FOR_SIZE
+    bool "Optimise for size"
+    default n
+    help
+        Compile the kernel at opt-level "z" instead of 1 (debug) or 2. For
+        targets where the image's size is the constraint that matters: the
+        roadmap's ARMv7-M image has 64 KiB of flash to fit in. Takes
+        precedence over DEBUG_BUILD's optimisation level, not over its
+        checks.
+
 config KALLOC_FAULT_INJECT
     bool "Allocation fault injection"
     default n
@@ -114,7 +126,7 @@ config LOCKDEP_ABBA_TEST
 
 config QEMU_EXIT
     bool "Guest-initiated emulator exit"
-    depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64 || ARCH_RISCV32
+    depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64 || ARCH_RISCV32 || ARCH_ARMV7M
     default n
     help
         Let the guest terminate the emulator with a status. This is the result
@@ -122,10 +134,11 @@ config QEMU_EXIT
         never a string scraped from console output; see docs/testing.md.
 
         How it is done is per-architecture: isa-debug-exit on x86, semihosting
-        on AArch64, the sifive_test finisher on riscv32. None belongs in a
+        on AArch64 and ARMv7-M, the sifive_test finisher on riscv32. None belongs in a
         production image. The x86 form writes to an I/O port that is merely
         inert on real hardware, but the AArch64 form executes HLT #0xF000,
-        which is UNDEFINED without a debugger attached, and the riscv32 form
+        which is UNDEFINED without a debugger attached (ARMv7-M's BKPT #0xAB
+        escalates to a HardFault on a board with no debugger), and the riscv32 form
         stores to a fixed physical address — so this must be off in anything
         that ships.
 
