@@ -2,9 +2,10 @@
 //! `kmain`.
 //!
 //! Far less has to happen here than on x86. AArch64 starts in a 64-bit mode with a
-//! flat address space and the MMU off, so there is no mode switch to engineer and no
-//! page table to build before Rust can run. What is left is the handful of things
-//! that genuinely cannot be expressed in Rust:
+//! flat address space and the MMU off, so there is no mode switch to engineer and the
+//! page tables can be built in Rust once there is a stack — which is what
+//! `paging::aarch64_mmu_init` does, called from the bottom of this file. What is left
+//! in assembly is the handful of things that genuinely cannot be expressed in Rust:
 //!
 //! 1. **Park the secondary CPUs.** QEMU releases every `-smp` CPU at the same entry
 //!    point. Without the MPIDR check below they would all race through `.bss`
@@ -18,6 +19,8 @@
 //!    `.bss`, so zeroing after switching to it would erase the frames underneath us.
 //!    Nothing before the stack switch needs a stack — the descent to EL1 goes
 //!    through system registers and `eret`, and the zeroing loop uses registers only.
+//!    The translation tables also live in `.bss`, so the zeroing is what makes every
+//!    descriptor start out invalid.
 //!
 //! Register state on entry is whatever QEMU left. Its ELF path is documented as
 //! "assume that raw images are Linux kernels and ELF images are not", so unlike the
@@ -118,6 +121,12 @@ _start:
     // stops here instead of walking into whatever the loader left behind.
     mov     x29, xzr
     mov     x30, xzr
+
+    // Build the identity map and turn the MMU on, in Rust, before anything else runs.
+    // It needs the stack, which is why it cannot come earlier, and it comes before
+    // kmain so that no part of the kernel proper ever runs untranslated. x19 survives
+    // the call because it is callee-saved under AAPCS64.
+    bl      aarch64_mmu_init
 
     mov     x0, x19
     bl      kmain

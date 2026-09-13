@@ -202,7 +202,13 @@ pub fn init() {
             13,
             idt::EntryPoint::with_code(exception::general_protection),
         );
-        idt::set_gate(14, idt::EntryPoint::with_code(exception::page_fault));
+        // #PF is the one vector whose handler may return: it re-executes the faulting
+        // instruction after resolving the fault, and falls through to the fatal
+        // reporter when it cannot. See `exception::page_fault`.
+        idt::set_gate(
+            14,
+            idt::EntryPoint::resumable_with_code(exception::page_fault),
+        );
 
         // The rest of the architecturally defined range, so that an unexpected one
         // reports itself instead of escalating to a triple fault.

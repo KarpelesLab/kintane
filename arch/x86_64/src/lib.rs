@@ -17,6 +17,7 @@ mod exception;
 mod gdt;
 mod idt;
 pub mod interrupt;
+pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod serial;
@@ -167,6 +168,5 @@ pub fn image_range() -> (u64, u64) {
 /// Exists so `kmain` can exercise the paging path without naming an architecture.
 /// Returns `true` only when a mapping was demonstrably installed and used.
 pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    paging::selftest(c)
 }

@@ -51,11 +51,19 @@ pub type Handler = extern "x86-interrupt" fn(InterruptFrame);
 pub type DivergingHandler = extern "x86-interrupt" fn(InterruptFrame) -> !;
 /// An entry point for a vector that pushes an error code and does not return.
 pub type HandlerWithCode = extern "x86-interrupt" fn(InterruptFrame, u64) -> !;
+/// An entry point for a vector that pushes an error code and may return.
+///
+/// Distinct from [`HandlerWithCode`] rather than a relaxation of it: a diverging
+/// handler is a promise that the interrupted instruction never runs again, and #PF is
+/// the vector where that promise stops being true. A handler that resolves the fault
+/// and returns causes the faulting instruction to re-execute, which is the entire
+/// mechanism behind demand paging, copy-on-write and a guard page that grows a stack.
+pub type ResumableHandlerWithCode = extern "x86-interrupt" fn(InterruptFrame, u64);
 
 /// The address of an interrupt entry point, with its ABI shape already checked.
 ///
 /// The constructor names are the whole point: an entry point can only reach
-/// [`set_gate`] through one of the three, and each takes a specific function-pointer
+/// [`set_gate`] through one of the four, and each takes a specific function-pointer
 /// type, so a handler whose signature does not match what its vector pushes is a
 /// compile error rather than a wild `iret`.
 #[derive(Clone, Copy)]
@@ -75,6 +83,12 @@ impl EntryPoint {
 
     /// A handler for a vector that pushes an error code.
     pub fn with_code(f: HandlerWithCode) -> EntryPoint {
+        EntryPoint(f as usize)
+    }
+
+    /// A handler for a vector that pushes an error code and may return to the
+    /// interrupted instruction, which then re-executes.
+    pub fn resumable_with_code(f: ResumableHandlerWithCode) -> EntryPoint {
         EntryPoint(f as usize)
     }
 }

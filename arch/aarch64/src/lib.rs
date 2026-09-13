@@ -10,6 +10,7 @@ mod boot;
 pub mod exception;
 pub mod gic;
 pub mod irq;
+pub mod paging;
 pub mod serial;
 pub mod timer;
 
@@ -104,11 +105,13 @@ impl Arch for Aarch64 {
 }
 
 impl HasMmu for Aarch64 {
-    // 4 KiB granule, 48-bit virtual address: levels 0 through 3.
+    // 4 KiB granule, 48-bit virtual address: four tables of 9 index bits each.
     const LEVELS: u8 = 4;
-    // A level-2 block is 2 MiB and a level-1 block is 1 GiB. There is no larger
-    // block at this granule; the 512 GiB level-0 block exists only with 64 KiB
-    // pages, which this port does not use.
+    // Beware the numbering: in `hal`'s convention, where level 0 is the leaf, a
+    // level-1 block is 2 MiB and a level-2 block is 1 GiB. Arm's own numbering calls
+    // those L2 and L1. There is no larger block at this granule — the 512 GiB block
+    // exists only with 64 KiB pages, which this port does not use. See
+    // `paging`'s module comment for the full translation between the two.
     const HUGE_PAGE_SIZES: &'static [usize] = &[2 * 1024 * 1024, 1024 * 1024 * 1024];
 }
 
@@ -304,7 +307,10 @@ pub fn image_range() -> (u64, u64) {
 ///
 /// Exists so `kmain` can exercise the paging path without naming an architecture.
 /// Returns `true` only when a mapping was demonstrably installed and used.
+///
+/// On this port the MMU is already on by the time `kmain` runs — `_start` calls
+/// [`paging::aarch64_mmu_init`] before it — so what is left to prove here is that the
+/// translation is real rather than merely configured. See [`paging::selftest`].
 pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    paging::selftest(c)
 }

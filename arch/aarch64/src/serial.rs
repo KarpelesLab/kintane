@@ -36,9 +36,11 @@ const FR_TXFF: u32 = 1 << 5;
 /// `off` must be a register offset of a PL011 that is actually mapped at [`UART0`],
 /// and the write must be one the device tolerates in its current state.
 unsafe fn write_reg(off: usize, value: u32) {
-    // SAFETY: the MMU is off, so 0x09000000 is the device itself and the access is
-    // naturally aligned. `write_volatile` is what keeps the compiler from merging or
-    // reordering stores that the device distinguishes.
+    // SAFETY: the boot identity map in `paging` maps 0x09000000 to itself as
+    // Device-nGnRnE, so this address is the device and the memory type is one that
+    // neither caches nor reorders the access. It is naturally aligned, which Device
+    // memory requires regardless of `SCTLR_EL1.A`. `write_volatile` is what keeps the
+    // compiler from merging or reordering stores that the device distinguishes.
     unsafe { write_volatile((UART0 + off) as *mut u32, value) };
 }
 

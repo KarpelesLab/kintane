@@ -112,9 +112,11 @@ const FIRST_SPECIAL_IRQ: u32 = 1020;
 /// `addr` must be the address of a mapped, naturally aligned 32-bit device register,
 /// and the write must be one the device tolerates in its current state.
 unsafe fn write32(addr: usize, value: u32) {
-    // SAFETY: the MMU is off, so the constant address is the device itself. Volatile
-    // is what stops the compiler merging, reordering or eliding accesses the device
-    // distinguishes — every GIC register here is one where that matters.
+    // SAFETY: the boot identity map covers the whole first GiB as Device-nGnRnE, so
+    // the constant address is the device itself and the mapping neither caches nor
+    // reorders the access. Volatile is what stops the *compiler* merging, reordering
+    // or eliding accesses the device distinguishes — every GIC register here is one
+    // where that matters.
     unsafe { write_volatile(addr as *mut u32, value) };
 }
 
@@ -473,8 +475,9 @@ static GICV3: Gicv3 = Gicv3 { gicd: GICD_BASE, gicr: GICR_BASE };
 ///
 /// # Safety
 /// `gicd` must be an address it is safe to read a word from — either a GIC distributor
-/// or at least a mapping where a stray read cannot disturb something else. The MMU is
-/// off in Phase 0, so this is a statement about the board's memory map.
+/// or at least a mapping where a stray read cannot disturb something else. The boot
+/// map is an identity one, so this remains a statement about the board's memory map
+/// rather than about the page tables.
 pub unsafe fn detect(gicd: usize) -> Option<&'static dyn IrqChip> {
     // SAFETY: PIDR2 is a read-only identification register; reading it has no side
     // effects and depends on no prior configuration, which is exactly why it can be

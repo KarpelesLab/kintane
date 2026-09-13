@@ -166,8 +166,10 @@ const VEC_CURRENT_SPX_IRQ: u64 = 5;
 pub unsafe fn install_vectors() {
     // SAFETY: `__exception_vectors` is a 2 KiB-aligned, 16-entry table defined in the
     // assembly above and linked into `.text`, which is exactly what VBAR_EL1 requires.
-    // The MMU is off, so the link-time address is the physical address the CPU will
-    // fetch from. `isb` is what makes the new table visible to exceptions taken by
+    // The kernel is identity-mapped, so the link-time address is both the virtual
+    // address VBAR_EL1 takes and the physical address behind it — and this is called
+    // once before the MMU is enabled and again after, with the same answer either
+    // way. `isb` is what makes the new table visible to exceptions taken by
     // instructions after this point rather than at some later context-synchronising
     // event. Writing VBAR_EL1 is permitted at EL1 and has no other effect.
     unsafe {
