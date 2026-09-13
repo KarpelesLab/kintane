@@ -118,8 +118,24 @@ static INSTALLING: AtomicBool = AtomicBool::new(false);
 static REGION_START: AtomicU64 = AtomicU64::new(0);
 static REGION_LEN: AtomicU64 = AtomicU64::new(0);
 
-/// Interrupt handlers the kernel is inside. See [`irq_enter`].
-static IRQ_DEPTH: AtomicU32 = AtomicU32::new(0);
+/// Interrupt handlers each CPU is inside. See [`irq_enter`].
+///
+/// Per CPU: a thread on one CPU is not in interrupt context because another CPU is
+/// taking a timer interrupt, and one shared count refused its sleeping allocations as if
+/// it were.
+static IRQ_DEPTH: [AtomicU32; crate::mp::CPUS] = [const { AtomicU32::new(0) }; crate::mp::CPUS];
+
+/// This CPU's depth counter, read with interrupts masked so the CPU cannot change
+/// between reading its index and using the counter.
+fn with_depth<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
+    let irq = <Cpu as hal::Arch>::irq_save();
+    let cpu = <Cpu as hal::Arch>::cpu_index();
+    // A CPU past the table's run queues never runs a thread; the last slot stands in.
+    let r = f(&IRQ_DEPTH[cpu.min(crate::mp::CPUS - 1)]);
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { <Cpu as hal::Arch>::irq_restore(irq) };
+    r
+}
 
 /// Why the kernel heap refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -271,17 +287,18 @@ pub fn region() -> (u64, u64) {
 /// switches threads calls `irq_exit` before it does, because the thread it resumes is
 /// not in interrupt context.
 pub fn irq_enter() {
-    IRQ_DEPTH.fetch_add(1, Ordering::Relaxed);
+    with_depth(|d| d.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Mark the end of what [`irq_enter`] started.
 pub fn irq_exit() {
-    IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
+    with_depth(|d| d.fetch_sub(1, Ordering::Relaxed));
 }
 
-/// Whether the caller is inside an interrupt handler that called [`irq_enter`].
+/// Whether the caller is inside an interrupt handler that called [`irq_enter`], on the
+/// CPU it runs on.
 pub fn in_interrupt() -> bool {
-    IRQ_DEPTH.load(Ordering::Relaxed) != 0
+    with_depth(|d| d.load(Ordering::Relaxed) != 0)
 }
 
 /// Allocate from the kernel heap.

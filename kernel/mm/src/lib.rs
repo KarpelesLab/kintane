@@ -51,6 +51,9 @@ pub mod flat;
 pub mod frame;
 pub mod paged;
 pub mod phys;
+// Atomic compare-and-swap at pointer width; a CPU with none has no other CPU to shoot at.
+#[cfg(target_has_atomic = "ptr")]
+pub mod tlb;
 pub mod vm;
 
 pub use directmap::DirectMap;

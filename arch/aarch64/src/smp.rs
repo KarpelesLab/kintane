@@ -34,19 +34,28 @@
 //! # What a secondary does
 //!
 //! It installs the vectors, prepares its part of the interrupt controller, starts its
-//! own generic timer at [`SECONDARY_HZ`], and waits for interrupts. It takes timer ticks
-//! and IPIs and runs nothing else: the scheduler is the boot CPU's alone (see
-//! `docs/architecture.md`, SMP). Its ticks are counted in its block and never reach the
-//! scheduler's hook, which belongs to the boot CPU's run queue.
+//! own generic timer at [`SECONDARY_HZ`], and waits for interrupts. Until [`release`], it
+//! takes timer ticks and IPIs and runs nothing else, and its ticks are counted in its
+//! block and never reach the scheduler's hook. After it, the CPU is the scheduler's (see
+//! below, and `docs/architecture.md`, SMP).
 //!
 //! # IPIs
 //!
-//! SGI [`IPI_CALL`] runs a function on the target and records the result, and SGI
-//! [`IPI_RESCHEDULE`] is delivered and counted. One function call is outstanding per
+//! SGI [`IPI_CALL`] runs a function on the target and records the result, SGI
+//! [`IPI_RESCHEDULE`] is counted and then reaches the scheduler's hook, and SGI
+//! [`IPI_TLB`] runs the kernel's shootdown handler. One function call is outstanding per
 //! target at a time. [`call`] is a boot-path facility that waits for its answer, and the
 //! boot CPU is its only caller.
+//!
+//! # Handing the secondaries to the scheduler
+//!
+//! Until [`release`], a secondary's timer is its own and its ticks go no further than its
+//! block. [`release`] records the function each secondary enters and wakes them. A
+//! secondary leaves its bring-up loop on its next wake-up, stops its periodic timer, and
+//! calls that function, which is the scheduler's and never returns. From then on its
+//! timer interrupts and reschedule IPIs reach the scheduler's hook like the boot CPU's.
 
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use hal::{Arch, IrqNumber};
 
@@ -58,9 +67,11 @@ pub const MAX_CPUS: usize = 8;
 
 /// SGI that runs a function on the target.
 pub const IPI_CALL: u32 = 0;
-/// SGI that asks the target to reschedule. Nothing reschedules on a secondary yet, so it
-/// is counted, which is all a check needs to prove it arrived.
+/// SGI that asks the target to reschedule. It is counted, and once the scheduler owns the
+/// CPUs, the interrupt path calls the scheduler's hook after it as after a timer tick.
 pub const IPI_RESCHEDULE: u32 = 1;
+/// SGI that makes the target run the kernel's shootdown handler.
+pub const IPI_TLB: u32 = 2;
 /// Interrupt IDs below this are SGIs.
 pub(crate) const SGI_LIMIT: u32 = 16;
 
@@ -386,6 +397,7 @@ pub unsafe fn prepare_boot_cpu() -> bool {
     block.has_ipi_target.store(1, Ordering::Release);
     chip.enable(IrqNumber(IPI_CALL));
     chip.enable(IrqNumber(IPI_RESCHEDULE));
+    chip.enable(IrqNumber(IPI_TLB));
     block.state.store(ONLINE, Ordering::Release);
     true
 }
@@ -549,6 +561,7 @@ extern "C" fn aarch64_secondary_main(block: &'static CpuBlock) -> ! {
 
     chip.enable(IrqNumber(IPI_CALL));
     chip.enable(IrqNumber(IPI_RESCHEDULE));
+    chip.enable(IrqNumber(IPI_TLB));
     chip.enable(IrqNumber(timer::PPI));
     let period = u32::try_from(timer::frequency() / SECONDARY_HZ).unwrap_or(u32::MAX);
     block.period.store(period, Ordering::Release);
@@ -556,46 +569,120 @@ extern "C" fn aarch64_secondary_main(block: &'static CpuBlock) -> ! {
 
     block.state.store(ONLINE, Ordering::Release);
 
-    // Idle: nothing else runs here. `wait_for_interrupt` returns with IRQs unmasked, having
-    // taken whatever woke it; masking again before the next wait is what keeps the check
-    // for work and the wait inseparable once there is work to check for.
+    // Idle until released: nothing else runs here. `wait_for_interrupt` returns with IRQs
+    // unmasked, having taken whatever woke it; masking again before the next look is what
+    // keeps the check for work and the wait inseparable once there is work to check for.
     loop {
         // SAFETY: the vectors are installed and every source enabled above has a handler.
         unsafe { tick::wait_for_interrupt() };
         let _ = Aarch64::irq_save();
+        if let Some(entry) = released_entry() {
+            // The timer is the scheduler's from here: no more periodic re-arming. Stopped
+            // before the entry runs, which arms it one-shot for itself.
+            block.period.store(0, Ordering::Release);
+            timer::stop();
+            entry(block.index);
+        }
     }
 }
 
-/// Handle a timer interrupt if it arrived on a secondary. Returns `false` on the boot CPU,
-/// whose timer belongs to the tick.
-pub(crate) fn on_secondary_tick() -> bool {
+/// The scheduler's entry for secondaries, as a type-erased `fn(usize) -> !`. Null until
+/// [`release`].
+static SECONDARY_ENTRY: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+fn released_entry() -> Option<fn(usize) -> !> {
+    let raw = SECONDARY_ENTRY.load(Ordering::Acquire);
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: written only by `release`, with a `fn(usize) -> !` cast to a data pointer;
+    // the two have the same size and representation on this target.
+    Some(unsafe { core::mem::transmute::<*mut (), fn(usize) -> !>(raw) })
+}
+
+/// Whether the scheduler owns the secondaries' timers and reschedule IPIs.
+pub(crate) fn released() -> bool {
+    !SECONDARY_ENTRY.load(Ordering::Acquire).is_null()
+}
+
+/// Hand every online secondary to `entry`. See the module docs.
+///
+/// # Safety
+/// Once, from the boot CPU, after the scheduler `entry` joins exists.
+pub unsafe fn release(entry: fn(usize) -> !) {
+    // `Release`, and before the wake-ups: a secondary woken by the IPI below loads it with
+    // `Acquire`, so it sees the entry.
+    SECONDARY_ENTRY.store(entry as *mut (), Ordering::Release);
+    for cpu in 1..MAX_CPUS {
+        if is_online(cpu) {
+            let _ = send(cpu, IPI_RESCHEDULE);
+        }
+    }
+}
+
+/// The handler every [`IPI_TLB`] runs, as a type-erased `fn()`. Null to ignore them.
+static TLB_HANDLER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Set what [`IPI_TLB`] runs.
+pub fn set_tlb_handler(handler: Option<fn()>) {
+    let raw = handler.map_or(core::ptr::null_mut(), |f| f as *mut ());
+    TLB_HANDLER.store(raw, Ordering::Release);
+}
+
+/// The kernel's extension of a local invalidation to every CPU, as a type-erased
+/// `fn(Option<usize>)`. Null keeps invalidation local.
+static SHOOTDOWN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Set what [`crate::paging`]'s `flush_tlb` calls after it invalidates locally.
+pub fn set_shootdown(hook: Option<fn(Option<usize>)>) {
+    let raw = hook.map_or(core::ptr::null_mut(), |f| f as *mut ());
+    SHOOTDOWN.store(raw, Ordering::Release);
+}
+
+/// Called by `flush_tlb` after its local invalidation.
+pub(crate) fn shootdown(addr: Option<usize>) {
+    let raw = SHOOTDOWN.load(Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: written only by `set_shootdown`, with a `fn(Option<usize>)` cast to a data
+    // pointer, or null, excluded above.
+    let hook = unsafe { core::mem::transmute::<*mut (), fn(Option<usize>)>(raw) };
+    hook(addr);
+}
+
+/// Handle a timer interrupt if it arrived on a secondary. `None` on the boot CPU, whose
+/// timer belongs to the tick. `Some(true)` when the scheduler owns this CPU and its hook
+/// should run, `Some(false)` when the tick was the secondary's own.
+pub(crate) fn on_secondary_tick() -> Option<bool> {
     let cpu = cpu_index();
     if cpu == 0 {
-        return false;
+        return None;
     }
-    let Some(block) = BLOCKS.get(cpu) else {
-        return false;
-    };
-    // Level-sensitive, as on the boot CPU: re-arming is what deasserts it.
-    match block.period.load(Ordering::Acquire) {
+    let block = BLOCKS.get(cpu)?;
+    // Level-sensitive, as on the boot CPU: re-arming is what deasserts it. Once released,
+    // the period is zero and the scheduler's hook arms the next deadline.
+    let period = block.period.load(Ordering::Acquire);
+    match period {
         0 => timer::stop(),
         p => timer::arm(p),
     }
     block.ticks.fetch_add(1, Ordering::Release);
-    true
+    Some(period == 0 && released())
 }
 
-/// Handle SGI `id` on the running CPU.
-pub(crate) fn on_ipi(id: u32) {
+/// Handle SGI `id` on the running CPU. Returns whether the scheduler's hook should run
+/// after it: a reschedule IPI once the scheduler owns the CPUs.
+pub(crate) fn on_ipi(id: u32) -> bool {
     let Some(block) = BLOCKS.get(cpu_index()) else {
-        return;
+        return false;
     };
     match id {
         IPI_CALL => {
             let f = block.call_fn.swap(0, Ordering::AcqRel);
             if f == 0 {
                 // Withdrawn after a timeout, or a duplicate; nobody waits.
-                return;
+                return false;
             }
             // SAFETY: `call_fn` is written only by `call`, with a `fn(u64) -> u64` cast to
             // an address, or with zero, excluded above. Function and data addresses are
@@ -604,10 +691,22 @@ pub(crate) fn on_ipi(id: u32) {
             let result = f(block.call_arg.load(Ordering::Acquire));
             block.call_result.store(result, Ordering::Release);
             block.calls_done.fetch_add(1, Ordering::Release);
+            false
         }
         IPI_RESCHEDULE => {
             block.reschedules.fetch_add(1, Ordering::Release);
+            released()
         }
-        _ => {}
+        IPI_TLB => {
+            let raw = TLB_HANDLER.load(Ordering::Acquire);
+            if !raw.is_null() {
+                // SAFETY: written only by `set_tlb_handler`, with a `fn()` cast to a data
+                // pointer, or null, excluded above.
+                let handler = unsafe { core::mem::transmute::<*mut (), fn()>(raw) };
+                handler();
+            }
+            false
+        }
+        _ => false,
     }
 }

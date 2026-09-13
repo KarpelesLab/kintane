@@ -18,9 +18,20 @@ mod demand;
 mod heap;
 mod kheap;
 mod lockcheck;
+// The scheduler's multiprocessor half: a run queue per CPU, the scheduler lock, IPIs and
+// TLB shootdown with `SMP`; a stub costing nothing without it. Shootdown rides on the
+// paged memory model, so a flat kernel is uniprocessor here whatever `SMP` says.
+#[cfg(all(CONFIG_SMP, CONFIG_MM_PAGED))]
+#[path = "mp_smp.rs"]
+mod mp;
+#[cfg(not(all(CONFIG_SMP, CONFIG_MM_PAGED)))]
+#[path = "mp_up.rs"]
+mod mp;
 mod persist;
 mod preempt;
 mod shared;
+#[cfg(all(CONFIG_SMP, CONFIG_MM_PAGED))]
+mod shootdown;
 #[cfg(CONFIG_MM_PAGED)]
 mod space;
 // The stress run on a paged kernel; on a flat one, the same calls doing nothing.
@@ -262,6 +273,10 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // preemption check has stopped the tick: `start_secondaries`'s contract.
     let smp = unsafe { platform::start_secondaries(c) }.map_or(Check::Skipped, Check::from_ok);
 
+    // With the secondaries up and nothing scheduled on them yet.
+    c.write_str("\n  shootdown  ");
+    let shootdown = mp::check_shootdown(c, live);
+
     // Last, so it sees every lock the checks above took.
     c.write_str("\n  lockdep    ");
     let lockdep = lockcheck::verdict(c);
@@ -277,6 +292,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))
         .and(smp)
+        .and(shootdown)
         .and(lockdep);
     (verdict, live)
 }

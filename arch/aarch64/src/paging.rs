@@ -384,45 +384,64 @@ impl HasPageTables for Aarch64 {
     }
 
     unsafe fn flush_tlb(addr: Option<usize>) {
-        // The barriers here are not decoration, unlike x86's `invlpg`. `tlbi` is
-        // issued to the memory system and completes asynchronously: without the
-        // leading `dsb ishst` the walker may still be looking at the old descriptor
-        // when the invalidate is broadcast, and without the trailing `dsb ish; isb`
-        // the very next instruction may still use a translation the invalidate was
-        // supposed to remove. Both windows are small, which is what makes them
-        // vicious.
-        match addr {
-            Some(va) => {
-                // VAAE1IS: by address, all ASIDs, inner shareable. The operand is the
-                // virtual address shifted right by 12, not the address itself.
-                //
-                // SAFETY: the caller is responsible for the table writes this
-                // publishes. `tlbi` is architecturally permitted at EL1 and affects
-                // only cached translations.
-                unsafe {
-                    core::arch::asm!(
-                        "dsb ishst",
-                        "tlbi vaae1is, {v}",
-                        "dsb ish",
-                        "isb",
-                        v = in(reg) (va as u64) >> 12,
-                        options(nostack, preserves_flags)
-                    );
-                }
+        // SAFETY: forwarded; the caller's contract.
+        unsafe { flush_local(addr) };
+        crate::smp::shootdown(addr);
+    }
+}
+
+/// Invalidate `addr`, or everything, on this CPU alone. `flush_tlb` is this followed by
+/// the kernel's shootdown; a CPU a shootdown reaches calls this directly.
+///
+/// # Safety
+/// As `HasPageTables::flush_tlb`.
+pub(crate) unsafe fn flush_local(addr: Option<usize>) {
+    // The barriers here are not decoration, unlike x86's `invlpg`. `tlbi` is
+    // issued to the memory system and completes asynchronously: without the
+    // leading `dsb ishst` the walker may still be looking at the old descriptor
+    // when the invalidate is issued, and without the trailing `dsb ish; isb`
+    // the very next instruction may still use a translation the invalidate was
+    // supposed to remove. Both windows are small, which is what makes them
+    // vicious.
+    //
+    // This CPU only, then the kernel's shootdown for the others (`smp::shootdown`).
+    // The `...IS` forms would broadcast the invalidate to every CPU in the system
+    // without an interrupt, and on real hardware that is a legitimate shootdown by
+    // itself; Linux relies on it. It is not used, so that one protocol with
+    // acknowledgements covers every port, including ports whose TLBs have no
+    // broadcast form, and so that a shootdown that misses a CPU is observable here
+    // rather than silently covered by the broadcast. Using the broadcast on this
+    // port is an optimisation left for when shootdowns show up in a profile.
+    match addr {
+        Some(va) => {
+            // VAAE1: by address, all ASIDs, this CPU. The operand is the virtual
+            // address shifted right by 12, not the address itself.
+            //
+            // SAFETY: the caller is responsible for the table writes this
+            // publishes. `tlbi` is architecturally permitted at EL1 and affects
+            // only cached translations.
+            unsafe {
+                core::arch::asm!(
+                    "dsb ishst",
+                    "tlbi vaae1, {v}",
+                    "dsb ish",
+                    "isb",
+                    v = in(reg) (va as u64) >> 12,
+                    options(nostack, preserves_flags)
+                );
             }
-            None => {
-                // SAFETY: as above. VMALLE1IS drops every stage-1 EL1&0 translation on
-                // every CPU in the inner shareable domain, which is always safe and
-                // merely expensive.
-                unsafe {
-                    core::arch::asm!(
-                        "dsb ishst",
-                        "tlbi vmalle1is",
-                        "dsb ish",
-                        "isb",
-                        options(nostack, preserves_flags)
-                    );
-                }
+        }
+        None => {
+            // SAFETY: as above. VMALLE1 drops every stage-1 EL1&0 translation on this
+            // CPU, which is always safe and merely expensive.
+            unsafe {
+                core::arch::asm!(
+                    "dsb ishst",
+                    "tlbi vmalle1",
+                    "dsb ish",
+                    "isb",
+                    options(nostack, preserves_flags)
+                );
             }
         }
     }
