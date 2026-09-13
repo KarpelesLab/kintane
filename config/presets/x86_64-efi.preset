@@ -5,7 +5,7 @@
 # over the boot protocol's own structure. This is the path a real x86_64 machine
 # takes, and the one `-kernel` skips. See docs/bootloader.md.
 ARCH_X86_64=y
-BOOT_KINBOOT=y
+KINBOOT_EFI=y
 SMP=n
 EARLY_CONSOLE=y
 DEBUG_BUILD=y

@@ -1219,3 +1219,43 @@ fn every_error_names_an_offset_inside_the_blob() {
         }
     }
 }
+
+// --- /chosen -------------------------------------------------------------------------
+
+#[test]
+fn bootargs_are_read_from_chosen_and_only_from_chosen() {
+    // A decoy `chosen` below the root must not count: only `/chosen` is the firmware's.
+    let mut with = Dtb::new();
+    with.begin("")
+        .cells("#size-cells", &[2])
+        .cells("#address-cells", &[2])
+        .begin("memory@40000000")
+        .cells("reg", &[0, 0x4000_0000, 0, 0x0800_0000])
+        .str_prop("device_type", "memory")
+        .begin("chosen")
+        .str_prop("bootargs", "decoy")
+        .end()
+        .end()
+        .begin("chosen")
+        .str_prop("stdout-path", "/uart@9000000")
+        .str_prop("bootargs", "mode=safe kintane.canary=x")
+        .end()
+        .end();
+    let blob = with.finish();
+    assert_eq!(
+        Fdt::new(&blob).unwrap().bootargs(),
+        Ok(Some(&b"mode=safe kintane.canary=x"[..]))
+    );
+
+    let blob = machine().finish();
+    assert_eq!(Fdt::new(&blob).unwrap().bootargs(), Ok(None), "no /chosen, no line");
+
+    let mut bad = Dtb::new();
+    bad.begin("")
+        .begin("chosen")
+        .prop("bootargs", b"no terminator")
+        .end()
+        .end();
+    let blob = bad.finish();
+    assert!(matches!(Fdt::new(&blob).unwrap().bootargs(), Err(Error::BadString { .. })));
+}

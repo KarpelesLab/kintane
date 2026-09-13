@@ -184,8 +184,9 @@ layer = "loader"
 target = "x86_64-unknown-uefi"
 ```
 
-Such a unit is a separate image — today, the UEFI loader — and it is built after the
-kernel in a build of its own under `build/<kernel target>/<triple>/`: `core`,
+Such a unit is a separate image — today, the UEFI loader, and with `CHAIN_TEST` the UEFI
+chainload test application — and it is built after the kernel in a build of its own under
+`build/<kernel target>/<triple>/`: `core`,
 `compiler_builtins` and the generated config compiled for that triple, then its
 dependencies, then itself. Nothing compiled is shared with the kernel, which is not
 waste: the kernel's `boot_protocol` rlib is for a different target and could not be
@@ -196,6 +197,11 @@ kernel's.
 
 The target must be one built into the pinned rustc, which is the point: firmware
 targets are exactly what rustc already describes, and they need no linker script.
+
+The image format decides where each such image goes, by unit name: the `efi-esp` format
+places `kinboot_efi` at `EFI/BOOT/BOOTX64.EFI` and `kinboot_efi_chaintest` at
+`EFI/KINTANE/CHAIN.EFI` (`kbuild/src/build.rs`). An image that is built but that no format
+has a place for is an error, not a file silently left out of the disk.
 
 ### Caching
 
@@ -354,15 +360,24 @@ The release packaging above is ahead of the code. What `kbuild build` writes to
 - `kintane.mb32.elf` (x86_64) or `kintane.img.elf` (everything else) — the bootable
   image, `--strip-all`. It has no symbol table, and CI checks that.
 - `kinboot-bios.img` (x86 with `KINBOOT_BIOS=y`) — a raw MBR disk: `kinboot-bios`
-  stage 1 and stage 2, then the bootable image above, byte for byte. `kbuild run` and
+  stage 1 and stage 2, the boot entries, then the bootable image above, byte for byte;
+  with `CHAIN_TEST`, also the BIOS chain test record as partition 2. `kbuild run` and
   `kbuild test --target` boot this instead of passing `-kernel`. The loader itself is
   built beside it in `build/<target>/kinboot-bios/`, for its own target
   (`targets/i686-kinboot.json`) with its own `core`; see
   [bootloader.md](bootloader.md#build-integration).
-- With `BOOT_KINBOOT` (the `x86_64-efi` preset): `kintane.esp.img`, a 33 MiB disk image
+- With `KINBOOT_EFI` (the `x86_64-efi` preset): `kintane.esp.img`, a 33 MiB disk image
   whose EFI system partition holds `EFI/BOOT/BOOTX64.EFI` — the loader, built to
-  `build/x86_64-kintane/x86_64-unknown-uefi/kinboot_efi.efi` — and `KINTANE/KERNEL.ELF`,
-  the stripped ELF64. The ELF64 rather than the ELF32: the loader enters in long mode.
+  `build/x86_64-kintane/x86_64-unknown-uefi/kinboot_efi.efi` — `KINTANE/BOOT.CFG`, the boot
+  entries, and `KINTANE/KERNEL.ELF`, the stripped ELF64. The ELF64 rather than the ELF32:
+  the loader enters in long mode. With `CHAIN_TEST` it also holds `EFI/KINTANE/CHAIN.EFI`.
+
+Both disk images carry the same boot entries, written by `kbuild/src/bootcfg.rs` from
+`CMDLINE`, `BOOT_MODE`, `BOOT_MENU_TIMEOUT` and `CHAIN_TEST`. A `-kernel` boot gets the
+default entry's command line through `-append` instead. The entry format belongs to
+`boot/kinboot-menu`. kbuild cannot link that crate, so the writer and the parser are held
+together by two files in `boot/kinboot-menu/testdata`: kbuild's tests require it to write
+exactly those bytes, and the crate's tests require its parser to read them as meant.
 
 ### The build ID
 

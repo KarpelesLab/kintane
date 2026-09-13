@@ -109,3 +109,25 @@ fn an_absurd_declared_size_is_not_believed() {
     // SAFETY: only the 16-byte header is read before the size is rejected.
     assert_eq!(unsafe { memory_regions(addr, &mut out) }, Err(Error::Malformed { offset: 0 }));
 }
+
+#[test]
+fn the_command_line_is_copied_out_and_its_absence_is_reported_as_none() {
+    let mut buf = vec![0u8; 4096];
+    let mut b = Builder::new(&mut buf).unwrap();
+    b.firmware(Firmware::Bios).unwrap();
+    b.command_line(b"mode=safe kintane.canary=x").unwrap();
+    let len = b.finish();
+    let mut out = [0u8; 64];
+    assert_eq!(command_line_from(&buf[..len], &mut out), Ok(Some(26)));
+    assert_eq!(&out[..26], b"mode=safe kintane.canary=x");
+
+    // A buffer too small for the line is an error, never a truncated line.
+    let mut small = [0u8; 8];
+    assert!(matches!(
+        command_line_from(&buf[..len], &mut small),
+        Err(Error::Malformed { .. })
+    ));
+
+    assert_eq!(command_line_from(&handover(1), &mut out), Ok(None));
+    assert_eq!(command_line_from(&[0u8; 32], &mut out), Err(Error::NoLoader));
+}

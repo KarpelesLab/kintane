@@ -56,7 +56,8 @@ The byte-level layout — 8-byte tag alignment, `tags_size` including the End ta
 memory map's explicit `entry_size` so a region entry can grow — is specified where it
 is implemented, in `boot/protocol/src/tags.rs`, with a host-tested reader and a writer
 that needs no allocator. Of the tags above, v1 as implemented writes the memory map,
-the ACPI RSDP, the kernel's physical range and the firmware type.
+the command line, the ACPI RSDP, the kernel's physical range and the firmware type. Both
+loaders write the command line. `kinboot-bios` has no ACPI RSDP to pass yet.
 
 ### Entering the kernel
 
@@ -68,6 +69,15 @@ owned by `KinTane` (type 1) that carries the entry's physical address and the pr
 version it expects. The program headers say exactly where the note is, so there is
 nothing to scan for, and `--strip-all` keeps it. `boot_protocol::image` parses it and
 states the machine state each architecture's entry expects.
+
+A loader running in 32-bit protected mode, which is `kinboot-bios`, uses the other entry:
+the ELF entry point, which a Multiboot loader would call. That entry's machine state is
+already Multiboot 1's, so the protocol reuses it. What differs is the magic in `EAX`:
+`boot_protocol::ENTRY32_MAGIC` (`KINT`) instead of `0x2BADB002`. `EBX` then points at a
+`BootInfo`. The kernel's entry code needed no change, because it already keeps `EBX`
+and nothing else. A kernel built for a KinTane loader reads `EBX` as a `BootInfo` and
+validates its magic, so a Multiboot handover to such a kernel fails its boot with a
+reason instead of being misread.
 
 ### This is a genuinely stable ABI
 
@@ -150,12 +160,17 @@ Where the design above was silent or wrong, the implementation decided:
   `compiler_builtins` satisfies those symbols with stubs that trap, and kbuild fails the
   build if one survives the linker's dead-code removal (`lib/builtins/src/uefi_link.rs`).
 
-Not in the minimal loader, and following the phasing below: boot entries and modes,
-GOP framebuffer, the command line from `LoadOptions`, Secure Boot and signature
-verification, measured boot, the boot counter, chainloading, and the aarch64 and i686
-UEFI builds. The loader carries no symbol bundle yet either: it is linked without a
-PDB, because lld-link's PDB records a path rustc picks at random and would make the
-image irreproducible.
+Since then it has gained the [boot entries and menu](#as-built-entries-the-menu-and-the-command-line),
+the command line tag, and [chainloading](#as-built-chainloading) through
+`LoadImage`/`StartImage`. The menu and the boot entry list are `core::fmt` and a parser,
+and the loader is 54 KiB now, still under half its budget.
+
+Not yet, and following the phasing below: GOP framebuffer, a command line from
+`LoadOptions` (a firmware boot entry's options are ignored; the entry list is the one
+place arguments come from), Secure Boot and signature verification, measured boot, the
+boot counter, and the aarch64 and i686 UEFI builds. The loader carries no symbol bundle
+yet either: it is linked without a PDB, because lld-link's PDB records a path rustc
+picks at random and would make the image irreproducible.
 
 ### `kinboot-bios` — MBR / BIOS
 
@@ -167,10 +182,12 @@ It exists, in `boot/kinboot-bios/`, and boots both x86 kernels under QEMU. The
 
 ```text
 LBA 0                MBR: stage 1 code (at most 424 bytes), stage 1 table, disk
-                     signature, one partition entry, 0x55AA
-LBA 1 ..             stage 2 (at most 32 KiB), with a header naming the kernel's LBA,
-                     length and CRC-32
-LBA 1 + stage 2      the packaged kernel image, byte for byte
+                     signature, partition entries, 0x55AA
+LBA 1 ..             stage 2 (at most 32 KiB), with a header naming the LBA, length and
+                     CRC-32 of the boot entries and of the kernel
+after stage 2        the boot entries, at most 4 KiB
+after the entries    the packaged kernel image, byte for byte
+after the kernel     with CHAIN_TEST only: partition 2, one sector, the chain test record
 ```
 
 **Stage 1** occupies the 440 bytes of MBR boot code (bytes 440–445 are the disk
@@ -207,33 +224,46 @@ real-mode **thunk** (`loader/stage2.rs`). The thunk drops to real mode, performs
    port `0x92` in that order, testing after each.
 2. **Memory map**: E820, handling 20- and 24-byte entries, the ACPI 3.0 "enabled" bit
    and the continuation value. On a BIOS without E820 it builds the map E801 implies.
-3. **Kernel**: checks the header, then streams the kernel off the disk in 32 KiB chunks
+3. **Boot entries**: reads the entry list the header names and checks its CRC-32, then
+   shows the [menu](#as-built-entries-the-menu-and-the-command-line) on the screen and
+   COM1, reading keys from INT 16h and from COM1, and waiting between polls with INT 15h
+   `86h`, or on the BIOS clock tick where that is missing.
+4. **Kernel**: checks the header, then streams the kernel off the disk in 32 KiB chunks
    through a bounce buffer at `0x20000`. The ELF is validated from its first chunk, and
    each segment's destination is checked against the memory map before any byte is
    copied. The CRC-32 of the whole file must match the header before the jump.
-4. **Handover**: jumps to the ELF entry point as a Multiboot 1 loader, with
-   `EAX = 0x2BADB002` and `EBX` pointing to an information structure carrying the memory
-   map, `mem_lower`/`mem_upper`, the boot drive, a command line and the loader's name.
+5. **Handover**: writes the boot protocol's structure, with the memory map translated
+   from E820, the kernel's range, the firmware kind and the entry's command line, and
+   enters the kernel's 32-bit entry with `EAX = ENTRY32_MAGIC` and `EBX` pointing at it.
+   For a chainload entry it [boots the partition's record](#as-built-chainloading)
+   instead.
 
-**The handover is interim.** Both x86 kernels already accept Multiboot 1 through
-`boot/info-multiboot`, because QEMU's `-kernel` uses it, so no kernel change was needed.
-Switching this loader to the native `BootInfo` protocol comes once a kernel-side
-`BootInfo` consumer exists; `kinboot-efi` is the first loader to produce one.
+**The handover used to be interim.** The first version of this loader handed over as
+Multiboot 1, which both x86 kernels already accepted through `boot/info-multiboot`. Now
+that `kinboot-efi` produces `BootInfo` and `boot/info-kinboot` reads it, this loader
+writes the same structure through the same builder, and both `*-bios` presets use the
+kinboot provider. `-kernel` boots keep the Multiboot path.
 
-Every decision stage 2 makes is in the `kinboot-bios` crate (`boot/kinboot-bios/src/`),
-which is byte-slice code with no `unsafe` and has host tests. That covers the disk
-layout, E820/E801 decoding, ELF validation, the streaming copy plan and the Multiboot
-structure's offsets. The disk layout file is also compiled into `kbuild`, so the writer
-and the reader cannot disagree. `loader/` only does I/O.
+Every decision stage 2 makes is in the `kinboot-bios` crate (`boot/kinboot-bios/src/`)
+or in `kinboot-menu`, which are byte-slice code with no `unsafe` and have host tests.
+That covers the disk layout, E820/E801 decoding, ELF validation, the streaming copy
+plan, the handover, which partition a chainload boots and what it is handed, and the
+whole menu. The disk layout file is also compiled into `kbuild`, so the writer and the
+reader cannot disagree. `loader/` only does I/O.
 
-On any failure the loader prints `kinboot-bios:` and a reason to the screen and COM1,
-then calls INT 18h, the BIOS's "this device did not boot" entry. A real machine moves
-on to its next boot device. Under QEMU, the harness passes `-boot reboot-timeout=0
--no-reboot`, so a failed boot ends the run within seconds instead of timing out.
+Before an entry is chosen, a failure prints `kinboot-bios:` and a reason to the screen
+and COM1, then calls INT 18h, the BIOS's "this device did not boot" entry. A real machine
+moves on to its next boot device. After an entry is chosen, the entry list's
+`on-failure` decides: INT 18h, or a reset through port `0xCF9` with the keyboard
+controller as a fallback. Under QEMU, the harness passes `-boot reboot-timeout=0
+-no-reboot`, so either ends the run within seconds instead of timing out.
 
-**Not in the minimal loader yet:** the entry list and its `normal`/`safe`/`recovery`
-modes (below), the boot counter, chainloading, EDD and VBE queries, and GPT. The
-command line field in the disk header is written empty today.
+Stage 2 is 27.5 KiB with the menu and the entry parser. The first build of it was
+34.5 KiB, over budget. The `cmdline` crate's words were `str`, and slicing a `str` links
+`core`'s panic formatting and Unicode tables. Byte slices cost 7 KiB less.
+
+**Not in this loader yet:** the boot counter (see
+[Failure handling](#failure-handling)), EDD and VBE queries, and GPT.
 
 **Unvalidated on hardware.** Every path above, including the ones SeaBIOS never takes,
 was exercised under QEMU by forcing it:
@@ -300,6 +330,59 @@ nobody has enumerated is not a feature:
 `recovery` goes further: a minimal in-memory root and no storage writes, for fixing a
 system that safe mode cannot reach.
 
+**What a mode changes today.** Most of the list above is about subsystems that do not
+exist yet: secondary CPUs, driver isolation, modules, power management, storage. Each of
+them must read the mode when it arrives. That is an obligation recorded here, not a
+behaviour anyone can observe yet. The one item with a subject today is verbose output:
+in `safe` and `recovery` mode the kernel prints the loader's memory map, region by region,
+right after the command line (`kernel/main/src/bootargs.rs`). That is the first thing a
+person needs to know about a machine that does not boot, and it is too long for every
+boot. The banner reports the mode in every mode, as `boot mode`.
+
+### As built: entries, the menu and the command line
+
+Both loaders read the same entry list, and the same `boot/kinboot-menu` crate decides
+what it means: a line-based file with a few settings (`timeout`, `default`,
+`on-failure`) followed by entries. Each entry has a `title` and either a kernel `mode`
+and `cmdline` or a chainload target. The crate's documentation is the format's
+specification, and its host tests include the exact bytes `kbuild` writes. Nothing in
+the file is evaluated. A file that does not parse is reported with its line number, and
+the loader boots a built-in default entry, normal mode with no arguments, rather than
+refusing to boot a machine over a typo.
+
+Where the list lives: `\KINTANE\BOOT.CFG` on the ESP for `kinboot-efi`, and sectors after
+stage 2, named by stage 2's header, for `kinboot-bios`. The design above mentions EFI
+variables for UEFI boot configuration. A file was chosen first because the same file
+serves both loaders and is written by the build. Variables remain the way to let the
+firmware's own boot manager list our entries.
+
+The menu is printed on every console the loader has: ConOut on UEFI (which OVMF mirrors
+to the serial port), and the BIOS screen and COM1 on BIOS. The digit keys boot an entry
+at once, up and down (or `k` and `j` on a serial line) move the mark, and Enter boots the
+marked entry. Any key stops the countdown, so a person who has started choosing is not
+overtaken by the timeout. A zero timeout still prints the menu and boots the default
+without waiting.
+
+The kernel command line an entry hands over is `mode=<its mode>`, then the entry's
+`cmdline`. The kernel parses it with `boot/cmdline`, the grammar the loaders compose it
+with, so a mode a loader offers is a mode the kernel understands. A `-kernel` boot gets
+the same line from QEMU's `-append`: through the Multiboot command line on x86, and
+through `/chosen/bootargs` on aarch64.
+
+The configuration writes all of it (`config/main.kcfg`):
+
+| Symbol | What it sets |
+|---|---|
+| `CMDLINE` | the `cmdline` of every entry, and the arguments after `mode=` for `-append` |
+| `BOOT_MODE` | `normal`, `safe` or `recovery`: the default entry, and the `mode=` of a `-kernel` boot |
+| `BOOT_MENU_TIMEOUT` | the countdown, 0 in test builds and 5 otherwise |
+| `CHAIN_TEST` | adds a chainload test entry and makes it the default |
+| `BOOT_ARGS_CHECK`, `BOOT_EXPECT_MODE`, `BOOT_TEST_KEYS` | test settings; see [testing.md](testing.md#boot-entries-the-command-line-and-chainloading) |
+
+Test builds also write `on-failure reboot`. Under `-no-reboot`, a reset ends the run
+within a second, and handing a failed boot back to OVMF would leave it trying its other
+boot options until the harness timed out.
+
 ### Failure handling
 
 The loader increments a boot counter in persistent storage — an EFI variable on UEFI, a
@@ -310,6 +393,12 @@ the previously installed kernel.
 This is a small amount of machinery that turns an unbootable machine into a machine
 that boots badly, which on hardware without a serial console is the difference between
 debuggable and bricked.
+
+**Not built yet, deliberately.** The loader half is small: an EFI variable, or a reserved
+sector. The kernel half is not. The kernel clears the counter, so it needs to write an
+EFI variable through runtime services, or a sector through a disk driver, and it has
+neither. A counter that nothing clears would put every machine into safe mode on its
+third boot. It lands with the first kernel-side writer.
 
 ## Chainloading other operating systems
 
@@ -324,6 +413,29 @@ Scoped by what each platform actually makes easy:
 Explicitly **out of scope**: probing disks to detect installed operating systems,
 filesystem drivers for formats we do not otherwise need, and per-OS quirk handling. A
 user who wants that has GRUB, and should use it — we boot fine from it.
+
+### As built: chainloading
+
+Both mechanisms above exist, as entry targets.
+
+- **`chain-partition N`** (`kinboot-bios`) reads the MBR and checks its signature, takes
+  partition N's entry, reads that partition's first sector, and checks its signature too.
+  It then copies the MBR to `0x0600`, where classic MBRs relocate themselves, and the
+  record to `0x7C00`. It drops to real mode and jumps with `DL` = the boot drive and
+  `DS:SI` pointing at the partition's entry in that copy, which is what DOS-era boot
+  records read to find their own partition. The decisions are `kinboot_bios::chain`; the
+  jump is `chain_boot` in `loader/stage2.rs`.
+- **`chain-file \PATH`** (`kinboot-efi`) reads the file from the loader's own partition
+  and builds its device path: the partition's path with a file path node appended. It
+  calls `LoadImage`, sets the child's `LoadOptions` to `kinboot-efi`, and calls
+  `StartImage`. An application that returns to the loader is a failed boot.
+
+Each has a test payload that `kbuild` builds only for `CHAIN_TEST`, and that exits QEMU
+itself with a pass only if it was entered the way the mechanism promises. The BIOS one is
+a boot record written as partition 2 (`boot/kinboot-bios/loader/chaintest.rs`). It checks
+`DL` and that `DS:SI` is its own partition entry. The UEFI one is an EFI application on
+the ESP (`boot/kinboot-efi-chaintest`). It checks its load options and that its
+`FilePath` names its own file.
 
 ## What the bootloader must not do
 
@@ -369,17 +481,21 @@ and ship as part of the same release. `kbuild image --format` produces the boota
 artifact per platform: a GPT/ESP disk image, an MBR disk image, a raw XIP binary, or a
 FIT image.
 
-Today the MBR image is the one that exists. With `KINBOOT_BIOS=y`, `kbuild build` also
-writes `build/<target>/out/kinboot-bios.img` (`kbuild/src/bios.rs`), in these steps:
+Two disk images exist today: the ESP image for `KINBOOT_EFI`, which
+[build-system.md](build-system.md#what-a-build-produces-today) describes, and the MBR
+image. With `KINBOOT_BIOS=y`, `kbuild build` also writes
+`build/<target>/out/kinboot-bios.img` (`kbuild/src/bios.rs`), in these steps:
 
 1. **Build the loader.** `core` is built for the loader's own target, then the
    `kinboot-bios` crate and the loader binary.
 2. **Flatten it** with `llvm-objcopy -O binary`.
 3. **Check its layout.** The signature, table and header must be where the disk format
    says, and the partition table must be untouched.
-4. **Write the disk.** Stage 2's header is filled in, and the image is padded to whole
-   16×63 cylinders. SeaBIOS on q35 refuses to read a disk smaller than one cylinder,
-   which the first `x86_64-bios` boot found.
+4. **Write the disk.** Stage 2's header is filled in with the entry list's and the
+   kernel's locations and CRCs, the entries come from `kbuild/src/bootcfg.rs`, and with
+   `CHAIN_TEST` the chain test record goes in as partition 2 with its expected drive and
+   LBA filled in. The image is padded to whole 16×63 cylinders. SeaBIOS on q35 refuses to
+   read a disk smaller than one cylinder, which the first `x86_64-bios` boot found.
 
 The disk is byte-identical across cold builds; its signature is derived from its
 contents, not the clock.
@@ -409,5 +525,6 @@ Boot work is spread across the [roadmap](roadmap.md) rather than deferred:
   scheduling consequence most likely to be missed: the MBR loader is early work, not
   Phase 7 polish.
 - **Phase 4** — build-time `BootInfo` for the no-MMU targets.
-- **Phase 7** — Secure Boot, measured boot, last-known-good escalation, chainloading,
-  and real firmware on real machines.
+- **Phase 7** — Secure Boot, measured boot, last-known-good escalation, and real firmware
+  on real machines. Chainloading and the boot entries arrived early, with the minimal
+  loaders, because they were asked for from the start.

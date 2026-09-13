@@ -329,6 +329,63 @@ pub fn a20_enable() {
     );
 }
 
+/// The next key from the BIOS keyboard buffer, as `(scan code, ASCII)`, without waiting.
+/// INT 16h `AH=01h` peeks and leaves the key; only when it reports one is `AH=00h`
+/// called to take it, since `AH=00h` on an empty buffer waits.
+pub fn key() -> Option<(u8, u8)> {
+    const ZF: u32 = 1 << 6;
+    let peek = call(
+        0x16,
+        Regs {
+            eax: 0x0100,
+            ..Regs::default()
+        },
+    );
+    if peek.eflags & ZF != 0 {
+        return None;
+    }
+    let r = call(0x16, Regs::default());
+    Some(((r.eax >> 8) as u8, r.eax as u8))
+}
+
+/// Wait about a tenth of a second, for the boot menu's poll.
+///
+/// INT 15h `AH=86h` waits a number of microseconds with interrupts enabled. A BIOS that
+/// lacks it (carry set) gets a wait measured in BIOS clock ticks instead: the counter at
+/// `0x46C` advances 18.2 times a second, and only while interrupts are enabled, which
+/// here is inside BIOS calls, so the loop makes a harmless one while it watches.
+pub fn wait_100ms() {
+    let r = call(
+        0x15,
+        Regs {
+            eax: 0x8600,
+            ecx: 0x0001,
+            edx: 0x86A0,
+            ..Regs::default()
+        },
+    );
+    if !r.carry() {
+        return;
+    }
+    const TICKS: *const u32 = 0x46C as *const u32;
+    // SAFETY: the BIOS data area's tick counter, a plain RAM read.
+    let start = unsafe { TICKS.read_volatile() };
+    // Two ticks is 110 ms. Bounded, so a stopped clock costs a slow menu, not a hang.
+    for _ in 0..100_000 {
+        let _ = call(
+            0x16,
+            Regs {
+                eax: 0x0100,
+                ..Regs::default()
+            },
+        );
+        // SAFETY: as above.
+        if unsafe { TICKS.read_volatile() }.wrapping_sub(start) >= 2 {
+            return;
+        }
+    }
+}
+
 /// One character to the screen.
 pub fn teletype(c: u8) {
     call(
@@ -339,6 +396,28 @@ pub fn teletype(c: u8) {
             ..Regs::default()
         },
     );
+}
+
+/// Reset the machine: the entry list's `on-failure reboot`.
+///
+/// Port `0xCF9` is the reset control register on every PC chipset since the PIIX; the
+/// keyboard controller's reset line is the older way, tried if the first did nothing.
+/// QEMU run with `-no-reboot` exits on either, which is how a test boot fails fast.
+pub fn reboot() -> ! {
+    use crate::port::{inb, outb};
+    // SAFETY: 0xCF9 bit 1 selects a hard reset and bit 2 performs it. The 8042 command
+    // 0xFE pulses its reset output. Neither returns if the hardware is there.
+    unsafe {
+        outb(0xCF9, 0x02);
+        outb(0xCF9, 0x06);
+        for _ in 0..100_000 {
+            if inb(0x64) & 2 == 0 {
+                break;
+            }
+        }
+        outb(0x64, 0xFE);
+    }
+    boot_failed()
 }
 
 /// Give up: INT 18h tells the BIOS this device did not boot. A real machine tries its

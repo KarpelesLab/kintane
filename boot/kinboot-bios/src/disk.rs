@@ -12,7 +12,9 @@
 //!                       table, 0x55AA
 //! LBA 1 ..              stage 2, at most STAGE2_MAX_SECTORS sectors; its header is at
 //!                       STAGE2_HEADER_OFFSET
-//! LBA 1 + stage 2 size  the kernel image, byte for byte, padded to a whole sector
+//! LBA 1 + stage 2 size  the boot entries (`boot/kinboot-menu`'s format), padded to a
+//!                       whole sector
+//! after the entries     the kernel image, byte for byte, padded to a whole sector
 //! ```
 //!
 //! Stage 1 learns where stage 2 is from its table, which `kbuild` writes. Stage 2
@@ -57,11 +59,15 @@ pub const STAGE2_HEADER_OFFSET: usize = 8;
 /// `KBS2`.
 pub const STAGE2_MAGIC: [u8; 4] = *b"KBS2";
 /// Version of the header layout below.
-pub const HEADER_VERSION: u16 = 1;
-/// Bytes of kernel command line the header carries, terminator included.
-pub const CMDLINE_BYTES: usize = 128;
+///
+/// Version 2 replaced version 1's fixed 128-byte command line with the location of the
+/// boot entries, which carry a command line each.
+pub const HEADER_VERSION: u16 = 2;
 /// Total size of the stage 2 header.
-pub const HEADER_BYTES: usize = 4 + 2 + 2 + 4 + 4 + 4 + CMDLINE_BYTES;
+pub const HEADER_BYTES: usize = 4 + 2 + 2 + 6 * 4;
+/// The largest boot entry list the disk carries: `kinboot_menu::MAX_FILE`, which the
+/// loader asserts at compile time.
+pub const CONFIG_MAX_BYTES: usize = 4096;
 
 /// The stage 1 table: where stage 2 is. Little-endian, at [`STAGE1_TABLE_OFFSET`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -87,16 +93,18 @@ impl Stage1Table {
     }
 }
 
-/// What stage 2 needs to find and check the kernel.
+/// What stage 2 needs to find and check the kernel and the boot entries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Header {
     pub kernel_lba: u32,
     pub kernel_bytes: u32,
     /// CRC-32 (IEEE) of the kernel's `kernel_bytes` bytes.
     pub kernel_crc32: u32,
-    /// NUL-terminated; the terminator is always present because the last byte is
-    /// forced to zero on both write and parse.
-    pub cmdline: [u8; CMDLINE_BYTES],
+    pub config_lba: u32,
+    /// Zero when the disk carries no entries; the loader then boots its built-in default.
+    pub config_bytes: u32,
+    /// CRC-32 (IEEE) of the entries' `config_bytes` bytes.
+    pub config_crc32: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -107,8 +115,8 @@ pub enum LayoutError {
     Version(u16),
     /// A header size smaller than the fields this version defines.
     HeaderSize(u16),
-    /// A command line longer than the header can carry.
-    CmdlineTooLong,
+    /// A boot entry list longer than [`CONFIG_MAX_BYTES`].
+    ConfigTooLarge,
 }
 
 impl Header {
@@ -128,8 +136,12 @@ impl Header {
         h[8..12].copy_from_slice(&self.kernel_lba.to_le_bytes());
         h[12..16].copy_from_slice(&self.kernel_bytes.to_le_bytes());
         h[16..20].copy_from_slice(&self.kernel_crc32.to_le_bytes());
-        h[20..20 + CMDLINE_BYTES].copy_from_slice(&self.cmdline);
-        h[20 + CMDLINE_BYTES - 1] = 0;
+        if self.config_bytes as usize > CONFIG_MAX_BYTES {
+            return Err(LayoutError::ConfigTooLarge);
+        }
+        h[20..24].copy_from_slice(&self.config_lba.to_le_bytes());
+        h[24..28].copy_from_slice(&self.config_bytes.to_le_bytes());
+        h[28..32].copy_from_slice(&self.config_crc32.to_le_bytes());
         Ok(())
     }
 
@@ -148,25 +160,18 @@ impl Header {
             return Err(LayoutError::HeaderSize(size));
         }
         let le = |at: usize| u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]]);
-        let mut cmdline = [0u8; CMDLINE_BYTES];
-        cmdline.copy_from_slice(&h[20..20 + CMDLINE_BYTES]);
-        cmdline[CMDLINE_BYTES - 1] = 0;
-        Ok(Header {
+        let header = Header {
             kernel_lba: le(8),
             kernel_bytes: le(12),
             kernel_crc32: le(16),
-            cmdline,
-        })
-    }
-
-    /// A command line as the header stores it.
-    pub fn cmdline_from(text: &[u8]) -> Result<[u8; CMDLINE_BYTES], LayoutError> {
-        if text.len() >= CMDLINE_BYTES {
-            return Err(LayoutError::CmdlineTooLong);
+            config_lba: le(20),
+            config_bytes: le(24),
+            config_crc32: le(28),
+        };
+        if header.config_bytes as usize > CONFIG_MAX_BYTES {
+            return Err(LayoutError::ConfigTooLarge);
         }
-        let mut c = [0u8; CMDLINE_BYTES];
-        c[..text.len()].copy_from_slice(text);
-        Ok(c)
+        Ok(header)
     }
 }
 
@@ -246,6 +251,17 @@ mod tests {
         img
     }
 
+    fn header() -> Header {
+        Header {
+            kernel_lba: 1,
+            kernel_bytes: 1,
+            kernel_crc32: 0,
+            config_lba: 0,
+            config_bytes: 0,
+            config_crc32: 0,
+        }
+    }
+
     #[test]
     fn header_round_trips() {
         let mut img = stage2_image();
@@ -253,25 +269,26 @@ mod tests {
             kernel_lba: 65,
             kernel_bytes: 123_204,
             kernel_crc32: 0xDEAD_BEEF,
-            cmdline: Header::cmdline_from(b"mode=normal").unwrap(),
+            config_lba: 64,
+            config_bytes: 512,
+            config_crc32: 0x1234_5678,
         };
         h.write(&mut img).unwrap();
         let back = Header::parse(&img[STAGE2_HEADER_OFFSET..]).unwrap();
         assert_eq!(back, h);
         // Fixed offsets are the contract with the assembly, so pin them.
         assert_eq!(&img[STAGE2_HEADER_OFFSET + 8..STAGE2_HEADER_OFFSET + 12], &65u32.to_le_bytes());
-        assert_eq!(HEADER_BYTES, 148);
+        assert_eq!(
+            &img[STAGE2_HEADER_OFFSET + 20..STAGE2_HEADER_OFFSET + 24],
+            &64u32.to_le_bytes()
+        );
+        assert_eq!(HEADER_BYTES, 32);
     }
 
     #[test]
     fn header_refuses_a_moved_layout() {
         let mut img = vec![0u8; 1024];
-        let h = Header {
-            kernel_lba: 1,
-            kernel_bytes: 1,
-            kernel_crc32: 0,
-            cmdline: [0; CMDLINE_BYTES],
-        };
+        let h = header();
         assert_eq!(h.write(&mut img), Err(LayoutError::BadMagic));
         assert_eq!(Header::parse(&img[STAGE2_HEADER_OFFSET..]), Err(LayoutError::BadMagic));
         assert_eq!(Header::parse(&STAGE2_MAGIC), Err(LayoutError::TooShort));
@@ -280,40 +297,28 @@ mod tests {
     #[test]
     fn header_checks_version_and_size() {
         let mut img = stage2_image();
-        let h = Header {
-            kernel_lba: 1,
-            kernel_bytes: 1,
-            kernel_crc32: 0,
-            cmdline: [0; CMDLINE_BYTES],
-        };
-        h.write(&mut img).unwrap();
+        header().write(&mut img).unwrap();
         let at = STAGE2_HEADER_OFFSET;
-        img[at + 4] = 2;
-        assert_eq!(Header::parse(&img[at..]), Err(LayoutError::Version(2)));
         img[at + 4] = 1;
+        assert_eq!(Header::parse(&img[at..]), Err(LayoutError::Version(1)), "the v1 layout");
+        img[at + 4] = 2;
         img[at + 6] = 20;
         img[at + 7] = 0;
         assert_eq!(Header::parse(&img[at..]), Err(LayoutError::HeaderSize(20)));
     }
 
     #[test]
-    fn cmdline_is_always_terminated() {
-        assert_eq!(Header::cmdline_from(&[b'x'; CMDLINE_BYTES]), Err(LayoutError::CmdlineTooLong));
-        let full = Header::cmdline_from(&[b'x'; CMDLINE_BYTES - 1]).unwrap();
-        assert_eq!(full[CMDLINE_BYTES - 1], 0);
-        // A disk whose header lost its terminator still parses to a terminated line.
+    fn an_oversized_entry_list_is_refused_on_both_sides() {
         let mut img = stage2_image();
-        let h = Header {
-            kernel_lba: 1,
-            kernel_bytes: 1,
-            kernel_crc32: 0,
-            cmdline: [0; CMDLINE_BYTES],
+        let big = Header {
+            config_bytes: CONFIG_MAX_BYTES as u32 + 1,
+            ..header()
         };
-        h.write(&mut img).unwrap();
-        let end = STAGE2_HEADER_OFFSET + HEADER_BYTES;
-        img[end - CMDLINE_BYTES..end].fill(b'y');
-        let back = Header::parse(&img[STAGE2_HEADER_OFFSET..]).unwrap();
-        assert_eq!(back.cmdline[CMDLINE_BYTES - 1], 0);
+        assert_eq!(big.write(&mut img), Err(LayoutError::ConfigTooLarge));
+        header().write(&mut img).unwrap();
+        let at = STAGE2_HEADER_OFFSET + 24;
+        img[at..at + 4].copy_from_slice(&(CONFIG_MAX_BYTES as u32 + 1).to_le_bytes());
+        assert_eq!(Header::parse(&img[STAGE2_HEADER_OFFSET..]), Err(LayoutError::ConfigTooLarge));
     }
 
     #[test]

@@ -201,6 +201,23 @@ impl Image {
         &self.segments[..self.count]
     }
 
+    /// The physical range the segments occupy, `(start, len)`, gaps included.
+    pub fn extent(&self) -> (u64, u64) {
+        let start = self
+            .segments()
+            .iter()
+            .map(|s| s.paddr as u64)
+            .min()
+            .unwrap_or(0);
+        let end = self
+            .segments()
+            .iter()
+            .map(|s| s.paddr as u64 + s.memsz as u64)
+            .max()
+            .unwrap_or(0);
+        (start, end - start)
+    }
+
     /// Every segment must land in RAM the firmware says is free.
     pub fn check_placement(&self, map: &MemoryMap) -> Result<(), Error> {
         for (index, s) in self.segments().iter().enumerate() {

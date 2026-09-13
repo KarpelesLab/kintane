@@ -454,3 +454,32 @@ fn uefi_descriptors_become_byte_regions() {
     assert_eq!(uefi::region(memory_type::CONVENTIONAL, u64::MAX - 0x1000, 2), None);
     assert_eq!(uefi::region(memory_type::CONVENTIONAL, 0, u64::MAX), None);
 }
+
+#[test]
+fn a_command_line_round_trips_and_its_absence_is_not_an_empty_line() {
+    let with = build(|b| b.command_line(b"mode=safe kintane.canary=x").unwrap());
+    let p = tags::parse(&with).unwrap();
+    assert_eq!(p.command_line().unwrap(), Some(&b"mode=safe kintane.canary=x"[..]));
+
+    let without = build(|b| b.firmware(Firmware::Bios).unwrap());
+    assert_eq!(tags::parse(&without).unwrap().command_line().unwrap(), None);
+
+    let empty = build(|b| b.command_line(b"").unwrap());
+    assert_eq!(tags::parse(&empty).unwrap().command_line().unwrap(), Some(&b""[..]));
+}
+
+#[test]
+fn an_overlong_command_line_is_refused_by_both_sides() {
+    let long = vec![b'x'; tags::MAX_COMMAND_LINE + 1];
+    let mut buf = vec![0u8; 4096];
+    let mut b = Builder::new(&mut buf).unwrap();
+    assert_eq!(b.command_line(&long), Err(Error::NoRoom));
+    assert!(b.command_line(&long[..tags::MAX_COMMAND_LINE]).is_ok());
+
+    // A loader that bypasses the builder is still caught by the reader.
+    let bytes = build(|b| b.tag(TagKind::CommandLine, &long).unwrap());
+    assert!(matches!(
+        tags::parse(&bytes).unwrap().command_line(),
+        Err(Error::Malformed { .. })
+    ));
+}

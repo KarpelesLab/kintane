@@ -1,0 +1,18 @@
+# The kernel command line: its grammar, and the boot modes it selects.
+#
+# Shared by both sides of the handover. The kernel parses the line it was given, and the
+# loaders compose `mode=` from a boot entry with the same names, so a mode a loader can
+# offer is a mode the kernel understands by construction.
+#
+# Byte-slice code with no `unsafe` and no dependencies, at layer `hal` so a loader built
+# for another target can link it. Its host tests run under every preset, and
+# `kbuild portability` keeps it honest.
+[unit]
+name = "cmdline"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "hal"
+
+[deps]
+units = []

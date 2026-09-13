@@ -1,4 +1,4 @@
-//! `kinboot-bios` stage 2: from protected mode to a running kernel.
+//! `kinboot-bios` stage 2: from protected mode to a running kernel or another system.
 //!
 //! `stage2.rs` has switched to protected mode and called [`kinboot_main`] with the boot
 //! drive. From here, in order:
@@ -9,19 +9,26 @@
 //!    where it is something else.
 //! 2. **Memory map.** E820, or E801 on a BIOS without it. The loader's own memory and the bounce
 //!    buffer must be usable RAM in that map; otherwise nothing below is safe.
-//! 3. **Kernel.** Read the disk header, then stream the kernel off the disk in 32 KiB chunks
+//! 3. **Boot entries.** Read the entry list from the disk and check its CRC-32, then show the menu
+//!    on the screen and COM1 and wait for a key or the timeout. A list that does not parse is
+//!    reported, and the loader boots its built-in default, normal mode with no arguments, rather
+//!    than refusing to boot a machine over a typo.
+//! 4. **Kernel.** Read the disk header, then stream the kernel off the disk in 32 KiB chunks
 //!    through the bounce buffer. The ELF is validated from its first chunk, every segment's
 //!    destination is checked against the memory map before a byte is written, and each chunk is
 //!    copied to where it belongs. A CRC-32 of the whole file is checked against the header before
 //!    the jump.
-//! 4. **Handover.** Build the Multiboot 1 information structure in low memory and jump to the ELF
-//!    entry point with `EAX = 0x2BADB002` and `EBX` pointing at it.
+//! 5. **Handover.** Write the boot protocol's structure, with the entry's command line, in low
+//!    memory and enter the kernel's 32-bit entry with `EAX = ENTRY32_MAGIC` and `EBX` pointing at
+//!    it. Or, for a chainload entry, read the partition's boot record to `0x7C00` and jump to it in
+//!    real mode.
 //!
-//! Any failure prints `kinboot-bios: ` and the reason to COM1 and the screen, then
-//! returns control to the BIOS with INT 18h.
+//! Before an entry is chosen, a failure prints `kinboot-bios: ` and the reason to COM1 and
+//! the screen, then returns control to the BIOS with INT 18h. After, the entry list's
+//! `on-failure` decides: INT 18h, or a reset.
 //!
-//! Every decision in that list is made by the `kinboot-bios` crate, which has host
-//! tests. This file does the I/O.
+//! Every decision in that list is made by the `kinboot-bios` and `kinboot-menu` crates,
+//! which have host tests. This file does the I/O.
 //!
 //! The loader runs single-threaded, identity-mapped, with interrupts disabled except
 //! inside BIOS calls, and never returns.
@@ -36,8 +43,9 @@ mod stage2;
 use bios::{Disk, DiskError, MapError, MapSource};
 use kinboot_bios::disk::{self, Crc32};
 use kinboot_bios::elf::{self, Image};
-use kinboot_bios::mbinfo;
 use kinboot_bios::memmap::MemoryMap;
+use kinboot_bios::{chain, handover};
+use kinboot_menu::{Config, Menu, OnFailure, Step, Target};
 
 /// Chunk of kernel read per disk request. Half the bounce buffer; the top of the buffer
 /// is reserved for request packets.
@@ -51,18 +59,24 @@ const KERNEL_FLOOR: u32 = 0x10_0000;
 const LOADER_LOW: u64 = 0x500;
 const LOADER_HIGH: u64 = bios::BOUNCE as u64 + 0x1_0000;
 
+const _: () = assert!(disk::CONFIG_MAX_BYTES == kinboot_menu::MAX_FILE);
+const _: () = assert!(disk::CONFIG_MAX_BYTES <= CHUNK_BYTES);
+
 unsafe extern "C" {
     static disk_header: u8;
-    fn enter_kernel(entry: u32, info: u32) -> !;
+    fn enter_kernel(entry: u32, info: u32, magic: u32) -> !;
+    fn chain_boot(drive: u32, si: u32) -> !;
 }
 
-/// The Multiboot handover lives in the loader's `.bss`, which the link script keeps
-/// below the bounce buffer, inside the kernel's reserved low memory.
-static mut INFO: [u8; mbinfo::INFO_BYTES] = [0; mbinfo::INFO_BYTES];
-static mut MMAP: [u8; kinboot_bios::memmap::MAX_ENTRIES * mbinfo::MMAP_ENTRY_BYTES] =
-    [0; kinboot_bios::memmap::MAX_ENTRIES * mbinfo::MMAP_ENTRY_BYTES];
-static mut CMDLINE: [u8; disk::CMDLINE_BYTES] = [0; disk::CMDLINE_BYTES];
-static LOADER_NAME: [u8; 13] = *b"kinboot-bios\0";
+/// The handover, the entry list and the command line live in the loader's `.bss`,
+/// which the link script keeps below the bounce buffer, inside the kernel's reserved low
+/// memory.
+static mut INFO: [u8; handover::BYTES] = [0; handover::BYTES];
+static mut CONFIG: [u8; disk::CONFIG_MAX_BYTES] = [0; disk::CONFIG_MAX_BYTES];
+static mut CMDLINE: [u8; cmdline::MAX_LINE] = [0; cmdline::MAX_LINE];
+
+/// The entry booted when the disk has no usable list.
+const FALLBACK: &[u8] = b"entry normal\ntitle KinTane (built-in default)\n";
 
 enum Fatal {
     A20,
@@ -70,10 +84,14 @@ enum Fatal {
     LowMemory,
     Header(disk::LayoutError),
     Disk(DiskError),
+    ConfigChecksum,
     EmptyKernel,
     Elf(elf::Error),
     Checksum { expected: u32, actual: u32 },
     Handover,
+    OtherKernel,
+    ChainFile,
+    Chain(chain::Error),
 }
 
 #[unsafe(no_mangle)]
@@ -81,14 +99,18 @@ pub extern "C" fn kinboot_main(drive: u32) -> ! {
     console::init();
     console::say("\r\nkinboot-bios: stage 2 from drive ");
     console::hex(drive, 2);
-    let Err(fatal) = boot(drive as u8);
+    let mut on_failure = OnFailure::Firmware;
+    let Err(fatal) = boot(drive as u8, &mut on_failure);
     console::say("\r\nkinboot-bios: ");
     describe(fatal);
     console::say("\r\n");
-    bios::boot_failed()
+    match on_failure {
+        OnFailure::Firmware => bios::boot_failed(),
+        OnFailure::Reboot => bios::reboot(),
+    }
 }
 
-fn boot(drive: u8) -> Result<core::convert::Infallible, Fatal> {
+fn boot(drive: u8, on_failure: &mut OnFailure) -> Result<core::convert::Infallible, Fatal> {
     console::say("\r\n  a20      ");
     console::say(a20::enable().ok_or(Fatal::A20)?);
 
@@ -119,15 +141,95 @@ fn boot(drive: u8) -> Result<core::convert::Infallible, Fatal> {
     console::say(" bytes at lba ");
     console::dec(header.kernel_lba);
 
-    let image = load(&disk, &header, &map)?;
-    let info = handover(&map, drive, &header)?;
+    let config = entries(&disk, &header)?;
+    *on_failure = config.on_failure;
+    let chosen = choose(&config);
+    let entry = config.entry(chosen).unwrap_or_else(|| unreachable_entry());
+    console::say("\r\nkinboot-bios: booting ");
+    console::bytes(entry.title);
 
-    console::say("\r\n  entry    ");
-    console::hex(image.entry, 8);
-    console::say("\r\n");
-    // SAFETY: every loadable segment has been copied to RAM the firmware reported free,
-    // the file's checksum matched, and the machine is in the state Multiboot 1 requires.
-    unsafe { enter_kernel(image.entry, info) }
+    match entry.target {
+        Target::Kernel { path: Some(_), .. } => Err(Fatal::OtherKernel),
+        Target::ChainFile(_) => Err(Fatal::ChainFile),
+        Target::ChainPartition(n) => chainload(&disk, drive, n),
+        Target::Kernel { path: None, .. } => {
+            // SAFETY: single-threaded, and this static is written only here, once.
+            let line = unsafe { &mut *(&raw mut CMDLINE) };
+            let n = kinboot_menu::kernel_command_line(&entry, line).ok_or(Fatal::Handover)?;
+            let image = load(&disk, &header, &map)?;
+            let info = handover(&map, &image, &line[..n])?;
+            console::say("\r\n  cmdline  ");
+            console::bytes(&line[..n]);
+            console::say("\r\n  entry    ");
+            console::hex(image.entry, 8);
+            console::say("\r\n");
+            // SAFETY: every loadable segment has been copied to RAM the firmware reported
+            // free, the file's checksum matched, the structure is complete, and the machine
+            // is in the state `boot_protocol::image` requires of a 32-bit entry.
+            unsafe { enter_kernel(image.entry, info, boot_protocol::ENTRY32_MAGIC) }
+        }
+    }
+}
+
+/// The entry list: the disk's, or the built-in default if it has none or it is unusable.
+fn entries(disk: &Disk, header: &disk::Header) -> Result<Config<'static>, Fatal> {
+    let fallback = || Config::parse(FALLBACK).unwrap_or_else(|_| unreachable_entry());
+    if header.config_bytes == 0 {
+        console::say("\r\n  entries  none on this disk; using the built-in default");
+        return Ok(fallback());
+    }
+    let len = header.config_bytes as usize;
+    disk.read(header.config_lba, disk::sectors_for(len) as u32)
+        .map_err(Fatal::Disk)?;
+    // SAFETY: single-threaded, and this static is written only here, once. The bounce
+    // buffer holds at least `len` bytes just read, `len` was bounded by `Header::parse`,
+    // and the two do not overlap.
+    let file = unsafe {
+        let config = &mut *(&raw mut CONFIG);
+        core::ptr::copy_nonoverlapping(bios::BOUNCE as *const u8, config.as_mut_ptr(), len);
+        &config[..len]
+    };
+    if disk::crc32(file) != header.config_crc32 {
+        return Err(Fatal::ConfigChecksum);
+    }
+    match Config::parse(file) {
+        Ok(config) => Ok(config),
+        Err(e) => {
+            console::say("\r\nkinboot-bios: the boot entries are unusable at line ");
+            console::dec(e.line);
+            console::say("; using the built-in default");
+            Ok(fallback())
+        }
+    }
+}
+
+/// Show the menu and wait for a choice or the timeout.
+fn choose(config: &Config<'_>) -> usize {
+    let mut menu = Menu::new(config);
+    kinboot_menu::render(config, &menu, &mut console::bytes);
+    let mut step = menu.start();
+    loop {
+        match step {
+            Step::Boot(i) => return i,
+            Step::Moved(i) => {
+                console::say("\r\n  marked ");
+                console::dec(i as u32 + 1);
+            }
+            Step::Wait => {}
+        }
+        step = match input::poll() {
+            Some(key) => menu.key(key),
+            None => {
+                bios::wait_100ms();
+                menu.tick()
+            }
+        };
+    }
+}
+
+fn unreachable_entry() -> ! {
+    console::say("\r\nkinboot-bios: internal error in the boot entries\r\n");
+    bios::boot_failed()
 }
 
 fn load(disk: &Disk, header: &disk::Header, map: &MemoryMap) -> Result<Image, Fatal> {
@@ -190,18 +292,46 @@ fn load(disk: &Disk, header: &disk::Header, map: &MemoryMap) -> Result<Image, Fa
     Ok(image)
 }
 
-fn handover(map: &MemoryMap, drive: u8, header: &disk::Header) -> Result<u32, Fatal> {
-    // SAFETY: single-threaded, and these statics are written only here, once.
-    let (info, mmap, cmdline) =
-        unsafe { (&mut *(&raw mut INFO), &mut *(&raw mut MMAP), &mut *(&raw mut CMDLINE)) };
-    cmdline.copy_from_slice(&header.cmdline);
-    let addresses = mbinfo::Addresses {
-        mmap: mmap.as_ptr() as u32,
-        cmdline: cmdline.as_ptr() as u32,
-        loader_name: LOADER_NAME.as_ptr() as u32,
-    };
-    mbinfo::write(info, mmap, map, drive, addresses).map_err(|_| Fatal::Handover)?;
+fn handover(map: &MemoryMap, image: &Image, cmdline: &[u8]) -> Result<u32, Fatal> {
+    // SAFETY: single-threaded, and this static is written only here, once.
+    let info = unsafe { &mut *(&raw mut INFO) };
+    handover::write(info, map, image.extent(), cmdline).map_err(|_| Fatal::Handover)?;
     Ok(info.as_ptr() as u32)
+}
+
+/// Boot a partition's boot record the way a classic MBR does.
+fn chainload(disk: &Disk, drive: u8, number: u8) -> Result<core::convert::Infallible, Fatal> {
+    // SAFETY: the bounce buffer is RAM checked usable above; each read below fills its
+    // first sector, which is copied out before the next read.
+    let sector = || unsafe { *(bios::BOUNCE as *const [u8; disk::SECTOR]) };
+    disk.read(0, 1).map_err(Fatal::Disk)?;
+    let mbr = sector();
+    let partition = chain::partition(&mbr, number).map_err(Fatal::Chain)?;
+    disk.read(partition.start_lba, 1).map_err(Fatal::Disk)?;
+    let record = sector();
+    chain::check_boot_record(&partition, &record).map_err(Fatal::Chain)?;
+
+    console::say("\r\n  chain    partition ");
+    console::dec(u32::from(number));
+    console::say(" at lba ");
+    console::dec(partition.start_lba);
+    console::say("\r\n");
+    // SAFETY: 0x600 and 0x7C00 are conventional memory below the loader's own stage 2 at
+    // 0x7E00, and nothing reads them again: stage 1 has done its work, and the real-mode
+    // stack used by the switch is below 0x7C00 and above the 0x600 copy's end at 0x800.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            mbr.as_ptr(),
+            chain::MBR_COPY_ADDRESS as *mut u8,
+            disk::SECTOR,
+        );
+        core::ptr::copy_nonoverlapping(
+            record.as_ptr(),
+            chain::LOAD_ADDRESS as *mut u8,
+            disk::SECTOR,
+        );
+        chain_boot(u32::from(drive), u32::from(partition.si()))
+    }
 }
 
 fn describe(f: Fatal) {
@@ -225,7 +355,7 @@ fn describe(f: Fatal) {
                 disk::LayoutError::BadMagic => "bad magic",
                 disk::LayoutError::Version(_) => "unknown version",
                 disk::LayoutError::HeaderSize(_) => "bad size",
-                disk::LayoutError::CmdlineTooLong => "command line too long",
+                disk::LayoutError::ConfigTooLarge => "boot entries too large",
             });
         }
         Fatal::Disk(DiskError::Read { lba, status }) => {
@@ -239,6 +369,7 @@ fn describe(f: Fatal) {
             say("kernel is beyond what CHS can address, at lba ");
             dec(lba);
         }
+        Fatal::ConfigChecksum => say("boot entries checksum mismatch"),
         Fatal::EmptyKernel => say("the disk carries no kernel"),
         Fatal::Elf(e) => {
             say("kernel image rejected: ");
@@ -250,7 +381,29 @@ fn describe(f: Fatal) {
             say(", read ");
             hex(actual, 8);
         }
-        Fatal::Handover => say("memory map does not fit the handover"),
+        Fatal::Handover => say("the boot information does not fit"),
+        Fatal::OtherKernel => say("this loader boots only the kernel on its own disk"),
+        Fatal::ChainFile => say("chainloading a file needs kinboot-efi; use chain-partition"),
+        Fatal::Chain(e) => {
+            say("cannot chainload: ");
+            match e {
+                chain::Error::NoSuchPartition(n) => {
+                    say("no partition ");
+                    dec(u32::from(n));
+                }
+                chain::Error::EmptyPartition(n) => {
+                    say("partition ");
+                    dec(u32::from(n));
+                    say(" is empty");
+                }
+                chain::Error::BadMbr => say("the MBR has no signature"),
+                chain::Error::NotBootable(n) => {
+                    say("partition ");
+                    dec(u32::from(n));
+                    say(" has no boot record");
+                }
+            }
+        }
     }
 }
 
@@ -269,9 +422,37 @@ fn elf_reason(e: elf::Error) -> &'static str {
         BelowFloor { .. } => "a segment loads below 1 MiB",
         NotRam { .. } => "a segment is not in usable RAM",
         NoLoadableSegment => "nothing to load",
-        NoMultibootHeader => "no multiboot header",
+        NoMultibootHeader => "no 32-bit entry (multiboot header)",
         MultibootChecksum => "multiboot header checksum",
         MultibootUnsupported(_) => "multiboot header requires an unsupported feature",
+    }
+}
+
+mod input {
+    //! Keys for the boot menu, from the BIOS keyboard and from COM1.
+
+    use kinboot_menu::Key;
+
+    use crate::bios;
+    use crate::port::inb;
+
+    const COM1: u16 = 0x3F8;
+
+    /// A key if one is waiting, without blocking.
+    pub fn poll() -> Option<Key> {
+        // SAFETY: reading the 16550's line status and, when bit 0 says a byte is there,
+        // its receive buffer, which consumes exactly that byte.
+        unsafe {
+            if inb(COM1 + 5) & 1 != 0 {
+                return Some(Key::from_ascii(inb(COM1)));
+            }
+        }
+        let (scan, ascii) = bios::key()?;
+        Some(match (scan, ascii) {
+            (0x48, 0) => Key::Up,
+            (0x50, 0) => Key::Down,
+            (_, a) => Key::from_ascii(a),
+        })
     }
 }
 
@@ -412,10 +593,14 @@ mod console {
         bios::teletype(c);
     }
 
-    pub fn say(s: &str) {
-        for &b in s.as_bytes() {
+    pub fn bytes(s: &[u8]) {
+        for &b in s {
             putc(b);
         }
+    }
+
+    pub fn say(s: &str) {
+        bytes(s.as_bytes());
     }
 
     pub fn hex(v: u32, digits: u32) {
@@ -426,20 +611,9 @@ mod console {
         }
     }
 
-    pub fn dec(mut v: u32) {
+    pub fn dec(v: u32) {
         let mut buf = [0u8; 10];
-        let mut i = buf.len();
-        loop {
-            i -= 1;
-            buf[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        for &b in &buf[i..] {
-            putc(b);
-        }
+        bytes(kinboot_menu::decimal(v, &mut buf));
     }
 }
 

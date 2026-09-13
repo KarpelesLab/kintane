@@ -55,10 +55,9 @@ stage2_start:
 .globl disk_header
 disk_header:
     .ascii "KBS2"
-    .word 1
-    .word 148
-    .long 0, 0, 0
-    .space 128, 0
+    .word 2
+    .word 32
+    .long 0, 0, 0, 0, 0, 0
 
 .Lreal_entry:
     cli
@@ -173,17 +172,48 @@ bios_int:
     popl %ebp
     ret
 
-// noreturn enter_kernel(u32 entry, u32 info)
+// noreturn enter_kernel(u32 entry, u32 info, u32 magic)
 //
-// The Multiboot 1 machine state: EAX = 0x2BADB002, EBX = the information structure,
-// flat 32-bit code and data segments, protected mode, paging off, interrupts off. All
-// of that except the two registers is already true here.
+// The 32-bit entry's machine state (boot_protocol::image): EAX = the magic naming the
+// structure, EBX = the structure, flat 32-bit code and data segments, protected mode,
+// paging off, interrupts off. All of that except the two registers is already true here.
 .globl enter_kernel
 enter_kernel:
     movl 4(%esp), %ecx
     movl 8(%esp), %ebx
-    movl $0x2BADB002, %eax
+    movl 12(%esp), %eax
     jmp *%ecx
+
+// noreturn chain_boot(u32 drive, u32 si)
+//
+// Enter a boot record at 0000:7C00 the way a BIOS or an MBR would: real mode, DL = the
+// boot drive, DS:SI = its partition entry, a stack below 0x7C00, interrupts enabled. The
+// record and the MBR copy are already in place. The two values ride through the mode
+// switch in EDX and ESI, which nothing on the way touches.
+.globl chain_boot
+chain_boot:
+    cli
+    movl 4(%esp), %edx
+    movl 8(%esp), %esi
+    ljmp $0x18, $.Lchain16
+
+.code16
+.Lchain16:
+    movl %cr0, %eax
+    andl $0xFFFFFFFE, %eax
+    movl %eax, %cr0
+    ljmp $0x0000, $.Lchain_real
+
+.Lchain_real:
+    xorw %ax, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw $0x7C00, %sp
+    sti
+    ljmp $0x0000, $0x7C00
+
+.code32
 
 .Lsaved_esp:
     .long 0

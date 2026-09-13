@@ -241,6 +241,52 @@ jobs:
           done
           exit $fail
 
+      # Every boot above already checks the command line arrives intact, because test builds
+      # set BOOT_ARGS_CHECK. These prove the rest of the boot path: safe mode reaches the
+      # kernel and has its effect on every preset, a key typed at each loader's menu picks
+      # an entry the default would not, and each loader's chainload hands over what a
+      # chainloaded system relies on. See docs/testing.md.
+      - name: Boot modes, the boot menu and chainloading
+        run: |
+          set -uo pipefail
+          fail=0
+          for p in config/presets/*.preset; do
+            name=$(basename "$p" .preset)
+            echo "::group::safe mode $name"
+            if ./kbuild/target/release/kbuild run --preset "$name" --set BOOT_MODE_SAFE=y \
+                --timeout 90 > build/safe.log 2>&1 \
+              && grep -q "conservative: the loader's memory map follows" build/safe.log; then
+              echo "safe mode ok: $name"
+            else
+              cat build/safe.log
+              echo "::error title=safe mode failed::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          for name in i686-bios x86_64-efi; do
+            echo "::group::menu keys $name"
+            if ./kbuild/target/release/kbuild run --preset "$name" --set BOOT_MENU_TIMEOUT=30 \
+                --set BOOT_TEST_KEYS=2 --set BOOT_EXPECT_MODE=safe --timeout 120; then
+              echo "menu keys ok: $name"
+            else
+              echo "::error title=menu keys failed::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          for name in i686-bios x86_64-bios x86_64-efi; do
+            echo "::group::chainload $name"
+            if ./kbuild/target/release/kbuild run --preset "$name" --set CHAIN_TEST=y --timeout 120; then
+              echo "chainload ok: $name"
+            else
+              echo "::error title=chainload failed::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       # A backtrace is read only after something has gone wrong, which is the worst time
       # to learn it stopped decoding. Each architecture crashes on purpose, once by panic
       # and once by fault, and the decoded report must name the functions it came from.
@@ -370,5 +416,20 @@ jobs:
           echo "second: $b"
           if [ "$a" != "$b" ]; then
             echo "::error title=not reproducible::the same source produced a different ESP image"
+            exit 1
+          fi
+      - name: Build the BIOS disk image twice from scratch and compare
+        run: |
+          set -euo pipefail
+          rm -rf build
+          ./kbuild/target/release/kbuild build --preset i686-bios
+          a=$(sha256sum build/i686-kintane/out/kinboot-bios.img | cut -d' ' -f1)
+          rm -rf build
+          ./kbuild/target/release/kbuild build --preset i686-bios
+          b=$(sha256sum build/i686-kintane/out/kinboot-bios.img | cut -d' ' -f1)
+          echo "first:  $a"
+          echo "second: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error title=not reproducible::the same source produced a different BIOS disk"
             exit 1
           fi

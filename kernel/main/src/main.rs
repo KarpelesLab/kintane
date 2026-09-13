@@ -10,6 +10,7 @@
 // docs/coding-standards.md; this is the replacement it names.
 #![feature(sync_unsafe_cell)]
 
+mod bootargs;
 mod clock;
 mod crash;
 mod demand;
@@ -206,6 +207,13 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     c.write_str(if kconfig::MM_PAGED { "y" } else { "n" });
     c.write_str(" DEBUG=");
     c.write_str(if kconfig::DEBUG_BUILD { "y" } else { "n" });
+    // Early, while the loader's memory is certainly still where it left it, and before the
+    // memory map is built on, so safe mode's verbose map comes before anything uses it.
+    c.write_str(
+        "
+  cmdline    ",
+    );
+    let args = bootargs::check(c, boot_arg);
     // Before `memory`, because this is where the architecture turns on the features
     // the kernel's own address space depends on — NXE among them. Building that space
     // first produced data mappings with no NX, which the space's own check caught.
@@ -262,6 +270,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
 
     c.write_str("\n\nreached kmain\n");
     let verdict = Check::from_ok(paging_ok)
+        .and(args)
         .and(devices)
         .and(mem)
         .and(Check::from_ok(irq_ok))

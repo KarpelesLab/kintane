@@ -9,14 +9,16 @@
 //! - [`disk`] — the on-disk layout, shared by path with the `kbuild` code that writes it;
 //! - [`memmap`] — decoding E820 and E801 into a memory map, and asking it questions;
 //! - [`elf`] — validating the kernel and planning its load while streaming it from disk;
-//! - [`mbinfo`] — the Multiboot 1 structure handed to the kernel.
+//! - [`handover`] — the boot protocol structure handed to the kernel;
+//! - [`chain`] — which sector a chainload entry boots, and what it is handed.
 //!
 //! See `docs/bootloader.md`.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+pub mod chain;
 pub mod disk;
 pub mod elf;
-pub mod mbinfo;
+pub mod handover;
 pub mod memmap;

@@ -1,0 +1,18 @@
+# The UEFI chainload test payload: an EFI application that passes the run only if
+# kinboot-efi started it the way a chainloaded system is started.
+#
+# Built for the same target as the loader, and placed on the ESP as
+# \EFI\KINTANE\CHAIN.EFI, which the chain test boot entry names. Only in CHAIN_TEST
+# builds: it is a test fixture, not something a machine should boot.
+[unit]
+name = "kinboot_efi_chaintest"
+kind = "bin"
+root = "src/main.rs"
+layer = "loader"
+target = "x86_64-unknown-uefi"
+
+[deps]
+units = []
+
+[config]
+requires = "KINBOOT_EFI && CHAIN_TEST"

@@ -34,3 +34,11 @@ pub const SOURCE: &str = "none yet";
 pub unsafe fn memory_regions(_boot_arg: u64, _out: &mut [MemoryRegion]) -> Result<usize, Error> {
     Err(Error::NoLoader)
 }
+
+/// Always fails, for the same reason as [`memory_regions`].
+///
+/// # Safety
+/// As [`memory_regions`]; it dereferences nothing.
+pub unsafe fn command_line(_boot_arg: u64, _out: &mut [u8]) -> Result<Option<usize>, Error> {
+    Err(Error::NoLoader)
+}
