@@ -1,0 +1,13 @@
+[unit]
+name = "module"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+# Nothing. The loader reads bytes and writes bytes: an ELF object in, relocated sections
+# out, into memory the kernel maps and protects itself. Keeping `hal` out is what lets a
+# module crate link this same unit for its declarations and macros without pulling in an
+# architecture's worth of traits, and what lets every relocation be tested on a laptop.
+[deps]
+units = []

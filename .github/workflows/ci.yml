@@ -373,6 +373,21 @@ jobs:
       # The build ID is what stops a log from being decoded against the wrong build's
       # symbols, into names that look right. So decode a log against a different build and
       # require the refusal: a crash log from a debug build, symbols from a release one.
+      # A module built from the SDK, outside the tree, must be the module kbuild builds in
+      # it: same flags, same toolchain, same bytes. Otherwise the SDK builds something the
+      # kernel was never tested with. See docs/modules.md, "The SDK".
+      - name: A module built from the SDK is the module built in the tree
+        run: |
+          set -euo pipefail
+          ./kbuild/target/release/kbuild sdk --preset x86_64-qemu
+          work=$(mktemp -d)
+          mkdir -p "$work/hello/src"
+          cp modules/test/roundtrip/src/lib.rs "$work/hello/src/lib.rs"
+          export RUSTC="$(rustup which --toolchain ${{ steps.pin.outputs.channel }} rustc)"
+          sh build/x86_64-kintane/sdk/build-module.sh "$work/hello/src/lib.rs" test-roundtrip \
+            "$work/test-roundtrip.kmod"
+          cmp "$work/test-roundtrip.kmod" build/x86_64-kintane/out/modules/test-roundtrip.kmod
+
       - name: A log from another build is refused
         run: |
           set -uo pipefail

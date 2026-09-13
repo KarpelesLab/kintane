@@ -43,6 +43,17 @@ pub fn paging_selftest(c: &dyn EarlyConsole) -> Check {
     Check::Skipped
 }
 
+/// The banner's `modules` line.
+pub fn module_check(
+    c: &dyn EarlyConsole,
+    _frames: &mut mm::phys::FrameAllocator<'static, Cpu>,
+    _live: Live,
+    _boot_arg: u64,
+) -> Check {
+    c.write_str("\n  modules    skipped: no MMU, so no protected module text");
+    Check::Skipped
+}
+
 /// The banner's `demand` line.
 pub fn demand_check(
     c: &dyn EarlyConsole,

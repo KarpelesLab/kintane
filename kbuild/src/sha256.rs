@@ -152,6 +152,13 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Hash a byte slice.
+pub fn digest(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finish()
+}
+
 /// Hash a byte slice and return lowercase hex.
 // Used by the tests, and the natural entry point for one-shot hashing.
 #[allow(dead_code)]

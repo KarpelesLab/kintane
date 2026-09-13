@@ -10,7 +10,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use boot_protocol::MemoryRegion;
+use boot_protocol::{MemoryKind, MemoryRegion};
 
 /// Why a memory map could not be obtained.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,6 +77,91 @@ pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<
         out[n] = region;
         n += 1;
     }
+
+    // The loader's map describes the machine; the boot modules it placed, and the list that
+    // says where they are, are in memory it calls usable. Take them out, so nothing
+    // allocates over a module before it is read.
+    if let Some((start, end)) = handover.module_list() {
+        n = carve(out, n, start as u64, end as u64, MemoryKind::BootData)?;
+    }
+    let mut index = 0;
+    // SAFETY: as above; the module list lives alongside the structure.
+    while let Some((start, end)) = unsafe { handover.module(index) } {
+        n = carve(out, n, start as u64, end as u64, MemoryKind::BootData)?;
+        index += 1;
+    }
+    Ok(n)
+}
+
+/// Whether this handover can carry a module bundle: multiboot boot modules can, so a kernel
+/// built with test modules and handed none has lost them.
+pub const MODULE_BUNDLES: bool = true;
+
+/// The boot module bundle the loader passed, as `(physical start, length)`: the first boot
+/// module, when there is one.
+///
+/// # Safety
+/// As [`memory_regions`].
+pub unsafe fn module_bundle(boot_arg: u64) -> Option<(u64, u64)> {
+    let addr = usize::try_from(boot_arg).ok().filter(|&a| a != 0)?;
+    // SAFETY: as in `memory_regions`.
+    let handover = unsafe { multiboot::Handover::new(multiboot::BOOTLOADER_MAGIC, addr) }.ok()?;
+    // SAFETY: the caller guarantees the loader's structures are still mapped.
+    let (start, end) = unsafe { handover.module(0) }?;
+    (end > start).then_some((start as u64, (end - start) as u64))
+}
+
+/// Mark `[start, end)`, rounded out to whole pages, as `kind` within the first `n` regions
+/// of `out`, splitting any region it falls inside. Returns the new count. Regions of other
+/// kinds are left as they are: only memory the map calls usable is taken.
+pub fn carve(
+    out: &mut [MemoryRegion],
+    mut n: usize,
+    start: u64,
+    end: u64,
+    kind: MemoryKind,
+) -> Result<usize, Error> {
+    const PAGE: u64 = 4096;
+    let start = start & !(PAGE - 1);
+    let end = end.saturating_add(PAGE - 1) & !(PAGE - 1);
+    if end <= start {
+        return Ok(n);
+    }
+    let mut i = 0;
+    while i < n {
+        let r = out[i];
+        let r_end = r.start.saturating_add(r.len);
+        if r.kind != MemoryKind::Usable as u32 || end <= r.start || start >= r_end {
+            i += 1;
+            continue;
+        }
+        let (lo, hi) = (start.max(r.start), end.min(r_end));
+        let pieces = [
+            (r.start, lo, r.kind),
+            (lo, hi, kind as u32),
+            (hi, r_end, r.kind),
+        ];
+        let pieces: &[(u64, u64, u32)] = &pieces;
+        let keep = pieces.iter().filter(|(a, b, _)| b > a).count();
+        if n - 1 + keep > out.len() {
+            return Err(Error::TooManyRegions {
+                capacity: out.len(),
+            });
+        }
+        out.copy_within(i + 1..n, i + keep);
+        let mut at = i;
+        for &(a, b, k) in pieces.iter().filter(|(a, b, _)| b > a) {
+            out[at] = MemoryRegion {
+                start: a,
+                len: b - a,
+                kind: k,
+                _reserved: 0,
+            };
+            at += 1;
+        }
+        n = n - 1 + keep;
+        i += keep;
+    }
     Ok(n)
 }
 
@@ -126,7 +211,46 @@ pub fn strip_image_path(line: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_image_path;
+    use super::{Error, MemoryKind, MemoryRegion, carve, strip_image_path};
+
+    fn r(start: u64, len: u64, kind: MemoryKind) -> MemoryRegion {
+        MemoryRegion {
+            start,
+            len,
+            kind: kind as u32,
+            _reserved: 0,
+        }
+    }
+
+    #[test]
+    fn a_boot_module_is_carved_out_of_usable_memory_in_whole_pages() {
+        let mut out = [r(0, 0, MemoryKind::Reserved); 8];
+        out[0] = r(0, 0x9f000, MemoryKind::Usable);
+        out[1] = r(0xf0000, 0x10000, MemoryKind::Reserved);
+        out[2] = r(0x100000, 0x7f00000, MemoryKind::Usable);
+        let n = carve(&mut out, 3, 0x20_1234, 0x20_5001, MemoryKind::BootData).unwrap();
+        assert_eq!(
+            out[..n],
+            [
+                r(0, 0x9f000, MemoryKind::Usable),
+                r(0xf0000, 0x10000, MemoryKind::Reserved),
+                r(0x100000, 0x101000, MemoryKind::Usable),
+                r(0x201000, 0x5000, MemoryKind::BootData),
+                r(0x206000, 0x7dfa000, MemoryKind::Usable),
+            ]
+        );
+        // At a region's start, nothing is split off before it; inside a reserved region,
+        // nothing changes.
+        let n2 = carve(&mut out, n, 0, 0x1000, MemoryKind::BootData).unwrap();
+        assert_eq!(out[0], r(0, 0x1000, MemoryKind::BootData));
+        assert_eq!(out[1], r(0x1000, 0x9e000, MemoryKind::Usable));
+        assert_eq!(n2, n + 1);
+        assert_eq!(carve(&mut out, n2, 0xf1000, 0xf2000, MemoryKind::BootData), Ok(n2));
+        assert_eq!(
+            carve(&mut out[..n2], n2, 0x300000, 0x301000, MemoryKind::BootData),
+            Err(Error::TooManyRegions { capacity: n2 })
+        );
+    }
 
     #[test]
     fn the_loaders_image_path_is_dropped_and_arguments_are_kept() {

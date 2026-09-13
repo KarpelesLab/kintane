@@ -19,6 +19,8 @@ mod epoch;
 mod heap;
 mod kheap;
 mod lockcheck;
+#[cfg(CONFIG_MM_PAGED)]
+mod modules;
 mod persist;
 mod preempt;
 mod shared;
@@ -476,6 +478,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(alloc)
         .and(heap::bring_up(c, &mut frames, &regions[..n]))
         .and(model::demand_check(c, &mut frames, live))
+        .and(model::module_check(c, &mut frames, live, boot_arg))
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(stress::reserve(c, &mut frames, &regions[..n], live));
     (space, live)

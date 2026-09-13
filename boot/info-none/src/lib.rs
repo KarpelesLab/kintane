@@ -42,3 +42,16 @@ pub unsafe fn memory_regions(_boot_arg: u64, _out: &mut [MemoryRegion]) -> Resul
 pub unsafe fn command_line(_boot_arg: u64, _out: &mut [u8]) -> Result<Option<usize>, Error> {
     Err(Error::NoLoader)
 }
+
+/// Whether this handover can carry a module bundle at all. When it cannot, a kernel built
+/// with test modules has nothing to load, and says so rather than failing.
+pub const MODULE_BUNDLES: bool = false;
+
+/// The boot module bundle a loader passed, as `(physical start, length)`. This loader
+/// passes none yet; see docs/modules.md.
+///
+/// # Safety
+/// None required; `unsafe` so every `bootinfo` provider has one signature.
+pub unsafe fn module_bundle(_boot_arg: u64) -> Option<(u64, u64)> {
+    None
+}

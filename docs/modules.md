@@ -90,6 +90,192 @@ text. Rules:
 Modules may also be marked permanent, which is the right answer for anything on the
 fault-handling or scheduling path.
 
+## As built
+
+What exists today is the core of the design, on x86-64: build, identity, interface, load,
+relocate, protect, reference-count, unload, and the SDK. Dependencies between modules,
+parameters, driver match tables, signing and loading after boot are not yet built. Where
+this section and the design above differ, this section is what the code does, and the
+design is corrected below it.
+
+### A module is a unit of kind `module`
+
+```toml
+[unit]
+name = "test-roundtrip"
+kind = "module"
+root = "src/lib.rs"
+layer = "subsystem"
+
+[deps]
+units = ["module"]
+
+[config]
+requires = "MODULE_TEST"
+```
+
+A module unit is built only when its `config.requires` evaluates to `m`, which needs
+`MODULES=y`. The graph refuses the two ways `m` could lie:
+
+- a module unit whose condition is `y` has no way into the image, so it is an error;
+- a library unit enabled by an `m` would be linked in as if it were `y`, so that is an
+  error too.
+
+A module may depend only on units at `core` or below. It reaches the kernel through its
+interface and never through a second copy of a crate that holds kernel state. Nothing may
+depend on a module.
+
+`MODULES` depends on `ARCH_X86_64 && MM_PAGED`. `MODULE_TEST` is a tristate capped at
+`m` (`depends on MODULES && QEMU_EXIT && m`), and builds the three test modules under
+`modules/test`.
+
+### Building one
+
+`kbuild/src/modules.rs` builds each module against the finished configuration:
+
+1. **Compile.** The module's dependencies, `core` included, are compiled with embedded
+   bitcode, and the module crate is compiled as a `staticlib` with fat LTO in one codegen
+   unit. Only what the module reaches survives. The round-trip module is 7 KiB, with
+   `core::fmt` in it.
+2. **Link.** `rust-lld -r --whole-archive` turns the archive into one `ET_REL` object.
+3. **Stamp.** `llvm-objcopy` strips debug information and leftover bitcode, and adds
+   `.kintane.identity`.
+
+A module unit may ask to be built against another configuration:
+`[module] config-overrides = ["DEBUG_BUILD=!"]`, where `!` means "the opposite of the
+kernel's". It is a test facility, and `test-other-config` is its one user.
+
+The static relocation model and the kernel's `small` code model mean a module's absolute
+32-bit relocations must reach it. Modules are therefore loaded below 2 GiB. The loader
+refuses a relocation that does not fit rather than truncating it.
+
+### Sections
+
+| Section | Contents |
+|---|---|
+| `.kintane.identity` | `KTIDENT1`, the SHA-256 of the identity text, its length, the text |
+| `.kintane.imports` | one 64-byte record per interface function: name, length, interface hash |
+
+The **identity text** is `kbuild/src/codegen.rs`'s `identity_text`. It holds the
+toolchain identity, the SHA-256 of the target specification, and every configuration
+symbol's value in declaration order. The kernel gets the same text and its hash as
+`kconfig::MODULE_IDENTITY` and `MODULE_IDENTITY_HASH`.
+
+The hash decides. The text only explains a refusal: `built with DEBUG_BUILD=n, kernel has
+y`, or another toolchain, or another target. A hash mismatch over identical text is
+reported as corruption. The per-crate interface hashes the design lists are not part of
+the identity. A module links no kernel crate, so the identity has nothing of the kind to
+cover.
+
+### The interface
+
+`kernel/module/src/abi.rs` declares, with `declare_interface!`, every `extern "C"`
+function a module may call. Today there are four: `kt_log`, `kt_register_callback`,
+`kt_unregister_callback` and `kt_panic`. Parameters are primitives, raw pointers and
+`extern "C"` function pointers, so the signature text is the ABI.
+
+A function's **interface hash** is FNV-1a over that text, computed by the compiler on both
+sides. That is not the structural hash from rustc's type information the design called
+for. It becomes necessary only if the interface admits a `#[repr(C)]` struct.
+
+- **The kernel's side.** It builds its export table with `module::export!`, which casts each
+  implementation to the declared type. An implementation that disagrees with its
+  declaration does not compile.
+- **The module's side.** `module::module!` defines `kt_module_init` and `kt_module_exit`, a
+  panic handler that calls `kt_panic`, and the imports records.
+- **The loader's check.** Every symbol a module leaves undefined must be exported, recorded,
+  and recorded with the kernel's hash. Otherwise the module is refused by name:
+  `kt_register_callback is not the kernel's interface`.
+
+### Loading
+
+`kernel/module` is host-tested and allocates nothing. Its steps:
+
+1. check the machine;
+2. check the identity;
+3. check the imports;
+4. lay the allocated sections out into text, read-only data and writable data;
+5. copy them into memory the caller supplies;
+6. apply every relocation;
+7. find the entry points.
+
+Relocation is per ELF machine, not per running architecture. It is arithmetic on bytes
+(`kernel/module/src/reloc.rs`), so it lives with the loader and is tested on the host.
+The design put it in `arch/<name>/module.rs`.
+
+- **x86-64 relocations** (the ones rustc emits for modules): `R_X86_64_64`, `PC32`, `PLT32`,
+  `32`, `32S` and `PC64`. The GOT-relative types are refused by name.
+- **AArch64 relocations:** `ABS64`, `ABS32`, `PREL64`, `PREL32`, `CALL26`, `JUMP26`,
+  `ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC` and the `LDST*_ABS_LO12_NC` family. They are
+  host-tested but not used yet. An AArch64 kernel needs module text within 128 MiB of its
+  exports, or veneers, before `MODULES` can include it.
+
+On a paged kernel, `kernel/main/src/modules.rs` maps each region page by page into a window
+of the live kernel space, writable. The loader writes and relocates. Then the regions are
+sealed: text `R-X`, read-only data `R--`, data `RW-`. The seal is read back from the live
+tables. There is a guard page between regions. Unloading unmaps every page, frees every
+frame, and frees every page table the mapping needed.
+
+### Getting modules to the kernel
+
+There is no filesystem yet. kbuild packs every module it built into a **bundle**,
+`build/<target>/out/modules.kmb`: `KTBUNDL1`, a count, a table of name, offset and
+length, then the modules. The boot path passes the bundle as a **multiboot boot module**.
+QEMU's `-kernel` loader takes it from `-initrd`, as GRUB takes a `module` line.
+
+`bootinfo::module_bundle` finds it. The multiboot provider carves the bundle and the
+module list out of the memory map as boot data, so no allocation lands on a module before
+it is read. The first boot to try this lost the module list that way.
+
+The kinboot loaders do not pass bundles yet. Their providers say so
+(`MODULE_BUNDLES = false`), and a kernel with test modules reports the check as skipped
+there instead of failing. On a multiboot boot, a missing bundle fails the boot.
+
+### Unloading
+
+`module::Registry` holds a reference count per loaded module:
+
+- A callback registered through `kt_register_callback` takes a reference.
+  `kt_unregister_callback` gives it back.
+- `begin_unload` is refused while any reference is held. Once it starts, no new reference
+  can be taken.
+- A module id carries a generation, so a stale id names nothing.
+- There is no force-unload.
+
+### The boot check
+
+With `MODULE_TEST`, every x86-64 multiboot boot gates on the `modules` line:
+
+1. load `test-roundtrip`, which logs and registers a callback, and call the callback twice.
+   The values 42 and 72 only come out of correctly relocated text, read-only data and
+   data;
+2. refuse to unload it while the callback holds it;
+3. unregister, unload, and require the frame allocator back to its free count before the
+   first load;
+4. refuse `test-other-config`, naming `DEBUG_BUILD`, and `test-other-interface`, naming
+   `kt_register_callback`, both before any memory is taken.
+
+Modules do not outlive the check yet. That needs the registry and the export state under
+the kernel's lock, and a lasting home for the module window.
+
+## The design, corrected
+
+The format section of the original design listed six sections, and the loading steps put
+relocation in `arch/`. What changed, and why:
+
+- **Two sections, not six.** `.kintane.exports`, `.kintane.deps`, `.kintane.drivers` and
+  `.kintane.params` wait for what needs them: a module that exports to another module,
+  dependencies, driver binding from modules, and parameters. `identity` holds no module
+  name, version or licence yet; the bundle entry names the module.
+- **Relocation in `kernel/module`**, keyed by `e_machine`, for the reason above.
+- **Interface hashes over signature text**, for the reason above.
+- **Registration is not yet glue-only.** `kt_register_callback` takes a bare function pointer
+  and a module id, and the reference it takes is what pins the module. The rule above, a
+  type only `module!`'s glue can construct, is still the goal: today a module could
+  register a pointer into another module, or pass another module's id.
+- **The identity covers configuration, toolchain and target.** It does not cover crate
+  interfaces, which modules do not link.
+
 ## Modules and isolation domains
 
 A module destined for an isolated domain is loaded into that domain's address space
@@ -102,20 +288,25 @@ down and the module is loaded again into a fresh one.
 
 ## The SDK
 
-`kbuild sdk` produces everything needed to build an out-of-tree module against one
-kernel build:
+`kbuild sdk --preset P` writes `build/<target>/sdk/`, everything needed to build a module
+for that one kernel build without the kernel's source:
 
-- the build identity
-- `hal/` and public kernel crate interfaces, as compiled `.rmeta` plus source
-- generated `config.rs` and the `--cfg` set
-- the pinned toolchain identity (the toolchain itself must match, not merely be
-  compatible)
-- target specification
-- a `kbuild`-compatible manifest template
+| Entry | What it is |
+|---|---|
+| `IDENTITY`, `identity.section` | the build identity, as text and as the section to stamp |
+| `config.rs` | the generated configuration, as a module's `kconfig` crate sees it |
+| `<target>.json` | the target specification, under the name rustc knows it by |
+| `lib/` | `core`, `compiler_builtins`, `kconfig` and `module`, compiled with bitcode |
+| `src/module/` | the interface crate's source, for reading |
+| `example/` | a module to start from |
+| `build-module.sh SRC NAME OUT` | build a module |
 
-Shipping the SDK alongside a release is what makes third-party drivers possible
-without shipping the whole kernel source. It is also large enough that it is an
-optional deliverable, not part of the default release.
+`build-module.sh` refuses any rustc but the pinned one. It runs the rustc, `rust-lld` and
+`llvm-objcopy` invocations kbuild runs, with the kernel build's own flags written in, taken
+from the same code that builds in-tree modules (`Build::unit_args`). A module's sources are
+remapped to `/module/<name>` wherever they are, so the result is byte for byte what kbuild
+produces from the same source. The CI checks exactly that, on a copy of the round-trip
+module outside the tree.
 
 ## Signing
 

@@ -76,7 +76,8 @@ pub fn check(
     let dir = root.join("build/portability").join(machine.triple);
     let out = dir.join("out");
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let generated = codegen::emit(table, res, &dir.join("gen"))?;
+    let identity = codegen::identity_text(table, res, &tc.identity(), machine.triple);
+    let generated = codegen::emit(table, res, &dir.join("gen"), &identity)?;
 
     let b = Build {
         root: root.to_path_buf(),
@@ -91,6 +92,7 @@ pub fn check(
         opt_level: "1".into(),
         link_script: None,
         deny_warnings: true,
+        bitcode: false,
         verbose,
     };
 

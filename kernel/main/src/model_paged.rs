@@ -11,7 +11,7 @@ use arch::Cpu;
 use boot_protocol::{MemoryKind, MemoryRegion};
 use hal::{EarlyConsole, HasMmu, HasPageTables};
 
-use crate::{Check, DIRECT_MAP_MAX, demand, finish, space, write_hex, write_usize};
+use crate::{Check, DIRECT_MAP_MAX, demand, finish, modules, space, write_hex, write_usize};
 
 /// The translation this image runs under, for the banner's `paging` line.
 pub fn write_translation(c: &dyn EarlyConsole) {
@@ -33,6 +33,16 @@ pub fn demand_check(
     live: Live,
 ) -> Check {
     demand::check(c, frames, live)
+}
+
+/// Load, call and unload the test modules, and refuse the ones built for another kernel.
+pub fn module_check(
+    c: &dyn EarlyConsole,
+    frames: &mut mm::phys::FrameAllocator<'static, Cpu>,
+    live: Live,
+    boot_arg: u64,
+) -> Check {
+    modules::check(c, frames, live, boot_arg)
 }
 
 /// Run the test mode the configuration names, if any. Each ends the run, so this returns

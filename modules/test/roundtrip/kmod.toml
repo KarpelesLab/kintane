@@ -1,0 +1,13 @@
+# The module the boot check loads, calls through, fails to unload while it is referenced,
+# and unloads. See kernel/main/src/modules.rs.
+[unit]
+name = "test-roundtrip"
+kind = "module"
+root = "src/lib.rs"
+layer = "subsystem"
+
+[deps]
+units = ["module"]
+
+[config]
+requires = "MODULE_TEST"
