@@ -1,0 +1,15 @@
+# Arm PrimeCell PL011 UART, bound from the device tree.
+#
+# The arch-side early console keeps its own minimal writer at a fixed address, because
+# it has to work before a tree can be parsed. This is the driver: it takes its window
+# and its clock from the tree, and boot checks that the two agree. Plain MMIO, so it is
+# host-tested under every preset and not gated on an architecture.
+[unit]
+name = "pl011"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = ["hal", "device"]

@@ -3,10 +3,11 @@
 //! `kernel/main` builds the space from the memory map and `image_sections()`, verifies
 //! it, and installs it in `TTBR0_EL1`. The per-port parts are here.
 //!
-//! 1. **Devices.** This is the port where leaving them out is fatal and silent: the console is a
-//!    PL011 at a fixed MMIO address, so the first write after the switch would fault, and the fault
-//!    report would itself be a write to the unmapped console. [`device_windows`] names the UART and
-//!    the GIC's region.
+//! 1. **Devices.** Not here. This is the port where leaving one out is fatal and silent — the
+//!    console is a PL011, so the first write after the switch would fault, and the fault report
+//!    would itself be a write to the unmapped console — which is why the windows are not a list a
+//!    person keeps up to date. `kernel/platform/fdt` maps exactly what the drivers bound from the
+//!    device tree claimed, and refuses to proceed if the tree's console is not the early one.
 //! 2. **Enforcement.** [`enforcement_selftest`] asks the MMU rather than the tables. `AT S1E1W`
 //!    runs a write translation through the live regime and reports a permission fault in `PAR_EL1`
 //!    without taking one, so "the hardware refuses a write to `.rodata`" is observed directly.
@@ -26,34 +27,10 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use hal::paging::DeviceWindow;
 use hal::{Arch, EarlyConsole, HasContextSwitch, KernAddr};
 
 use crate::Aarch64;
 use crate::exception::write_hex;
-
-/// Device memory the kernel touches after its own tables are installed.
-///
-/// The GIC window is QEMU `virt`'s whole interrupt controller region: the distributor,
-/// the GICv2 CPU interface, and the GICv3 ITS and redistributors all sit inside it, so
-/// one entry covers either version without the address space having to know which the
-/// runtime probe will find. Like the addresses in `serial` and `gic`, these are the
-/// machine's and not discovered; the device tree replaces all three together.
-pub fn device_windows() -> &'static [DeviceWindow] {
-    const WINDOWS: &[DeviceWindow] = &[
-        DeviceWindow {
-            phys: crate::gic::GICD_BASE as u64,
-            len: 0x0100_0000,
-            what: "GIC",
-        },
-        DeviceWindow {
-            phys: crate::serial::UART0 as u64,
-            len: 0x1000,
-            what: "PL011",
-        },
-    ];
-    WINDOWS
-}
 
 /// Ask the MMU whether it enforces the live tables, and report what it said.
 ///

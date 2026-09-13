@@ -91,6 +91,46 @@ const BOOT_DATA: u32 = MemoryKind::BootData as u32;
 /// QEMU's `virt` machine with RAM identity-mapped, which is what this port boots on; a
 /// board whose RAM does not start there needs a different probe address, not this one.
 pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<usize, Error> {
+    // SAFETY: this function's contract is `device_tree`'s, passed through unchanged.
+    let blob = unsafe { device_tree(boot_arg) }?;
+    let address = blob.as_ptr().addr() as u64;
+    let tree = fdt::Fdt::new(blob).map_err(translate)?;
+
+    let capacity = out.len();
+    let (first, rest) = out
+        .split_first_mut()
+        .ok_or(Error::TooManyRegions { capacity })?;
+    *first = MemoryRegion {
+        start: address,
+        len: u64::from(tree.header().total_size),
+        kind: BOOT_DATA,
+        _reserved: 0,
+    };
+
+    let n = tree.memory_map(rest).map_err(|e| match e {
+        fdt::Error::TooManyRegions { .. } => Error::TooManyRegions { capacity },
+        other => translate(other),
+    })?;
+    // `rest` is `out.len() - 1` long and `n` counts slots of it, so this cannot overflow.
+    Ok(n.saturating_add(1))
+}
+
+/// The device tree the platform was booted with, as the bytes of its `totalsize`.
+///
+/// Found the way [`memory_regions`] describes: at `boot_arg`, or probed at the base of
+/// RAM when that is zero. The slice is the loader's memory, which the memory map marks
+/// as boot data, so it stays intact for as long as nothing reclaims boot data — which
+/// nothing does yet.
+///
+/// # Errors
+/// [`Error::NoLoader`] when no tree is where one was looked for, and
+/// [`Error::Malformed`] when its header is unusable or its size is implausible. The rest
+/// of the tree is not validated here; `fdt::Fdt::new` does that.
+///
+/// # Safety
+/// As [`memory_regions`]. The returned slice must not be used after the memory it lies
+/// in is unmapped or reused.
+pub unsafe fn device_tree(boot_arg: u64) -> Result<&'static [u8], Error> {
     let address = if boot_arg != 0 {
         boot_arg
     } else {
@@ -132,32 +172,12 @@ pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<
     // SAFETY: the header at `base` carries the device tree magic, and for that case the
     // caller guarantees `totalsize` bytes are readable; `total` is that value, capped at
     // MAX_TREE_BYTES, and the range was just checked not to wrap or exceed `isize`. The
-    // slice is of bytes, which have no invalid values. Nothing writes to the tree while
-    // the slice lives: it is dropped before this function returns, and the boot path is
-    // single-threaded until well after.
-    let blob: &[u8] = unsafe {
+    // slice is of bytes, which have no invalid values. Nothing writes to the tree: it is
+    // the loader's, the memory map reports it as boot data so the frame allocator never
+    // hands it out, and the caller undertakes not to use the slice once it is unmapped.
+    Ok(unsafe {
         core::slice::from_raw_parts(core::ptr::with_exposed_provenance::<u8>(base), total)
-    };
-
-    let tree = fdt::Fdt::new(blob).map_err(translate)?;
-
-    let capacity = out.len();
-    let (first, rest) = out
-        .split_first_mut()
-        .ok_or(Error::TooManyRegions { capacity })?;
-    *first = MemoryRegion {
-        start: address,
-        len: u64::from(header.total_size),
-        kind: BOOT_DATA,
-        _reserved: 0,
-    };
-
-    let n = tree.memory_map(rest).map_err(|e| match e {
-        fdt::Error::TooManyRegions { .. } => Error::TooManyRegions { capacity },
-        other => translate(other),
-    })?;
-    // `rest` is `out.len() - 1` long and `n` counts slots of it, so this cannot overflow.
-    Ok(n.saturating_add(1))
+    })
 }
 
 fn translate(e: fdt::Error) -> Error {

@@ -268,7 +268,7 @@ fn window(direct: DirectMap) -> Option<usize> {
     let (_, img_end) = arch::image_range();
     let mut top = direct.virt_base().raw() as u64 + direct.len();
     top = top.max(img_end);
-    for w in arch::kspace::device_windows() {
+    for w in platform::device_windows().unwrap_or(&[]) {
         top = top.max(w.phys + w.len);
     }
     const GIB: u64 = 1 << 30;

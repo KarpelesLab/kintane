@@ -21,8 +21,9 @@
 //! it lacked was the devices. RAM and the image are described by the memory map and the
 //! linker script. A device is described by neither, and a device left out is a fault on
 //! the first register access after the switch. On aarch64, where the console is MMIO,
-//! that fault has nowhere to print. Each port now names its windows through
-//! `arch::kspace::device_windows`, and they are mapped here with everything else.
+//! that fault has nowhere to print. The windows come from `platform::device_windows`:
+//! on aarch64, exactly what the drivers bound from the device tree claimed; on the PC
+//! ports, the architecture's own list. They are mapped here with everything else.
 
 use hal::paging::{DeviceWindow, HasPageTables, ImageSections, MapError, PageFlags};
 use hal::{Arch, EarlyConsole, PhysAddr};

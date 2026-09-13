@@ -3,12 +3,14 @@
 //!
 //! Two things live here. The first is the slot holding the selected controller, which
 //! is where the seam in `docs/portability.md` becomes concrete — the type is
-//! `&'static dyn IrqChip`, chosen at run time, and [`dispatch`] calls through the
-//! vtable without knowing or caring which driver answered.
+//! `&'static dyn IrqChip`, chosen at run time by the device tree, installed by
+//! `kernel/platform/fdt`, and [`dispatch`] calls through the vtable without knowing or
+//! caring which driver answered.
 //!
-//! The second is the handler table, which in Phase 0 has exactly one entry: the timer.
-//! A real registry keyed by IRQ number belongs to the device framework, not to `arch`,
-//! and arrives with it in Phase 3.
+//! The second is the handler table, which still has exactly one entry: the timer. The
+//! device model has a handler table gated on probe phases (`device::Handlers`); dispatch
+//! moves onto it when the first interrupt-driven driver needs one, because `arch` cannot
+//! name it and the hand-off has to be designed rather than bolted on.
 //!
 //! # Concurrency
 //!

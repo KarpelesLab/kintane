@@ -1,0 +1,17 @@
+# The `platform` provider for machines described by a flattened device tree.
+#
+# Layer `kernel`, because this is the one place that has to know both halves: it reads
+# the tree through the device model and binds drivers, which the architecture may not
+# depend on, and it hands the bound interrupt controller to the architecture's interrupt
+# path, which only the kernel image may name. kbuild enforces both halves of that.
+[unit]
+name = "platform"
+kind = "lib"
+root = "src/lib.rs"
+layer = "kernel"
+
+[deps]
+units = ["hal", "arch", "bootinfo", "device", "gic", "pl011"]
+
+[config]
+requires = "ARCH_AARCH64"
