@@ -253,3 +253,12 @@ pub fn image_sections() -> hal::ImageSections {
         stack_guard: (at(&raw const __stack_guard_start), at(&raw const __stack_guard_end)),
     }
 }
+
+/// Start a second kernel thread, switch to it and back, and prove both directions work.
+///
+/// Returns `true` only if control reached the new thread *and* came back, with the
+/// callee-saved registers the original thread was holding intact.
+pub fn context_switch_selftest(c: &dyn hal::EarlyConsole) -> bool {
+    c.write_str("not implemented on this port");
+    false
+}

@@ -136,6 +136,11 @@ fn banner(boot_arg: u64) -> Check {
     let irq_ok = arch::interrupt_selftest(c);
     c.write_str(if irq_ok { " ok" } else { "" });
 
+    c.write_str("\n  threads    ");
+    // Reported but not yet gating: a port without context switching is an honest gap
+    // today, not a regression. It joins the verdict below once all three ports have it.
+    let _switch = arch::context_switch_selftest(c);
+
     c.write_str("\n\nreached kmain\n");
     Check::from_ok(paging_ok)
         .and(mem)

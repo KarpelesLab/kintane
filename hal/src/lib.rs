@@ -12,6 +12,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod addr;
+pub mod context;
 pub mod paging;
 
 // Mock architectures for host-side testing. Gated at the module boundary, which is
@@ -20,6 +21,7 @@ pub mod paging;
 pub mod mock;
 
 pub use addr::{AddrOverflow, KernAddr, PhysAddr, UserAddr};
+pub use context::{HasContextSwitch, ThreadEntry};
 pub use paging::{HasPageTables, ImageSections, MapError, PageFlags, PageTableEntry};
 
 /// Byte order of the target.
