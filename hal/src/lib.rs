@@ -11,6 +11,15 @@
 
 #![no_std]
 
+pub mod addr;
+
+// Mock architectures for host-side testing. Gated at the module boundary, which is
+// the only place cfg is allowed, and off in every kernel image.
+#[cfg(CONFIG_MOCK_ARCH)]
+pub mod mock;
+
+pub use addr::{AddrOverflow, KernAddr, PhysAddr, UserAddr};
+
 /// Byte order of the target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Endian {
@@ -98,6 +107,43 @@ pub trait HasCoherentDma: Arch {}
 /// Floating-point or SIMD state that must be saved across context switches.
 pub trait HasFpu: Arch {
     type FpuState: Default;
+}
+
+/// An interrupt number as the interrupt controller numbers them.
+///
+/// Not a global identifier: two controllers on the same machine may both have an
+/// IRQ 5. Mapping a device's line to a controller is the device framework's job.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct IrqNumber(pub u32);
+
+/// An interrupt controller.
+///
+/// Object-safe and dispatched through `dyn`, unlike the architecture traits above.
+/// This is the deliberate seam described in `docs/portability.md`: **the architecture
+/// layer is generic, the device layer is dynamic.** One aarch64 image must drive a
+/// GICv2 on one board and a GICv3 on another, discovered at runtime from a device
+/// tree, and that cannot be a type parameter.
+///
+/// Builds that cannot afford a vtable in the interrupt path pin a single provider in
+/// the configuration, and kbuild emits a type alias instead.
+pub trait IrqChip: Sync {
+    /// Prepare the controller. Called once, before any interrupt is enabled.
+    ///
+    /// # Safety
+    /// Must be called once per controller, with interrupts masked.
+    unsafe fn init(&self);
+
+    fn enable(&self, irq: IrqNumber);
+    fn disable(&self, irq: IrqNumber);
+
+    /// Acknowledge and return the interrupt now being serviced, if any.
+    fn claim(&self) -> Option<IrqNumber>;
+
+    /// Signal end-of-interrupt for a previously claimed interrupt.
+    fn eoi(&self, irq: IrqNumber);
+
+    /// Name for diagnostics, e.g. "GICv3".
+    fn name(&self) -> &'static str;
 }
 
 /// A console usable before the device framework exists.

@@ -11,6 +11,7 @@ config TARGET
     readonly
     default "x86_64-kintane" if ARCH_X86_64
     default "aarch64-kintane" if ARCH_AARCH64
+    default "i686-kintane" if ARCH_I686
     default ""
     help
         Name of the target specification under targets/.
@@ -20,6 +21,7 @@ config LINKER_SCRIPT
     readonly
     default "arch/x86_64/link.ld" if ARCH_X86_64
     default "arch/aarch64/link.ld" if ARCH_AARCH64
+    default "arch/i686/link.ld" if ARCH_I686
     default ""
 
 # --- memory model -----------------------------------------------------------
@@ -86,8 +88,18 @@ config IMAGE_FORMAT
     readonly
     default "multiboot-elf32" if ARCH_X86_64
     default "elf"
+    # i686 links as ELF32 already, so the multiboot container needs no rewrite.
     help
         How the linked image is packaged for the platform's loader.
         QEMU's multiboot loader refuses an ELF64 container, so on x86_64 the
         image is rewritten to ELF32 after linking. The 64-bit code is untouched
         and the ELF64 is kept as the debug artifact.
+
+config MOCK_ARCH
+    bool "Mock architectures for host testing"
+    default n
+    help
+        Compile the MockArch family in hal. These implement the capability
+        traits in software so that subsystems can be tested on the host
+        against several different hardware profiles. Never enabled in a
+        kernel image; `kbuild test --host` turns it on.
