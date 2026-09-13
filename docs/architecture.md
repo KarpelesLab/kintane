@@ -41,6 +41,8 @@ than pretending one answer fits all hardware.
 │  userspace                                                        │
 ├──────────────────────────────────────────────────────────────────┤
 │  syscall / object layer      capability handles, invocation        │
+│    ├─ native ABI             the real interface                    │
+│    └─ linux personality      compat surface, a client of the above │
 ├──────────────────────────────────────────────────────────────────┤
 │  subsystems                                                        │
 │  ┌──────────┬──────────┬──────────┬──────────┬─────────────────┐ │

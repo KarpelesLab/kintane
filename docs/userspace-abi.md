@@ -3,24 +3,38 @@
 Status: **design sketch.** Nothing here is implemented, and the details will move.
 The principles are the commitment; the syscall numbers are not.
 
-## Decision: our own ABI
+## Two ABIs, one kernel
 
-KinTane does not implement the Linux syscall interface. The reasons:
+KinTane has a **native ABI** and a **Linux-compatible ABI**, selected per process by a
+personality tag. They are not peers:
 
-- Linux compatibility is all-or-nothing in practice. Partial compatibility produces
-  software that runs until it does not, which is worse than software that does not
-  run.
-- The Linux ABI encodes forty years of decisions about a machine with an MMU, a
-  process model, and POSIX signals. We want to serve machines with none of those.
-- `errno`, `fork`, ambient authority through the filesystem namespace, and integer
-  file descriptors are exactly the parts we would most like to do differently.
+- The **native ABI** is the real interface. It is capability-based, handle-oriented,
+  and designed for the range of machines this kernel targets — including those with no
+  MMU, where most of the Linux process model cannot exist.
+- The **Linux personality** is a compatibility surface implemented *on top of* the
+  native kernel interfaces, so that unmodified Linux userland binaries run
+  transparently.
 
-The cost is real: no existing userland, so we write our own, and the ecosystem
-argument is not on our side. We accept it because a kernel that exists to support
-unusual hardware should not start by adopting an ABI designed around usual hardware.
+The native ABI is primary because the Linux ABI encodes forty years of decisions about
+a machine with an MMU, a POSIX process model, and signals. A kernel that exists to
+serve unusual hardware cannot take that as its foundation. `errno`, ambient authority
+through a global filesystem namespace, and integer file descriptors are precisely the
+parts we want to do differently.
 
-A Linux compatibility layer *in userspace*, translating to native primitives, remains
-possible later. It is not a goal.
+The Linux personality exists anyway, for two reasons that outweigh the purity
+argument:
+
+1. **An existing userland from day one.** Static musl binaries, busybox, real
+   compilers and test suites — available the moment the syscall layer works, instead
+   of after we have written a userland of our own. This collapses the gap between
+   "the kernel schedules processes" and "the kernel runs useful software", and it is
+   what makes Phase 7's storage and networking work testable against programs that
+   were not written to flatter us.
+2. **A migration path.** Hardware that nobody can run existing software on is
+   hardware nobody deploys.
+
+See [the Linux personality](#the-linux-personality) below for how the surface is
+scoped and how we avoid the failure mode of partial compatibility.
 
 ## Principles
 
@@ -49,6 +63,10 @@ discipline.
 Instead, a process is built explicitly: create an empty process object, map segments
 into it, install exactly the handles it should have, set its entry point, start it.
 Verbose, auditable, and implementable on a machine with no MMU.
+
+`fork` and `clone` exist in the Linux personality, which is why that personality
+requires a paged memory model and is unavailable on no-MMU builds. The native ABI
+does not gain a `fork` because the compat layer needs one.
 
 ### Errors are values
 
@@ -94,14 +112,146 @@ async later is a mistake that is very hard to undo.
 
 ## Syscall surface
 
-Deliberately small. The target is under fifty syscalls, with functionality that would
-otherwise be syscalls expressed as messages to services over channels. Anything that
-looks like it wants to be an `ioctl` is a channel protocol instead.
+The *native* surface is deliberately small. The target is under fifty syscalls, with
+functionality that would otherwise be syscalls expressed as messages to services over
+channels. Anything that looks like it wants to be an `ioctl` is a channel protocol
+instead. (The Linux surface is not small, and cannot be; that is its problem, not the
+native ABI's.)
 
 Syscall dispatch is generated from `#[syscall]` attributes
 ([build-system.md](build-system.md#generated-sources)), which keeps the numbering
 table, the argument-validation code, the userspace bindings, and the documentation
 generated from one source.
+
+## The Linux personality
+
+### The tag
+
+Every process carries a personality, fixed at load time:
+
+```rust
+#[non_exhaustive]
+pub enum Personality {
+    Native,
+    Linux,
+}
+```
+
+The tag is cached in the thread control block as a pointer to a syscall dispatch
+table, so the entry path loads a table pointer and indexes it. There is no branch on
+personality in the syscall path and no cost to a native process for the compat layer
+existing.
+
+A process is tagged `Linux` when:
+
+- its ELF header declares `ELFOSABI_LINUX`, or it declares `ELFOSABI_SYSV` and carries
+  no `.note.kintane.abi` section (i.e. it was not built for us), **or**
+- the creating process asked for it explicitly when constructing the process object.
+
+Native binaries carry `.note.kintane.abi`. The fallback for unmarked SysV binaries is
+a config option, defaulting to `Linux`, because in practice an unmarked binary is a
+Linux binary and making that work without ceremony is the point.
+
+### Implemented on native primitives
+
+The governing rule:
+
+> **The Linux personality is a client of the native kernel interfaces, not a second
+> path into the kernel.**
+
+A Linux `openat` resolves to the same VFS service call the native interface uses. A
+Linux `clone` builds the same `Process` and `Thread` objects. The compat layer owns
+translation — argument shapes, error numbering, structure layouts — not mechanism.
+
+This is a deliberate forcing function. If the Linux personality needs a kernel
+facility the native interfaces cannot express, that is **a gap in the native ABI**, to
+be fixed there, rather than a special case bolted onto the compat layer. Linux is a
+thorough specification of what a general-purpose kernel must actually do; using it to
+audit our own interface is worth more than the compatibility itself.
+
+The exception is performance. Where translation demonstrably dominates — the read and
+write paths, futexes, `epoll` — the compat layer may reach further into a subsystem,
+and each such case is documented where it happens with the measurement that justified
+it.
+
+### What the layer has to supply
+
+Beyond syscall translation, a Linux process needs a machine-shaped environment:
+
+| Area | Notes |
+|---|---|
+| File descriptors | An `int` → handle table, a compat view over the same `KObject`s. Rights are set wide at creation; the fd table *is* the ambient authority. |
+| Ambient namespace | A root directory handle installed at creation, plus `cwd`. Path resolution starts there rather than from a passed-in handle. |
+| `fork` / `clone` | Copy-on-write address space cloning. Requires `MM_PAGED`. |
+| Signals | Full POSIX delivery: masks, handlers, `sigaltstack`, per-architecture signal frames, restart semantics. The largest single item, and the one most likely to be subtly wrong. |
+| `errno` | Native `Result` error enums mapped to negative errno returns. The mapping is many-to-one and lossy; it is a table, reviewed, not an afterthought. |
+| `/proc`, `/sys`, `/dev` | More userland depends on these than on most syscalls. Minimal but real implementations, served through the VFS. |
+| `mmap`, `brk` | Linux mapping semantics, including the parts nobody likes. |
+| TLS setup | `arch_prctl`, `set_thread_area`, and equivalents per architecture. |
+| vDSO | Per-architecture, for `clock_gettime` and friends. Optional at first; some libcs hard-require it. |
+| Syscall tables | Numbering differs per architecture. Generated per target from a table in-tree, not hand-written. |
+
+### Scoping, and the partial-compatibility problem
+
+The objection to Linux compatibility is real and this document previously used it to
+reject the idea outright: *partial compatibility produces software that runs until it
+does not, which is worse than software that does not run.* Committing to the
+personality does not make that objection go away. It makes it something to manage.
+
+The management is: **compatibility is defined by a corpus, not by a percentage.** We
+do not claim a compatibility level. We publish the list of programs CI runs, and that
+list is the claim.
+
+Corpus tiers, in the order they are pursued:
+
+1. **Static musl binaries.** No dynamic linker, no NSS, no locale machinery — a
+   dramatically smaller surface, and enough for busybox, toybox, and most test
+   programs. This is the early-testing target and where most of the value lands.
+2. **Static glibc**, then **dynamic musl** — the dynamic linker, `mmap` of shared
+   objects, TLS models.
+3. **Dynamic glibc userland.** A real distribution's `/bin`. The point at which the
+   personality is genuinely useful rather than merely demonstrable.
+4. **Selected LTP subsets** as a conformance measure, chosen per subsystem rather than
+   run wholesale for a number.
+
+Unimplemented syscalls return `-ENOSYS` **and log the syscall name, arguments, and
+process**. A config option makes them fatal instead; CI runs with it enabled, so a gap
+surfaces as a test failure with a name attached rather than as a program that behaves
+strangely.
+
+### Security posture
+
+A Linux process has ambient authority by construction — that is what the fd table and
+the root namespace are. This weakens the capability model, and it does so *only for
+processes that opted into it*. Native processes are unaffected: the kernel does not
+acquire a global namespace because the compat layer has one, it acquires a namespace
+service that Linux processes are given a handle to.
+
+Confining Linux processes is therefore done with the native tools — give the process a
+root handle pointing at a subtree, restrict the `Job` it belongs to — rather than by
+reimplementing namespaces and cgroups. Whether we eventually want those too is a
+question for after the corpus is running.
+
+### Configuration
+
+```kcfg
+config ABI_LINUX
+    tristate "Linux syscall compatibility"
+    depends on ABI_NATIVE && MM_PAGED
+    default m
+    help
+        Run unmodified Linux userland binaries. Processes are tagged at
+        load time and dispatched to the Linux syscall table.
+
+        Requires a paged memory model: fork(2) needs copy-on-write, which
+        the flat memory model cannot provide.
+```
+
+Tristate, and `m` by default: the personality is a loadable module in a
+general-purpose build, compiled in for appliance builds, and absent from embedded
+ones. A kernel that runs Linux binaries and a kernel that fits in 64 KiB are the same
+source tree with different configurations, which is the whole thesis applied to the
+ABI layer.
 
 ## Scaling down
 
@@ -114,6 +264,9 @@ degradation to apologize for:
   microcontroller build is cooperative and we say so, rather than implying a
   protection guarantee the hardware cannot make.
 - Processes may be static, defined at build time, with no loader.
+- The Linux personality does not exist. `ABI_LINUX` depends on `MM_PAGED`, and the
+  config system enforces that rather than offering a version of it that cannot
+  `fork`.
 - The syscall layer may be configured away entirely: a build with no userspace is
   tasks in the kernel, which is what an RTOS is.
 
@@ -132,8 +285,14 @@ is the whole point of the project.
 
 ## Stability
 
-The ABI is unstable until Phase 6 completes. After that: syscall numbers and
+The native ABI is unstable until Phase 6 completes. After that: syscall numbers and
 structure layouts are frozen within a major version; additions are additive; removals
 require a major version and a deprecation period of at least one. The `Completion`
 and `Channel` protocols are versioned independently of the syscall numbering, because
 they will evolve faster.
+
+The Linux ABI's stability is not ours to set — it is Linux's, and it is famously never
+broken. We inherit that: a syscall the personality implements keeps working, and
+changes to our internals must not be visible to a Linux process. The compat layer is
+therefore versioned by *corpus*, not by number: the published list of programs CI runs
+only grows.

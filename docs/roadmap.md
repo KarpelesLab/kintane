@@ -135,22 +135,54 @@ measured and documented rather than asserted.
 
 ---
 
-## Phase 6 — Userspace and the ABI
+## Phase 6 — Userspace, the native ABI, and the Linux personality
+
+### 6a — Native first
+
+The native object layer comes first because the Linux personality is built on top of
+it. Building compatibility first would shape the kernel around Linux semantics and
+leave the native ABI a veneer over them.
 
 - Syscall entry per architecture; dispatch generated from `#[syscall]`.
 - Handle tables, rights masks, handle transfer over channels.
 - `Process`, `Thread`, `MemoryRegion`, `Mapping`, `Event`, `Timer`, `Job`.
-- Explicit process construction; no `fork`.
+- Explicit process construction; no `fork` in the native ABI.
 - Completion-queue-based asynchronous primitives, with blocking wrappers.
 - ELF loading, PIE, per-process address spaces.
 - Native runtime library; first userspace programs.
 - A VFS as a service over channels, and a simple in-memory filesystem.
 - Syscall and parser fuzzing from the day each exists.
 
-**Exit:** a userspace program starts, communicates over a channel, maps memory, is
-scheduled against other processes, and exits cleanly on x86_64 and aarch64. A process
-with no handles provably cannot affect anything. The ABI is frozen for the major
-version.
+**6a exit:** a native userspace program starts, communicates over a channel, maps
+memory, is scheduled against other processes, and exits cleanly on x86_64 and aarch64.
+A process with no handles provably cannot affect anything. The native ABI is frozen
+for the major version.
+
+### 6b — The Linux personality
+
+Same phase, immediately after, because it is what turns the kernel from demonstrable
+into usable — and because every gap it exposes in the native interfaces is a gap worth
+fixing while the ABI freeze is still fresh.
+
+- Personality tag on `Process`, dispatch-table pointer in the thread control block,
+  ELF-note-based tagging at load.
+- Per-architecture Linux syscall tables, generated from an in-tree table.
+- The fd table as a compat view over handles; ambient root namespace and `cwd`.
+- `fork` / `clone` with copy-on-write; depends on `MM_PAGED`.
+- POSIX signals: masks, handlers, `sigaltstack`, per-arch signal frames, restart
+  semantics. Budget accordingly — this is the largest single item in the phase.
+- The `Result` → `errno` mapping table, reviewed rather than accreted.
+- Minimal `/proc`, `/sys`, `/dev`; `mmap` and `brk` semantics; TLS setup; vDSO.
+- `-ENOSYS` with a named log line for gaps, fatal under a CI config flag.
+- `ABI_LINUX` as a loadable module, exercising Phase 4's module work against something
+  substantial.
+- The compatibility corpus in CI, starting at static musl.
+
+**6b exit:** an unmodified static busybox runs on x86_64 and aarch64 — shell, coreutils
+applets, pipes, job control — from a corpus CI runs on every merge. Every gap found is
+either implemented or recorded with its syscall name. At least one gap has been fixed
+in the *native* ABI rather than papered over in the compat layer, demonstrating the
+forcing function works.
 
 ---
 
@@ -167,8 +199,13 @@ version.
 - Crash-dump format and offline decoder.
 - First tagged release, with images, modules, symbol bundles, and SDK.
 
+- Compatibility corpus extended to dynamic musl and then glibc userland, run against
+  real storage and networking rather than an in-memory filesystem.
+
 **Exit:** KinTane boots on physical hardware for all tier-1 targets, mounts a
-filesystem from a real disk, serves network traffic, and survives a week-long soak.
+filesystem from a real disk, serves network traffic, and survives a week-long soak —
+with the soak workload driven by unmodified Linux programs, which is the point of
+having the personality.
 
 ---
 
@@ -192,5 +229,7 @@ of writing an `arch/` crate and nothing else.
 | Driver isolation is too slow to ever enable | Phase 5 | Measure early with a prototype in Phase 3; `InKernel` is always available, so the fallback is the status quo |
 | `kbuild` becomes a second project competing for attention | continuous | Keep it minimal; it resolves config and calls `rustc`. Any feature that is not needed for a shipping kernel is out |
 | Nightly toolchain churn breaks builds | continuous | Pinned toolchain with hashes; upgrades are deliberate, separate commits with a full-matrix build |
-| Own ABI means no software runs | Phase 6–7 | Accepted cost. A POSIX-ish library above the native interface, and a userspace Linux compat layer remain possible later |
+| The Linux personality is a large, permanently incomplete surface; signals alone are substantial | Phase 6b | Compatibility is defined by a published corpus CI runs, never a percentage claim. Gaps are loud: `-ENOSYS` plus a named log line, fatal under CI. Scope grows corpus tier by corpus tier, starting at static musl |
+| The compat path becomes the de-facto ABI and the native one gets no users | Phase 6b onward | The personality is a client of native interfaces, so it cannot outgrow them; native-first sequencing in 6a; the native runtime library and our own userland stay the primary target. Accepted as a live risk, not a solved one |
+| Linux semantics leak into kernel design through the compat layer | Phase 6b onward | Each place the layer reaches past the native interfaces for performance is documented at the site with the measurement that justified it, so the exceptions stay countable |
 | Scope is a full operating system built by very few people | all of it | Phases are ordered so that each produces something usable on its own; a project that stops after Phase 4 is still a working embedded kernel |

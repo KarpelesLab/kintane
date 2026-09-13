@@ -30,8 +30,11 @@ KinTane is a from-scratch kernel with three commitments:
 - Not a crate. It will never be published to crates.io, and cargo is not the build
   system. Builds go through `kbuild`, a purpose-built Rust tool that owns config
   resolution, the crate graph, and `rustc` invocation.
-- Not a Linux clone. The userspace ABI is our own (see
-  [docs/userspace-abi.md](docs/userspace-abi.md)).
+- Not a Linux clone. The native userspace ABI is our own — capability-based and
+  designed for machines that may have no MMU. A per-process **Linux personality** runs
+  unmodified Linux binaries on top of those native interfaces, which gives us a real
+  userland for testing without making Linux the foundation. See
+  [docs/userspace-abi.md](docs/userspace-abi.md).
 - Not source-distributed. Deliverables are compiled kernel images, optional loadable
   modules, and separately packaged debug symbols.
 

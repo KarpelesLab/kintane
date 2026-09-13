@@ -65,20 +65,53 @@ See [build-system.md](build-system.md).
 
 ---
 
-### D4 — Our own userspace ABI
-**Accepted.** 2026-09-13.
+### D4 — Our own userspace ABI, plus an in-kernel Linux personality
+**Accepted** 2026-09-13. **Amended** 2026-09-13 — see below.
 
-Capability-based, handle-oriented, no `fork`, errors as values, asynchronous
-primitives with synchronous wrappers. Not Linux-compatible.
+The native ABI is capability-based, handle-oriented, no `fork`, errors as values,
+asynchronous primitives with synchronous wrappers.
 
-*Why:* partial Linux compatibility is worse than none; the Linux ABI assumes a machine
-model we deliberately do not require.
+*Why:* the Linux ABI assumes a machine model — MMU, POSIX process model, signals — we
+deliberately do not require. A kernel serving no-MMU hardware cannot take it as a
+foundation.
 
-*Cost:* no existing userland; we write one. A POSIX-ish library above the native
-interface reduces porting pain, and a userspace Linux compatibility layer stays
-possible but is not a goal.
+*Cost:* no existing native userland; we write one. A POSIX-ish library above the
+native interface reduces porting pain.
 
-See [userspace-abi.md](userspace-abi.md).
+**Amendment — the Linux personality.** The original decision also rejected Linux
+syscall compatibility outright, on the grounds that partial compatibility produces
+software that runs until it does not. That reasoning still holds as a warning, but it
+does not outweigh what compatibility buys, so it is now a thing to manage rather than
+a reason to refuse.
+
+The kernel implements a second syscall ABI, selected per process by a personality tag
+fixed at load time, so unmodified Linux binaries run transparently. It is in-kernel,
+not a userspace translation layer.
+
+*Why the change:* an existing userland from the day the syscall layer works — static
+musl binaries, busybox, real test suites — instead of after we have written one. It
+collapses the distance between "schedules processes" and "runs useful software", makes
+Phase 7's storage and network work testable against programs not written to flatter
+us, and gives the hardware a migration path.
+
+*Why it does not undermine the native ABI:* the personality is a **client of the
+native kernel interfaces, not a second path into the kernel**. Where it needs
+something those interfaces cannot express, the native ABI is fixed — Linux is a
+thorough specification of what a general-purpose kernel must do, and auditing our
+interface against it is worth more than the compatibility itself.
+
+*Cost:* a large and permanently incomplete surface; signals alone are substantial.
+Ambient authority for processes that opt in, weakening the capability model for those
+processes only. `ABI_LINUX` depends on `MM_PAGED` — `fork` needs copy-on-write — so it
+does not exist on no-MMU targets, and it is tristate so a general-purpose build can
+load it as a module. Managed by defining compatibility as a published corpus of
+programs CI runs rather than as a percentage claim, and by making unimplemented
+syscalls loud (`-ENOSYS` plus a named log line; fatal under CI).
+
+*Risk carried:* the compat path could become the de-facto ABI, leaving the native one
+with no users. Tracked in the [roadmap](roadmap.md#risks).
+
+See [userspace-abi.md](userspace-abi.md#the-linux-personality).
 
 ---
 

@@ -61,6 +61,18 @@ deliberate fault injection — kill an isolated driver and confirm it restarts, 
 memory and confirm the fallible allocation paths are actually exercised rather than
 merely present.
 
+From Phase 6b, this level gains its most valuable input: **unmodified Linux binaries**.
+The compatibility corpus — static musl programs first, busybox, later a real userland —
+is run under the Linux personality on every merge. Software written without any
+knowledge of this kernel is the only test workload that does not share our
+assumptions, and it finds things our own tests structurally cannot. The corpus is also
+the compatibility claim itself; see
+[userspace-abi.md](userspace-abi.md#scoping-and-the-partial-compatibility-problem).
+
+Gaps are made loud rather than silent: an unimplemented syscall returns `-ENOSYS` and
+logs its name, and CI builds enable the config option that makes it fatal, so a
+missing syscall is a named test failure instead of a program that misbehaves.
+
 ### 4. Hardware
 
 A small rack of real machines for tier-1 targets, driven nightly: an x86_64 server,
@@ -95,6 +107,8 @@ A change may not land unless:
    ([the rule](portability.md#where-cfg-is-still-allowed)).
 6. Layering is not violated.
 7. The size report does not regress beyond the configured budget.
+8. From Phase 6b: the Linux compatibility corpus passes. Programs leave the corpus
+   only by explicit decision, never by being quietly removed when they break.
 
 Gates 1 and 3 are what make the portability claim real, and they are affordable only
 because of `kbuild`'s content-addressed cache.
