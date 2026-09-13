@@ -187,12 +187,28 @@ pub fn run(
 
     // Dependencies first, as plain rlibs. A unit under test is compiled twice: once
     // as a library for its dependents, once with --test for itself.
+    //
+    // A unit that fails to compile is recorded and the run *continues*. The first
+    // version of this runner returned on the first compile failure, which meant one
+    // broken unit silently withheld the results of every unit ordered after it — a red
+    // build that reported one problem while hiding whether there were others.
+    let mut broken: Vec<(String, String)> = Vec::new();
     for u in &needed {
-        if built.contains_key(&u.name) {
+        if built.contains_key(&u.name) || broken.iter().any(|(n, _)| n == &u.name) {
             continue;
         }
-        let p = hb.rlib(u, &built)?;
-        built.insert(u.name.clone(), p);
+        // A unit whose own dependency is broken cannot be built either; say which one
+        // rather than reporting a cascade of unrelated-looking compile errors.
+        if let Some(dep) = u.deps.iter().find(|d| broken.iter().any(|(n, _)| n == *d)) {
+            broken.push((u.name.clone(), format!("depends on `{dep}`, which did not build")));
+            continue;
+        }
+        match hb.rlib(u, &built) {
+            Ok(p) => {
+                built.insert(u.name.clone(), p);
+            }
+            Err(e) => broken.push((u.name.clone(), e)),
+        }
     }
 
     let mut summary = Summary {
@@ -202,13 +218,33 @@ pub fn run(
     };
 
     for u in &wanted {
-        let bin = hb.test_binary(u, &built)?;
-        println!("\n\x1b[36m{}\x1b[0m", u.name);
-        let status = Command::new(&bin)
-            .status()
-            .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
         summary.units += 1;
-        if status.success() {
+
+        if let Some((_, why)) = broken.iter().find(|(n, _)| n == &u.name) {
+            println!("\n\x1b[36m{}\x1b[0m", u.name);
+            eprintln!("\x1b[31mdid not build\x1b[0m: {why}");
+            summary.failed += 1;
+            continue;
+        }
+
+        let bin = match hb.test_binary(u, &built) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("\n\x1b[36m{}\x1b[0m", u.name);
+                eprintln!("\x1b[31mtests did not build\x1b[0m: {e}");
+                summary.failed += 1;
+                continue;
+            }
+        };
+
+        println!("\n\x1b[36m{}\x1b[0m", u.name);
+        let passed = Command::new(&bin)
+            .status()
+            .map(|s| s.success())
+            // A test binary that cannot even be started is a failure of that unit, not
+            // a reason to stop reporting on the others.
+            .unwrap_or(false);
+        if passed {
             summary.passed += 1;
         } else {
             summary.failed += 1;
