@@ -87,7 +87,7 @@ fn banner(boot_arg: u64) {
     c.write_str(if kconfig::DEBUG_BUILD { "y" } else { "n" });
     memory(c, boot_arg);
 
-    c.write_str("\n  paging     ");
+    c.write_str("\n  pagetable  ");
     let paging_ok = arch::paging_selftest(c);
     c.write_str(if paging_ok { " ok" } else { "" });
 
