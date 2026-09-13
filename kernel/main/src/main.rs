@@ -137,14 +137,17 @@ fn banner(boot_arg: u64) -> Check {
     c.write_str(if irq_ok { " ok" } else { "" });
 
     c.write_str("\n  threads    ");
-    // Reported but not yet gating: a port without context switching is an honest gap
-    // today, not a regression. It joins the verdict below once all three ports have it.
-    let _switch = arch::context_switch_selftest(c);
+    // Gating now that every port switches. Until all three had it, a missing context
+    // switch was an honest gap rather than a regression; from here, one breaking is a
+    // failure. Every register falsification the ports ran exited 33 before this line,
+    // which is precisely the kind of check that cannot change an outcome.
+    let switch_ok = arch::context_switch_selftest(c);
 
     c.write_str("\n\nreached kmain\n");
     Check::from_ok(paging_ok)
         .and(mem)
         .and(Check::from_ok(irq_ok))
+        .and(Check::from_ok(switch_ok))
 }
 
 /// Room for the loader's memory map. QEMU reports a handful of regions; real

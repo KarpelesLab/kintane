@@ -22,6 +22,12 @@
 //! duplicated because the two `arch` crates are separate units that may not depend on
 //! each other. The one gap this port has and x86-64 does not is a dedicated #DF stack;
 //! `idt.rs` records why.
+//!
+//! `context` implements `hal::context`. Its module comment records a measurement that
+//! matters beyond the switch: for this target's LLVM triple the compiler assumes only a
+//! 4-byte-aligned stack on entry and realigns wherever it needs more, so the 16-byte
+//! alignment the port guarantees is insurance against a target-specification change
+//! rather than something today's code generation depends on.
 
 // IDT entry points. The calling convention differs from every other ABI on the
 // machine — the CPU has already pushed a frame the callee must `iret` from, and the
@@ -33,6 +39,7 @@
 #![no_std]
 
 mod boot;
+pub mod context;
 mod exception;
 mod idt;
 pub mod interrupt;
@@ -259,6 +266,5 @@ pub fn image_sections() -> hal::ImageSections {
 /// Returns `true` only if control reached the new thread *and* came back, with the
 /// callee-saved registers the original thread was holding intact.
 pub fn context_switch_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    context::selftest(c)
 }

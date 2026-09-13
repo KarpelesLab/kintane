@@ -24,7 +24,9 @@
 //! * **i386 SysV**: ebx, esi, edi, ebp and the stack pointer. The XMM registers are all
 //!   caller-saved — which matters here, because the i686 kernel has SSE enabled and LLVM emits
 //!   vector instructions in ordinary code (see `docs/targets.md#i686`). Because they are
-//!   caller-saved they need no saving across a switch.
+//!   caller-saved they need no saving across a switch. Stack alignment on this target is less
+//!   forgiving than it looks and more forgiving than it sounds; see
+//!   [`HasContextSwitch::STACK_ALIGN`].
 //! * **AArch64 AAPCS64**: x19–x29, the link register, the stack pointer — **and the low 64 bits of
 //!   d8–d15**, which *are* callee-saved. A port that saves only the general registers is correct
 //!   exactly as long as nothing in the kernel touches the vector registers, and then silently
@@ -63,10 +65,23 @@ pub trait HasContextSwitch: Arch {
 
     /// Required stack alignment, in bytes, at the point a function is entered.
     ///
-    /// Stated rather than assumed because it is not uniform and getting it wrong is
-    /// deferred: 16 on x86-64 and AArch64, and a misaligned stack works until the first
-    /// function that uses an aligned vector instruction, which on i686 is LLVM's own
-    /// output rather than anything the author wrote.
+    /// Stated per port rather than assumed, because the compiler's own assumption is not
+    /// uniform and is set somewhere surprising. It is 16 on x86-64 and AArch64. On i686
+    /// it depends on the **target triple**, not on the data layout: LLVM assumes 16 for
+    /// Linux, Darwin and FreeBSD triples and only 4 otherwise, so for this kernel's
+    /// `i686-unknown-none-elf` it assumes 4 and realigns the stack itself with
+    /// `and $-16, %esp` before every aligned vector write. A misaligned thread stack
+    /// therefore does *not* fault on i686 today.
+    ///
+    /// An earlier version of this comment claimed the opposite — that a misaligned stack
+    /// works until LLVM's own aligned SSE output faults. That is true under a Linux
+    /// triple and false under ours; the i686 port disproved it by disassembly, by
+    /// comparing `llc` output across both triples, and at run time.
+    ///
+    /// Which is exactly why ports should still honour 16: the 4-byte assumption hangs on
+    /// one string in a JSON file. Change the triple and every 4-aligned thread stack
+    /// faults on its first aligned vector instruction, with no source change anywhere
+    /// to explain it. Sixteen is correct under both, and costs at most twelve bytes.
     const STACK_ALIGN: usize;
 
     /// Prepare `ctx` so that switching to it begins executing `entry(arg)` on a stack
