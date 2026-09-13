@@ -1,0 +1,14 @@
+# One of the units providing the name `bootinfo`: platforms that describe their memory
+# with a flattened device tree. The configuration selects which provider, so the kernel
+# image depends on the role and never on which loader ran.
+[unit]
+name = "bootinfo"
+kind = "lib"
+root = "src/lib.rs"
+layer = "core"
+
+[deps]
+units = ["boot_protocol", "fdt"]
+
+[config]
+requires = "ARCH_AARCH64"

@@ -1,11 +1,18 @@
 /* aarch64 kernel image layout for QEMU's `virt` machine.
  *
- * RAM on `virt` begins at 0x40000000 and 0x40080000 is the conventional place to put
- * a kernel there: it is the address the Linux arm64 boot protocol's "text offset" of
- * 0x80000 lands on, and every loader for the board already expects an image to start
- * somewhere at or above it. The half megabyte it leaves below is where QEMU puts the
- * device tree when it has one to hand over, which is why the gap is worth keeping even
- * though nothing reads the DTB yet.
+ * RAM on `virt` begins at 0x40000000, and the image is linked 2 MiB above it at
+ * 0x40200000 so that the device tree fits underneath.
+ *
+ * It used to be linked at 0x40080000 — the Linux arm64 "text offset" — with a comment
+ * claiming the half megabyte below was where QEMU puts the device tree. That was wrong,
+ * and silently so. QEMU places the DTB below an ELF kernel only if it fits, and skips it
+ * without a word when it does not; the `virt` tree is 1 MiB (`totalsize 0x100000`), and
+ * half a megabyte cannot hold it. A scan of all guest RAM found no `d00dfeed` anywhere,
+ * and QEMU's `info roms` listed no DTB. The device-tree parser was built, tested and
+ * working, and still found nothing, because there was nothing to find.
+ *
+ * 0x40200000 leaves 2 MiB, and is a 2 MiB block boundary, so the image starts exactly
+ * where the boot map's first refined block begins.
  *
  * There is no header to place first here, unlike multiboot on x86: QEMU loads an ELF
  * and jumps to its entry point, so `.text.boot` leads only so that `_start` sits at a
@@ -47,7 +54,7 @@ ENTRY(_start)
 PAGE_SIZE = 4K;
 
 SECTIONS {
-    . = 0x40080000;
+    . = 0x40200000;
     __kernel_start = .;
 
     .text : ALIGN(PAGE_SIZE) {

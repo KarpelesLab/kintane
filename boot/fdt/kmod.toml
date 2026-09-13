@@ -1,0 +1,16 @@
+# The flattened device tree parser.
+#
+# No `config.requires`, unlike `multiboot`: a device tree is how aarch64, RISC-V and
+# most embedded ARM boards describe themselves, so the parser is not an aarch64 unit
+# even though aarch64 is its first consumer. It is also pure byte-slice parsing with
+# no `unsafe`, which is what lets its host tests run under every preset — the x86_64
+# one CI uses included.
+[unit]
+name = "fdt"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "hal"
+
+[deps]
+units = ["boot_protocol"]

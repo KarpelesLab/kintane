@@ -1,6 +1,7 @@
-# The other unit providing `bootinfo`: platforms where no loader supplies a memory
-# map yet. On aarch64 QEMU parks a device tree in RAM but does not pass a pointer to
-# it on the ELF path, so reading it needs the FDT parser that arrives in Phase 3.
+# A unit providing `bootinfo` for platforms where no loader supplies a memory map yet —
+# today the no-MMU targets. x86 has `info-multiboot` and aarch64 has `info-fdt`; the
+# condition below must exclude every architecture another provider claims, or two
+# units named `bootinfo` are enabled at once and kbuild refuses the build.
 [unit]
 name = "bootinfo"
 kind = "lib"
@@ -11,4 +12,4 @@ layer = "core"
 units = ["boot_protocol"]
 
 [config]
-requires = "!(ARCH_X86_64 || ARCH_I686)"
+requires = "!(ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64)"

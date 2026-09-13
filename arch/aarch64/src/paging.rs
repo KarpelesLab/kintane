@@ -59,7 +59,8 @@
 //!   the PL011, the GIC distributor and redistributors, and the flash — everything the kernel
 //!   reaches by MMIO.
 //! - `0x4000_0000..0x8000_0000` as 512 × 2 MiB Normal write-back blocks. RAM begins at
-//!   `0x4000_0000` on `virt` and the image is linked at `0x4008_0000`.
+//!   `0x4000_0000` on `virt` and the image is linked at `0x4020_0000`, leaving room below for the 1
+//!   MiB device tree QEMU places there.
 //!
 //! The second is deliberately larger than the RAM QEMU is usually given, so that
 //! changing `-m` does not unmap the kernel. Mapping unbacked addresses as Normal

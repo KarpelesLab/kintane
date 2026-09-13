@@ -317,19 +317,31 @@ fn kernel_space(
 ) -> Check {
     c.write_str("\n  kspace     ");
 
-    let top = map
-        .iter()
-        .filter(|r| r.kind == MemoryKind::Usable as u32)
-        .map(|r| r.start + r.len)
-        .max()
-        .unwrap_or(0);
-    let len = top.min(DIRECT_MAP_MAX);
+    // The direct map spans where RAM actually is, not `[0, top)`. An earlier version
+    // assumed memory starts at physical zero, which is true on a PC and false on
+    // aarch64, where RAM begins at 1 GiB: `[0, 1 GiB)` then contained no RAM at all, and
+    // the first page table allocation failed with nothing to allocate from.
+    let usable = || map.iter().filter(|r| r.kind == MemoryKind::Usable as u32);
+    let Some(lo) = usable().map(|r| r.start).min() else {
+        c.write_str("no usable memory");
+        return Check::Failed;
+    };
+    let hi = usable().map(|r| r.start + r.len).max().unwrap_or(lo);
+    let len = (hi - lo).min(DIRECT_MAP_MAX);
     if len == 0 {
         c.write_str("no usable memory");
         return Check::Failed;
     }
 
-    let direct = match mm::DirectMap::identity(len) {
+    let base = hal::PhysAddr::new(lo);
+    let virt = match usize::try_from(lo) {
+        Ok(v) => hal::KernAddr::new(v),
+        Err(_) => {
+            c.write_str("RAM starts above the addressable range");
+            return Check::Failed;
+        }
+    };
+    let direct = match mm::DirectMap::new(base, virt, len) {
         Ok(d) => d,
         Err(_) => {
             c.write_str("direct map rejected");
