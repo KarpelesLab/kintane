@@ -267,8 +267,7 @@ fn literal(res: &Resolution, name: &str) -> String {
         .get(name)
         .map(|v| match v {
             crate::kcfg::Val::Str(s) => s.clone(),
-            crate::kcfg::Val::Int(i) => i.to_string(),
-            crate::kcfg::Val::Tri(t) => t.as_str().to_string(),
+            other => other.display(),
         })
         .unwrap_or_default()
 }

@@ -377,6 +377,38 @@ The configuration space is too large to enumerate, so we sample it deliberately:
   reproducible. This is where the unbuildable-configuration bugs that plague
   `#ifdef`-based kernels would surface — and where we find out whether the trait
   approach really removed them.
+
+### As built
+
+- `kbuild randconfig-build --count K --seed S` builds `K` samples, one seed each
+  (`S`, `S+1`, ...), each on a preset picked by its own seed.
+- `--allyes` and `--allno` build every preset's boundary instead.
+- A failure is printed with the command that rebuilds it, such as
+  `kbuild build --preset i686-qemu --random --seed 1031`, and its log is kept under
+  `build/randconfig/`.
+- The generator is described in [build-system.md](build-system.md#generated-configurations).
+  It never produces a configuration the resolver refuses. If one appears anyway, the
+  report counts it separately as a kbuild bug, apart from configurations that resolve
+  and do not build.
+- The nightly workflow (`.github/workflows/nightly.yml`) runs both boundaries and 50
+  random samples. Its seed comes from the run number, so every night draws a new sample.
+- Random values stay within what a preset leaves free: the preset fixes the
+  architecture, so a sample never asks for an architecture with no port.
+- `int` and `hex` symbols are sampled only when they declare a `range`. The range is the
+  only statement of which values are meant to work.
+
+**What the first run found.** 36 of the first 50 random samples, and every `--allyes`
+boundary, failed to build. None of that was a kernel bug. `MOCK_ARCH`, the switch that
+compiles `hal`'s mock architectures for host tests, had a prompt, so the generator
+treated it as a choice a person could make. Kernel images built with it failed in two
+ways: the mocks' `extern crate std`, and a 64-bit shift in `hal/src/mock.rs` that is an
+overflow on i686. The fix was to the declaration, not the kernel. `MOCK_ARCH` no longer
+has a prompt, which in this language means "derived, not chosen"; `kbuild test` still
+sets it. After that, all 50 samples (seed 1000) and all 14 boundary builds passed.
+
+**What "builds" does not yet cover.** A sample is built, not booted. Several of the
+symbols it varies select test modes that crash on purpose. `MM_FLAT` changes no unit on
+the paged ports today, so a sample that picks it proves less than it seems to.
 - **Pairwise coverage** over symbols known to interact (SMP × memory model × isolation
   × modules × `ABI_LINUX`), once exhaustive becomes impractical.
 
@@ -403,18 +435,47 @@ only because of `kbuild`'s content-addressed cache.
 
 ## Size budgets
 
-Each preset declares a maximum image size in `config/presets/`. `kbuild size
---compare <ref>` reports per-crate and per-section deltas against a baseline.
+Each preset declares a maximum image size in `config/presets/` as `SIZE_BUDGET_KIB`.
+`kbuild size --preset P` builds the preset and reports every allocated section and
+every crate against the budget and a baseline. It fails when the total exceeds the
+budget.
 
 ```
-$ kbuild size --compare origin/main
-  preset armv7m-minimal     budget 64 KiB
-    .text      41,208   +312
-    .rodata     6,944    +18
-    .data         512     +0
-    .bss       11,520     +0
-    total      60,184   +330    ( 92% of budget)
+$ kbuild size --preset x86_64-qemu --compare origin/master
+  preset x86_64-qemu          budget 768 KiB
+    .bss                          155,648       +0
+    .rodata                        16,344      +18
+    .text                         135,168     +312
+    .thread_stacks                262,144       +0
+    ...
+    total                         591,180     +330   (75% of budget)
+  crates (text + rodata + data + bss)
+    arch                          118,691       +0   text 27,937, rodata 0, data 361, bss 90,393
+    kintane                        83,546     +330   text 42,456, rodata 48, data 3,964, bss 37,078
+    ...
 ```
+
+- **What is measured:** the linked kernel ELF's allocated sections, `.bss` and the
+  thread-stack array included, since that is what the machine must hold. The packaged
+  image, whose size depends on the container, is not measured.
+- **How crates are attributed:** each sized symbol (`llvm-nm --print-size --demangle`)
+  is charged to the crate its demangled path starts in. A generic is charged to the
+  crate that defines it, which is where the code to shrink lives. Assembly and
+  unmangled symbols, and LLVM's anonymous constants, get rows of their own.
+- **Which crates are listed:** the largest dozen, plus every crate whose size moved, so a
+  regression is never hidden below the cut.
+- **The baseline:** `config/size-baseline/<preset>.size`, a line-oriented report
+  rewritten by `--update-baseline` and reviewed like any other diff. `--compare` takes
+  another report file, or a git revision, whose committed baseline is read with
+  `git show`, so comparing against `origin/master` needs no second build.
+  - A baseline that drifts from reality only makes the deltas stale. The budget is the
+    gate.
+- **When budgets and baselines change:** whenever a change moves the kernel's size on
+  purpose, in the same commit. Budgets were set with roughly 25–30% headroom over the
+  size at the time.
+- **CI:** every push and pull request runs `kbuild size` on every preset.
+- **Falsified:** adding a 256 KiB static to `kmain` failed x86_64-qemu at 108% of its
+  budget, with the growth attributed to `kintane`'s rodata.
 
 A 300-byte regression on a Cortex-M matters and is invisible on x86_64. Tracking it
 per-commit is the only way small targets stay viable, and it is what keeps "supports

@@ -10,3 +10,5 @@ DEBUG_BUILD=y
 QEMU_EXIT=y
 # QEMU's default 32-bit core, not `max`: this target exists for legacy machines.
 QEMU_CPU="qemu32"
+# 548 KiB when set. `kbuild size --preset i686-qemu` shows where it goes.
+SIZE_BUDGET_KIB=768

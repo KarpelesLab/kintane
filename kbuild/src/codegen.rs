@@ -74,6 +74,11 @@ pub fn emit(table: &SymbolTable, res: &Resolution, gen_dir: &Path) -> Result<Gen
             (Kind::Int, Val::Int(i)) => {
                 out.push_str(&format!("pub const {name}: usize = {i};\n\n"));
             }
+            (Kind::Hex, Val::Hex(h)) => {
+                // u64, not usize: an address on a 32-bit target's 64-bit physical bus
+                // must survive being generated.
+                out.push_str(&format!("pub const {name}: u64 = {h:#x};\n\n"));
+            }
             (Kind::Str, Val::Str(s)) => {
                 out.push_str(&format!("pub const {name}: &str = {s:?};\n\n"));
             }

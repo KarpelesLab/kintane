@@ -12,3 +12,5 @@ SMP=n
 EARLY_CONSOLE=y
 DEBUG_BUILD=y
 QEMU_EXIT=y
+# 622 KiB when set. `kbuild size --preset aarch64-virt` shows where it goes.
+SIZE_BUDGET_KIB=832

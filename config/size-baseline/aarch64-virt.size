@@ -1,0 +1,31 @@
+# kbuild size report for preset aarch64-virt. Rewrite with `kbuild size --preset aarch64-virt --update-baseline`.
+section .bss 122880
+section .data 70936
+section .rodata 16384
+section .stack 16384
+section .stack_guard 4096
+section .text 143360
+section .thread_stacks 262144
+crate (anonymous) text 0 rodata 1258 data 0 bss 0
+crate (unmangled) text 5612 rodata 0 data 0 bss 0
+crate __rustc text 172 rodata 0 data 0 bss 0
+crate arch text 8472 rodata 0 data 264 bss 65813
+crate bootinfo text 984 rodata 0 data 0 bss 0
+crate buildid text 252 rodata 32 data 0 bss 0
+crate core text 6508 rodata 0 data 0 bss 0
+crate device text 12784 rodata 0 data 0 bss 0
+crate fdt text 6560 rodata 0 data 0 bss 0
+crate gic text 3260 rodata 0 data 0 bss 224
+crate hal text 592 rodata 0 data 0 bss 0
+crate kalloc text 12388 rodata 0 data 0 bss 0
+crate kintane text 37756 rodata 48 data 3964 bss 37366
+crate mm text 21032 rodata 0 data 0 bss 0
+crate pl011 text 1140 rodata 0 data 80 bss 24
+crate platform text 3512 rodata 0 data 65536 bss 1672
+crate sched text 428 rodata 0 data 0 bss 0
+crate strip_suffix text 52 rodata 0 data 0 bss 0
+crate sync text 5968 rodata 0 data 1088 bss 272
+crate thread text 1976 rodata 0 data 0 bss 0
+crate time text 2860 rodata 0 data 0 bss 0
+crate unwind text 2700 rodata 0 data 0 bss 0
+total 636184
