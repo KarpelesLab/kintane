@@ -1,0 +1,14 @@
+[unit]
+name = "ipc"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+# `kobject` for handles, entries and rights; `sync` for the two lock types; `hal` for
+# the capability bounds that choose between them (and the mocks the host tests run
+# against). Not `kalloc`: a channel's storage is sized by const generics and lives
+# inline in the channel, so a send never allocates and cannot fail for want of memory
+# — a full queue is the only way it runs out, and that is an answer the sender gets.
+[deps]
+units = ["hal", "sync", "kobject"]
