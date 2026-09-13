@@ -7,9 +7,13 @@
 #![no_std]
 
 mod boot;
+pub mod exception;
+pub mod gic;
+pub mod irq;
 pub mod serial;
+pub mod timer;
 
-use hal::{Arch, Endian, HasCas, HasFpu, HasMmu, HasSmp};
+use hal::{Arch, Endian, HasCas, HasFpu, HasMmu, HasSmp, IrqNumber};
 
 pub use serial::EARLY;
 
@@ -209,6 +213,72 @@ pub fn exit_emulator(ok: bool) -> ! {
 /// port. Returns `true` when the path is demonstrably live: a handler ran and
 /// control returned.
 pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    // SAFETY: `kmain` is documented as calling this once with interrupts masked, and
+    // nothing before it has enabled an interrupt source, so this is the first and only
+    // installation and nothing can be delivered against a half-built table.
+    unsafe { exception::install_vectors() };
+
+    // The one genuinely dynamic decision in the image: which interrupt controller this
+    // machine has. Everything after this point talks to it through `dyn IrqChip`.
+    //
+    // SAFETY: on this machine 0x08000000 is the GIC distributor, and PIDR2 is a
+    // read-only identification register — the probe cannot disturb a device that turns
+    // out to be something else, and on `virt` there is nothing else it could be.
+    let Some(chip) = (unsafe { gic::detect(gic::GICD_BASE) }) else {
+        c.write_str("no GIC at 0x08000000");
+        return false;
+    };
+    c.write_str(chip.name());
+
+    // SAFETY: first and only initialisation of this controller, with interrupts still
+    // masked, which is exactly the contract `IrqChip::init` states.
+    unsafe { chip.init() };
+    // SAFETY: called once, before any source is enabled, on an initialised controller.
+    unsafe { irq::set_chip(chip) };
+
+    let freq = timer::frequency();
+    if freq == 0 {
+        c.write_str(", no counter frequency");
+        return false;
+    }
+
+    chip.enable(IrqNumber(timer::PPI));
+    // Ten milliseconds: long enough that arming and unmasking cannot race the
+    // deadline, short enough that a boot nobody is watching does not stall on it.
+    timer::arm((freq / 100) as u32);
+
+    // SAFETY: the vector table is installed, the controller is initialised, the only
+    // enabled source has a handler, and the masks are put back before returning — so
+    // the window in which an interrupt can arrive is exactly the loop below.
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
+    }
+
+    // Wait, but not forever. A second of counter ticks is two orders of magnitude more
+    // than the timer needs; reaching the deadline means the interrupt never came, which
+    // is a result to report rather than a reason to hang.
+    let deadline = timer::counter().wrapping_add(freq);
+    while irq::timer_ticks() == 0 && timer::counter() < deadline {
+        // SAFETY: `wfi` is a hint. With IRQs unmasked the timer wakes it, and the
+        // architecture permits it to return for no reason at all, which the loop
+        // tolerates.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+    }
+
+    // SAFETY: restores the mask this function cleared, leaving DAIF as `kmain` had it.
+    unsafe {
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
+    timer::stop();
+    chip.disable(IrqNumber(timer::PPI));
+
+    if irq::timer_ticks() == 0 {
+        c.write_str(", timer IRQ never fired");
+        return false;
+    }
+    // The counter is incremented by the handler and read here, on the interrupted
+    // side, so a non-zero value is proof of both halves: the handler ran, and control
+    // came back through `eret`.
+    c.write_str(", timer IRQ taken");
+    true
 }
