@@ -1,0 +1,10 @@
+# riscv32 (rv32imac) under QEMU's `virt` machine with no firmware (-bios none): the
+# Phase 4 no-MMU configuration.
+#
+# No MMU, so the memory model resolves to MM_FLAT. QEMU_EXIT here is the sifive_test
+# finisher at 0x100000, which `virt` always has; like the other ports' channels it must
+# stay off in anything that ships.
+ARCH_RISCV32=y
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y

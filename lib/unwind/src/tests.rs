@@ -97,6 +97,45 @@ fn synthetic_stack_32() {
     well_formed(4);
 }
 
+/// The RISC-V shape: each frame pointer is the top of its frame and the record is the
+/// two words below it. The outermost frame's pointer is the very top of the stack, one
+/// past its last byte, and its record must still count as inside.
+#[test]
+fn records_below_the_frame_pointer() {
+    let word = 4;
+    let base = 0x8000_0000;
+    let mut s = Stack::new(base, word, 32);
+    let top = s.end();
+    let (a, b) = (base + 12 * word, base + 20 * word);
+    // `[fp - 8]` saved frame pointer, `[fp - 4]` return address.
+    let below = |s: &mut Stack, fp: usize, saved: usize, ra: usize| {
+        s.put(fp - 2 * word, saved);
+        s.put(fp - word, ra);
+    };
+    below(&mut s, a, b, 0x8000_0111);
+    below(&mut s, b, top, 0x8000_0222);
+    below(&mut s, top, 0, 0x8000_0333);
+
+    let layout = Layout::record_below(word);
+    let mut w = Walk::new(&s, layout, s.base, s.end(), a);
+    let ras: Vec<usize> = w.by_ref().collect();
+    assert_eq!(ras, [0x8000_0111, 0x8000_0222, 0x8000_0333]);
+    assert_eq!(w.stop(), Some(Stop::NullFrame));
+    assert_eq!(s.out_of_range.get(), 0);
+    assert_eq!(layout.record_start(top), Some(top - 8), "looked up by a byte inside");
+}
+
+#[test]
+fn a_record_below_the_bottom_of_the_stack_is_outside_it() {
+    let s = Stack::new(0x1000, 4, 8);
+    // The frame pointer is in bounds; the record below it is not.
+    let mut w = Walk::new(&s, Layout::record_below(4), s.base, s.end(), 0x1004);
+    assert_eq!(w.next(), None);
+    assert_eq!(w.stop(), Some(Stop::OutsideStack));
+    assert_eq!(s.reads.get(), 0);
+    assert_eq!(Layout::record_below(4).record_start(4), None, "does not wrap below zero");
+}
+
 #[test]
 fn a_null_frame_pointer_is_an_empty_backtrace() {
     let s = Stack::new(0x1000, 8, 8);

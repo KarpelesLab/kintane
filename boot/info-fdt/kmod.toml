@@ -11,4 +11,4 @@ layer = "core"
 units = ["boot_protocol", "fdt"]
 
 [config]
-requires = "ARCH_AARCH64"
+requires = "ARCH_AARCH64 || ARCH_RISCV32"

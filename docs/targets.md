@@ -111,6 +111,38 @@ can be configured away, exercising the `HasCas` bound.
 *Stresses:* a third ISA in the no-MMU class, optional atomics, PLIC/CLINT interrupt
 model.
 
+**As built** (the `riscv32-virt` preset, `targets/riscv32-kintane.json`):
+
+- **Boot and traps.** rv32imac in machine mode on QEMU `virt` with `-bios none`. There is
+  no firmware below the kernel, which owns `mtvec` and the CLINT directly.
+- **Timer, clock and context.**
+  - `mtime` is the clock source, and `mtimecmp` a one-shot timer.
+  - Traps save every register plus `mepc` and `mstatus` in the frame, so the timer
+    interrupt can preempt.
+  - The context switch saves `ra`, `sp` and `s0`–`s11`.
+- **Capabilities.** It implements `Arch`, `HasCas`, `UniProcessor` and
+  `HasContextSwitch`, and nothing else.
+- **What passes.**
+  - The whole boot banner, the flat region allocator and the heap.
+  - Preemption, sleep and the tickless idle.
+  - All 35 in-kernel checks.
+  - Crash decoding by panic and by fault.
+- **What reports Skipped.** The MMU checks. The guard-page test modes do not exist here.
+
+What the port found outside `arch/`:
+
+- **64-bit atomics.** The target spec's `max-atomic-width` is 32, the truth for rv32imac.
+  `kernel/main` kept 64-bit counters in `AtomicU64`, so it gained an alias that becomes
+  `sync::IrqU64` on a uniprocessor without them.
+- **A tree above 2 GiB.** `boot/info-fdt` refused a device tree ending above `isize::MAX`,
+  which is every tree on a 32-bit machine whose RAM starts at 2 GiB.
+- **Record below the frame pointer.** The RISC-V frame record sits below the frame
+  pointer, which `lib/unwind` could not describe.
+
+The addresses of the UART, the CLINT and `sifive_test`, and the timebase frequency, are
+`virt`'s constants. The device tree carries the same facts, and reading them is the device
+model's work, which only aarch64 has so far.
+
 ## Tier 2
 
 Planned, in roughly this order:

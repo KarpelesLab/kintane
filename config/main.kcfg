@@ -12,6 +12,7 @@ config TARGET
     default "x86_64-kintane" if ARCH_X86_64
     default "aarch64-kintane" if ARCH_AARCH64
     default "i686-kintane" if ARCH_I686
+    default "riscv32-kintane" if ARCH_RISCV32
     default ""
     help
         Name of the target specification under targets/.
@@ -22,6 +23,7 @@ config LINKER_SCRIPT
     default "arch/x86_64/link.ld" if ARCH_X86_64
     default "arch/aarch64/link.ld" if ARCH_AARCH64
     default "arch/i686/link.ld" if ARCH_I686
+    default "arch/riscv32/link.ld" if ARCH_RISCV32
     default ""
 
 # --- memory model -----------------------------------------------------------
@@ -112,7 +114,7 @@ config LOCKDEP_ABBA_TEST
 
 config QEMU_EXIT
     bool "Guest-initiated emulator exit"
-    depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64
+    depends on ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64 || ARCH_RISCV32
     default n
     help
         Let the guest terminate the emulator with a status. This is the result
@@ -120,10 +122,12 @@ config QEMU_EXIT
         never a string scraped from console output; see docs/testing.md.
 
         How it is done is per-architecture: isa-debug-exit on x86, semihosting
-        on AArch64. Neither belongs in a production image. The x86 form writes
-        to an I/O port that is merely inert on real hardware, but the AArch64
-        form executes HLT #0xF000, which is UNDEFINED without a debugger
-        attached — so this must be off in anything that ships.
+        on AArch64, the sifive_test finisher on riscv32. None belongs in a
+        production image. The x86 form writes to an I/O port that is merely
+        inert on real hardware, but the AArch64 form executes HLT #0xF000,
+        which is UNDEFINED without a debugger attached, and the riscv32 form
+        stores to a fixed physical address — so this must be off in anything
+        that ships.
 
 config BOOT_KINBOOT
     bool "Boot through kinboot-efi"
@@ -192,7 +196,8 @@ config INKERNEL_TESTS
 
 config STACK_GUARD_TEST
     bool "Overflow the boot stack on purpose"
-    depends on QEMU_EXIT
+    # A guard page is an unmapped page; without translation there is none.
+    depends on QEMU_EXIT && MM_PAGED
     default n
     help
         After bring-up, recurse until the boot stack reaches its guard page,
@@ -208,7 +213,7 @@ config STACK_GUARD_TEST
 
 config THREAD_STACK_GUARD_TEST
     bool "Overflow a kernel thread's stack on purpose"
-    depends on QEMU_EXIT
+    depends on QEMU_EXIT && MM_PAGED
     default n
     help
         After bring-up, start a kernel thread on a stack from the guarded
@@ -221,7 +226,7 @@ config THREAD_STACK_GUARD_TEST
 
 config NULL_DEREF_TEST
     bool "Read through a null pointer on purpose"
-    depends on QEMU_EXIT
+    depends on QEMU_EXIT && MM_PAGED
     default n
     help
         After bring-up, read address zero. Page 0 is never mapped in the

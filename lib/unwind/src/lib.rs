@@ -57,37 +57,66 @@ mod tests;
 use hal::{EarlyConsole, ImageSections};
 
 /// Where a frame record keeps its two words, relative to the frame pointer.
+///
+/// Signed, because not every ABI puts the record at or above the frame pointer. The
+/// RISC-V psABI points `s0` at the *top* of the frame — the caller's stack pointer on
+/// entry — and keeps the record in the two words just below it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Layout {
     /// Size of a saved frame pointer and of a return address, in bytes.
     pub word: usize,
     /// Offset of the caller's saved frame pointer.
-    pub saved_fp: usize,
+    pub saved_fp: isize,
     /// Offset of the return address into the caller.
-    pub return_address: usize,
+    pub return_address: isize,
 }
 
 impl Layout {
-    /// The layout every current port uses: the saved frame pointer at the frame
-    /// pointer, the return address one word above it. `push rbp; mov rbp, rsp` on
-    /// x86_64, the same with `ebp` on i686, and the `{x29, x30}` pair that AAPCS64
-    /// requires `x29` to point at.
+    /// The saved frame pointer at the frame pointer, the return address one word above
+    /// it. `push rbp; mov rbp, rsp` on x86_64, the same with `ebp` on i686, and the
+    /// `{x29, x30}` pair that AAPCS64 requires `x29` to point at.
     pub const fn frame_record(word: usize) -> Layout {
         Layout {
             word,
             saved_fp: 0,
-            return_address: word,
+            return_address: word as isize,
         }
     }
 
-    /// Bytes from the frame pointer to the end of the record.
+    /// The record in the two words below the frame pointer: the return address at
+    /// `fp - word`, the saved frame pointer at `fp - 2 * word`. RISC-V's shape.
+    pub const fn record_below(word: usize) -> Layout {
+        Layout {
+            word,
+            saved_fp: -2 * (word as isize),
+            return_address: -(word as isize),
+        }
+    }
+
+    /// Offset of the record's lowest byte from the frame pointer.
+    const fn lowest(&self) -> isize {
+        if self.saved_fp < self.return_address {
+            self.saved_fp
+        } else {
+            self.return_address
+        }
+    }
+
+    /// Bytes from the record's lowest byte to its end.
     fn span(&self) -> usize {
         let hi = if self.saved_fp > self.return_address {
             self.saved_fp
         } else {
             self.return_address
         };
-        hi + self.word
+        (hi - self.lowest()).unsigned_abs() + self.word
+    }
+
+    /// The address of the record's lowest byte for frame pointer `fp`, or `None` if it
+    /// would wrap. A stack is looked up by an address inside it, and with the record
+    /// below the frame pointer the outermost frame's `fp` is one past the stack's top.
+    pub fn record_start(&self, fp: usize) -> Option<usize> {
+        fp.checked_add_signed(self.lowest())
     }
 }
 
@@ -197,19 +226,24 @@ impl<M: Memory> Iterator for Walk<'_, M> {
         if self.layout.word == 0 || fp % self.layout.word != 0 {
             return self.end(Stop::Misaligned);
         }
-        // Checked arithmetic: a frame pointer near the top of the address space must be
-        // rejected, not wrapped around into a small address that happens to pass.
-        let inside = fp >= self.lo
-            && fp
-                .checked_add(self.layout.span())
-                .is_some_and(|end| end <= self.hi);
+        // Checked arithmetic: a frame pointer near either end of the address space must be
+        // rejected, not wrapped around into an address that happens to pass.
+        let inside = self.layout.record_start(fp).is_some_and(|start| {
+            start >= self.lo
+                && start
+                    .checked_add(self.layout.span())
+                    .is_some_and(|end| end <= self.hi)
+        });
         if !inside {
             return self.end(Stop::OutsideStack);
         }
 
+        // Neither wraps: both words lie inside the record just checked.
         let (Some(ra), Some(saved)) = (
-            self.mem.read_word(fp + self.layout.return_address),
-            self.mem.read_word(fp + self.layout.saved_fp),
+            self.mem
+                .read_word(fp.wrapping_add_signed(self.layout.return_address)),
+            self.mem
+                .read_word(fp.wrapping_add_signed(self.layout.saved_fp)),
         ) else {
             return self.end(Stop::Unreadable);
         };
@@ -333,7 +367,10 @@ pub unsafe fn print(
         write_addr(c, pc);
         c.write_str("\n");
     }
-    let Some((lo, hi)) = stack_bounds(sections, fp) else {
+    let found = layout
+        .record_start(fp)
+        .and_then(|at| stack_bounds(sections, at));
+    let Some((lo, hi)) = found else {
         c.write_str("  bt end: frame pointer ");
         write_addr(c, fp);
         c.write_str(" is not in any known stack\n");
@@ -383,7 +420,10 @@ pub struct Chain {
 pub unsafe fn chain(layout: Layout, sections: &ImageSections, fp: usize) -> Chain {
     let as_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
     let text = as_usize(sections.text.0)..as_usize(sections.text.1);
-    let Some((lo, hi)) = stack_bounds(sections, fp) else {
+    let found = layout
+        .record_start(fp)
+        .and_then(|at| stack_bounds(sections, at));
+    let Some((lo, hi)) = found else {
         return Chain {
             frames: 0,
             stop: Stop::OutsideStack,

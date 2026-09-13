@@ -103,6 +103,7 @@ pub mod lockdep;
 pub mod once;
 #[cfg(target_has_atomic = "32")]
 pub mod spin;
+pub mod wide;
 
 #[cfg(test)]
 mod testing;
@@ -123,3 +124,4 @@ pub use once::{CasGate, CasOnce};
 pub use once::{Claim, IrqGate, IrqOnce, Once, OnceGate};
 #[cfg(target_has_atomic = "32")]
 pub use spin::{SpinGuard, SpinIrqGuard, SpinLock};
+pub use wide::IrqU64;

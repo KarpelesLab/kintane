@@ -141,7 +141,11 @@ Each verdict was falsified, in every case by a mutation confirmed to have applie
 | aarch64 vector ignores the thread-stack array | the thread overflow is reported from a frame beneath its guard and fails; the boot-stack test still passes |
 | Page 0 mapped | the kernel space is refused. With the check also removed, the null read succeeds and x86_64 and i686 fail |
 
-CI runs all three on every preset, beside the ordinary boot.
+CI runs all three on every preset with an MMU, beside the ordinary boot. A guard page
+is an unmapped page, and `riscv32-virt` has nothing to unmap: the three symbols depend on
+`MM_PAGED`, the configuration refuses them there, and CI skips that preset and says so.
+An overflow on `riscv32` is not caught today. PMP regions could catch it and are not
+programmed yet.
 
 ### 3. Boot and integration tests
 
@@ -182,7 +186,7 @@ hand:
 | i686 (`i686-bios`) | `qemu-system-i386` | `pc` (i440FX), raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
 | armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
-| riscv32 | `qemu-system-riscv32` | `virt` | `-bios none` | `sifive_test` |
+| riscv32 (`riscv32-virt`) | `qemu-system-riscv32` | `virt` | `-bios none`, `-kernel` | `sifive_test` |
 
 The UEFI row is the `x86_64-efi` preset. It needs firmware that is not part of the
 pinned toolchain, so `kbuild` looks for OVMF where distributions put it: next to the
@@ -226,7 +230,12 @@ terminate with a status, and we use it:
   there is no other channel at all.
 - **RISC-V:** the `sifive_test` MMIO finisher built into the `virt` machine (it is part
   of the machine, not a `-device`). Write `0x5555` to pass, `0x3333 | (code << 16)` to
-  fail.
+  fail. A pass is QEMU exit status 0, the same asymmetry as semihosting: QEMU also exits
+  0 for reasons of its own, and a guest that wrote `0x3333` with a code of 0 would pass.
+  The harness treats a timeout as a failure; only the kernel's own `exit_emulator` writes
+  the register, and it writes a code of 1 for a failure. A fatal trap on this port ends
+  the run through the same channel, so a crash test finishes at once instead of timing
+  out.
 
 ### Structured output
 

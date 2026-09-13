@@ -47,7 +47,7 @@ use core::cell::SyncUnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use arch::Cpu;
 use boot_protocol::{MemoryKind, MemoryRegion};
@@ -58,7 +58,7 @@ use mm::phys::{FrameAllocator, bitmap_bytes};
 use sync::LockFamily;
 use sync::lockdep::LockClass;
 
-use crate::{Check, DIRECT_MAP_MAX, Locks, write_usize};
+use crate::{AtomicU64, Check, DIRECT_MAP_MAX, Locks, write_usize};
 
 /// Frames the heap owns for the life of the kernel.
 const PAGES: usize = 512;
