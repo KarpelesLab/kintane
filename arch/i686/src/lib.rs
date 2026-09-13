@@ -141,3 +141,14 @@ pub fn qemu_exit(code: u8) -> ! {
 pub fn exit_emulator(ok: bool) -> ! {
     qemu_exit(if ok { 0x10 } else { 0x11 })
 }
+
+/// Bring up interrupt handling and prove it works, reporting what happened.
+///
+/// Exists so that `kmain` can exercise the interrupt path without naming an
+/// architecture, and so that adding interrupt support to a port touches only that
+/// port. Returns `true` when the path is demonstrably live: a handler ran and
+/// control returned.
+pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
+    c.write_str("not implemented on this port");
+    false
+}

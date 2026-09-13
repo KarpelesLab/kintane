@@ -56,6 +56,12 @@ fn banner(boot_arg: u64) {
     c.write_str(if kconfig::MM_PAGED { "y" } else { "n" });
     c.write_str(" DEBUG=");
     c.write_str(if kconfig::DEBUG_BUILD { "y" } else { "n" });
+    c.write_str("\n  interrupts ");
+    // The architecture brings up its own interrupt path; the image only reports the
+    // verdict. Nothing here names a machine.
+    let irq_ok = arch::interrupt_selftest(c);
+    c.write_str(if irq_ok { " ok" } else { "" });
+
     c.write_str("\n\nreached kmain\n");
 }
 
