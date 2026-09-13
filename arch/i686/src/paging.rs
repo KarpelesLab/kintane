@@ -354,6 +354,44 @@ fn read_cr3() -> u32 {
     }
     v
 }
+/// Set `CR0.WP`, and report whether it took.
+///
+/// With WP clear, a supervisor write to a page whose R/W bit is 0 **succeeds
+/// silently**. Every read-only mapping the kernel makes for itself — `.rodata`, a
+/// guard page, a W^X split — is then decorative, and the first symptom is not a fault
+/// but the absence of one. The x86-64 port shipped with this bit clear and its
+/// read-only check printed "NO FAULT" the first time it ran; this port had the same
+/// hole and no check to notice, which is the more interesting half of the story.
+///
+/// Safe to call at exactly this point: everything currently mapped is writable, so
+/// turning the bit on cannot fault anything already in flight.
+///
+/// Read back rather than assumed, for the same reason as NXE.
+pub fn enable_write_protect() -> bool {
+    // SAFETY: CR0 is readable and writable at CPL 0, which is where the kernel runs.
+    // Setting WP changes only whether supervisor writes honour the R/W bit; it does
+    // not alter any mapping.
+    unsafe {
+        let mut cr0: u32;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        cr0 |= 1 << 16;
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+        let check: u32;
+        core::arch::asm!("mov {}, cr0", out(reg) check, options(nomem, nostack, preserves_flags));
+        check & (1 << 16) != 0
+    }
+}
+
+/// Whether `CR0.WP` is set, so a clear R/W bit binds the kernel too.
+pub fn write_protect_enabled() -> bool {
+    // SAFETY: reading CR0 at CPL 0 has no side effects.
+    unsafe {
+        let cr0: u32;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        cr0 & (1 << 16) != 0
+    }
+}
+
 
 /// Turn on `EFER.NXE` if the CPU has it, and report whether bit 63 is now usable.
 ///
@@ -553,8 +591,12 @@ const WIDE_PHYS: u64 = 0x0000_000F_1234_5000;
 /// no code or data lives in.
 pub fn selftest(c: &dyn EarlyConsole) -> bool {
     let nx = enable_nx();
+    // Without this a read-only mapping does not bind the kernel at all, so every
+    // protection below would report success while enforcing nothing.
+    let wp = enable_write_protect();
 
     let geometry_ok = check_geometry(c, nx);
+    c.write_str(if wp { ", WP on" } else { ", WP UNAVAILABLE" });
     let root = build();
 
     // SAFETY: `build` has just written a complete PAE hierarchy whose four PDPTEs
