@@ -3,9 +3,9 @@ section .bss 131072
 section .data 69632
 section .rodata 16384
 section .stack 16384
-section .text 180224
+section .text 188416
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 1358 data 0 bss 0
+crate (anonymous) text 0 rodata 1700 data 0 bss 0
 crate (unmangled) text 1236 rodata 0 data 0 bss 0
 crate __rustc text 161 rodata 0 data 0 bss 0
 crate acpi text 6827 rodata 0 data 0 bss 0
@@ -14,17 +14,17 @@ crate boot_protocol text 1700 rodata 0 data 0 bss 0
 crate bootinfo text 1949 rodata 0 data 0 bss 0
 crate buildid text 181 rodata 32 data 0 bss 0
 crate cmdline text 1271 rodata 0 data 0 bss 0
-crate core text 5863 rodata 0 data 0 bss 0
+crate core text 6069 rodata 0 data 0 bss 0
 crate device text 16600 rodata 0 data 0 bss 0
 crate hal text 1395 rodata 0 data 0 bss 0
 crate kalloc text 13235 rodata 0 data 0 bss 0
-crate kintane text 46534 rodata 24 data 2732 bss 36554
-crate mm text 23154 rodata 0 data 0 bss 0
+crate kintane text 50527 rodata 24 data 2988 bss 36867
+crate mm text 23170 rodata 0 data 0 bss 0
 crate platform text 15410 rodata 96 data 63020 bss 1412
-crate sched text 365 rodata 0 data 0 bss 0
+crate sched text 1300 rodata 0 data 0 bss 0
 crate strip_suffix text 39 rodata 0 data 0 bss 0
-crate sync text 5021 rodata 0 data 800 bss 136
-crate thread text 3439 rodata 0 data 0 bss 0
+crate sync text 8076 rodata 16 data 800 bss 136
+crate thread text 2828 rodata 0 data 0 bss 0
 crate time text 3971 rodata 0 data 0 bss 0
 crate unwind text 2448 rodata 0 data 0 bss 0
-total 675840
+total 684032

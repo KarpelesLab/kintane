@@ -1,28 +1,28 @@
 # kbuild size report for preset riscv32-virt. Rewrite with `kbuild size --preset riscv32-virt --update-baseline`.
 section .bss 57344
-section .data 3736
+section .data 3992
 section .rodata 12288
 section .stack 16384
 section .stack_guard 4096
-section .text 86016
+section .text 98304
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 6877 data 28 bss 3632
+crate (anonymous) text 0 rodata 7242 data 16 bss 4168
 crate (unmangled) text 2320 rodata 0 data 0 bss 0
 crate __rustc text 160 rodata 0 data 0 bss 0
-crate arch text 3970 rodata 0 data 0 bss 16520
+crate arch text 3898 rodata 0 data 0 bss 16520
 crate bootinfo text 1224 rodata 0 data 0 bss 0
 crate buildid text 334 rodata 32 data 0 bss 0
 crate cmdline text 1292 rodata 0 data 0 bss 0
-crate core text 5484 rodata 0 data 0 bss 0
+crate core text 5608 rodata 0 data 0 bss 0
 crate fdt text 6374 rodata 0 data 0 bss 0
 crate hal text 818 rodata 0 data 0 bss 0
-crate kalloc text 12102 rodata 0 data 0 bss 0
-crate kintane text 26490 rodata 24 data 2924 bss 36830
-crate mm text 7214 rodata 0 data 0 bss 0
+crate kalloc text 12078 rodata 0 data 0 bss 0
+crate kintane text 36050 rodata 24 data 3180 bss 37366
+crate mm text 6092 rodata 0 data 0 bss 0
 crate platform text 68 rodata 0 data 0 bss 0
-crate sched text 332 rodata 0 data 0 bss 0
-crate sync text 5746 rodata 0 data 808 bss 136
-crate thread text 3454 rodata 0 data 0 bss 0
-crate time text 3554 rodata 0 data 0 bss 0
+crate sched text 836 rodata 0 data 0 bss 0
+crate sync text 7400 rodata 16 data 808 bss 136
+crate thread text 3298 rodata 0 data 0 bss 0
+crate time text 3970 rodata 0 data 0 bss 0
 crate unwind text 2300 rodata 0 data 0 bss 0
-total 442008
+total 454552
