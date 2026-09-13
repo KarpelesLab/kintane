@@ -47,8 +47,13 @@ a rewrite. See [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-Pre-implementation. The repository currently contains design documentation and a
-roadmap. Nothing boots yet.
+Pre-implementation. The repository currently contains design documentation, a
+roadmap, and the pinned toolchain. Nothing boots yet.
+
+The build engine is pinned exactly in [`toolchain.toml`](toolchain.toml): a Rust 1.98
+stable baseline on a hash-pinned nightly, with the unstable surface enumerated in one
+table. Nightly is required rather than preferred — 32-bit x86 bare metal has no
+built-in rustc target, and hand-written target specs are nightly-gated.
 
 Start with the [roadmap](docs/roadmap.md) for what is planned and in what order, and
 [docs/decisions.md](docs/decisions.md) for the foundational choices and why they were

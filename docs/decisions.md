@@ -159,19 +159,42 @@ for third parties. See [modules.md](modules.md).
 
 ---
 
-### D8 — Pinned nightly toolchain, no third-party crates in the kernel
+### D8 — Rust 1.98 baseline on a pinned nightly engine, no third-party crates
 **Accepted.** 2026-09-13.
 
-Exact nightly date and component hashes in `toolchain.toml`. Everything under `hal/`,
-`arch/`, `kernel/`, `drivers/`, `lib/` is written in-tree or vendored with a
-documented reason.
+**Baseline: Rust 1.98.** The stable surface we may rely on freely; nothing older is
+supported and no shims are written for it.
 
-*Why:* nightly is unavoidable for custom target specs and `naked_functions`; an
-unpinned nightly is not a build system. Zero external dependencies keeps the `unsafe`
-budget and the audit surface under our control.
+**Engine: an exactly pinned nightly**, recorded in [`toolchain.toml`](../toolchain.toml)
+— channel, release, `commit-hash`, `commit-date`, and LLVM version, all verified by
+`kbuild` before it builds anything.
 
-*Cost:* we write things that exist elsewhere. Accepted; it is the normal cost of a
-kernel.
+*Why nightly is required rather than preferred* — verified against stable 1.98, not
+assumed:
+
+1. Custom JSON target specs are nightly-gated, and **there is no built-in
+   `i686-unknown-none`**. Every other tier-1 target has a built-in bare-metal
+   equivalent; 32-bit x86 does not. Tier-1 `i686` cannot exist on stable.
+2. `extern "x86-interrupt"` for IDT entry points is still experimental.
+3. Building `core` and `compiler_builtins` from source with our own codegen flags.
+
+`naked_functions` was listed as a reason in the first draft of this decision and is
+not one: `#[unsafe(naked)]` has been stable since 1.88. The unstable surface is
+enumerated in `toolchain.toml`'s `[features]` table, and each bump re-checks whether
+an entry can be dropped. The intent is for that table to empty and the engine to move
+to stable.
+
+*Why the pin is by hash:* the dated nightly manifest carries a SHA256 per component,
+so pinning one manifest hash transitively pins all 997 packages — no per-component
+list to drift. LLVM's version is pinned alongside rustc's because codegen differs
+between LLVM releases even when the compiler does not change.
+
+*Why no third-party crates:* everything under `hal/`, `arch/`, `kernel/`, `drivers/`,
+`lib/` is written in-tree or vendored with a documented reason and license. Keeps the
+`unsafe` budget and the audit surface under our control.
+
+*Cost:* nightly churns, so bumps are deliberate, isolated commits with a full-matrix
+build. We write things that exist elsewhere — the normal cost of a kernel.
 
 ---
 

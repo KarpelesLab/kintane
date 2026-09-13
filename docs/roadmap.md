@@ -21,7 +21,12 @@ out.
 - Crate graph from `kmod.toml`, topological build, direct `rustc` invocation, content-
   addressed cache.
 - Building `core` from source against in-tree target specs.
-- Pinned toolchain in `toolchain.toml`.
+- `kbuild toolchain --verify` / `--fetch`: enforce the pin in
+  [`toolchain.toml`](../toolchain.toml) before any build, and refuse to proceed on a
+  `commit-hash`, `release`, or LLVM-version mismatch.
+- Reproducibility from the start — path remapping, `SOURCE_DATE_EPOCH`, deterministic
+  link order — because retrofitting byte-identical builds is far harder than never
+  losing them.
 - `x86_64` target spec, UEFI entry, early serial console, panic handler, `kbuild run`
   under QEMU.
 - Skeleton `hal` traits — `Arch` only, no capability traits yet.

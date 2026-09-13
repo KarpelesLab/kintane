@@ -1,0 +1,64 @@
+# The build engine, pinned exactly.
+#
+# kbuild verifies every field here against the toolchain it is about to invoke and
+# refuses to build on a mismatch. There is no "compatible enough" — a kernel built
+# with a different compiler is a different kernel.
+#
+# See docs/build-system.md#toolchain-policy for the reasoning and the bump procedure.
+
+[baseline]
+# The stable Rust release whose language and library surface we may rely on freely.
+# Nothing older is supported and no compatibility shims are written for it.
+# Raising this is a deliberate change, not a side effect of a nightly bump.
+rust = "1.98"
+edition = "2024"
+
+[toolchain]
+# Nightly is required, not preferred. Three things force it, each verified:
+#   1. Custom JSON target specs are nightly-gated, and i686 bare-metal has no
+#      built-in target — there is no i686-unknown-none. Our tier-1 i686 support
+#      cannot exist on stable.
+#   2. extern "x86-interrupt", for x86 and x86_64 IDT entry points.
+#   3. Building core and compiler_builtins from source with our own codegen flags.
+# If all three ever stabilize, this section moves to a stable channel and the
+# [features] list below empties.
+channel     = "nightly-2026-08-30"
+release     = "1.100.0-nightly"
+commit-hash = "90850177249efe0321573c569aec5d12b257f8d6"
+commit-date = "2026-08-30"
+llvm        = "23.1.0"
+
+# Pinning the manifest pins everything: it carries a SHA256 for each of the 997
+# component packages it describes. One hash to verify, no per-component list to
+# keep in sync.
+manifest        = "https://static.rust-lang.org/dist/2026-08-30/channel-rust-nightly.toml"
+manifest-sha256 = "d950b3b494cde6b8448964e1795a86530bff7ee5e729a48ed6341c6ec3ee5ad1"
+
+# Mirrored locally at release time. static.rust-lang.org retains dated nightlies,
+# but a reproducible build may not depend on someone else's retention policy.
+mirror = "https://mirror.kintane.example/rust/2026-08-30/"
+
+[components]
+required = [
+    "rustc",        # the compiler
+    "rust-std",     # host std only, for kbuild and host tests
+    "rust-src",     # core + compiler_builtins sources; we build them ourselves
+    "llvm-tools",   # objcopy, nm, strip, for image packaging and symbol extraction
+]
+optional = ["rustfmt", "clippy", "rust-analyzer"]
+
+# The complete list of unstable features the kernel is permitted to use.
+# Adding an entry requires a written justification and a reviewer. Every toolchain
+# bump re-checks whether an entry has stabilized and can be dropped.
+[features]
+"custom-target-specs" = "i686 bare metal has no built-in target; see targets.md"
+"build-core-from-source" = "panic_immediate_abort, our codegen flags, no prebuilt std"
+"abi_x86_interrupt" = "IDT entry points on x86_64 and i686"
+"sync_unsafe_cell" = "shared mutable statics with a documented invariant; static mut is forbidden"
+
+[reproducibility]
+# Byte-identical output from the same source and config, on any machine.
+remap-path-prefix = true    # no build directory in the binary
+source-date-epoch = true    # from the commit, never from the clock
+deterministic-link-order = true
+record-build-hash = true    # emitted alongside the image; CI rebuilds and compares

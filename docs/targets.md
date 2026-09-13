@@ -51,6 +51,26 @@ hardware description, segmentation.
 This target exists specifically to catch the `usize`-as-physical-address assumption
 that creeps into any kernel written 64-bit-first. It is tier 1 for that reason.
 
+It is also the hardest target to stand up, and the one that dictates our toolchain
+policy. **There is no built-in `i686-unknown-none`**: every other tier-1 target has a
+built-in bare-metal equivalent, but 32-bit x86 bare metal must be described by a
+hand-written target specification — which is nightly-gated, and is therefore the
+single reason we cannot build on stable
+([build-system.md](build-system.md#engine-a-pinned-nightly)).
+
+Two known hazards in that specification, found while validating it:
+
+- `+soft-float` is rejected outright as incompatible with the i686 ABI, which returns
+  floats in x87 registers. The x86_64 approach of `-mmx,-sse,+soft-float` does not
+  transfer.
+- Disabling SSE fails to build `core`, which contains functions requiring the `sse`
+  target feature. A kernel that does not want SSE in kernel context still has to get
+  `core` compiled, so the feature set and the FP-usage policy have to be settled
+  together rather than assumed.
+
+Neither is a blocker; both are Phase 1 work that would otherwise have been discovered
+late.
+
 ### `armv7m` — Cortex-M, no MMU
 
 Thumb-2, MPU instead of MMU, no privilege model worth speaking of, single core,
@@ -105,6 +125,12 @@ Each target has a JSON spec under `targets/` pinned in-tree rather than relying 
 built-in rustc target, so that a rustc upgrade cannot silently change our ABI, our
 relocation model, or our atomic width assumptions. `kbuild` builds `core` from source
 against these specs.
+
+Built-in targets are used as the *starting point* where one exists — `x86_64-unknown-none`,
+`aarch64-unknown-none-softfloat`, `thumbv7m-none-eabi`, `riscv32imac-unknown-none-elf`,
+and `riscv32i-unknown-none-elf` for the no-atomics variant — dumped with
+`--print target-spec-json`, then edited and committed. `i686` has no such starting
+point and is written from scratch.
 
 The spec records, among other things:
 - pointer width, data layout, endianness

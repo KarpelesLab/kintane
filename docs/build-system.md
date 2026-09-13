@@ -14,8 +14,10 @@ neither. Specifically:
   a different panic strategy.
 - **`build.rs` is the wrong hook.** Config resolution is a whole-tree constraint
   problem, not a per-crate script.
-- **Target JSON and `build-std` are still awkward**, and we need to build `core` from
-  source for every target, with our own codegen flags.
+- **Building `core` from source is a cargo problem, not a rustc problem.** We need
+  `core` and `compiler_builtins` compiled per target with our own codegen flags.
+  Through cargo that means `-Z build-std` and its constraints; calling `rustc`
+  directly makes it just another crate in the graph.
 - **We are not shipping source.** Dependency resolution, semver, and registry
   publishing are machinery we pay for and never use.
 
@@ -180,6 +182,7 @@ every-target-every-merge rule in [testing.md](testing.md) affordable.
 ## Commands
 
 ```
+kbuild toolchain [--verify|--fetch]       check or install the pinned toolchain
 kbuild config [--preset P] [--set K=V]   resolve configuration
 kbuild menuconfig                         interactive configuration
 kbuild build [--target T]                 build the kernel image
@@ -194,14 +197,91 @@ kbuild sdk                                produce a module SDK for this config
 
 ## Toolchain policy
 
-- **Pinned nightly**, recorded in `toolchain.toml` with an exact date and the SHA256
-  of each required component. Nightly is unavoidable — we need features like
-  `naked_functions` for exception entry and custom target specs — but an unpinned
-  nightly is not a build system, it is a lottery.
-- **Toolchain bumps are deliberate changes** with their own commit, a note on what
-  they buy, and a full-matrix build.
-- **`rustc` is invoked directly.** No `cargo`, no `rustup` wrapper shims in the build
-  path; `kbuild` resolves the absolute toolchain paths once and records them.
+Recorded in [`toolchain.toml`](../toolchain.toml) at the repository root. An unpinned
+toolchain is not a build system, it is a lottery.
+
+### Baseline: Rust 1.98
+
+The stable release whose language and library surface we may rely on freely. Nothing
+older is supported and no compatibility shims are written for it. Raising the baseline
+is a deliberate change with its own commit, not a side effect of a nightly bump.
+
+### Engine: a pinned nightly
+
+Nightly is **required, not preferred**. Three things force it, each verified against
+stable 1.98 rather than assumed:
+
+1. **Custom JSON target specifications are nightly-gated** — stable rejects them
+   outright: *"custom targets are unstable and require `-Zunstable-options`"*. This
+   matters because **there is no built-in `i686-unknown-none`**. Every other tier-1
+   target has a built-in bare-metal equivalent (`x86_64-unknown-none`,
+   `aarch64-unknown-none-softfloat`, `thumbv7m-none-eabi`,
+   `riscv32imac-unknown-none-elf`), but 32-bit x86 bare metal does not exist as a
+   built-in target and must be described by hand. Our tier-1 `i686` support cannot
+   exist on stable.
+2. **`extern "x86-interrupt"`** for IDT entry points on x86_64 and i686 — still
+   experimental.
+3. **Building `core` and `compiler_builtins` from source** with our own codegen
+   flags.
+
+Notably *not* a reason any more: `naked_functions`. `#[unsafe(naked)]` and
+`naked_asm!` are stable as of 1.88 and compile fine on 1.98, as does
+`#[diagnostic::on_unimplemented]`, which [portability.md](portability.md#what-this-costs)
+relies on for capability-trait error messages.
+
+The unstable surface is enumerated in `toolchain.toml`'s `[features]` table and
+nowhere else. Adding an entry needs a written justification and a reviewer. Every
+bump re-checks whether an entry has stabilized and can be dropped — the goal is for
+that table to shrink to nothing and this section to name a stable channel.
+
+### How the pin is enforced
+
+`kbuild` runs `rustc -vV` before anything else and compares **`commit-hash`,
+`release`, and `LLVM version`** against `toolchain.toml`. A mismatch is a hard error,
+not a warning. A kernel built with a different compiler is a different kernel, and
+LLVM's version is part of that: codegen differs between LLVM releases even when rustc
+does not change.
+
+Component integrity comes from the dated manifest at
+`static.rust-lang.org/dist/<date>/channel-rust-nightly.toml`, which carries a SHA256
+for each component package it describes. **Pinning that one manifest hash transitively
+pins all 997 of them**, so there is no per-component hash list to maintain and drift.
+`kbuild toolchain --verify` checks it; `kbuild toolchain --fetch` installs from it.
+
+Dated nightlies are retained upstream, but a reproducible build should not depend on
+someone else's retention policy, so releases are cut against a local mirror recorded
+in the same file.
+
+### Bumping
+
+A toolchain bump is its own commit, containing only `toolchain.toml` and whatever
+minimal changes the new compiler forces, with a message stating what the bump buys,
+which `[features]` entries it lets us drop, and the result of a full-matrix build.
+Bumps do not ride along with feature work.
+
+### Reproducibility
+
+Same source plus same `.config` plus same `toolchain.toml` must produce a
+byte-identical image on any machine:
+
+- `--remap-path-prefix` for every input, so no build directory appears in the binary.
+- `SOURCE_DATE_EPOCH` derived from the commit, never from the clock.
+- Deterministic link order — the crate graph is topologically sorted with ties broken
+  by name, never by filesystem iteration order.
+- No `__DATE__`-equivalents, no hostname, no build counter anywhere in the image.
+- `kbuild build` records the hash of every output. CI rebuilds each release from
+  scratch on a different machine and compares; a mismatch blocks the release.
+
+This is also what makes the build identity in [modules.md](modules.md) meaningful — a
+module's compatibility check is only as trustworthy as the determinism of the build it
+names.
+
+### Invocation
+
+**`rustc` is invoked directly.** No `cargo`, no `rustup` shims in the build path;
+`kbuild` resolves absolute toolchain paths once and records them. Note that
+`-Z build-std` never enters the picture — it is a *cargo* feature, and since we call
+`rustc` ourselves, compiling `core` from source is simply compiling a crate.
 - **No third-party crates in the kernel.** Everything under `hal/`, `arch/`,
   `kernel/`, `drivers/`, and `lib/` is written here or vendored with a documented
   reason. This is a defensible position for a kernel and it keeps the audit surface
