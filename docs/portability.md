@@ -326,6 +326,61 @@ one name and let the configuration select among them. The rule was true for the 
 architecture and not for the second, and that distinction is the kind of thing a
 roadmap tends to lose.
 
+### The other extreme: riscv32
+
+The fourth architecture was the first without an MMU: rv32imac in machine mode, which
+implements `Arch`, `HasCas`, `UniProcessor` and a context switch, and nothing else. The
+same `kernel/main` boots on it and runs everything that does not need translation:
+
+- the memory map, the frame allocator and the kernel heap;
+- interrupts, the context switch and preemption;
+- sleep, the tickless idle and lock-order checking;
+- all 35 in-kernel checks and crash decoding.
+
+The MMU checks report Skipped. The claim was that code needing a capability simply is not
+in an image without it. For the kernel's subsystems that held with no change: every one
+of them already compiled for rv32imac, which `kbuild portability` had been checking since
+Phase 2.
+
+The rule about which files an architecture may touch did **not** hold, and the files are
+worth listing, because each is a different kind of miss.
+
+- **`kernel/main` assumed an MMU (the expected one).** The banner, the kernel address
+  space, demand paging and three test modes named `HasMmu`, `HasPageTables` and arch
+  functions no flat port has. They moved unchanged into `model_paged.rs`, and
+  `model_flat.rs` answers the same calls. The choice between them is made once, at module
+  level on `MM_PAGED`/`MM_FLAT`. A one-time cost, like the provider units were for the
+  second architecture. Every existing preset's banner is identical before and after,
+  apart from numbers.
+- **`kernel/main` used `AtomicU64` (the portability check could not see it).** The image
+  crate is not host-tested, so `kbuild portability` never compiled it. rv32imac has no
+  64-bit atomics, so `kernel/main` now names `crate::AtomicU64`: the real one where the
+  target has it, otherwise `sync::IrqU64`, a masked-interrupt counter with the same
+  methods that only a `UniProcessor` can use. The hardware-independent units needed
+  nothing, and the one unit that was never checked did.
+- **Latent bugs in shared code.**
+  - `boot/info-fdt` refused a device tree ending above `isize::MAX`, a requirement it
+    read into `slice::from_raw_parts` that the function does not have. On a 64-bit port
+    it could never trigger. On a 32-bit machine whose RAM starts at 2 GiB it turned every
+    tree into "no loader".
+  - `lib/unwind`'s frame layout had unsigned offsets, so the RISC-V record, which sits
+    below the frame pointer, could not be described at all.
+- **Selection and plumbing, not code.**
+  - `info-fdt` and `info-none` gained `ARCH_RISCV32` in their `requires` lines.
+  - `kbuild/src/qemu.rs` gained the machine.
+  - CI's guard-page loops skip presets without `MM_PAGED`.
+
+  All of that is configuration in everything but location.
+
+The port also found a mistake that would have been easy to copy into every future one.
+Its `irq_restore` was written like aarch64's, with `options(nomem)`. That tells the
+optimiser the instruction touches no memory, yet unmasking lets a handler run that
+writes the tick counter. The clock check's wait loop had its counter read hoisted out,
+and it waited out its whole timeout for an interrupt it had already taken. The asm that
+unmasks interrupts on this port no longer claims `nomem`. The aarch64 and x86 ports use
+atomics for their counters and passed. They carry the same claim, and whether it can
+bite them is not yet checked.
+
 ### Keeping it true
 
 The claim is only credible if it is checked continuously. The rule:

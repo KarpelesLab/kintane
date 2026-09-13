@@ -159,13 +159,15 @@ pub unsafe fn device_tree(boot_arg: u64) -> Result<&'static [u8], Error> {
         .ok_or(Error::Malformed {
             offset: TOTALSIZE_OFFSET,
         })?;
-    // `from_raw_parts` requires the range not to wrap and to fit in `isize`. A header
-    // read at an address this close to the top would already have faulted, but that is
-    // a fact about the hardware, and this is the check that does not depend on it.
-    if base
-        .checked_add(total)
-        .is_none_or(|end| end > isize::MAX.unsigned_abs())
-    {
+    // `from_raw_parts` requires the length to fit in `isize`, which `MAX_TREE_BYTES` already
+    // guarantees, and the range not to wrap. A header read at an address this close to
+    // the top would already have faulted, but that is a fact about the hardware, and this
+    // is the check that does not depend on it.
+    //
+    // It once also refused any tree *ending* above `isize::MAX`. On a 64-bit port that
+    // never mattered. On riscv32, RAM starts at 2 GiB, QEMU puts the tree at the top of
+    // it, and the check turned a valid tree into "no loader".
+    if base.checked_add(total).is_none() {
         return Err(Error::NoLoader);
     }
 

@@ -47,6 +47,7 @@
 #![deny(unsafe_code)]
 
 pub mod directmap;
+pub mod flat;
 pub mod frame;
 pub mod paged;
 pub mod phys;

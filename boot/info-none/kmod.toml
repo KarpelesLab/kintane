@@ -1,5 +1,5 @@
 # A unit providing `bootinfo` for platforms where no loader supplies a memory map yet —
-# today the no-MMU targets. x86 has `info-multiboot` and aarch64 has `info-fdt`; the
+# today ARMv7-M. x86 has `info-multiboot`, aarch64 and riscv32 have `info-fdt`; the
 # condition below must exclude every architecture another provider claims, or two
 # units named `bootinfo` are enabled at once and kbuild refuses the build.
 [unit]
@@ -12,4 +12,4 @@ layer = "core"
 units = ["boot_protocol"]
 
 [config]
-requires = "!(ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64)"
+requires = "!(ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64 || ARCH_RISCV32)"

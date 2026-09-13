@@ -65,7 +65,7 @@
 
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use arch::Cpu;
 use hal::{Arch, EarlyConsole, KernAddr};
@@ -73,7 +73,7 @@ use sched::{Priority, ThreadId};
 use thread::Threads;
 use time::{Duration, Instant};
 
-use crate::{Check, kheap, shared, timekeeping, write_usize};
+use crate::{AtomicU64, Check, kheap, shared, timekeeping, write_usize};
 
 /// Boot, idle, high, two workers, and one spare slot.
 pub const SLOTS: usize = 6;

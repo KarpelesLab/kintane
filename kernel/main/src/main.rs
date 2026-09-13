@@ -12,33 +12,56 @@
 
 mod clock;
 mod crash;
+#[cfg(CONFIG_MM_PAGED)]
 mod demand;
 mod heap;
 mod kheap;
 mod lockcheck;
 mod preempt;
 mod shared;
+#[cfg(CONFIG_MM_PAGED)]
 mod space;
 mod timekeeping;
+
+// The memory model's part of bring-up: the kernel address space, demand paging and the
+// test modes that need a guard page on a paged kernel; the flat region allocator on one
+// without an MMU. Selected here, once, at module level, which is where `cfg` belongs. The
+// rest of `kmain` calls `model::` and never learns which it got.
+#[cfg(CONFIG_MM_PAGED)]
+#[path = "model_paged.rs"]
+mod model;
+#[cfg(CONFIG_MM_FLAT)]
+#[path = "model_flat.rs"]
+mod model;
 
 use core::cell::SyncUnsafeCell;
 
 use arch::Cpu;
+use model::Live;
 
 /// The lock family for state the whole kernel shares. Named once, here, because the image
 /// is the one place allowed to name the architecture. See `sync::family`.
 type Locks = sync::Spin<Cpu>;
 use boot_protocol::{MemoryKind, MemoryRegion};
-use hal::{Arch, EarlyConsole, HasMmu, HasPageTables};
+use hal::{Arch, EarlyConsole};
 use mm::phys::{FrameAllocator, bitmap_bytes};
+
+/// A 64-bit counter the image's checks can keep in a `static`: the real atomic where the
+/// target has one.
+#[cfg(target_has_atomic = "64")]
+type AtomicU64 = core::sync::atomic::AtomicU64;
+/// On a uniprocessor without 64-bit atomics — rv32imac has none — a `u64` read and written
+/// with interrupts masked, which has the same methods.
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicU64 = sync::IrqU64<Cpu>;
 
 /// Entry from the architecture's boot code, which has already established a stack,
 /// whatever execution mode the target needs, and an identity mapping.
 ///
 /// `boot_arg` is whatever the platform's loader left in the first argument register:
-/// the multiboot info pointer on x86, a device tree pointer on aarch64, or the boot
-/// protocol's own structure when kinboot-efi started the image. The configuration's
-/// `bootinfo` provider knows which.
+/// the multiboot info pointer on x86, a device tree pointer on aarch64 and riscv32, or
+/// the boot protocol's own structure when kinboot-efi started the image. The
+/// configuration's `bootinfo` provider knows which.
 ///
 /// # Safety
 /// Called exactly once, by the architecture's boot code, with interrupts masked.
@@ -50,29 +73,7 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     let (boot, live) = banner(boot_arg);
     let c = &arch::EARLY;
 
-    // A test mode that ends the run from the fault handler. Only on a machine that came
-    // up cleanly: an overflow on tables that failed verification proves nothing.
-    if kconfig::STACK_GUARD_TEST {
-        if boot == Check::Failed {
-            finish(false);
-        }
-        c.write_str("\n  overflowing the boot stack into its guard page\n");
-        arch::kspace::provoke_guard_fault();
-    }
-    if kconfig::THREAD_STACK_GUARD_TEST {
-        if boot == Check::Failed {
-            finish(false);
-        }
-        c.write_str("\n  overflowing a kernel thread's stack into its guard page\n");
-        arch::kspace::provoke_thread_guard_fault();
-    }
-    if kconfig::NULL_DEREF_TEST {
-        if boot == Check::Failed {
-            finish(false);
-        }
-        c.write_str("\n  reading through a null pointer\n");
-        arch::kspace::provoke_null_dereference();
-    }
+    model::test_modes(c, boot);
 
     // In a production image this is the no-op provider and folds away entirely; the
     // test image gets the real one. Which is linked is a configuration question, so
@@ -109,34 +110,6 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // printed FAILED and still exited as a pass. A check that cannot change the outcome
     // is a log line.
     finish(ok && boot != Check::Failed && intact)
-}
-
-/// The kernel address space as installed, for checks made after bring-up.
-#[derive(Clone, Copy)]
-struct Live {
-    /// Frames the tables occupy, `[lo, hi)`. Empty when nothing was installed.
-    tables: (u64, u64),
-    /// The direct map the tables are reached through, when they were installed.
-    direct: Option<mm::DirectMap>,
-}
-
-impl Live {
-    const NONE: Live = Live {
-        tables: (0, 0),
-        direct: None,
-    };
-
-    /// Whether the installed tables still say what they said at bring-up. Trivially true
-    /// when nothing was installed, which the bring-up verdict has already failed.
-    fn still_intact(self, c: &dyn EarlyConsole) -> bool {
-        let Some(direct) = self.direct else {
-            return true;
-        };
-        c.write_str("  kspace     after the suite: ");
-        let ok = space::check_live::<Cpu>(c, direct, arch::image_sections());
-        c.write_str(if ok { " ok\n" } else { " DAMAGED\n" });
-        ok
-    }
 }
 
 /// The outcome of a bring-up check.
@@ -196,8 +169,8 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     c.write_str("\n  page size  ");
     write_usize(c, Cpu::PAGE_SIZE);
     c.write_str("\n  paging     ");
-    write_usize(c, <Cpu as HasMmu>::LEVELS as usize);
-    c.write_str(" levels\n  boot arg   ");
+    model::write_translation(c);
+    c.write_str("\n  boot arg   ");
     write_hex(c, boot_arg);
 
     c.write_str("\n  config     SMP=");
@@ -210,8 +183,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // the kernel's own address space depends on — NXE among them. Building that space
     // first produced data mappings with no NX, which the space's own check caught.
     c.write_str("\n  pagetable  ");
-    let paging_ok = arch::paging_selftest(c);
-    c.write_str(if paging_ok { " ok" } else { "" });
+    let paging = model::paging_selftest(c);
 
     // Before `memory`, because the kernel's address space maps the device windows the
     // drivers found here claim, and before interrupts, because this is where the
@@ -266,7 +238,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     let lockdep = lockcheck::verdict(c);
 
     c.write_str("\n\nreached kmain\n");
-    let verdict = Check::from_ok(paging_ok)
+    let verdict = paging
         .and(devices)
         .and(mem)
         .and(Check::from_ok(irq_ok))
@@ -326,7 +298,7 @@ static STORE: SyncUnsafeCell<[u8; STORE_BYTES]> = SyncUnsafeCell::new([0; STORE_
 
 /// Report what the loader said about memory, then prove the frame allocator works on
 /// it by handing out a frame and giving it back. Also returns the kernel address space
-/// [`kernel_space`] installed.
+/// the memory model's `kernel_space` installed.
 fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
     c.write_str("\n  memory map ");
     c.write_str(bootinfo::SOURCE);
@@ -435,7 +407,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
     write_usize(c, stats.free);
     c.write_str(" free");
 
-    let (space, live) = kernel_space(c, &mut frames, &regions[..n], boot_arg);
+    let (space, live) = model::kernel_space(c, &mut frames, &regions[..n], boot_arg);
     // Re-read: building the kernel space consumed frames for its tables, so the
     // accounting check below has to compare against the books as they are now.
     let stats = frames.stats();
@@ -467,7 +439,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
     let space = space
         .and(alloc)
         .and(heap::bring_up(c, &mut frames, &regions[..n]))
-        .and(demand::check(c, &mut frames, live))
+        .and(model::demand_check(c, &mut frames, live))
         .and(kheap::install(c, &mut frames, &regions[..n]));
     (space, live)
 }
@@ -480,103 +452,6 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
 /// cannot hold a page table, which `Frames::alloc_zeroed` reports rather than
 /// pretends about.
 const DIRECT_MAP_MAX: u64 = 1024 * 1024 * 1024;
-
-/// Build the kernel's own address space, check it, and install it.
-///
-/// Returns the verdict and what was installed. Nothing is installed unless every check
-/// of the built tables passed.
-fn kernel_space(
-    c: &dyn EarlyConsole,
-    frames: &mut mm::phys::FrameAllocator<'_, Cpu>,
-    map: &[MemoryRegion],
-    boot_arg: u64,
-) -> (Check, Live) {
-    c.write_str("\n  kspace     ");
-
-    // The direct map spans where RAM actually is, not `[0, top)`. An earlier version
-    // assumed memory starts at physical zero, which is true on a PC and false on
-    // aarch64, where RAM begins at 1 GiB: `[0, 1 GiB)` then contained no RAM at all, and
-    // the first page table allocation failed with nothing to allocate from.
-    let usable = || map.iter().filter(|r| r.kind == MemoryKind::Usable as u32);
-    let Some(lo) = usable().map(|r| r.start).min() else {
-        c.write_str("no usable memory");
-        return (Check::Failed, Live::NONE);
-    };
-    let hi = usable().map(|r| r.start + r.len).max().unwrap_or(lo);
-    let len = (hi - lo).min(DIRECT_MAP_MAX);
-    if len == 0 {
-        c.write_str("no usable memory");
-        return (Check::Failed, Live::NONE);
-    }
-
-    let base = hal::PhysAddr::new(lo);
-    let virt = match usize::try_from(lo) {
-        Ok(v) => hal::KernAddr::new(v),
-        Err(_) => {
-            c.write_str("RAM starts above the addressable range");
-            return (Check::Failed, Live::NONE);
-        }
-    };
-    let direct = match mm::DirectMap::new(base, virt, len) {
-        Ok(d) => d,
-        Err(_) => {
-            c.write_str("direct map rejected");
-            return (Check::Failed, Live::NONE);
-        }
-    };
-
-    // The loader's structure is read again after the switch, by the in-kernel suite, so
-    // it has to be inside the space. Zero means there is no such pointer on this port.
-    let boot_data = [boot_arg];
-    let must_reach: &[u64] = if boot_arg == 0 { &[] } else { &boot_data };
-    let sections = arch::image_sections();
-    let Some(devices) = platform::device_windows() else {
-        // Without them the switch would unmap the console on a port whose console is a
-        // device, and nothing could report what happened next.
-        c.write_str("no device windows (device discovery failed), not installed");
-        return (Check::Failed, Live::NONE);
-    };
-    let Some(built) =
-        space::build_and_verify::<Cpu>(c, frames, direct, sections, devices, must_reach)
-    else {
-        c.write_str(" FAILED, not installed");
-        return (Check::Failed, Live::NONE);
-    };
-    c.write_str(" ok");
-
-    c.write_str("\n  live       ");
-    let root = built.space.root();
-    // SAFETY: `build_and_verify` returned the space only after walking it and confirming
-    // that it maps the image with its sections' permissions, the boot stack, the whole
-    // direct map (which holds the frame allocator's bitmap and these tables), every
-    // device window the port names, and the boot data. The code running now is in
-    // `.text`, the stack is the boot stack, and interrupts are masked, so the instruction
-    // after the switch is fetchable and nothing can be delivered against a stale map.
-    // Nothing is ever freed from this space: it is the kernel's for the life of the
-    // machine, so dropping the handle below leaks nothing that should be reclaimed.
-    unsafe { built.space.activate() };
-    let installed = <Cpu as HasPageTables>::root() == root;
-    let live = Live {
-        tables: built.tables,
-        direct: Some(direct),
-    };
-    c.write_str(if installed {
-        "root "
-    } else {
-        "ROOT READ BACK WRONG "
-    });
-    write_hex(c, root.raw());
-    if !installed {
-        // Nothing below means anything on tables that are not ours, and the hardware
-        // probes edit whatever table is live.
-        return (Check::Failed, live);
-    }
-    c.write_str(", ");
-    let walked = space::check_live::<Cpu>(c, direct, sections);
-    c.write_str("\n             ");
-    let enforced = arch::kspace::enforcement_selftest(c);
-    (Check::from_ok(walked && enforced), live)
-}
 
 fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
     if v == 0 {

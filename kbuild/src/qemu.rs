@@ -187,6 +187,38 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         });
     }
 
+    if res.is_on("ARCH_RISCV32") {
+        return Ok(Machine {
+            binary: "qemu-system-riscv32",
+            args: vec![
+                // No firmware: the reset vector jumps straight to the image in M-mode,
+                // with the hart ID in a0 and the device tree in a1. `virt` always has
+                // the sifive_test finisher, which is the result channel.
+                s("-machine"),
+                s("virt"),
+                s("-bios"),
+                s("none"),
+                s("-m"),
+                mem,
+                s("-kernel"),
+                image.display().to_string(),
+                s("-serial"),
+                s("stdio"),
+                s("-display"),
+                s("none"),
+                s("-no-reboot"),
+                s("-d"),
+                s("int,guest_errors"),
+                s("-D"),
+                log.display().to_string(),
+            ],
+            // sifive_test's pass value powers off with status 0, like aarch64's
+            // semihosting, and the harness treats a timeout as a failure for the same
+            // reason.
+            success_code: 0,
+        });
+    }
+
     Err("no QEMU machine is defined for this configuration".into())
 }
 

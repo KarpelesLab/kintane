@@ -225,6 +225,38 @@ lets i686 say so, and the walker then reloads CR3 after filling or clearing such
 QEMU's TCG does not model that cache, so this follows the SDM and is not observable under
 emulation.
 
+#### The flat model, as built today (`mm::flat`)
+
+`riscv32` is the first port without an MMU, and it runs the flat model.
+`mm::flat::Regions` is a fixed-capacity, sorted list of free physical ranges. It is built
+from the memory map with every non-usable region subtracted, including the device tree,
+which sits inside RAM. It hands out first-fit ranges of any size at any power-of-two
+alignment, and returns them with coalescing. A free that overlaps free memory is refused
+as a double free. It is host-tested, including 2000 rounds of scrambled
+allocations and frees that must end at exactly the starting list.
+
+It sits beside the frame allocator, not in place of it. The heap is built on frames, and a
+4 KiB frame is still a fine unit on a flat machine. What the flat model adds is contiguous
+memory of arbitrary size and alignment, which a paged kernel gets from virtual memory
+instead. On every flat boot, a check allocates a DMA-sized and a stack-sized range from the
+real map and confirms they are aligned, inside usable RAM, outside the image and disjoint.
+It then frees both and requires the list to come back byte for byte, and requires a double
+free to be refused.
+
+Two limits are worth stating:
+
+- **A free can fail.** A free with no neighbour to merge with needs an entry of its own,
+  so capacity has to cover the map's ranges plus the most allocations alive at once. A
+  full list refuses the free, and nothing is lost.
+- **No kernel code allocates physical ranges yet.** The allocator does not outlive the
+  boot check, and no MPU or PMP regions are programmed.
+
+`kernel/main` chooses its memory model once, at module level. `model_paged.rs` holds the
+kernel address space, demand paging and the guard-page test modes; `model_flat.rs` holds
+this check. `main.rs` calls `model::` and contains no `cfg` in any body. On a flat image
+every MMU check reports Skipped: `pagetable`, `demand`, and the guard-page test modes,
+which the configuration refuses without `MM_PAGED`. None of them reports Passed.
+
 ### `kalloc` — allocation
 
 We do **not** use the `alloc` crate. Its collections abort on allocation failure,
