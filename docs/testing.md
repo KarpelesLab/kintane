@@ -204,11 +204,31 @@ memory map comes from, and a kernel built for the loader fails its boot check if
 handover is missing — a lost `rdi` must not read as "no memory map on this port".
 
 The `aarch64-virt-smp` preset is the `aarch64-virt` kernel with `SMP=y` and
-`QEMU_SMP=4`. `QEMU_SMP` is both the `-smp` given to QEMU and the CPU count the kernel
+`QEMU_CPUS=4`. `QEMU_CPUS` is both the `-smp` given to QEMU and the CPU count the kernel
 requires the device tree to report. So a run that loses the option fails, instead of
 passing an SMP check on one CPU. Its `smp` banner line is described in
 [architecture.md](architecture.md#smp). It runs every mode the other aarch64 preset runs.
 The one-CPU preset reports that line as skipped: `SMP=n`, so nothing was started.
+
+Every x86 row also gets two CPUs (`QEMU_CPUS`) and, with `QEMU_PCI_TEST_DEVICE`, a
+`pci-testdev` behind a bridge: a PCI Express root port on q35, a PCI-to-PCI bridge on pc.
+The kernel starts only one CPU, and nothing drives the test device. They exist so that
+device discovery has something to be wrong about:
+
+- the MADT must list exactly two enabled processors;
+- enumeration must follow the bridge to find the device;
+- its BARs must size to exactly 4 KiB of memory and 256 bytes of I/O;
+- the host bridge at `00:00.0` must be the chipset the machine type implies.
+
+Discovery also re-reads every BAR it sized and fails the boot if any reads differently.
+Each of these was falsified by mutation; see the device model in
+[architecture.md](architecture.md#device--the-device-framework).
+
+The ACPI parser's host tests read the firmware's tables from three of these machines,
+captured without booting anything: `boot/acpi/src/testdata/capture.sh` starts the
+machine with no kernel, lets the firmware build its tables and fail to find a boot
+device, saves guest memory through the QEMU monitor, and extracts the RSDP and every
+table it reaches.
 
 QEMU also ships system emulators for `m68k`, `sparc`, `sh4`, `mips`, `alpha`, `hppa`,
 and `ppc` — every architecture in the

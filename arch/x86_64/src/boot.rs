@@ -6,8 +6,11 @@
 //!
 //! 1. Take a stack and stash the multiboot info pointer, which arrives in `ebx`.
 //! 2. Build page tables. Long mode requires paging to be enabled *before* it can be entered, so
-//!    there is no way to defer this to Rust. We identity-map the first 1 GiB with 2 MiB pages:
-//!    three tables, one loop, and enough to reach `kmain`.
+//!    there is no way to defer this to Rust. We identity-map the first 4 GiB with 2 MiB pages: a
+//!    PML4, a PDPT and four page directories filled by one loop. One gigabyte reaches `kmain`; four
+//!    also reach the PC's MMIO hole below 4 GiB, where device discovery reads the PCI Express
+//!    configuration window and the APICs before the kernel's own address space exists
+//!    (`kernel/platform/acpi`, [`crate::pc::BOOT_IDENTITY_END`]).
 //! 3. Enable PAE (`CR4.PAE`), set `EFER.LME`, load `CR3`, then enable paging (`CR0.PG`). Setting
 //!    LME only arms long mode; it activates when paging comes on.
 //! 4. Load a GDT with a 64-bit code segment and far-jump to reload `CS`. Until that jump the CPU is
@@ -54,7 +57,7 @@
 //!
 //! Two things the loader guarantees make that safe: the image and the structure are
 //! identity-mapped by the firmware's tables while the kernel's are built, and both lie
-//! below 1 GiB, which is all the kernel's bootstrap map covers.
+//! below 1 GiB, well inside the kernel's bootstrap map.
 
 core::arch::global_asm!(
     r#"
@@ -97,12 +100,18 @@ _start:
     movl %eax, pd(,%ecx,8)
     movl $0, pd+4(,%ecx,8)
     incl %ecx
-    cmpl $512, %ecx
+    cmpl $2048, %ecx
     jne .Lfill_pd
 
     movl $pd, %eax
     orl $0x03, %eax
     movl %eax, pdpt
+    addl $4096, %eax
+    movl %eax, pdpt+8
+    addl $4096, %eax
+    movl %eax, pdpt+16
+    addl $4096, %eax
+    movl %eax, pdpt+24
 
     movl $pdpt, %eax
     orl $0x03, %eax
@@ -168,12 +177,18 @@ kinboot_entry:
     orq $0x83, %rax
     movq %rax, pd(,%rcx,8)
     incl %ecx
-    cmpl $512, %ecx
+    cmpl $2048, %ecx
     jne .Lfill_pd64
 
     movq $pd, %rax
     orq $0x03, %rax
     movq %rax, pdpt
+    addq $4096, %rax
+    movq %rax, pdpt+8
+    addq $4096, %rax
+    movq %rax, pdpt+16
+    addq $4096, %rax
+    movq %rax, pdpt+24
     movq $pdpt, %rax
     orq $0x03, %rax
     movq %rax, pml4
@@ -216,8 +231,9 @@ pml4:
     .skip 4096
 pdpt:
     .skip 4096
+/* Four page directories, one per gigabyte of the identity map. */
 pd:
-    .skip 4096
+    .skip 16384
 multiboot_info:
     .skip 8
 

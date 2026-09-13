@@ -56,6 +56,9 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             // the bytes the build produced.
             s("-drive"),
             format!("format=raw,snapshot=on,file={}", image.display()),
+        ]);
+        args.extend(x86_platform(res, "q35"));
+        args.extend([
             s("-device"),
             s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
             s("-serial"),
@@ -112,6 +115,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 log.display().to_string(),
             ]
             .into_iter()
+            .chain(x86_platform(res, "q35"))
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
@@ -143,6 +147,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 log.display().to_string(),
             ]
             .into_iter()
+            .chain(x86_platform(res, "pc"))
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
@@ -151,7 +156,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
 
     if res.is_on("ARCH_AARCH64") {
         // `-smp` only when asked, so a one-CPU preset's command line is what it was.
-        let smp = match res.int("QEMU_SMP") {
+        let smp = match res.int("QEMU_CPUS") {
             n if n > 1 => vec![s("-smp"), n.to_string()],
             _ => Vec::new(),
         };
@@ -220,6 +225,28 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
 
     Err("no QEMU machine is defined for this configuration".into())
+}
+
+/// The processors and devices an x86 guest's firmware describes, beyond the chipset's
+/// own: `-smp` from `QEMU_CPUS`, and with `QEMU_PCI_TEST_DEVICE` a pci-testdev behind a
+/// bridge (a PCI Express root port on q35, a PCI-to-PCI bridge on pc), which enumeration
+/// finds only by following the bridge. `docs/testing.md` lists what the kernel checks.
+fn x86_platform(res: &Resolution, chipset: &str) -> Vec<String> {
+    let mut args = vec!["-smp".to_string(), res.int("QEMU_CPUS").max(1).to_string()];
+    if res.is_on("QEMU_PCI_TEST_DEVICE") {
+        let (bridge, device) = if chipset == "q35" {
+            ("pcie-root-port,id=kt_bridge,chassis=1", "pci-testdev,bus=kt_bridge")
+        } else {
+            ("pci-bridge,id=kt_bridge,chassis_nr=1", "pci-testdev,bus=kt_bridge,addr=3")
+        };
+        args.extend([
+            "-device".to_string(),
+            bridge.to_string(),
+            "-device".to_string(),
+            device.to_string(),
+        ]);
+    }
+    args
 }
 
 /// How an x86 guest gets its kernel: straight from QEMU's multiboot loader, or from a

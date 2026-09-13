@@ -114,7 +114,7 @@ pub(crate) unsafe fn start_secondaries(c: &dyn EarlyConsole) -> Option<bool> {
 
     // A run that asked QEMU for N CPUs and got another count is a harness failure, and
     // one that would otherwise pass an SMP check on a single CPU.
-    let asked = kconfig::QEMU_SMP;
+    let asked = kconfig::QEMU_CPUS;
     let count_ok = asked == 0 || t.count == asked;
     if !count_ok {
         c.write_str(", THE RUN ASKED FOR ");

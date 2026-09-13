@@ -279,17 +279,6 @@ config QEMU_MEMORY_MB
     range 8 65536
     default 128
 
-config QEMU_SMP
-    int "CPUs under QEMU"
-    depends on QEMU_EXIT
-    range 1 8
-    default 1
-    help
-        How many CPUs the emulated machine has. The kernel reads the same
-        number: a boot that finds a different count in the device tree
-        fails, so a run that silently lost its `-smp` cannot pass as an SMP
-        test on one CPU.
-
 config QEMU_CPU
     string "CPU model under QEMU"
     depends on QEMU_EXIT
@@ -312,3 +301,29 @@ config SIZE_BUDGET_KIB
         Set per preset, with headroom a real change can use and a
         regression cannot hide in. Deliberately unranged, so randomized
         configurations leave it alone. See docs/testing.md, "Size budgets".
+
+config QEMU_CPUS
+    int "CPUs under QEMU"
+    depends on QEMU_EXIT
+    range 1 255
+    default 2 if ARCH_X86_64 || ARCH_I686
+    default 1
+    help
+        The -smp count, and the CPU count the kernel requires firmware to
+        describe: the MADT on x86, the device tree's /cpus on aarch64. So a
+        run that silently lost its `-smp` cannot pass as an SMP test on one
+        CPU. On aarch64 an SMP build starts every one of them. On x86 only
+        the boot CPU runs today; two are described on the PC ports, so a MADT
+        walk that stopped after its first entry cannot pass.
+
+config QEMU_PCI_TEST_DEVICE
+    bool "A PCI test device behind a bridge under QEMU"
+    depends on QEMU_EXIT
+    default y if ARCH_X86_64 || ARCH_I686
+    help
+        Add QEMU's pci-testdev behind a bridge: a PCI Express root port on
+        q35, a PCI-to-PCI bridge on pc. Enumeration that does not follow
+        bridges misses it, and its BARs have known sizes (256 bytes of I/O,
+        4 KiB of memory), so the device check on x86 requires both to be
+        found exactly. Also turns on the checks that only hold on QEMU's
+        machines, such as the host bridge's identity.

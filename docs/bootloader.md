@@ -136,8 +136,10 @@ Where the design above was silent or wrong, the implementation decided:
   specification reserves for OS loaders, and the translation turns those into the
   protocol's `KernelImage` and `BootData`. Everything else the firmware or the loader
   used becomes usable, because after `ExitBootServices` it is.
-- **Handover below 1 GiB.** The kernel's bootstrap page tables map the first gigabyte,
-  so the loader refuses an image above it and allocates the structure below it.
+- **Handover below 1 GiB.** The loader refuses an image above the first gigabyte and
+  allocates the structure below it. The kernel's bootstrap page tables mapped exactly
+  that much when this was written; they now map four, so the limit is conservative
+  rather than required.
 - **The map is coalesced.** OVMF reports around a hundred descriptors; merged by kind,
   the kernel receives 26. Without merging the map does not fit the kernel's region
   buffer, which the boot check turns into a failure rather than a truncated map.

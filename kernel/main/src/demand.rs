@@ -262,17 +262,30 @@ fn poke(addr: usize, v: u8) {
     unsafe { (addr as *mut u8).write_volatile(v) }
 }
 
-/// The first 1 GiB boundary above everything the kernel space maps: the direct map, the
-/// image and every device window. Nothing is mapped there, which `reserve` confirms.
+/// The first whole gigabyte above the direct map and the image that no device window
+/// touches. Nothing is mapped there, which `reserve` confirms.
+///
+/// Not "above every device window": on a PC the APICs sit just below 4 GiB, and above
+/// them there is no gigabyte left in a 32-bit address space, which is how the i686 check
+/// failed when x86 discovery began claiming them.
 fn window(direct: DirectMap) -> Option<usize> {
-    let (_, img_end) = arch::image_range();
-    let mut top = direct.virt_base().raw() as u64 + direct.len();
-    top = top.max(img_end);
-    for w in platform::device_windows().unwrap_or(&[]) {
-        top = top.max(w.phys + w.len);
-    }
     const GIB: u64 = 1 << 30;
-    usize::try_from(top.div_ceil(GIB) * GIB).ok()
+    let (_, img_end) = arch::image_range();
+    let low = (direct.virt_base().raw() as u64 + direct.len()).max(img_end);
+    let devices = platform::device_windows().unwrap_or(&[]);
+    // Bounded: a few dozen gigabytes is far past any window list a machine has.
+    (low.div_ceil(GIB)..64)
+        .map(|g| g * GIB)
+        .find(|&start| {
+            !devices
+                .iter()
+                .any(|w| w.phys < start + GIB && start < w.phys.saturating_add(w.len))
+        })
+        .and_then(|start| {
+            usize::try_from(start + GIB - 1)
+                .ok()
+                .map(|_| start as usize)
+        })
 }
 
 /// Run the check. `frames` is the boot frame allocator; `live` is what `kernel_space`

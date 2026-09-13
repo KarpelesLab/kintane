@@ -1,11 +1,15 @@
 //! The device model.
 //!
 //! Firmware describes a machine; drivers drive parts of it. This crate is what sits
-//! between the two, and it has four pieces:
+//! between the two:
 //!
-//! * [`tree`] — one node representation that the flattened device tree enumerates into today, and
-//!   ACPI and PCIe will tomorrow: names, `compatible` lists, register windows translated to CPU
-//!   addresses, and interrupts resolved to their controller.
+//! * [`tree`] — one node representation that every enumerator fills in: the flattened device tree,
+//!   PCI enumeration, and firmware tables. Nodes have names, `compatible` lists, register windows
+//!   as CPU addresses, and (for device-tree nodes) interrupts resolved to their controller.
+//! * [`pci`] — enumerating PCI and PCI Express buses through whichever configuration access the
+//!   platform has, and sizing BARs without disturbing them.
+//! * [`table`] — records for devices a firmware table lists directly, such as ACPI's processors and
+//!   interrupt controllers.
 //! * [`driver`] — binding a driver to a node by `compatible` string, and the phases a bound device
 //!   moves through, each a token only the previous step can produce.
 //! * [`resource`] — the ledger of claimed register windows and interrupt lines, which refuses
@@ -22,8 +26,11 @@
 
 pub mod cell;
 pub mod driver;
+pub mod pci;
 pub mod registers;
 pub mod resource;
+pub mod table;
+pub mod text;
 pub mod tree;
 
 pub use cell::BootCell;
@@ -35,7 +42,11 @@ pub use driver::{
 pub use fdt::Fdt;
 pub use registers::Registers;
 pub use resource::{ClaimError, IrqClaim, IrqLine, Mmio, MmioClaim, Resources};
-pub use tree::{DeviceTree, Node, NodeId, Specifier};
+pub use table::Described;
+pub use tree::{Builder, DeviceTree, Node, NodeId, Origin, Specifier};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod pci_tests;
