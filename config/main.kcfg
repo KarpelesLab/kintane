@@ -172,13 +172,18 @@ config KINBOOT_BIOS
         trust, and this option offers no security guarantee.
 
 config MOCK_ARCH
-    bool "Mock architectures for host testing"
+    bool
     default n
     help
         Compile the MockArch family in hal. These implement the capability
         traits in software so that subsystems can be tested on the host
         against several different hardware profiles. Never enabled in a
         kernel image; `kbuild test --host` turns it on.
+
+        Deliberately without a prompt, so that neither menuconfig nor a
+        generated configuration offers it. It had one, and the first
+        random-configuration run found that 36 of 50 samples failed to build
+        because of it: the mocks need `std`, and assume a 64-bit usize.
 
 config INKERNEL_TESTS
     bool "In-kernel test suite"
@@ -294,3 +299,16 @@ config QEMU_CPU
         its main preset, because it exists to serve legacy machines and
         testing it only on a modern core would defeat that. A second preset
         raises it, so both are covered.
+
+config SIZE_BUDGET_KIB
+    int "Kernel image size budget (KiB, 0 for none)"
+    default 0
+    help
+        The most the linked kernel may occupy: every allocated section,
+        .bss included, since that is what the machine must hold. `kbuild
+        size` fails a build over it. A build setting rather than a kernel
+        one, like QEMU_MEMORY_MB; the kernel never reads it.
+
+        Set per preset, with headroom a real change can use and a
+        regression cannot hide in. Deliberately unranged, so randomized
+        configurations leave it alone. See docs/testing.md, "Size budgets".

@@ -159,6 +159,25 @@ jobs:
           done
           exit $fail
 
+      # Gate 8 in docs/testing.md: each preset's SIZE_BUDGET_KIB. The deltas against
+      # config/size-baseline are printed for the reviewer; only the budget fails.
+      - name: Size budget on every preset
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in config/presets/*.preset; do
+            name=$(basename "$p" .preset)
+            echo "::group::size $name"
+            if ./kbuild/target/release/kbuild size --preset "$name"; then
+              echo "size ok: $name"
+            else
+              echo "::error title=over size budget::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       - name: Boot every preset under QEMU
         run: |
           set -euo pipefail

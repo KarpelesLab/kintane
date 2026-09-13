@@ -1,0 +1,27 @@
+# kbuild size report for preset x86_64-qemu. Rewrite with `kbuild size --preset x86_64-qemu --update-baseline`.
+section .bss 155648
+section .data 5456
+section .note.kintane 36
+section .rodata 16344
+section .stack 16384
+section .text 135168
+section .thread_stacks 262144
+crate (anonymous) text 0 rodata 1077 data 0 bss 0
+crate (unmangled) text 1116 rodata 0 data 0 bss 0
+crate __rustc text 139 rodata 0 data 0 bss 0
+crate arch text 27937 rodata 0 data 361 bss 90393
+crate bootinfo text 710 rodata 0 data 0 bss 0
+crate buildid text 288 rodata 32 data 0 bss 0
+crate core text 6867 rodata 0 data 0 bss 0
+crate hal text 531 rodata 0 data 0 bss 0
+crate kalloc text 13809 rodata 0 data 0 bss 0
+crate kintane text 42456 rodata 48 data 3964 bss 37078
+crate mm text 24245 rodata 0 data 0 bss 0
+crate multiboot text 314 rodata 0 data 0 bss 0
+crate platform text 37 rodata 0 data 0 bss 0
+crate sched text 365 rodata 0 data 0 bss 0
+crate sync text 5068 rodata 0 data 1088 bss 272
+crate thread text 1989 rodata 0 data 0 bss 0
+crate time text 2782 rodata 0 data 0 bss 0
+crate unwind text 3099 rodata 0 data 0 bss 0
+total 591180

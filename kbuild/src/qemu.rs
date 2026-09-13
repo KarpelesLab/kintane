@@ -254,8 +254,8 @@ struct Firmware {
 /// every distribution puts it somewhere else, so this looks in the known places:
 ///
 /// - `KINTANE_OVMF_CODE` (and optionally `KINTANE_OVMF_VARS`), for anything else;
-/// - the edk2 build QEMU itself ships, next to the `qemu-system-x86_64` on `PATH` —
-///   Homebrew's, for one;
+/// - the edk2 build QEMU itself ships, next to the `qemu-system-x86_64` on `PATH` — Homebrew's, for
+///   one;
 /// - Debian and Ubuntu's `ovmf` package, Fedora's `edk2-ovmf`, Arch's `edk2-ovmf`.
 ///
 /// The variable store is copied into the build directory for every boot, so a run never

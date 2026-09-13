@@ -1,0 +1,26 @@
+# kbuild size report for preset i686-qemu. Rewrite with `kbuild size --preset i686-qemu --update-baseline`.
+section .bss 131072
+section .data 4096
+section .rodata 12288
+section .stack 16384
+section .text 135168
+section .thread_stacks 262144
+crate (anonymous) text 0 rodata 1073 data 0 bss 0
+crate (unmangled) text 1102 rodata 0 data 0 bss 0
+crate __rustc text 161 rodata 0 data 0 bss 0
+crate arch text 26252 rodata 0 data 376 bss 67640
+crate bootinfo text 738 rodata 0 data 0 bss 0
+crate buildid text 181 rodata 32 data 0 bss 0
+crate core text 4729 rodata 0 data 0 bss 0
+crate hal text 1395 rodata 0 data 0 bss 0
+crate kalloc text 13358 rodata 0 data 0 bss 0
+crate kintane text 43987 rodata 24 data 2732 bss 36554
+crate mm text 23170 rodata 0 data 0 bss 0
+crate multiboot text 369 rodata 0 data 0 bss 0
+crate platform text 38 rodata 0 data 0 bss 0
+crate sched text 365 rodata 0 data 0 bss 0
+crate sync text 4797 rodata 0 data 800 bss 136
+crate thread text 3439 rodata 0 data 0 bss 0
+crate time text 3971 rodata 0 data 0 bss 0
+crate unwind text 2546 rodata 0 data 0 bss 0
+total 561152

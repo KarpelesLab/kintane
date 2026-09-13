@@ -1,0 +1,70 @@
+# Configuration coverage, nightly: docs/testing.md#configuration-coverage.
+#
+# The merge gate builds the presets, the configurations we ship. This builds the ones
+# nobody chose: every preset's boundary configurations, and random samples from a seed
+# that changes every night. A failure is reported with the exact `kbuild build` command
+# that reproduces it, so a red run here is one command away from a local reproduction.
+#
+# Nightly rather than per merge because it is slow and because its findings are about
+# the configuration space, not about the change that happened to land last.
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "First seed (default: derived from the run number)"
+        required: false
+      count:
+        description: "Random configurations to build"
+        required: false
+        default: "50"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  randconfig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - name: Build kbuild
+        run: cargo build --release --manifest-path kbuild/Cargo.toml
+
+      - name: Boundary configurations of every preset
+        run: |
+          set -uo pipefail
+          fail=0
+          ./kbuild/target/release/kbuild randconfig-build --allno || fail=1
+          ./kbuild/target/release/kbuild randconfig-build --allyes || fail=1
+          exit $fail
+
+      - name: Random configurations
+        if: always()
+        run: |
+          # The run number makes every night a different sample, and the seed is in the
+          # log next to every failure, so no night is unreproducible.
+          seed="${{ github.event.inputs.seed }}"
+          seed="${seed:-$(( ${{ github.run_number }} * 1000 ))}"
+          count="${{ github.event.inputs.count }}"
+          ./kbuild/target/release/kbuild randconfig-build --count "${count:-50}" --seed "$seed"
+
+      - name: Keep the failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: randconfig-logs
+          path: build/randconfig/
+          if-no-files-found: ignore

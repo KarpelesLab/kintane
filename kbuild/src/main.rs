@@ -14,9 +14,12 @@ mod graph;
 mod hosttest;
 mod kcfg;
 mod lint;
+mod menuconfig;
 mod portable;
 mod qemu;
+mod randconfig;
 mod sha256;
+mod size;
 mod symbolize;
 mod toml;
 mod toolchain;
@@ -36,7 +39,13 @@ USAGE:
 COMMANDS:
     toolchain            verify the pinned toolchain in toolchain.toml
     config               resolve a configuration and write .config
+    menuconfig           edit a configuration interactively; saves .config and
+                         menuconfig.preset
     build                build the kernel image
+    randconfig-build     build --count random configurations from --seed, and
+                         report each failure with the command that reproduces it
+    size                 build, then report section and per-crate sizes against
+                         the preset's SIZE_BUDGET_KIB and the size baseline
     test [--host|--target]
                          run tests: on the host against the mocks (default),
                          or in-kernel under QEMU on the real architecture
@@ -49,8 +58,16 @@ COMMANDS:
     clean                remove build outputs (the cache is kept)
 
 OPTIONS:
-    --preset <name>      start from config/presets/<name>.preset
+    --preset <name>      start from config/presets/<name>.preset, or a preset file
+                         when <name> is a path (contains `/`)
     --set SYM=VALUE      override one symbol (repeatable)
+    --random [--seed N]  extend the configuration randomly; any command. The same
+                         seed and preset give the same configuration everywhere
+    --allyes, --allno    extend it to everything on, or everything off, that can be
+    --count K            `randconfig-build`: how many configurations (default 20)
+    --compare REF|FILE   `size`: baseline to compare with (default: the committed one)
+    --save FILE          `size`: also write the report to FILE
+    --update-baseline    `size`: rewrite config/size-baseline/<preset>.size
     --verbose, -v        show each rustc invocation
     --timeout <secs>     QEMU timeout for `run` (default 30)
     --only <name>        `test`: only units whose name contains <name>
@@ -82,6 +99,16 @@ struct Opts {
     timeout: u64,
     /// Arguments that are not options. Only `symbolize` takes one.
     positional: Vec<String>,
+    /// `--random`, `--allyes` or `--allno`: how to extend the configuration.
+    generate: Option<kcfg::random::Mode>,
+    /// `--count` and `--seed`, for `randconfig-build`, which derives one seed per
+    /// configuration from `--seed`.
+    count: u64,
+    seed: Option<u64>,
+    /// `--compare`, `--save` and `--update-baseline`, for `size`.
+    compare: Option<String>,
+    save: Option<String>,
+    update_baseline: bool,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -93,7 +120,15 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         verbose: false,
         timeout: 30,
         positional: Vec::new(),
+        generate: None,
+        count: 20,
+        seed: None,
+        compare: None,
+        save: None,
+        update_baseline: false,
     };
+    let mut random = false;
+    let mut seed: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -122,10 +157,44 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--host" => o.in_kernel = false,
             "--target" => o.in_kernel = true,
             "-v" | "--verbose" => o.verbose = true,
+            "--random" => random = true,
+            "--seed" => {
+                i += 1;
+                let s = args.get(i).ok_or("--seed needs a number")?;
+                seed = Some(
+                    s.parse()
+                        .map_err(|_| format!("--seed expects a number, got `{s}`"))?,
+                );
+            }
+            "--allyes" => o.generate = Some(kcfg::random::Mode::AllYes),
+            "--allno" => o.generate = Some(kcfg::random::Mode::AllNo),
+            "--count" => {
+                i += 1;
+                let s = args.get(i).ok_or("--count needs a number")?;
+                o.count = s
+                    .parse()
+                    .map_err(|_| format!("--count expects a number, got `{s}`"))?;
+            }
+            "--compare" => {
+                i += 1;
+                o.compare = Some(args.get(i).ok_or("--compare needs a ref or file")?.clone());
+            }
+            "--save" => {
+                i += 1;
+                o.save = Some(args.get(i).ok_or("--save needs a file")?.clone());
+            }
+            "--update-baseline" => o.update_baseline = true,
             other if !other.starts_with('-') => o.positional.push(other.to_string()),
             other => return Err(format!("unknown option `{other}`")),
         }
         i += 1;
+    }
+    o.seed = seed;
+    if random {
+        if o.generate.is_some() {
+            return Err("--random, --allyes and --allno are alternatives; give one".into());
+        }
+        o.generate = Some(kcfg::random::Mode::Random(seed.unwrap_or_else(randconfig::fresh_seed)));
     }
     Ok(o)
 }
@@ -137,6 +206,9 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         if let Some(p) = opts.positional.first() {
             return Err(format!("unexpected argument `{p}`"));
         }
+    }
+    if opts.seed.is_some() && opts.generate.is_none() && cmd != "randconfig-build" {
+        return Err("--seed goes with --random (or with `randconfig-build`)".into());
     }
     let root = find_root()?;
 
@@ -165,6 +237,9 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "build" => do_build(&root, &opts).map(|_| ()),
+        "menuconfig" => menuconfig::run(&root, &opts),
+        "randconfig-build" => randconfig::run(&root, &opts),
+        "size" => size::run(&root, &opts),
         "test" if opts.in_kernel => {
             // A test image: the real selftest provider is linked in, and the guest's
             // exit status is the verdict. Console output is for a human reading a
@@ -426,12 +501,47 @@ fn resolve_config(
     root: &Path,
     opts: &Opts,
 ) -> Result<(kcfg::SymbolTable, kcfg::Resolution), String> {
+    let (table, requests) = base_requests(root, opts)?;
+    let describe = |errs: Vec<kcfg::resolve::ResolveError>| {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let Some(mode) = opts.generate else {
+        let res = kcfg::resolve::resolve(&table, &requests).map_err(describe)?;
+        return Ok((table, res));
+    };
+    let (res, all) = kcfg::random::generate(&table, &requests, mode).map_err(describe)?;
+    let generated: Vec<String> = all[requests.len()..]
+        .iter()
+        .map(|r| format!("{}={}", r.symbol, r.text))
+        .collect();
+    println!(
+        "\x1b[36mgenerated\x1b[0m {} ({} requests): {}",
+        mode.source(),
+        generated.len(),
+        generated.join(" ")
+    );
+    Ok((table, res))
+}
+
+/// The symbol table, and the requests the options make before anything is generated:
+/// the preset, then `--set`.
+fn base_requests(root: &Path, opts: &Opts) -> Result<(kcfg::SymbolTable, Vec<Request>), String> {
     let entry = root.join("config/main.kcfg");
     let table = kcfg::parse::parse_tree(&entry).map_err(|e| e.to_string())?;
 
     let mut requests: Vec<Request> = Vec::new();
     if let Some(p) = &opts.preset {
-        let path = root.join("config/presets").join(format!("{p}.preset"));
+        // A name is one of config/presets; a path is a preset file somewhere else, such
+        // as the one `menuconfig` saves.
+        let path = if p.contains('/') {
+            PathBuf::from(p)
+        } else {
+            root.join("config/presets").join(format!("{p}.preset"))
+        };
         if !path.exists() {
             let avail = list_presets(root).join(", ");
             return Err(format!("no preset `{p}`\n  available: {avail}"));
@@ -452,14 +562,7 @@ fn resolve_config(
             source: "--set".into(),
         });
     }
-
-    let res = kcfg::resolve::resolve(&table, &requests).map_err(|errs| {
-        errs.iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
-    Ok((table, res))
+    Ok((table, requests))
 }
 
 fn list_presets(root: &Path) -> Vec<String> {

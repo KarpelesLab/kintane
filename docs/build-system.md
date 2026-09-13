@@ -81,6 +81,44 @@ definition and describe what the hardware can do; everything else depends on the
 This means the config system knows that `SMP` is impossible on a Cortex-M without
 anyone writing that rule down twice.
 
+#### The language, as implemented
+
+`kbuild/src/kcfg` implements the following. Each rule is host-tested, and each rule
+that changes a verdict has a test that fails if the rule is removed.
+
+- **Types.** `bool`, `tristate`, `int`, `hex` and `string`. A `hex` value must be
+  written with its `0x` prefix. An address a factor of sixteen away from the one the
+  reader assumed is not a typo worth allowing. Hex values are unsigned 64-bit, so an
+  upper-half address is not a negative number. Generated Rust gives `int` as `usize`,
+  `hex` as `u64` and `tristate` as an enum, so `m` is never silently truthy.
+- **Menus.** `menu "Title"` ... `endmenu` groups entries for `menuconfig`. A menu's
+  `depends on` is added to everything inside it, nested menus and choices included, by
+  folding it into each entry's own condition. A menu must close in the file that opened
+  it.
+- **Ranges.** `range LOW HIGH [if CONDITION]`, on `int` and `hex` only; any other type is
+  a parse error. When several are given, the first whose condition holds applies, as in
+  Kconfig, so the conditional ones go first. A value outside its range is an error,
+  whether a preset asked for it or a default produced it. The error names the range that
+  applied and why.
+- **Choices.** Members are `bool`; exactly one usable member is on. A member with unmet
+  dependencies is reported as such rather than as "another member was chosen".
+- **`select` does not override `depends on`.** Selecting a symbol whose dependencies are
+  unmet is an error naming the selector, the target, and the dependency that is off. In
+  Kconfig it is a warning, and the result is a symbol that is on without what it needs.
+  Only `bool` and `tristate` symbols can be selected, never a choice member: a choice
+  already decides its member.
+- **`tristate` and modules.** `m` is meaningful only while `MODULES` is `y`, and no
+  `.kcfg` declares `MODULES` yet, because the loader is Phase 4 work.
+  - Asking for `m` (preset, `--set` or `menuconfig`) is an error that says modules do not
+    exist. A module quietly becoming built-in code is not what was asked for.
+  - `default m`, or a `select` from an `m` symbol, is built in. The recorded reason says
+    so ("it would be m (...), and MODULES is not y").
+  - `depends on` limits a tristate to its condition's value: a driver on an `m` bus can
+    be `m` but not `y`.
+  - A `bool` whose condition is `m` may still be `y`, since it has no module form.
+- **Not implemented:** `imply`, `visible if` and `comment`. This document does not use
+  them, and nothing in the tree needs them.
+
 ### Resolution
 
 `kbuild config` resolves a configuration to a fixed point, reports conflicts with the
@@ -97,6 +135,50 @@ error: cannot set SMP=n
     NUMA is enabled by preset x86_64-server
   to disable SMP, first disable NUMA
 ```
+
+#### `menuconfig`
+
+`kbuild menuconfig [--preset P]` starts from a preset and lets a person walk the menus
+and choices in declaration order and change values. The keys are:
+
+- arrows or `hjkl` to move, enter to open a menu or change a value, space to toggle,
+  `y`/`n`/`m` to set directly;
+- `?` for a symbol's help, `w` for why it has its value (following a `select` back to
+  whatever set its selector), `s` to save, `q` to quit.
+
+Every change is re-resolved before it is accepted. A change the resolver refuses is not
+applied, and the resolver's own explanation is shown in its place, so the editor can
+never hold an invalid configuration.
+
+Saving writes `.config` and `menuconfig.preset`. A build resolves from presets, not from
+`.config`, so the preset is what to build: `kbuild build --preset ./menuconfig.preset`.
+A `--preset` that contains a `/` is a file path.
+
+Raw terminal mode comes from `stty`, not from `termios` declared by hand. The `termios`
+struct's layout differs between macOS and Linux, and a hand-written definition that
+nothing checks is a stack-corruption bug in a build tool. The editor itself
+(`menuconfig::Session`) is plain data driven by key events, and its tests run it without
+a terminal.
+
+#### Generated configurations
+
+Every command takes `--random [--seed N]`, `--allyes` or `--allno`. Each extends the
+preset and `--set` requests into a complete configuration:
+
+- **`--random`:** each settable symbol at random, each choice a random usable member, and
+  each ranged `int` or `hex` biased towards its bounds. Without `--seed`, a seed is
+  picked and printed.
+- **`--allyes`:** everything on that can be on.
+- **`--allno`:** everything off that can be off.
+
+The preset's own requests are never changed, and a generated configuration is always
+valid. Proposals are made one symbol at a time, and each is kept only if the whole
+request set still resolves. The same preset and seed give the same configuration on any
+machine, so `kbuild build --preset x86_64-qemu --random --seed 1234` reproduces a
+nightly failure exactly. `kbuild randconfig-build --count K --seed S` builds `K` of
+them, and `--allyes` or `--allno` there builds each preset's boundary. Either way it
+reports every failure with that command; see
+[testing.md](testing.md#configuration-coverage).
 
 ### Presets
 
@@ -209,7 +291,11 @@ every-target-every-merge rule in [testing.md](testing.md) affordable.
 ```
 kbuild toolchain [--verify|--fetch]       check or install the pinned toolchain
 kbuild config [--preset P] [--set K=V]   resolve configuration
-kbuild menuconfig                         interactive configuration
+kbuild config --random [--seed N]         ... extended randomly (any command takes this)
+kbuild config --allyes | --allno          ... extended to a boundary (any command)
+kbuild menuconfig [--preset P]            interactive configuration; saves menuconfig.preset
+kbuild randconfig-build --count K --seed S  build sampled configurations, report each failure
+kbuild randconfig-build --allyes|--allno  build every preset's boundary configuration
 kbuild build [--target T]                 build the kernel image
 kbuild modules                            build loadable modules
 kbuild image [--format elf|bin|uki|uimage]  package a bootable artifact
@@ -219,7 +305,9 @@ kbuild run [--machine M]                  boot the image under QEMU
 kbuild test [--host|--target]             run the test suites
 kbuild lint                               cfg-in-body and the other rules rustc cannot express
 kbuild portability                        compile host-testable units for rv32i, rv32imac, thumbv7m
-kbuild size [--compare REF]               size report, optionally vs a baseline
+kbuild size --preset P [--compare REF|FILE] [--save FILE] [--update-baseline]
+                                          sections and per-crate sizes, against the preset's
+                                          SIZE_BUDGET_KIB and a baseline report
 kbuild sdk                                produce a module SDK for this config
 ```
 

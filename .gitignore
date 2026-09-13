@@ -2,6 +2,7 @@
 /build/
 /.config
 /.config.old
+/menuconfig.preset
 
 # kbuild is the one cargo project in the tree
 /kbuild/target/
