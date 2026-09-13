@@ -79,3 +79,61 @@ pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<
     }
     Ok(n)
 }
+
+/// Copy the kernel command line into `out`, returning its length, or `None` when the
+/// loader passed none.
+///
+/// Multiboot loaders put the image's own path first. GRUB writes the path it loaded the
+/// kernel from, and QEMU's `-kernel` writes the file name before `-append`. So a first
+/// word that is a path is dropped, recognised by its first byte: `/`, or `(` for GRUB's
+/// device syntax. A line that starts with an argument is passed through whole. The rule
+/// is [`strip_image_path`], which has host tests.
+///
+/// # Safety
+/// As [`memory_regions`].
+pub unsafe fn command_line(boot_arg: u64, out: &mut [u8]) -> Result<Option<usize>, Error> {
+    if boot_arg == 0 {
+        return Err(Error::NoLoader);
+    }
+    let addr = usize::try_from(boot_arg).map_err(|_| Error::NoLoader)?;
+    // SAFETY: as in `memory_regions`.
+    let handover = unsafe { multiboot::Handover::new(multiboot::BOOTLOADER_MAGIC, addr) }
+        .map_err(|_| Error::NoLoader)?;
+    // SAFETY: the caller guarantees the loader's structures are still mapped.
+    let Some(line) = (unsafe { handover.cmdline() }) else {
+        return Ok(None);
+    };
+    let line = strip_image_path(line.as_bytes());
+    let slot = out
+        .get_mut(..line.len())
+        .ok_or(Error::Malformed { offset: 0 })?;
+    slot.copy_from_slice(line);
+    Ok(Some(line.len()))
+}
+
+/// `line` without a leading image path, and without the separators after it.
+pub fn strip_image_path(line: &[u8]) -> &[u8] {
+    match line.first() {
+        Some(b'/' | b'(') => {
+            let end = line.iter().position(|&b| b == b' ').unwrap_or(line.len());
+            let rest = &line[end..];
+            let start = rest.iter().position(|&b| b != b' ').unwrap_or(rest.len());
+            &rest[start..]
+        }
+        _ => line,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_image_path;
+
+    #[test]
+    fn the_loaders_image_path_is_dropped_and_arguments_are_kept() {
+        assert_eq!(strip_image_path(b"/build/kintane.mb32.elf mode=safe x=1"), b"mode=safe x=1");
+        assert_eq!(strip_image_path(b"(hd0,1)/boot/kintane  mode=normal"), b"mode=normal");
+        assert_eq!(strip_image_path(b"/boot/kintane"), b"");
+        assert_eq!(strip_image_path(b"mode=safe /not/a/path"), b"mode=safe /not/a/path");
+        assert_eq!(strip_image_path(b""), b"");
+    }
+}

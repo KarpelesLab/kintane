@@ -1,31 +1,32 @@
 # kbuild size report for preset aarch64-virt-smp. Rewrite with `kbuild size --preset aarch64-virt-smp --update-baseline`.
 section .bss 126976
-section .data 72424
+section .data 76520
 section .rodata 16384
 section .stack 16384
 section .stack_guard 4096
-section .text 151552
+section .text 159744
 section .thread_stacks 393216
-crate (anonymous) text 0 rodata 1563 data 0 bss 0
-crate (unmangled) text 6164 rodata 0 data 0 bss 32
+crate (anonymous) text 0 rodata 1835 data 0 bss 0
+crate (unmangled) text 6256 rodata 0 data 0 bss 32
 crate __rustc text 172 rodata 0 data 0 bss 0
 crate arch text 10384 rodata 0 data 1160 bss 65813
-crate bootinfo text 976 rodata 0 data 0 bss 0
+crate bootinfo text 1544 rodata 0 data 0 bss 0
 crate buildid text 252 rodata 32 data 0 bss 0
-crate core text 6508 rodata 0 data 0 bss 0
-crate device text 13616 rodata 0 data 0 bss 0
-crate fdt text 6560 rodata 0 data 0 bss 0
+crate cmdline text 1448 rodata 0 data 0 bss 0
+crate core text 6904 rodata 0 data 0 bss 0
+crate device text 14512 rodata 0 data 0 bss 0
+crate fdt text 7076 rodata 0 data 0 bss 0
 crate gic text 4152 rodata 0 data 0 bss 224
 crate hal text 592 rodata 0 data 0 bss 0
-crate kalloc text 12516 rodata 0 data 0 bss 0
-crate kintane text 36892 rodata 48 data 3964 bss 37366
-crate mm text 21032 rodata 0 data 0 bss 0
+crate kalloc text 12508 rodata 0 data 0 bss 0
+crate kintane text 39076 rodata 48 data 3964 bss 37366
+crate mm text 21372 rodata 0 data 0 bss 0
 crate pl011 text 1140 rodata 0 data 80 bss 24
-crate platform text 8824 rodata 32 data 66128 bss 1736
+crate platform text 8824 rodata 32 data 70224 bss 1736
 crate sched text 428 rodata 0 data 0 bss 0
 crate strip_suffix text 52 rodata 0 data 0 bss 0
-crate sync text 6012 rodata 0 data 1088 bss 2176
-crate thread text 3016 rodata 0 data 0 bss 0
+crate sync text 5664 rodata 0 data 1088 bss 2176
+crate thread text 3364 rodata 0 data 0 bss 0
 crate time text 2860 rodata 0 data 0 bss 0
 crate unwind text 2500 rodata 0 data 0 bss 0
-total 781032
+total 793320

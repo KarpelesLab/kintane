@@ -15,6 +15,8 @@ pub struct Machine {
     pub args: Vec<String>,
     /// Exit code QEMU reports when the guest signalled success.
     pub success_code: i32,
+    /// Bytes typed on the guest's serial console as it starts: `BOOT_TEST_KEYS`.
+    pub input: Vec<u8>,
 }
 
 pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine, String> {
@@ -32,7 +34,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         }
     };
 
-    if res.is_on("ARCH_X86_64") && res.is_on("BOOT_KINBOOT") {
+    if res.is_on("ARCH_X86_64") && res.is_on("KINBOOT_EFI") {
         // The firmware path: OVMF boots the disk image's EFI system partition, which
         // starts kinboot-efi, which starts the kernel. No -kernel: QEMU's own loader is
         // exactly what this configuration exists to not use.
@@ -78,6 +80,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             binary: "qemu-system-x86_64",
             args,
             success_code: (0x10 << 1) | 1,
+            input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
         });
     }
 
@@ -119,6 +122,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
+            input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
         });
     }
 
@@ -151,6 +155,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
+            input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
         });
     }
 
@@ -175,6 +180,9 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             .chain([
                 s("-kernel"),
                 image.display().to_string(),
+                // QEMU writes this into the device tree's `/chosen/bootargs`.
+                s("-append"),
+                crate::bootcfg::kernel_command_line(res),
                 s("-semihosting-config"),
                 s("enable=on,target=native"),
                 s("-serial"),
@@ -189,6 +197,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             ])
             .collect(),
             success_code: 0,
+            input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
         });
     }
 
@@ -207,6 +216,9 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 mem,
                 s("-kernel"),
                 image.display().to_string(),
+                // QEMU writes this into the device tree's `/chosen/bootargs`.
+                s("-append"),
+                crate::bootcfg::kernel_command_line(res),
                 s("-serial"),
                 s("stdio"),
                 s("-display"),
@@ -221,6 +233,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             // semihosting, and the harness treats a timeout as a failure for the same
             // reason.
             success_code: 0,
+            input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
         });
     }
 
@@ -266,7 +279,14 @@ fn x86_boot_media(res: &Resolution, image: &Path) -> Vec<String> {
             "reboot-timeout=0".into(),
         ]
     } else {
-        vec!["-kernel".into(), image.display().to_string()]
+        // QEMU's multiboot loader passes this after the image's file name, as GRUB would;
+        // `boot/info-multiboot` drops that leading path.
+        vec![
+            "-kernel".into(),
+            image.display().to_string(),
+            "-append".into(),
+            crate::bootcfg::kernel_command_line(res),
+        ]
     }
 }
 
@@ -362,6 +382,14 @@ pub struct Outcome {
     pub console: Vec<u8>,
 }
 
+/// What a KinTane loader prints when its menu is ready for a key: the line
+/// `kinboot_menu::render` ends the entry list with, which that crate's tests pin.
+const MENU_PROMPT: &[u8] = b"boots an entry, Enter the marked one";
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Boot, passing the console through as it arrives and keeping a copy.
 ///
 /// A guest that never signals is killed after `timeout_secs` and reported through
@@ -370,9 +398,21 @@ pub struct Outcome {
 pub fn run(m: &Machine, timeout_secs: u64) -> Result<Outcome, String> {
     let mut child = Command::new(m.binary)
         .args(&m.args)
+        .stdin(if m.input.is_empty() {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}\nis QEMU installed?", m.binary))?;
+
+    // Typed when the guest shows its boot menu, not at once. Bytes sent before then are
+    // lost: firmware and the loader both reset the UART's receive FIFO when they program
+    // it, which the first version of this, typing immediately, ran into. The pipe stays
+    // open until QEMU exits, because an end of file on `-serial stdio` is not something a
+    // guest expects.
+    let mut keys = child.stdin.take().map(|stdin| (stdin, m.input.clone()));
 
     let mut pipe = child
         .stdout
@@ -382,6 +422,7 @@ pub fn run(m: &Machine, timeout_secs: u64) -> Result<Outcome, String> {
         let mut kept = Vec::new();
         let mut buf = [0u8; 4096];
         let mut out = std::io::stdout();
+        let mut stdin = None;
         // Ends when QEMU exits or is killed and its end of the pipe closes.
         while let Ok(n) = pipe.read(&mut buf) {
             if n == 0 {
@@ -390,7 +431,15 @@ pub fn run(m: &Machine, timeout_secs: u64) -> Result<Outcome, String> {
             let _ = out.write_all(&buf[..n]);
             let _ = out.flush();
             kept.extend_from_slice(&buf[..n]);
+            if keys.is_some() && contains(&kept, MENU_PROMPT) {
+                if let Some((mut pipe, input)) = keys.take() {
+                    let _ = pipe.write_all(&input);
+                    let _ = pipe.flush();
+                    stdin = Some(pipe);
+                }
+            }
         }
+        drop(stdin);
         kept
     });
 

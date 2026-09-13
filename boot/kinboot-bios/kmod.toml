@@ -1,5 +1,5 @@
 # The decision-making half of the BIOS loader: disk layout, memory map decoding, ELF
-# validation and the Multiboot structure, as plain code with host tests.
+# validation, the boot protocol handover and chainloading, as plain code with host tests.
 #
 # The loader binary in `loader/` is not a unit of the kernel graph. It is built by
 # `kbuild` for its own target (`targets/i686-kinboot.json`, no SSE, no x87) and linked at
@@ -16,4 +16,4 @@ host-tests = true
 layer = "hal"
 
 [deps]
-units = []
+units = ["boot_protocol"]

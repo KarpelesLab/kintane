@@ -13,4 +13,4 @@ QEMU_MEMORY_MB=5120
 QEMU_CPU="max"
 FRAME_BITMAP_KIB=512
 # 1028 KiB when set, nearly half of it the frame bitmap reserve above.
-SIZE_BUDGET_KIB=1280
+SIZE_BUDGET_KIB=1536

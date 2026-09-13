@@ -24,7 +24,7 @@
 //! | kind | payload |
 //! |---|---|
 //! | `MemoryMap` | `entry_size: u32`, `_reserved: u32`, then entries of `entry_size` bytes, each beginning with a [`MemoryRegion`] |
-//! | `CommandLine` | UTF-8 bytes, not NUL-terminated |
+//! | `CommandLine` | UTF-8 bytes, not NUL-terminated; at most [`MAX_COMMAND_LINE`] bytes |
 //! | `AcpiRsdp` | `address: u64`, physical |
 //! | `KernelRange` | `start: u64`, `len: u64`, physical |
 //! | `Firmware` | `kind: u32` ([`Firmware`]), `_reserved: u32` |
@@ -44,6 +44,11 @@ pub const HEADER_SIZE: usize = core::mem::size_of::<BootInfo>();
 pub const TAG_HEADER_SIZE: usize = 8;
 /// Size of a [`MemoryRegion`] as this version writes it.
 pub const REGION_SIZE: usize = core::mem::size_of::<MemoryRegion>();
+
+/// The longest command line a loader writes and a kernel accepts. A line claiming more is
+/// malformed rather than truncated: a kernel that silently dropped the end of its
+/// arguments would boot a configuration nobody asked for.
+pub const MAX_COMMAND_LINE: usize = 1024;
 
 /// Tags are padded to this alignment, so every tag header can be read as aligned data.
 const TAG_ALIGN: usize = 8;
@@ -221,6 +226,22 @@ impl<'a> Parsed<'a> {
         self.u64_tag(TagKind::AcpiRsdp)
     }
 
+    /// The kernel command line, if the loader passed one.
+    ///
+    /// Any bytes are returned as they are, UTF-8 or not: the kernel's argument parser
+    /// decides what it will accept, and a loader that wrote garbage should be reported as
+    /// such by the code that knows what an argument looks like. Only the length is
+    /// judged here.
+    pub fn command_line(&self) -> Result<Option<&'a [u8]>, Error> {
+        let Some(tag) = self.find(TagKind::CommandLine)? else {
+            return Ok(None);
+        };
+        if tag.payload.len() > MAX_COMMAND_LINE {
+            return Err(Error::Malformed { offset: tag.offset });
+        }
+        Ok(Some(tag.payload))
+    }
+
     /// Which kind of firmware or loader produced this structure.
     pub fn firmware(&self) -> Result<Option<u32>, Error> {
         Ok(self
@@ -338,6 +359,15 @@ impl<'a> Builder<'a> {
 
     pub fn acpi_rsdp(&mut self, address: u64) -> Result<(), Error> {
         self.tag(TagKind::AcpiRsdp, &address.to_ne_bytes())
+    }
+
+    /// Append the kernel command line. Longer than [`MAX_COMMAND_LINE`] is refused, for
+    /// the reason the reader refuses it.
+    pub fn command_line(&mut self, line: &[u8]) -> Result<(), Error> {
+        if line.len() > MAX_COMMAND_LINE {
+            return Err(Error::NoRoom);
+        }
+        self.tag(TagKind::CommandLine, line)
     }
 
     pub fn firmware(&mut self, firmware: Firmware) -> Result<(), Error> {

@@ -1,0 +1,19 @@
+# The boot entry list and the menu both KinTane loaders show.
+#
+# What an entry is, how the list is written on the boot medium, which entry a key
+# selects, and when the countdown boots the default: all of it is here, as plain code
+# with host tests. Each loader only reads a file and a keyboard and prints lines, so
+# `kinboot-bios` and `kinboot-efi` offer the same entries in the same way.
+#
+# At layer `hal`, with `cmdline` its only dependency, so both loaders can link it for
+# their own targets. No `config.requires`: it builds, and its tests run, under every
+# preset.
+[unit]
+name = "kinboot-menu"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "hal"
+
+[deps]
+units = ["cmdline"]

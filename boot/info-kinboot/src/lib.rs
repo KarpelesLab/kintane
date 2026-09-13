@@ -128,6 +128,44 @@ fn translate(e: boot_protocol::Error) -> Error {
 /// for the total size the header declares, up to [`MAX_BOOT_INFO_BYTES`]. A zero
 /// `boot_arg` is reported as [`Error::NoLoader`] and nothing is read.
 pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<usize, Error> {
+    // SAFETY: this function's contract is `structure`'s, passed through unchanged.
+    let bytes = unsafe { structure(boot_arg) }?;
+    regions_from(boot_arg, bytes, out)
+}
+
+/// Copy the kernel command line the loader passed into `out`, returning its length, or
+/// `None` when the structure carries no command line tag.
+///
+/// Absent and empty are different answers on purpose. A loader that passes an empty line
+/// has said "no arguments"; one that passes no tag at all may predate the tag, and a
+/// kernel that requires its arguments should be able to tell the two apart.
+///
+/// # Safety
+/// As [`memory_regions`].
+pub unsafe fn command_line(boot_arg: u64, out: &mut [u8]) -> Result<Option<usize>, Error> {
+    // SAFETY: this function's contract is `structure`'s, passed through unchanged.
+    let bytes = unsafe { structure(boot_arg) }?;
+    command_line_from(bytes, out)
+}
+
+/// [`command_line`] for a structure already in hand as bytes.
+pub fn command_line_from(bytes: &[u8], out: &mut [u8]) -> Result<Option<usize>, Error> {
+    let parsed = tags::parse(bytes).map_err(translate)?;
+    let Some(line) = parsed.command_line().map_err(translate)? else {
+        return Ok(None);
+    };
+    let slot = out
+        .get_mut(..line.len())
+        .ok_or(Error::Malformed { offset: 0 })?;
+    slot.copy_from_slice(line);
+    Ok(Some(line.len()))
+}
+
+/// The boot information structure at `boot_arg`, bounded by what its header claims.
+///
+/// # Safety
+/// As [`memory_regions`]. The slice must not outlive the loader's memory.
+unsafe fn structure(boot_arg: u64) -> Result<&'static [u8], Error> {
     if boot_arg == 0 {
         return Err(Error::NoLoader);
     }
@@ -156,10 +194,10 @@ pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<
 
     // SAFETY: the header at `base` is valid, and for that case the caller guarantees
     // `total` bytes are readable; `total` was capped and the range checked not to wrap.
-    // Bytes have no invalid values, and nothing writes to the structure while the slice
-    // lives: it is dropped before this returns, on a single-threaded boot path.
-    let bytes: &[u8] = unsafe {
+    // Bytes have no invalid values, and nothing writes to the structure: it is the
+    // loader's, reported as boot data so the frame allocator never hands it out, and
+    // the callers in this file drop the slice before they return.
+    Ok(unsafe {
         core::slice::from_raw_parts(core::ptr::with_exposed_provenance::<u8>(base), total)
-    };
-    regions_from(boot_arg, bytes, out)
+    })
 }

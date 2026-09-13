@@ -147,6 +147,62 @@ is an unmapped page, and `riscv32-virt` has nothing to unmap: the three symbols 
 An overflow on `riscv32` is not caught today. PMP regions could catch it and are not
 programmed yet.
 
+### Boot entries, the command line and chainloading
+
+The boot path has its own settings, and each is proven the same way: by a boot whose exit
+code depends on it. See [bootloader.md](bootloader.md#as-built-entries-the-menu-and-the-command-line)
+for what they are.
+
+- **The command line arrives intact, on every preset.** Test builds set `CMDLINE` to a
+  canary and `BOOT_ARGS_CHECK`. The kernel's banner fails the boot unless it received
+  `mode=` `BOOT_EXPECT_MODE` followed by exactly the words of `CMDLINE`. Every boot in CI
+  therefore checks the whole path from the configuration to the kernel. On `-kernel`
+  presets that path is `-append`, through Multiboot on x86 and `/chosen/bootargs` on
+  aarch64. On the loader presets it is the entry list, the menu and the protocol's
+  command line tag. A line that is missing, cut short or in the wrong mode is exit 35.
+- **Safe mode does what safe mode does.** Every preset is also booted with
+  `BOOT_MODE_SAFE=y`. The check above then requires `mode=safe`, and the step requires the
+  mode's effect, the verbose memory map, in the console output.
+- **The menu reads a keyboard.** With a nonzero `BOOT_MENU_TIMEOUT`, `BOOT_TEST_KEYS` is
+  typed on the guest's serial console once the loader prints its menu, and
+  `BOOT_EXPECT_MODE` is set to the mode of the entry that key selects, not the default's:
+
+  ```
+  $ kbuild run --preset i686-bios --set BOOT_MENU_TIMEOUT=30 --set BOOT_TEST_KEYS=2 \
+        --set BOOT_EXPECT_MODE=safe
+  ```
+
+  The keys are typed when the menu appears rather than when QEMU starts, because firmware
+  and loader both reset the UART's receive FIFO when they program it. The first version
+  typed at once, and the keystroke was lost every time.
+- **Chainloading hands over what it promises.** `CHAIN_TEST` makes a test payload the
+  default entry, on `i686-bios`, `x86_64-bios` and `x86_64-efi`. The payload exits QEMU
+  itself: 33 if it was entered correctly, 35 if not. The BIOS payload checks `DL` and
+  `DS:SI`; the UEFI one checks its load options and `FilePath`.
+
+Each verdict was falsified by a mutation confirmed to have applied:
+
+| Mutation | What happened |
+|---|---|
+| `kinboot-bios` writes no command line tag | `cmdline none passed`, exit 35 |
+| `kinboot-efi` writes no command line tag | the same on `x86_64-efi` |
+| `-append` dropped from x86 `-kernel` boots | the kernel gets only QEMU's image path, which it strips; `EXPECTED ...`, exit 35 |
+| `-append` dropped from aarch64 | no `/chosen/bootargs`: `none passed`, exit 35 |
+| The BIOS loader hands over the line one byte short | `kintane.canary=cmdline-intac`, `EXPECTED ...`, exit 35 |
+| The menu ignores `default` (`BOOT_MODE_SAFE=y`) | both loaders boot normal, `EXPECTED mode=safe`, exit 35 |
+| Digit keys off by one (key `2` typed) | `i686-bios` boots recovery, exit 35; a `kinboot-menu` host test fails too |
+| Chainload with `DL` wrong | the record prints `FAILED, DL is not the boot drive`, exit 35 within seconds |
+| Chainload with `SI` one entry off | `FAILED, DS:SI is not this partition's entry`, exit 35; a `kinboot-bios` host test fails too |
+| Chain entry names an empty partition | `partition 3 is empty`, INT 18h, exit 0 (a failure) at once |
+| Entry list CRC written wrong | `boot entries checksum mismatch`, exit 0 (a failure) at once |
+| `kinboot-efi` sets no load options | the application prints `FAILED, not started by kinboot-efi`, exit 35 |
+| Chain entry names a missing EFI file | `cannot open`, then the `on-failure reboot` reset: exit 0 (a failure) two seconds in. **Control:** with `on-failure firmware`, OVMF moves on to PXE and the run times out at 60 s, which is why test builds write `reboot` |
+| Safe mode's verbose map removed | the boot still passes, as intended, since output is not a verdict, but the CI step's check for the map fails |
+| Multiboot image path not stripped | the kernel sees QEMU's file name as its first word, exit 35. This proves QEMU does pass the path |
+| `/chosen` not recognised | aarch64 `none passed`, exit 35; an `fdt` host test fails too |
+| kbuild writes a different entry title | kbuild's pinned-fixture tests fail |
+| The parser renames `chain-partition` | four `kinboot-menu` tests fail, the pinned fixture among them |
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once
@@ -188,6 +244,9 @@ hand:
 | aarch64 (`aarch64-virt-smp`) | `qemu-system-aarch64` | `virt`, `-smp 4` | `-kernel`, secondaries through PSCI | semihosting |
 | armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
 | riscv32 (`riscv32-virt`) | `qemu-system-riscv32` | `virt` | `-bios none`, `-kernel` | `sifive_test` |
+
+The `-kernel` rows also pass `-append` with the command line the configuration's default
+entry would hand over.
 
 The UEFI row is the `x86_64-efi` preset. It needs firmware that is not part of the
 pinned toolchain, so `kbuild` looks for OVMF where distributions put it: next to the

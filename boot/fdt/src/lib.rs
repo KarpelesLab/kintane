@@ -271,6 +271,12 @@ pub enum Error {
         /// Offset of the property or reservation entry.
         offset: usize,
     },
+    /// A property that must hold one string does not: no terminating NUL, or a NUL
+    /// inside it.
+    BadString {
+        /// Offset of the property.
+        offset: usize,
+    },
     /// More regions than the output buffer holds.
     TooManyRegions {
         /// The buffer's length.
@@ -315,7 +321,8 @@ impl Error {
             | Error::UnsupportedCells { offset, .. }
             | Error::RegLength { offset, .. }
             | Error::ValueTooWide { offset }
-            | Error::RegionOverflow { offset } => offset,
+            | Error::RegionOverflow { offset }
+            | Error::BadString { offset } => offset,
             Error::TooManyRegions { .. } | Error::NoMemory => 0,
         }
     }
@@ -638,6 +645,38 @@ impl Iterator for Reservations<'_> {
             return Some(Err(Error::RegionOverflow { offset }));
         }
         Some(Ok(Reservation { address, size }))
+    }
+}
+
+impl<'a> Fdt<'a> {
+    /// The kernel command line: the string in `/chosen`'s `bootargs`, if there is one.
+    ///
+    /// `None` when there is no `/chosen` node or it has no `bootargs`, which is how a
+    /// tree says no command line was given; QEMU writes `bootargs` only for `-append`.
+    ///
+    /// # Errors
+    /// A structure-block error from the walk, or [`Error::BadString`] if `bootargs` is
+    /// not exactly one NUL-terminated string.
+    pub fn bootargs(&self) -> Result<Option<&'a [u8]>, Error> {
+        let mut in_chosen = false;
+        for token in self.tokens() {
+            match token? {
+                Token::BeginNode { name, depth, .. } if depth == 2 => in_chosen = name == b"chosen",
+                Token::EndNode { depth, .. } if depth == 2 => in_chosen = false,
+                Token::Property {
+                    name: b"bootargs",
+                    value,
+                    depth: 2,
+                    offset,
+                } if in_chosen => {
+                    return string_value(value)
+                        .map(Some)
+                        .ok_or(Error::BadString { offset });
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
     }
 }
 

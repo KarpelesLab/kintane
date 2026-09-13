@@ -23,6 +23,12 @@
 //!
 //! Stated here because every loader for the architecture must provide it:
 //!
+//! - **x86, 32-bit protected mode** (i686 and x86_64 alike): the ELF entry point, which is the
+//!   image's Multiboot entry; paging off; flat 4 GiB code and data segments; interrupts disabled;
+//!   `EAX` = [`crate::ENTRY32_MAGIC`]; `EBX` = the boot information's physical address, below 4
+//!   GiB. That is Multiboot 1's machine state with a different magic, on purpose: the kernel's
+//!   32-bit entry is already written for exactly that state, and the magic tells a reader which
+//!   structure `EBX` points at. `kinboot-bios` enters this way.
 //! - **x86_64:** long mode; interrupts disabled; direction flag clear; the loaded segments and the
 //!   boot information identity-mapped; the boot information's physical address in `rdi`. The kernel
 //!   takes its own stack, page tables and GDT before it touches anything else, so the loader's are

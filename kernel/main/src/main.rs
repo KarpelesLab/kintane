@@ -10,6 +10,7 @@
 // docs/coding-standards.md; this is the replacement it names.
 #![feature(sync_unsafe_cell)]
 
+mod bootargs;
 mod clock;
 mod crash;
 #[cfg(CONFIG_MM_PAGED)]
@@ -179,6 +180,10 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     c.write_str(if kconfig::MM_PAGED { "y" } else { "n" });
     c.write_str(" DEBUG=");
     c.write_str(if kconfig::DEBUG_BUILD { "y" } else { "n" });
+    // Early, while the loader's memory is certainly still where it left it, and before the
+    // memory map is built on, so safe mode's verbose map comes before anything uses it.
+    c.write_str("\n  cmdline    ");
+    let args = bootargs::check(c, boot_arg);
     // Before `memory`, because the kernel's address space maps the device windows the
     // drivers found here claim, and before interrupts, because this is where the
     // interrupt controller is bound. Before `pagetable` too, because that check leaves
@@ -242,6 +247,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
 
     c.write_str("\n\nreached kmain\n");
     let verdict = paging
+        .and(args)
         .and(devices)
         .and(mem)
         .and(Check::from_ok(irq_ok))

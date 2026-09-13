@@ -4,6 +4,7 @@
 //! running the result. Cargo builds this tool and nothing else in the tree.
 
 mod bios;
+mod bootcfg;
 mod build;
 mod buildid;
 mod cache;
@@ -718,19 +719,18 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         b.cache.misses.get()
     );
 
-    let mut loaders = Vec::new();
+    // Each image built for a target of its own, by unit name. The image format decides
+    // where each goes, and refuses one it has no place for.
+    let mut images: Vec<(String, PathBuf)> = Vec::new();
     for unit in ordered.iter().filter(|u| u.target.is_some()) {
-        loaders.push(build_foreign_image(&b, unit, &ordered)?);
-    }
-    if loaders.len() > 1 {
-        return Err("more than one loader is enabled; the configuration should select one".into());
+        images.push((unit.name.clone(), build_foreign_image(&b, unit, &ordered)?));
     }
 
     let linked = image.ok_or("no unit of kind `bin` was built; nothing to boot")?;
     let symbols = b.split_symbols(&linked)?;
     let build_id = buildid::stamp(&b.tc.tool("llvm-objcopy")?, &linked, &symbols)?;
-    let image =
-        b.package(res.str("IMAGE_FORMAT"), &linked, loaders.first().map(PathBuf::as_path))?;
+    let entries = bootcfg::entry_list(&res, bootcfg::Chain::File(build::ESP_CHAIN_TEST_ENTRY_PATH));
+    let image = b.package(res.str("IMAGE_FORMAT"), &linked, &images, &entries)?;
     // A BIOS disk wraps the packaged image rather than replacing it: the kernel on the
     // disk is byte for byte the one `-kernel` boots.
     let image = if res.is_on(bios::SYMBOL) {

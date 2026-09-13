@@ -25,7 +25,9 @@ impl Status {
     pub const LOAD_ERROR: Status = Status(ERROR_BIT | 1);
     pub const INVALID_PARAMETER: Status = Status(ERROR_BIT | 2);
     pub const BUFFER_TOO_SMALL: Status = Status(ERROR_BIT | 5);
+    pub const NOT_READY: Status = Status(ERROR_BIT | 6);
     pub const OUT_OF_RESOURCES: Status = Status(ERROR_BIT | 9);
+    pub const NOT_FOUND: Status = Status(ERROR_BIT | 14);
 
     pub fn is_error(self) -> bool {
         self.0 & ERROR_BIT != 0
@@ -57,12 +59,12 @@ pub struct SystemTable {
     pub firmware_vendor: *const u16,
     pub firmware_revision: u32,
     pub console_in_handle: Handle,
-    pub con_in: *mut c_void,
+    pub con_in: *mut SimpleTextInput,
     pub console_out_handle: Handle,
     pub con_out: *mut SimpleTextOutput,
     pub standard_error_handle: Handle,
     pub std_err: *mut SimpleTextOutput,
-    pub runtime_services: *mut c_void,
+    pub runtime_services: *mut RuntimeServices,
     pub boot_services: *mut BootServices,
     pub number_of_table_entries: usize,
     pub configuration_table: *const ConfigurationTable,
@@ -121,13 +123,24 @@ pub struct BootServices {
     pub locate_handle: Unused,
     pub locate_device_path: Unused,
     pub install_configuration_table: Unused,
-    pub load_image: Unused,
-    pub start_image: Unused,
+    pub load_image: unsafe extern "efiapi" fn(
+        boot_policy: bool,
+        parent: Handle,
+        device_path: *const DevicePath,
+        source: *const u8,
+        source_size: usize,
+        image: *mut Handle,
+    ) -> Status,
+    pub start_image: unsafe extern "efiapi" fn(
+        image: Handle,
+        exit_data_size: *mut usize,
+        exit_data: *mut *mut u16,
+    ) -> Status,
     pub exit: Unused,
     pub unload_image: Unused,
     pub exit_boot_services: unsafe extern "efiapi" fn(image: Handle, map_key: usize) -> Status,
     pub get_next_monotonic_count: Unused,
-    pub stall: Unused,
+    pub stall: unsafe extern "efiapi" fn(microseconds: usize) -> Status,
     pub set_watchdog_timer: unsafe extern "efiapi" fn(
         timeout: usize,
         code: u64,
@@ -135,6 +148,65 @@ pub struct BootServices {
         data: *const u16,
     ) -> Status,
 }
+
+#[repr(C)]
+pub struct RuntimeServices {
+    pub hdr: TableHeader,
+    pub get_time: Unused,
+    pub set_time: Unused,
+    pub get_wakeup_time: Unused,
+    pub set_wakeup_time: Unused,
+    pub set_virtual_address_map: Unused,
+    pub convert_pointer: Unused,
+    pub get_variable: Unused,
+    pub get_next_variable_name: Unused,
+    pub set_variable: Unused,
+    pub get_next_high_monotonic_count: Unused,
+    pub reset_system: unsafe extern "efiapi" fn(
+        kind: u32,
+        status: Status,
+        data_size: usize,
+        data: *const c_void,
+    ) -> !,
+}
+
+/// `EFI_RESET_TYPE`.
+pub const RESET_COLD: u32 = 0;
+
+#[repr(C)]
+pub struct SimpleTextInput {
+    pub reset: Unused,
+    pub read_key_stroke:
+        unsafe extern "efiapi" fn(this: *mut SimpleTextInput, key: *mut InputKey) -> Status,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct InputKey {
+    /// `SCAN_UP` is 1 and `SCAN_DOWN` 2; zero for a key that has a character.
+    pub scan_code: u16,
+    pub unicode_char: u16,
+}
+
+pub const SCAN_UP: u16 = 1;
+pub const SCAN_DOWN: u16 = 2;
+
+pub const DEVICE_PATH_GUID: Guid =
+    Guid(0x0957_6E91, 0x6D3F, 0x11D2, [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
+
+/// The header every device path node starts with. A path is a sequence of nodes ending in
+/// one of type [`DEVICE_PATH_END`].
+#[repr(C)]
+pub struct DevicePath {
+    pub kind: u8,
+    pub sub_kind: u8,
+    pub length: [u8; 2],
+}
+
+pub const DEVICE_PATH_END: u8 = 0x7F;
+pub const DEVICE_PATH_END_ENTIRE: u8 = 0xFF;
+pub const DEVICE_PATH_MEDIA: u8 = 4;
+pub const DEVICE_PATH_MEDIA_FILE: u8 = 4;
 
 #[repr(C)]
 pub struct SimpleTextOutput {

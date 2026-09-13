@@ -130,23 +130,31 @@ config QEMU_EXIT
         that ships.
 
 config BOOT_KINBOOT
+    bool
+    readonly
+    help
+        The kernel is started by a KinTane loader and reads the boot
+        protocol's own structure rather than a multiboot one. Selected by
+        KINBOOT_EFI and KINBOOT_BIOS; off, the image is the multiboot kernel
+        QEMU loads directly, which is the faster path for everyday
+        development.
+
+config KINBOOT_EFI
     bool "Boot through kinboot-efi"
     depends on ARCH_X86_64
+    select BOOT_KINBOOT
     default n
     help
         Start the kernel from UEFI firmware through KinTane's own loader,
-        kinboot-efi, which hands over the boot protocol's structure instead
-        of a multiboot one. The build produces a disk image with an EFI
-        system partition holding the loader and the kernel, and QEMU boots
-        it under OVMF rather than with -kernel. See docs/bootloader.md.
-
-        Off, the image is the multiboot kernel QEMU loads directly, which is
-        the faster path for everyday development.
+        kinboot-efi, which hands over the boot protocol's structure. The
+        build produces a disk image with an EFI system partition holding the
+        loader, its boot entries and the kernel, and QEMU boots it under
+        OVMF rather than with -kernel. See docs/bootloader.md.
 
 config IMAGE_FORMAT
     string
     readonly
-    default "efi-esp" if BOOT_KINBOOT
+    default "efi-esp" if KINBOOT_EFI
     default "multiboot-elf32" if ARCH_X86_64
     default "elf"
     # i686 links as ELF32 already, so the multiboot container needs no rewrite.
@@ -160,16 +168,101 @@ config IMAGE_FORMAT
 config KINBOOT_BIOS
     bool "Boot from a BIOS disk through kinboot-bios"
     depends on ARCH_X86_64 || ARCH_I686
+    select BOOT_KINBOOT
     default n
     help
         Also build the BIOS loader and write build/<target>/out/kinboot-bios.img:
-        an MBR, stage 2 and the packaged kernel image. `kbuild run` and
-        `kbuild test --target` then boot that disk through the machine's
-        firmware, with no -kernel, so every boot test exercises the loader.
+        an MBR, stage 2, the boot entries and the packaged kernel image.
+        `kbuild run` and `kbuild test --target` then boot that disk through
+        the machine's firmware, with no -kernel, so every boot test exercises
+        the loader.
 
-        The loader hands over as a Multiboot 1 loader, which both x86 kernels
-        already accept. See docs/bootloader.md. The BIOS path has no root of
-        trust, and this option offers no security guarantee.
+        The loader hands over the boot protocol's structure through the
+        kernel's 32-bit entry. See docs/bootloader.md. The BIOS path has no
+        root of trust, and this option offers no security guarantee.
+
+# --- boot entries and the command line --------------------------------------
+# One set of settings for every boot path. A KinTane loader writes them into the
+# boot entries on its medium; `-kernel` boots get the same line through -append.
+# See docs/bootloader.md#boot-options.
+
+config CMDLINE
+    string "Kernel command line"
+    default "kintane.canary=cmdline-intact" if QEMU_EXIT
+    default ""
+    help
+        Arguments every boot entry passes to the kernel, after the entry's
+        own `mode=`. Test builds default to a canary the kernel's boot check
+        compares word for word, so a line lost or mangled anywhere between
+        the build and the kernel fails the boot.
+
+# The mode of the entry a loader boots when nobody chooses, and the `mode=` a
+# `-kernel` boot is given. The modes are defined in docs/bootloader.md#modes.
+choice BOOT_MODE
+    prompt "Default boot mode"
+    default BOOT_MODE_NORMAL
+
+    config BOOT_MODE_NORMAL
+        bool "normal"
+
+    config BOOT_MODE_SAFE
+        bool "safe"
+
+    config BOOT_MODE_RECOVERY
+        bool "recovery"
+endchoice
+
+config BOOT_MENU_TIMEOUT
+    int "Seconds the boot menu waits"
+    range 0 600
+    default 0 if QEMU_EXIT
+    default 5
+    help
+        How long a KinTane loader shows its entries before booting the
+        default. Test builds use 0, which still prints the menu but never
+        waits on it: a harness that has to sit through a countdown is a slow
+        harness.
+
+config BOOT_ARGS_CHECK
+    bool "Require the command line the build wrote"
+    depends on QEMU_EXIT
+    default y if QEMU_EXIT
+    help
+        Fail the boot unless the kernel received `mode=` BOOT_EXPECT_MODE
+        followed by exactly the words of CMDLINE. A test setting: a real
+        machine's boot entries are its owner's to edit.
+
+config BOOT_EXPECT_MODE
+    string "Mode the command line check requires"
+    depends on BOOT_ARGS_CHECK
+    default "safe" if BOOT_MODE_SAFE
+    default "recovery" if BOOT_MODE_RECOVERY
+    default "normal"
+    help
+        Usually the default mode. Set it apart from BOOT_MODE together with
+        BOOT_TEST_KEYS, to prove that a key chose an entry the default would
+        not have.
+
+config BOOT_TEST_KEYS
+    string "Keys typed at the boot menu"
+    depends on QEMU_EXIT
+    default ""
+    help
+        Bytes `kbuild run` and `kbuild test --target` type on the guest's
+        serial console as it starts, for proving the boot menu reads a
+        keyboard. Only meaningful with a nonzero BOOT_MENU_TIMEOUT.
+
+config CHAIN_TEST
+    bool "Default to a chainload test entry"
+    depends on QEMU_EXIT && BOOT_KINBOOT
+    default n
+    help
+        Add a boot entry that chainloads a test payload instead of the
+        kernel, and make it the default. The payload, which kbuild builds,
+        passes the run only if it was started the way a chainloaded system
+        expects: through LoadImage/StartImage with the loader's options on
+        UEFI, and from its partition's boot record with the boot drive in DL
+        on BIOS.
 
 config MOCK_ARCH
     bool

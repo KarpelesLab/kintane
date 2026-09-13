@@ -115,6 +115,26 @@ pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<
     Ok(n.saturating_add(1))
 }
 
+/// Copy the kernel command line into `out`, returning its length, or `None` when the tree
+/// carries none: `/chosen`'s `bootargs`, which QEMU writes for `-append` and a Linux-style
+/// loader writes from its own configuration.
+///
+/// # Safety
+/// As [`memory_regions`].
+pub unsafe fn command_line(boot_arg: u64, out: &mut [u8]) -> Result<Option<usize>, Error> {
+    // SAFETY: this function's contract is `device_tree`'s, passed through unchanged.
+    let blob = unsafe { device_tree(boot_arg) }?;
+    let tree = fdt::Fdt::new(blob).map_err(translate)?;
+    let Some(line) = tree.bootargs().map_err(translate)? else {
+        return Ok(None);
+    };
+    let slot = out
+        .get_mut(..line.len())
+        .ok_or(Error::Malformed { offset: 0 })?;
+    slot.copy_from_slice(line);
+    Ok(Some(line.len()))
+}
+
 /// The device tree the platform was booted with, as the bytes of its `totalsize`.
 ///
 /// Found the way [`memory_regions`] describes: at `boot_arg`, or probed at the base of

@@ -339,6 +339,16 @@ fn dep_order(unit: &Unit, deps: &BTreeMap<String, Built>) -> Vec<String> {
     v
 }
 
+/// Where each image built for the ESP goes, by unit name.
+const ESP_IMAGES: &[(&str, &str)] = &[
+    ("kinboot_efi", "EFI/BOOT/BOOTX64.EFI"),
+    ("kinboot_efi_chaintest", "EFI/KINTANE/CHAIN.EFI"),
+];
+
+/// The chainload test application as a boot entry names it: the ESP path above, the way
+/// UEFI spells paths.
+pub const ESP_CHAIN_TEST_ENTRY_PATH: &str = "\\EFI\\KINTANE\\CHAIN.EFI";
+
 impl Build {
     /// Package a linked image into something the platform's loader will accept.
     ///
@@ -358,10 +368,18 @@ impl Build {
         &self,
         format: &str,
         linked: &Path,
-        loader: Option<&Path>,
+        images: &[(String, PathBuf)],
+        entries: &str,
     ) -> Result<PathBuf, String> {
+        if format != "efi-esp"
+            && let Some((name, _)) = images.first()
+        {
+            return Err(format!(
+                "`{name}` was built, but the {format} image format has no place for it"
+            ));
+        }
         let (flags, dest): (&[&str], PathBuf) = match format {
-            "efi-esp" => return self.package_esp(linked, loader),
+            "efi-esp" => return self.package_esp(linked, images, entries),
             "" | "elf" => (&["--strip-all"], linked.with_extension("img.elf")),
             "multiboot-elf32" => {
                 (&["--strip-all", "-O", "elf32-i386"], linked.with_extension("mb32.elf"))
@@ -374,29 +392,51 @@ impl Build {
     }
 
     /// A disk image whose EFI system partition holds the loader, where the firmware's
-    /// boot manager looks for a removable medium's default, and the stripped ELF64, where
-    /// the loader looks for the kernel.
+    /// boot manager looks for a removable medium's default; the boot entries and the
+    /// stripped ELF64, where the loader looks for them; and any other image built for
+    /// the ESP, such as the chainload test application.
     ///
     /// The ELF64 rather than the ELF32 the multiboot path needs: kinboot-efi reads 64-bit
     /// program headers and enters in long mode.
-    fn package_esp(&self, linked: &Path, loader: Option<&Path>) -> Result<PathBuf, String> {
-        let loader =
-            loader.ok_or("the efi-esp image format needs a loader, and none is enabled")?;
+    fn package_esp(
+        &self,
+        linked: &Path,
+        images: &[(String, PathBuf)],
+        entries: &str,
+    ) -> Result<PathBuf, String> {
+        let place = |name: &str| {
+            ESP_IMAGES
+                .iter()
+                .find(|(unit, _)| *unit == name)
+                .map(|(_, at)| *at)
+        };
+        if !images.iter().any(|(name, _)| name == "kinboot_efi") {
+            return Err("the efi-esp image format needs kinboot_efi, and it is not enabled".into());
+        }
         let kernel = linked.with_extension("img.elf");
         self.objcopy(&["--strip-all"], linked, &kernel)
             .map_err(|e| format!("stripping the kernel failed:\n{e}"))?;
         let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
-        let (loader_bytes, kernel_bytes) = (read(loader)?, read(&kernel)?);
-        let disk = crate::esp::disk_image(&[
-            crate::esp::File {
-                path: "EFI/BOOT/BOOTX64.EFI",
-                data: &loader_bytes,
-            },
-            crate::esp::File {
-                path: "KINTANE/KERNEL.ELF",
-                data: &kernel_bytes,
-            },
-        ])?;
+        let mut contents = Vec::new();
+        for (name, path) in images {
+            let at = place(name)
+                .ok_or_else(|| format!("`{name}` was built, but the ESP has no place for it"))?;
+            contents.push((at, read(path)?));
+        }
+        let kernel_bytes = read(&kernel)?;
+        let mut files: Vec<crate::esp::File<'_>> = contents
+            .iter()
+            .map(|(path, data)| crate::esp::File { path, data })
+            .collect();
+        files.push(crate::esp::File {
+            path: "KINTANE/KERNEL.ELF",
+            data: &kernel_bytes,
+        });
+        files.push(crate::esp::File {
+            path: "KINTANE/BOOT.CFG",
+            data: entries.as_bytes(),
+        });
+        let disk = crate::esp::disk_image(&files)?;
         let dest = linked.with_extension("esp.img");
         std::fs::write(&dest, disk).map_err(|e| format!("{}: {e}", dest.display()))?;
         Ok(dest)

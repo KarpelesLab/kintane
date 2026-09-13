@@ -23,6 +23,11 @@ mod tests;
 
 pub const MAGIC: u64 = 0x4b_49_4e_54_41_4e_45_00; // "KINTANE\0"
 
+/// What a 32-bit x86 loader leaves in `EAX` when `EBX` points at a [`BootInfo`] rather
+/// than a Multiboot information structure, whose magic is `0x2BADB002`. `KINT` in ASCII.
+/// See [`image`] for the rest of that entry's contract.
+pub const ENTRY32_MAGIC: u32 = 0x4B49_4E54;
+
 /// Incremented only for an incompatible change. Adding a tag is not one.
 pub const VERSION: u16 = 1;
 
