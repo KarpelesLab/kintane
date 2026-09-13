@@ -44,6 +44,7 @@ pub mod context;
 mod exception;
 mod idt;
 pub mod interrupt;
+pub mod kspace;
 pub mod paging;
 pub mod pic;
 pub mod pit;

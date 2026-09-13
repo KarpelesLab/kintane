@@ -138,6 +138,22 @@ config INKERNEL_TESTS
         Requires a result channel, since the verdict is the guest's exit
         status rather than console output a harness would have to scrape.
 
+config STACK_GUARD_TEST
+    bool "Overflow the boot stack on purpose"
+    depends on QEMU_EXIT
+    default n
+    help
+        After bring-up, recurse until the boot stack reaches its guard page,
+        instead of running anything else. The run passes only if the fault
+        that ends it is on the guard page: the exception path checks the
+        faulting address and exits through the emulator's result channel.
+        Any other fault, or none, is a failure.
+
+        A test mode, never a production setting. It exists because "the guard
+        page is unmapped" is a property of a table, and "an overflow is caught
+        and reported" is a property of the running machine. Only the second
+        is worth having; see docs/testing.md.
+
 config FRAME_BITMAP_KIB
     int "Boot-time frame bitmap reserve (KiB)"
     range 4 4096

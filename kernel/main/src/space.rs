@@ -6,24 +6,25 @@
 //! unit may not depend on a `core` unit and therefore cannot reach `mm::paged`. The
 //! kernel image can reach both, so this is where the two halves meet.
 //!
-//! # Why it is built and checked but not activated
+//! # Verified before it is installed
 //!
 //! Installing a new set of tables is the single most unrecoverable thing a kernel can
 //! get wrong: the instruction after the switch has to be fetchable from the map that
 //! was just installed, and if it is not there is no fault handler, no console, and no
-//! evidence. So the space is built, every claim about it is verified through
-//! [`AddressSpace::translate`], and the result is reported — while the machine keeps
-//! running on the bootstrap tables it arrived on.
+//! evidence. So every claim about the space is verified through
+//! [`AddressSpace::translate`] first, and the caller installs it only if all of them
+//! held. A space that fails verification is reported and never becomes live.
 //!
-//! That ordering is deliberate rather than timid. Verifying a map by walking it
-//! proves the same things activation would, minus the part that cannot be undone, and
-//! it can be done on every port on the same day the ports gain section symbols.
-//! Activation is gated behind `ACTIVATE_KERNEL_SPACE` and needs one more thing first:
-//! every device the kernel touches has to be in the map, which is per-port knowledge
-//! — on x86 the console is an I/O port and needs nothing, on aarch64 it is MMIO at a
-//! fixed address and needs a device mapping.
+//! For a while the space was built, verified, and then left unused, with the machine
+//! still running on its bootstrap tables. That proved the tables were right and
+//! protected nothing: the guard page was a hole in a map the CPU was not using. What
+//! it lacked was the devices. RAM and the image are described by the memory map and the
+//! linker script. A device is described by neither, and a device left out is a fault on
+//! the first register access after the switch. On aarch64, where the console is MMIO,
+//! that fault has nowhere to print. Each port now names its windows through
+//! `arch::kspace::device_windows`, and they are mapped here with everything else.
 
-use hal::paging::{HasPageTables, ImageSections, MapError, PageFlags};
+use hal::paging::{DeviceWindow, HasPageTables, ImageSections, MapError, PageFlags};
 use hal::{Arch, EarlyConsole, PhysAddr};
 use mm::DirectMap;
 use mm::frame::Frame;
@@ -39,6 +40,10 @@ use mm::phys::FrameAllocator;
 pub struct Frames<'a, 'store, A: Arch> {
     pub alloc: &'a mut FrameAllocator<'store, A>,
     pub direct: DirectMap,
+    /// The lowest and highest-ending frame handed out, as `[lo, hi)`. Once the space is
+    /// live these frames are the running page tables, and anything else that builds a
+    /// frame pool from the loader's map has to be told to keep out of them.
+    pub span: (u64, u64),
 }
 
 impl<A: Arch> FrameSource for Frames<'_, '_, A> {
@@ -64,6 +69,14 @@ impl<A: Arch> FrameSource for Frames<'_, '_, A> {
         // owns it, and `ptr_to_phys` succeeded so it lies inside the direct map and is
         // writable for a whole page.
         unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, A::PAGE_SIZE) };
+        let (lo, hi) = self.span;
+        let start = frame.start().raw();
+        let end = start + A::PAGE_SIZE as u64;
+        self.span = if lo == hi {
+            (start, end)
+        } else {
+            (lo.min(start), hi.max(end))
+        };
         Ok(frame.start())
     }
 
@@ -87,19 +100,37 @@ struct Segment {
 /// above-image. The guard page is a hole rather than an entry.
 const MAX_SEGMENTS: usize = 8;
 
-/// Build the kernel address space and check it. Returns true if every claim held.
+/// A kernel address space that passed verification and has not been installed yet.
+pub struct Verified<A: HasPageTables> {
+    pub space: AddressSpace<A>,
+    /// `[lo, hi)` around every frame its tables occupy.
+    pub tables: (u64, u64),
+}
+
+/// Build the kernel address space and check it.
+///
+/// `devices` are mapped beside the direct map, and every address in `must_reach` has to
+/// translate: those are things the kernel reads after the switch that neither the
+/// memory map nor the image accounts for, such as the loader's boot information. Returns
+/// the space only if every claim held, so a caller cannot install one that did not.
 pub fn build_and_verify<A: HasPageTables>(
     c: &dyn EarlyConsole,
     alloc: &mut FrameAllocator<'_, A>,
     direct: DirectMap,
     sections: ImageSections,
-) -> bool {
-    let mut frames = Frames { alloc, direct };
+    devices: &[DeviceWindow],
+    must_reach: &[u64],
+) -> Option<Verified<A>> {
+    let mut frames = Frames {
+        alloc,
+        direct,
+        span: (0, 0),
+    };
     let mut space = match AddressSpace::<A>::new(direct, &mut frames) {
         Ok(s) => s,
         Err(_) => {
             c.write_str("no frame for the root table");
-            return false;
+            return None;
         }
     };
 
@@ -113,7 +144,7 @@ pub fn build_and_verify<A: HasPageTables>(
         Ok(n) => n,
         Err(m) => {
             c.write_str(m);
-            return false;
+            return None;
         }
     };
 
@@ -130,7 +161,7 @@ pub fn build_and_verify<A: HasPageTables>(
             Ok(v) => v.raw(),
             Err(_) => {
                 c.write_str("segment outside the direct map");
-                return false;
+                return None;
             }
         };
         if let Err(e) = space.map(virt, PhysAddr::new(seg.start), len, seg.flags, &mut frames) {
@@ -138,11 +169,92 @@ pub fn build_and_verify<A: HasPageTables>(
             c.write_str(seg.what);
             c.write_str(" failed: ");
             c.write_str(describe(e));
-            return false;
+            return None;
         }
     }
 
-    check(c, &space, direct, sections, &segs[..n])
+    if !map_devices(c, &mut space, &mut frames, devices) {
+        return None;
+    }
+
+    let mut ok = check(c, &space, direct, sections, &segs[..n]);
+    ok &= check_devices(c, &space, devices);
+    for &addr in must_reach {
+        let reached = usize::try_from(addr).ok().and_then(|v| space.translate(v));
+        if reached.map(|(p, _)| p.raw()) != Some(addr) {
+            c.write_str("\n             boot data at ");
+            write_kib(c, addr / 1024);
+            c.write_str(" is outside the kernel space");
+            ok = false;
+        }
+    }
+    let tables = frames.span;
+    ok.then_some(Verified { space, tables })
+}
+
+/// Map each device window at its own physical address, never executable.
+///
+/// Rounded outward to whole pages: a register block that starts mid-page still needs
+/// the whole page mapped, and a device window is not a place where rounding can grant
+/// anything to a neighbour, because nothing else is mapped beside it.
+fn map_devices<A: HasPageTables>(
+    c: &dyn EarlyConsole,
+    space: &mut AddressSpace<A>,
+    frames: &mut Frames<'_, '_, A>,
+    devices: &[DeviceWindow],
+) -> bool {
+    let mask = A::PAGE_SIZE as u64 - 1;
+    for d in devices {
+        let start = d.phys & !mask;
+        let end = d.phys.saturating_add(d.len).saturating_add(mask) & !mask;
+        let (Ok(virt), Ok(len)) = (usize::try_from(start), usize::try_from(end - start)) else {
+            c.write_str("\n             device ");
+            c.write_str(d.what);
+            c.write_str(" is not addressable");
+            return false;
+        };
+        let flags = PageFlags::KERNEL_DATA | PageFlags::DEVICE;
+        if let Err(e) = space.map(virt, PhysAddr::new(start), len, flags, frames) {
+            c.write_str("\n             map device ");
+            c.write_str(d.what);
+            c.write_str(" failed: ");
+            c.write_str(describe(e));
+            return false;
+        }
+    }
+    true
+}
+
+/// Every device window reads back as device memory, writable and not executable.
+fn check_devices<A: HasPageTables>(
+    c: &dyn EarlyConsole,
+    space: &AddressSpace<A>,
+    devices: &[DeviceWindow],
+) -> bool {
+    let mut ok = true;
+    for d in devices {
+        let last = d.phys + d.len.max(1) - 1;
+        for probe in [d.phys, last] {
+            let seen = usize::try_from(probe).ok().and_then(|v| space.translate(v));
+            let right = match seen {
+                Some((p, f)) => {
+                    // Execute is only demanded off where the CPU can express it, for the
+                    // reason `check` gives.
+                    p.raw() == probe
+                        && f.contains(PageFlags::DEVICE | PageFlags::WRITE)
+                        && !(A::can_forbid_execute() && f.contains(PageFlags::EXECUTE))
+                }
+                None => false,
+            };
+            if !right {
+                c.write_str("\n             device ");
+                c.write_str(d.what);
+                c.write_str(" is not mapped as device memory");
+                ok = false;
+            }
+        }
+    }
+    ok
 }
 /// Accumulates the runs to map, keeping them contiguous and non-overlapping.
 ///
@@ -364,6 +476,49 @@ fn check<A: HasPageTables>(
     c.write_str(" rodata, ");
     write_kib(c, s.data.1 - s.data.0);
     c.write_str(" data");
+    ok
+}
+
+/// Walk the tables the CPU is actually using, found through its root register.
+///
+/// Everything [`check`] established was about a data structure. This asks the same
+/// questions of whatever the register names, so a switch that silently did not happen,
+/// or happened to some other table, fails here rather than passing on the strength of a
+/// structure nobody installed.
+pub fn check_live<A: HasPageTables>(
+    c: &dyn EarlyConsole,
+    direct: DirectMap,
+    s: ImageSections,
+) -> bool {
+    // SAFETY: `A::root()` is the table the caller just installed, which was built through
+    // `direct` and is reachable through it; nothing modifies it while this runs.
+    let live = unsafe { AddressSpace::<A>::from_root(A::root(), direct) };
+    let at = |addr: u64| usize::try_from(addr).ok().and_then(|v| live.translate(v));
+    let mut ok = true;
+
+    let text = at(s.text.0);
+    if !text.is_some_and(|(_, f)| f.contains(PageFlags::EXECUTE) && !f.contains(PageFlags::WRITE)) {
+        c.write_str("live text is not read-execute, ");
+        ok = false;
+    }
+    if !s.is_split() {
+        c.write_str("image unsplit");
+        return ok;
+    }
+    if !at(s.rodata.0).is_some_and(|(_, f)| !f.contains(PageFlags::WRITE)) {
+        c.write_str("live rodata is writable, ");
+        ok = false;
+    }
+    if s.has_stack_guard() {
+        if at(s.stack_guard.0).is_some() {
+            c.write_str("live guard page is MAPPED");
+            ok = false;
+        } else {
+            c.write_str("guard page unmapped in the live tables");
+        }
+    } else {
+        c.write_str("no guard page on this port");
+    }
     ok
 }
 

@@ -17,7 +17,7 @@ use core::ptr::{read_volatile, write_volatile};
 use hal::EarlyConsole;
 
 /// PL011 #0 on QEMU `virt`. Fixed by the machine model, not discovered.
-const UART0: usize = 0x0900_0000;
+pub(crate) const UART0: usize = 0x0900_0000;
 
 // Byte offsets from the PL011 programmer's model. Only the handful the early console
 // touches are named; the rest belong to the real driver.

@@ -86,6 +86,46 @@ memory the loader described can be read and written. Anything that does not need
 hardware belongs in level 1, which is faster and far easier to debug. Page table
 manipulation and context switching join this level when they exist.
 
+### Expected faults: the stack guard test
+
+Some properties are only visible as a fault: "the guard page is unmapped" is a fact about
+a table, and "an overflow is caught and reported" is a fact about the running machine.
+A fault normally ends a run in a halt, and a halted guest looks the same to the harness as
+a hung one. So the image itself has to know the fault was expected, and say so through the
+result channel.
+
+`STACK_GUARD_TEST` (depends on `QEMU_EXIT`) does that:
+
+```
+$ kbuild run --preset x86_64-qemu --set QEMU_EXIT=y --set STACK_GUARD_TEST=y
+  ...
+  overflowing the boot stack into its guard page
+*** cpu exception 0x08 #DF double fault
+    cr2    0x000000000010ef68
+    ...
+stack overflow: cr2 is in the guard page below the boot stack, reported from the #DF IST stack
+expected guard page fault: observed
+guest signalled success (qemu exit 33)
+```
+
+After bring-up, and only if bring-up passed, the image overflows the boot stack. The
+exception path checks the faulting address against the guard page. That fault exits with
+success; any other fault exits with failure immediately, so a broken guard fails fast
+instead of timing out. Each port provokes and recognises the fault differently, and each
+difference is a limitation stated in its `kspace.rs`:
+
+| Port | Provoked by | Passes when |
+|---|---|---|
+| x86_64 | unbounded recursion | #PF or #DF with CR2 in the guard page |
+| aarch64 | unbounded recursion | the synchronous vector diverts a frame that would land in the guard page, or a data abort with FAR in it whose frame is *above* the guard |
+| i686 | one store into the guard page | #PF with CR2 in the guard page. A real overflow triple-faults on this port |
+
+Each verdict was falsified. With the guard page mapped, x86_64's recursion runs into
+`.rodata` and fails, and i686's store succeeds and fails. With aarch64's vector check
+removed, the report runs on a frame beneath the guard and fails.
+
+CI runs it on every preset, beside the ordinary boot.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

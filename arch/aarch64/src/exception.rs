@@ -56,6 +56,30 @@ core::arch::global_asm!(
     .balign 0x80
 .endm
 
+// The synchronous entry for the stack the kernel runs on, which is the one entry that can
+// be reached *because* that stack overflowed. Before opening a frame it checks, touching
+// no memory, whether the frame would land in the boot stack's guard page. If it would,
+// the store below faults, the next exception opens its frame 0x120 lower, beneath the
+// guard, and succeeds there — on top of `.bss`. So it goes to the overflow path in
+// `kspace.rs` instead, which runs on a stack of its own. The two EL0 thread-pointer
+// registers are scratch: nothing runs at EL0, so nothing reads them.
+.macro VECTOR_SYNC_SPX index
+    msr     tpidrro_el0, x0
+    msr     tpidr_el0, x1
+    sub     x0, sp, #0x120
+    and     x0, x0, #0xfffffffffffff000
+    adrp    x1, __stack_guard_start
+    cmp     x0, x1
+    mrs     x1, tpidr_el0
+    mrs     x0, tpidrro_el0
+    b.eq    __kspace_stack_overflow
+    sub     sp, sp, #0x120
+    str     x0, [sp, #0x00]
+    mov     x0, #\index
+    b       __exc_common
+    .balign 0x80
+.endm
+
 .section .text.vectors, "ax"
 .balign 0x800
 .globl __exception_vectors
@@ -64,7 +88,7 @@ __exception_vectors:
     VECTOR 1            // current EL, SP_EL0: IRQ
     VECTOR 2            // current EL, SP_EL0: FIQ
     VECTOR 3            // current EL, SP_EL0: SError
-    VECTOR 4            // current EL, SP_ELx: synchronous
+    VECTOR_SYNC_SPX 4   // current EL, SP_ELx: synchronous
     VECTOR 5            // current EL, SP_ELx: IRQ
     VECTOR 6            // current EL, SP_ELx: FIQ
     VECTOR 7            // current EL, SP_ELx: SError
@@ -217,6 +241,7 @@ extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
     c.write_str("\n  spsr ");
     write_hex(c, spsr);
     c.write_str("\n");
+    crate::kspace::after_fault_report(c, esr, far, frame as u64);
 
     <crate::Aarch64 as hal::Arch>::halt()
 }
