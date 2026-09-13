@@ -1,4 +1,10 @@
-//! The scheduler tick: the PIT as a periodic interrupt, and the one hook it calls.
+//! The scheduler tick: the timer interrupt, and the one hook it calls.
+//!
+//! Two timers can drive it. The local APIC timer, once discovery has installed one with
+//! [`set_event_timer`], is the one-shot timer a tickless kernel wants: 32 bits of count and a
+//! divider, reaching over a minute under QEMU. Until then, and on a machine without one, the
+//! PIT does, with its 55 ms reach. The periodic tick ([`start`]) stays on the PIT, which is
+//! what the interrupt and clock checks measure.
 //!
 //! `arch` may not depend on the scheduler (layering), so the scheduler registers a plain
 //! `fn()` and the timer interrupt calls it. The hook runs in interrupt context with
@@ -18,9 +24,40 @@
 //!   thread resumed through a voluntary switch restores its own saved state. A fresh thread starts
 //!   with IF clear, and enabling interrupts is its first act.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use hal::EventTimer;
+
 use crate::{interrupt, pit};
+
+/// Write-once storage for the event timer discovery installed.
+struct TimerSlot(UnsafeCell<Option<&'static dyn EventTimer>>);
+
+// SAFETY: written at most once, by `set_event_timer`, during single-threaded boot with
+// interrupts masked and before any secondary CPU exists; read-only afterwards.
+unsafe impl Sync for TimerSlot {}
+
+static TIMER: TimerSlot = TimerSlot(UnsafeCell::new(None));
+
+/// Install `timer` as the one-shot tick source, in place of the PIT.
+///
+/// Its interrupt must arrive on [`interrupt::TIMER_VECTOR`], which is where the local APIC
+/// driver is told to deliver it.
+///
+/// # Safety
+/// At most once, during single-threaded boot with interrupts masked, before the tick is
+/// started and before any secondary CPU is.
+pub unsafe fn set_event_timer(timer: &'static dyn EventTimer) {
+    // SAFETY: the caller's contract is the `TimerSlot` invariant.
+    unsafe { *TIMER.0.get() = Some(timer) };
+}
+
+/// The installed event timer, if discovery found one that can reach anywhere.
+pub fn event_timer() -> Option<&'static dyn EventTimer> {
+    // SAFETY: by the `TimerSlot` invariant the only write happened before any reader.
+    unsafe { *TIMER.0.get() }.filter(|t| t.reach_ns() > 0)
+}
 
 /// The registered hook, as a type-erased `fn()`. Null means none.
 static HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
@@ -68,19 +105,23 @@ pub unsafe fn start(hz: u32) -> u32 {
     pit::INPUT_HZ / effective
 }
 
-/// Start the timer as a one-shot and unmask its line, without arming it. Returns the
-/// longest delay one arming can cover, in nanoseconds: 54.9 ms, all the 8254's 16-bit
-/// counter holds.
+/// Start the timer as a one-shot, without arming it. Returns the longest delay one arming
+/// can cover, in nanoseconds.
 ///
-/// That limit is why the PIT is an interim one-shot timer. An idle period longer than
-/// it takes one interrupt per 54.9 ms rather than one in total. The local APIC timer
-/// has a 32-bit count and a divider and removes the limit. It comes with the APIC
-/// driver, which also owns the interrupt path this port still routes through the 8259A.
+/// With a local APIC timer installed that is its reach, and IRQ 0 is masked so the PIT
+/// cannot tick alongside it. Without one it is the PIT's 54.9 ms, all its 16-bit counter
+/// holds, and an idle period longer than that takes one interrupt per 54.9 ms rather than
+/// one in total.
 ///
 /// # Safety
 /// As [`start`].
 pub unsafe fn start_oneshot() -> u64 {
     interrupt::init();
+    if let Some(timer) = event_timer() {
+        interrupt::irq_chip().disable(interrupt::TIMER_IRQ);
+        timer.stop();
+        return timer.reach_ns();
+    }
     interrupt::irq_chip().enable(interrupt::TIMER_IRQ);
     count_to_ns(pit::MAX_COUNT)
 }
@@ -93,6 +134,12 @@ pub unsafe fn start_oneshot() -> u64 {
 /// # Safety
 /// Interrupts must be masked, and no one else may be programming the PIT.
 pub unsafe fn arm_ns(ns: u64) {
+    if let Some(timer) = event_timer() {
+        // SAFETY: forwarded; the caller's contract, on the boot CPU whose local APIC the
+        // driver prepared at installation.
+        unsafe { timer.arm_ns(ns) };
+        return;
+    }
     // Clamped before multiplying: 55 ms times 1.19 MHz is far inside a u64, and the
     // clamp keeps an absurd `ns` from overflowing.
     let ns = ns.min(count_to_ns(pit::MAX_COUNT));
@@ -106,9 +153,13 @@ fn count_to_ns(count: u32) -> u64 {
     u64::from(count) * 1_000_000_000 / u64::from(pit::INPUT_HZ)
 }
 
-/// Mask the timer line. Ticks already pending are not delivered.
+/// Stop the tick: mask the PIT's line, and stop the event timer if there is one. Ticks
+/// already pending are not delivered.
 pub fn stop() {
     interrupt::irq_chip().disable(interrupt::TIMER_IRQ);
+    if let Some(timer) = event_timer() {
+        timer.stop();
+    }
 }
 
 /// Timer interrupts taken since boot.

@@ -4,8 +4,9 @@
 //! ports, fixed input frequency, wired to IRQ 0 on every PC ever built. That makes it
 //! the right thing to prove the interrupt path with, and the wrong thing to keep as
 //! the system clock — it is slow to program, has no per-CPU instance, and its
-//! interrupt goes through the PIC. The real timekeeping source is the local APIC
-//! timer, calibrated against the TSC, which is Phase 3 work alongside the APIC driver.
+//! interrupt goes through the PIC. The scheduler's one-shot tick is the local APIC timer,
+//! calibrated against the TSC, once `kernel/platform/acpi` installs the APIC driver; the
+//! PIT stays the timer the interrupt and clock checks measure, and the fallback.
 //!
 //! Reference: Intel 8254 datasheet, and the PC/AT wiring that fixes the input clock
 //! at one third of the 3.579545 MHz NTSC colourburst frequency, because in 1981 that

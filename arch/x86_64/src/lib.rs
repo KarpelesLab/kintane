@@ -27,6 +27,7 @@ pub mod pc;
 pub mod pic;
 pub mod pit;
 pub mod serial;
+pub mod smp;
 pub mod tick;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};
@@ -94,6 +95,10 @@ impl Arch for X86_64 {
             }
         }
     }
+
+    fn cpu_index() -> usize {
+        smp::cpu_index()
+    }
 }
 
 impl HasMmu for X86_64 {
@@ -102,14 +107,11 @@ impl HasMmu for X86_64 {
 }
 
 impl HasSmp for X86_64 {
-    // One until the APIC driver brings up a second CPU; see `cpu_id`.
-    const MAX_CPUS: usize = 1;
+    const MAX_CPUS: usize = smp::MAX_CPUS;
 
     fn cpu_id() -> u32 {
-        // Placeholder until the APIC driver exists in Phase 3. Correct for the
-        // uniprocessor Phase 0 build and wrong for any other, which is why SMP is
-        // off in every preset that exists today.
-        0
+        // The logical index `GS` names, the same number `cpu_index` returns; see `smp`.
+        smp::cpu_index() as u32
     }
 }
 

@@ -12,10 +12,20 @@
 //!
 //! Every function becomes a node under its host bridge or behind its bridge. Every MADT
 //! device and configuration window becomes a node too. Drivers bind to all of them the
-//! way they bind on aarch64. The drivers here are placeholders that claim a window and
-//! drive nothing: nothing uses the APICs yet, but claiming their windows now is what
-//! makes the kernel address space map them, so the SMP work that drives them starts from
-//! a mapped window instead of a constant.
+//! way they bind on aarch64.
+//!
+//! # Interrupt controllers and CPUs
+//!
+//! Which drivers bind the APICs is the architecture's question, answered at module level:
+//!
+//! - **x86_64** binds the local APIC and I/O APIC drivers (`drivers/irqchip/apic`), installs the
+//!   controller and its timer in the architecture's interrupt path with the MADT's source overrides
+//!   applied, and starts every other enabled processor the MADT lists (`apic_x86_64.rs`,
+//!   `smp_x86_64.rs`).
+//! - **i686** binds placeholders that claim the APIC windows and drive nothing, and stays on the
+//!   8259A and the PIT (`apic_i686.rs`). Its interrupt path has no controller seam, and it has no
+//!   second CPU to start, so there is nothing yet for an APIC to do there. Claiming the windows
+//!   keeps its kernel address space the same shape as x86_64's.
 //!
 //! # Discovery runs on the boot identity map
 //!
@@ -40,9 +50,20 @@
 #![no_std]
 #![feature(sync_unsafe_cell)]
 
+#[cfg(CONFIG_ARCH_I686)]
+#[path = "apic_i686.rs"]
+mod controller;
+#[cfg(CONFIG_ARCH_X86_64)]
+#[path = "apic_x86_64.rs"]
+mod controller;
+#[cfg(CONFIG_ARCH_X86_64)]
+#[path = "smp_x86_64.rs"]
+mod smp;
+
 use core::cell::SyncUnsafeCell;
 
 use acpi::{EcamSegment, Madt, MadtEntry, Mcfg, PhysMemory, ProcessorFlags, Rsdp, Tables};
+use apic::Override;
 use device::driver::{self, best_match};
 use device::pci::{self, Address, Bar, ConfigSpace, Function};
 use device::table::Kind;
@@ -93,7 +114,7 @@ static WINDOWS: BootCell<([DeviceWindow; MAX_CLAIMS], usize)> = BootCell::new();
 pub const SOURCE: &str = "ACPI and PCI";
 
 /// A placeholder driver: claims the node's first window, and drives nothing.
-struct Reserve {
+pub(crate) struct Reserve {
     name: &'static str,
     compatible: &'static [&'static str],
     what: &'static str,
@@ -118,24 +139,65 @@ impl Driver for Reserve {
     }
 }
 
-static LOCAL_APIC: Reserve = Reserve {
-    name: "local-apic",
-    compatible: &["acpi,local-apic"],
-    what: "local APIC",
-};
-static IO_APIC: Reserve = Reserve {
-    name: "io-apic",
-    compatible: &["acpi,io-apic"],
-    what: "I/O APIC",
-};
-static ECAM: Reserve = Reserve {
+pub(crate) static ECAM: Reserve = Reserve {
     name: "ecam",
     compatible: &["pci-host-ecam-generic"],
     what: "PCI Express configuration space",
 };
 
-/// Every driver this image carries.
-static DRIVERS: [&dyn Driver; 3] = [&LOCAL_APIC, &IO_APIC, &ECAM];
+/// The processors the MADT lists, as `(APIC ID, enabled)`. More than this are counted and
+/// not started.
+pub(crate) const MAX_MADT_CPUS: usize = 64;
+
+/// What the MADT says beyond the devices that become nodes: every processor, for starting
+/// them, and the ISA interrupt source overrides, for routing.
+#[derive(Clone, Copy)]
+pub(crate) struct MadtFacts {
+    pub cpus: [(u32, bool); MAX_MADT_CPUS],
+    /// Every processor entry, including any past `cpus`' capacity.
+    pub cpu_count: usize,
+    pub overrides: [Override; apic::MAX_OVERRIDES],
+    pub override_count: usize,
+    /// An override did not fit, or was for a bus other than ISA.
+    pub overrides_dropped: bool,
+}
+
+impl MadtFacts {
+    const EMPTY: MadtFacts = MadtFacts {
+        cpus: [(0, false); MAX_MADT_CPUS],
+        cpu_count: 0,
+        overrides: [Override::EMPTY; apic::MAX_OVERRIDES],
+        override_count: 0,
+        overrides_dropped: false,
+    };
+
+    #[cfg_attr(
+        CONFIG_ARCH_I686,
+        expect(
+            dead_code,
+            reason = "the i686 port starts no CPUs and routes nothing through an APIC"
+        )
+    )]
+    pub fn overrides(&self) -> &[Override] {
+        self.overrides.get(..self.override_count).unwrap_or(&[])
+    }
+
+    #[cfg_attr(
+        CONFIG_ARCH_I686,
+        expect(
+            dead_code,
+            reason = "the i686 port starts no CPUs and routes nothing through an APIC"
+        )
+    )]
+    pub fn cpus(&self) -> &[(u32, bool)] {
+        self.cpus
+            .get(..self.cpu_count.min(MAX_MADT_CPUS))
+            .unwrap_or(&[])
+    }
+}
+
+/// Set by [`discover`] from the MADT.
+pub(crate) static MADT: BootCell<MadtFacts> = BootCell::new();
 
 /// Physical memory through the boot identity map.
 ///
@@ -291,13 +353,16 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     };
     let mut ok = true;
 
-    let cpus = match madt_devices(c, &tables, &mut records) {
+    let mut facts = MadtFacts::EMPTY;
+    let cpus = match madt_devices(c, &tables, &mut records, &mut facts) {
         Some(cpus) => cpus,
         None => {
             ok = false;
             0
         }
     };
+    // SAFETY: once, on the single-threaded boot path, before anything reads it.
+    let facts = unsafe { MADT.set(facts) }.ok();
     let (access, host) = config_access(c, &tables, &mut records, &mut ok);
     if records.overflowed {
         c.write_str(" TOO MANY DESCRIBED DEVICES");
@@ -325,6 +390,10 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     };
     let mut resources = Resources::new(mmio, irqs);
     ok &= bind(c, &tree, &mut resources);
+    if ok {
+        // SAFETY: the caller's contract, and the drivers have just probed: `install`'s.
+        ok &= unsafe { controller::install(c, facts) };
+    }
 
     if kconfig::QEMU_PCI_TEST_DEVICE {
         ok &= qemu_agrees(c, functions, cpus, matches!(access, Access::Ecam(_)));
@@ -379,6 +448,7 @@ fn madt_devices(
     c: &dyn EarlyConsole,
     tables: &Tables<'_, BootMemory>,
     records: &mut Records<'_>,
+    facts: &mut MadtFacts,
 ) -> Option<usize> {
     let madt = match tables.find(b"APIC").map(|t| t.map(Madt::parse)) {
         Ok(Some(Ok(madt))) => madt,
@@ -400,12 +470,34 @@ fn madt_devices(
                 processor_uid,
                 apic_id,
                 flags,
-            }) => processor(u32::from(apic_id), u32::from(processor_uid), flags),
+            }) => {
+                record_cpu(facts, u32::from(apic_id), flags);
+                processor(u32::from(apic_id), u32::from(processor_uid), flags)
+            }
             Ok(MadtEntry::LocalX2Apic {
                 x2apic_id,
                 flags,
                 processor_uid,
-            }) => processor(x2apic_id, processor_uid, flags),
+            }) => {
+                record_cpu(facts, x2apic_id, flags);
+                processor(x2apic_id, processor_uid, flags)
+            }
+            Ok(MadtEntry::SourceOverride {
+                bus,
+                source,
+                gsi,
+                flags,
+            }) => {
+                match facts.overrides.get_mut(facts.override_count) {
+                    // Bus 0 is ISA, the only bus ACPI defines overrides for.
+                    Some(slot) if bus == 0 => {
+                        *slot = Override { source, gsi, flags };
+                        facts.override_count += 1;
+                    }
+                    _ => facts.overrides_dropped = true,
+                }
+                continue;
+            }
             Ok(MadtEntry::IoApic {
                 id,
                 address,
@@ -456,6 +548,13 @@ fn madt_devices(
     write_usize(c, ioapics);
     c.write_str(" I/O APIC;");
     Some(cpus)
+}
+
+fn record_cpu(facts: &mut MadtFacts, apic_id: u32, flags: ProcessorFlags) {
+    if let Some(slot) = facts.cpus.get_mut(facts.cpu_count) {
+        *slot = (apic_id, flags.enabled());
+    }
+    facts.cpu_count += 1;
 }
 
 fn processor(apic_id: u32, processor_uid: u32, flags: ProcessorFlags) -> Option<Described> {
@@ -647,11 +746,12 @@ fn bind(c: &dyn EarlyConsole, tree: &DeviceTree<'_, '_>, resources: &mut Resourc
     let mut bound: [Option<(usize, Bound)>; MAX_BOUND] = [const { None }; MAX_BOUND];
     let mut ok = true;
     let mut n = 0;
+    let drivers = controller::DRIVERS;
     for id in tree.ids() {
-        let Some((d, _)) = best_match(tree, id, &DRIVERS) else {
+        let Some((d, _)) = best_match(tree, id, drivers) else {
             continue;
         };
-        let Some(&drv) = DRIVERS.get(d) else { continue };
+        let Some(&drv) = drivers.get(d) else { continue };
         match driver::probe(drv, tree, id, resources) {
             Ok(b) if n < MAX_BOUND => {
                 if let Some(slot) = bound.get_mut(n) {
@@ -675,7 +775,7 @@ fn bind(c: &dyn EarlyConsole, tree: &DeviceTree<'_, '_>, resources: &mut Resourc
         }
     }
     for (d, b) in bound.iter_mut().filter_map(Option::take) {
-        let Some(&drv) = DRIVERS.get(d) else { continue };
+        let Some(&drv) = drivers.get(d) else { continue };
         if let Err((_, why)) = driver::start(drv, b) {
             c.write_str("; ");
             c.write_str(drv.name());
@@ -762,14 +862,15 @@ fn qemu_agrees(c: &dyn EarlyConsole, functions: &[Function], cpus: usize, ecam: 
     ok
 }
 
-/// No other CPU is started on the PC ports yet; their bring-up will use the MADT's
-/// processor nodes found by [`discover`]. Returns `None`: nothing was checked.
+/// Start every other processor the MADT lists and prove each one that came up is a CPU of
+/// its own, on x86_64; on i686, nothing. `None` when nothing was checked.
 ///
 /// # Safety
-/// None required; `unsafe` only so every provider has one signature.
+/// Once, from `kmain`, on the boot CPU with interrupts masked, after the kernel address
+/// space and the interrupt controller are installed.
 pub unsafe fn start_secondaries(c: &dyn EarlyConsole) -> Option<bool> {
-    c.write_str("one CPU; this port starts no others yet");
-    None
+    // SAFETY: forwarded.
+    unsafe { controller::start_secondaries(c) }
 }
 
 /// Device memory the kernel touches after its own tables are installed: the port's own
@@ -824,7 +925,7 @@ fn write_address(c: &dyn EarlyConsole, at: Address) {
     ]);
 }
 
-fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
+pub(crate) fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     loop {
@@ -838,7 +939,7 @@ fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
     c.write_bytes(&buf[i..]);
 }
 
-fn write_hex(c: &dyn EarlyConsole, v: u64) {
+pub(crate) fn write_hex(c: &dyn EarlyConsole, v: u64) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut buf = [0u8; 18];
     buf[0] = b'0';

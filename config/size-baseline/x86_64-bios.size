@@ -1,31 +1,32 @@
 # kbuild size report for preset x86_64-bios. Rewrite with `kbuild size --preset x86_64-bios --update-baseline`.
 section .bss 167936
-section .data 98080
+section .data 100608
 section .note.kintane 36
 section .rodata 20440
 section .stack 16384
-section .text 192512
-section .thread_stacks 262144
-crate (anonymous) text 0 rodata 1772 data 0 bss 0
-crate (unmangled) text 1203 rodata 0 data 0 bss 0
+section .text 200704
+section .thread_stacks 393216
+crate (anonymous) text 0 rodata 2643 data 0 bss 0
+crate (unmangled) text 1203 rodata 0 data 832 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate acpi text 5696 rodata 0 data 0 bss 0
-crate arch text 31714 rodata 0 data 361 bss 90393
+crate apic text 5340 rodata 0 data 304 bss 232
+crate arch text 28313 rodata 0 data 1089 bss 90649
 crate boot_protocol text 2143 rodata 0 data 0 bss 0
 crate bootinfo text 2069 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
-crate core text 8706 rodata 0 data 0 bss 0
-crate device text 17750 rodata 0 data 0 bss 0
+crate core text 9102 rodata 0 data 0 bss 0
+crate device text 17892 rodata 0 data 0 bss 0
 crate hal text 531 rodata 0 data 0 bss 0
 crate kalloc text 13876 rodata 0 data 0 bss 0
-crate kintane text 44407 rodata 48 data 3964 bss 37078
+crate kintane text 47680 rodata 48 data 3964 bss 37454
 crate mm text 24994 rodata 0 data 0 bss 0
-crate platform text 16449 rodata 192 data 92624 bss 1672
-crate sched text 365 rodata 0 data 0 bss 0
+crate platform text 18006 rodata 48 data 93288 bss 1672
+crate sched text 511 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
-crate sync text 5306 rodata 0 data 1088 bss 272
-crate thread text 3825 rodata 0 data 0 bss 0
+crate sync text 4420 rodata 0 data 1088 bss 272
+crate thread text 3357 rodata 0 data 0 bss 0
 crate time text 2782 rodata 0 data 0 bss 0
 crate unwind text 3206 rodata 0 data 0 bss 0
-total 757532
+total 899324

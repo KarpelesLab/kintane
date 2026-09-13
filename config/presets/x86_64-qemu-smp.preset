@@ -1,0 +1,18 @@
+# x86_64 under QEMU q35 with four CPUs.
+#
+# The same kernel as x86_64-qemu, with SMP on: the boot CPU binds the local APIC and I/O
+# APIC from the MADT, then starts the other three with INIT and startup IPIs through a
+# real-mode trampoline, and the `smp` line of the banner proves each came online with its
+# own CPU number and APIC ID, takes its own local APIC timer interrupts at the rate it was
+# asked for, answers an IPI, keeps its own per-CPU counter, and holds locks on its own
+# lock-order stack. QEMU_CPUS is both the `-smp` QEMU is given and the count the kernel
+# requires the MADT to list, so a run that lost the option fails instead of passing on
+# one CPU.
+ARCH_X86_64=y
+SMP=y
+NR_CPUS=8
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+QEMU_CPUS=4
+SIZE_BUDGET_KIB=1280

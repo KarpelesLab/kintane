@@ -338,6 +338,7 @@ hand:
 | i686 (`i686-bios`) | `qemu-system-i386` | `pc` (i440FX), raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
 | aarch64 (`aarch64-virt-smp`) | `qemu-system-aarch64` | `virt`, `-smp 4` | `-kernel`, secondaries through PSCI | semihosting |
+| x86_64 (`x86_64-qemu-smp`) | `qemu-system-x86_64` | `q35`, `-smp 4` | `-kernel`, secondaries through INIT and startup IPIs | `isa-debug-exit` |
 | armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
 | riscv32 (`riscv32-virt`) | `qemu-system-riscv32` | `virt` | `-bios none`, `-kernel` | `sifive_test` |
 
@@ -365,10 +366,18 @@ passing an SMP check on one CPU. Its `smp` banner line is described in
 [architecture.md](architecture.md#smp). It runs every mode the other aarch64 preset runs.
 The one-CPU preset reports that line as skipped: `SMP=n`, so nothing was started.
 
+The `x86_64-qemu-smp` preset is the same for x86_64: the `x86_64-qemu` kernel with `SMP=y`
+and `QEMU_CPUS=4`, whose `smp` line requires the MADT to list exactly four processors and
+each started one to prove its number, its APIC ID, its own GDT and TSS, its timer's rate,
+an IPI round trip, its per-CPU counter and its lock-order stack. It runs every mode
+`x86_64-qemu` runs. The two-CPU x86_64 presets report the line as skipped. With a local
+APIC that lacks x2APIC mode (`--set QEMU_CPU=max,-x2apic`) the same preset exercises the
+driver's MMIO path; that run is not in CI.
+
 Every x86 row also gets two CPUs (`QEMU_CPUS`) and, with `QEMU_PCI_TEST_DEVICE`, a
 `pci-testdev` behind a bridge: a PCI Express root port on q35, a PCI-to-PCI bridge on pc.
-The kernel starts only one CPU, and nothing drives the test device. They exist so that
-device discovery has something to be wrong about:
+Outside the SMP presets the kernel starts only one CPU, and nothing drives the test
+device. They exist so that device discovery has something to be wrong about:
 
 - the MADT must list exactly two enabled processors;
 - enumeration must follow the bridge to find the device;

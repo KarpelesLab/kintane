@@ -1,0 +1,42 @@
+//! The APICs on i686: placeholders that claim their windows and drive nothing.
+//!
+//! The i686 port keeps the 8259A and the PIT. Its interrupt path routes through a fixed
+//! controller rather than one discovery installs, and it has no second CPU to start, which
+//! is the reason x86_64 needed an APIC at all. The windows are still claimed, so the kernel
+//! address space is built the same way on both PC ports.
+
+use device::Driver;
+use hal::EarlyConsole;
+
+use crate::{ECAM, MadtFacts, Reserve};
+
+static LOCAL_APIC: Reserve = Reserve {
+    name: "local-apic",
+    compatible: &["acpi,local-apic"],
+    what: "local APIC",
+};
+static IO_APIC: Reserve = Reserve {
+    name: "io-apic",
+    compatible: &["acpi,io-apic"],
+    what: "I/O APIC",
+};
+
+/// Every driver this image carries.
+pub(crate) const DRIVERS: &[&dyn Driver] = &[&LOCAL_APIC, &IO_APIC, &ECAM];
+
+/// Nothing to install: the 8259A stays.
+///
+/// # Safety
+/// None required; `unsafe` so both PC ports have one signature.
+pub(crate) unsafe fn install(_c: &dyn EarlyConsole, _facts: Option<&MadtFacts>) -> bool {
+    true
+}
+
+/// No other CPU is started on i686. Returns `None`: nothing was checked.
+///
+/// # Safety
+/// None required; `unsafe` so both PC ports have one signature.
+pub(crate) unsafe fn start_secondaries(c: &dyn EarlyConsole) -> Option<bool> {
+    c.write_str("one CPU; this port starts no others yet");
+    None
+}
