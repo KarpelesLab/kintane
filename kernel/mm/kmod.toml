@@ -1,0 +1,11 @@
+[unit]
+name = "mm"
+kind = "lib"
+root = "src/lib.rs"
+layer = "core"
+
+# `boot_protocol` is a hal-layer unit: the memory map is an input to this
+# subsystem, not a downward dependency on an architecture. Nothing here names
+# `arch_*`; the architecture arrives as the type parameter `A: Arch`.
+[deps]
+units = ["hal", "boot_protocol"]

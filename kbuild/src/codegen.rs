@@ -35,7 +35,11 @@ pub fn emit(table: &SymbolTable, res: &Resolution, gen_dir: &Path) -> Result<Gen
     );
 
     let mut cfgs = Vec::new();
-    let mut check_cfgs = Vec::new();
+    // Passing any --check-cfg turns on checking for *every* cfg name, so the ones
+    // rustc itself sets must be declared too or they warn. `test` is set by --test
+    // in host builds and read by the `cfg_attr(not(test), no_std)` in every kernel
+    // crate.
+    let mut check_cfgs = vec!["--check-cfg=cfg(test)".to_string()];
 
     for name in &table.order {
         let sym = &table.symbols[name];
