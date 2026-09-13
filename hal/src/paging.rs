@@ -188,6 +188,65 @@ pub enum MapError {
     BadPhysAddr,
 }
 
+/// Where the kernel image's parts live in physical memory.
+///
+/// Needed because a linker script knows things no amount of runtime probing can
+/// recover: which bytes are instructions, which are constants, and which are
+/// writable. Without that split there is no W^X — the whole image has to be mapped
+/// readable, writable and executable, which is what every port does at boot today.
+///
+/// Ranges are `[start, end)` and need not be page-aligned; the consumer rounds
+/// outward for writability and inward for execute, so a section boundary inside a
+/// page never grants more than both neighbours should have.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ImageSections {
+    /// Instructions. Mapped read + execute, never writable.
+    pub text: (u64, u64),
+    /// Constants. Mapped read-only and non-executable — which is the entire reason
+    /// `.rodata` is a section of its own.
+    pub rodata: (u64, u64),
+    /// Initialised and zeroed data, including the stacks. Read + write, never
+    /// executable.
+    pub data: (u64, u64),
+    /// A page below the boot stack that must be left **unmapped**.
+    ///
+    /// An IST or a separate fault stack lets the kernel report a stack overflow; it
+    /// does not let it *detect* one. Without a guard page an overflow walks quietly
+    /// into whatever the linker placed below the stack — on x86_64 that was the live
+    /// page tables — and the machine is gone before any handler runs. This is the
+    /// half that turns a silent death into a diagnosable fault.
+    ///
+    /// `(0, 0)` means the port has not carved one out yet.
+    pub stack_guard: (u64, u64),
+}
+
+impl ImageSections {
+    /// A single read-write-execute blob, for a port that has not split its image yet.
+    ///
+    /// Deliberately not the default anyone should keep: it maps instructions writable
+    /// and data executable. It exists so the address-space builder can be written and
+    /// tested before every port has section symbols, and so that a port that has not
+    /// done the work says so in its own type rather than silently looking finished.
+    pub const fn unsplit(start: u64, end: u64) -> ImageSections {
+        ImageSections {
+            text: (start, end),
+            rodata: (0, 0),
+            data: (0, 0),
+            stack_guard: (0, 0),
+        }
+    }
+
+    /// Whether this port actually distinguishes its sections.
+    pub const fn is_split(&self) -> bool {
+        self.rodata.1 > self.rodata.0 && self.data.1 > self.data.0
+    }
+
+    /// Whether this port has a guard page below its stack.
+    pub const fn has_stack_guard(&self) -> bool {
+        self.stack_guard.1 > self.stack_guard.0
+    }
+}
+
 /// An architecture with page tables.
 ///
 /// Extends [`crate::HasMmu`] with everything the shared walker needs. Kept separate

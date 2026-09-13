@@ -202,3 +202,13 @@ pub fn image_range() -> (u64, u64) {
 pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
     paging::selftest(c)
 }
+
+/// The kernel image's sections.
+///
+/// Currently unsplit: this port maps its whole image one way. Splitting it needs
+/// section symbols in `link.ld`, and until then saying so through
+/// [`hal::ImageSections::unsplit`] is more honest than inventing boundaries.
+pub fn image_sections() -> hal::ImageSections {
+    let (start, end) = image_range();
+    hal::ImageSections::unsplit(start, end)
+}
