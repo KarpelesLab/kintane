@@ -10,11 +10,17 @@
 //! # The layers
 //!
 //! ```text
-//!   Heap            routes by size, keeps the totals
+//!   Heap            routes by size, keeps the totals, consults the Injector
 //!    ├─ Slab        size classes 16..1024, free-list reuse, O(1) alloc and free
-//!    └─ Bump        an arena over contiguous frames; the bootstrap heap
+//!    ├─ Buddy       whole-page blocks 2^0..2^10 pages, split and merged; optional
+//!    └─ Bump        an arena over contiguous frames; the bootstrap heap, and the
+//!         │         fallback for anything the other two cannot serve
 //!         └─ FrameSource   ── mm::FrameAllocator, in a kernel image
 //! ```
+//!
+//! The buddy allocator sits beside the arena rather than on it. It is handed one run of
+//! frames ([`heap::Heap::attach_pages`]) and gives that run back whole when nothing in
+//! it is allocated. See [`buddy`] for why it manages a run and not the machine.
 //!
 //! The slab sits *on top of* the bump rather than beside it: a slab block is an
 //! ordinary bump allocation. That means there is exactly one place that turns frames
@@ -70,11 +76,11 @@
 //! Denied at the crate root and re-enabled module by module, each saying why at the
 //! top of its own file. [`directmap`] forms a pointer from an integer, in one
 //! expression; [`poison`] writes bytes; [`bump`] and [`slab`] call into [`poison`]
-//! for blocks they have just proved they own; [`heap`] forwards a `dealloc` and
-//! touches no memory at all. That is the whole budget — nine `unsafe` blocks outside
-//! the tests, each with a `// SAFETY:` comment, and every `unsafe fn` with a
-//! `# Safety` section stating the caller's obligation. [`context`] and [`frames`]
-//! have none at all.
+//! for blocks they have just proved they own; [`heap`] forwards a `dealloc`, and zeroes
+//! or poisons a buddy block the buddy allocator has just handed out or taken back.
+//! Every `unsafe` block has a `// SAFETY:` comment and every `unsafe fn` has a
+//! `# Safety` section stating the caller's obligation. [`buddy`], [`context`],
+//! [`frames`] and [`inject`] have none at all.
 //!
 //! `dealloc` is `unsafe` and that is deliberate. It cannot be made safe: safe code
 //! could free a pointer twice, and between the two calls the block may have been
@@ -90,10 +96,13 @@
 //!
 //! Stated plainly so nobody has to discover it:
 //!
-//! * **Nothing is ever returned to the frame allocator.** A slab block whose objects are all free
-//!   stays a slab block; a bump region stays a bump region. The bookkeeping to do it exists
+//! * **The arena never returns frames to the frame allocator.** A slab block whose objects are all
+//!   free stays a slab block; a bump region stays a bump region. The bookkeeping to do it exists
 //!   ([`bump::Bump`] records each region's physical start and frame count) but no caller wants it
-//!   yet.
+//!   yet. The buddy allocator's run is the exception: [`heap::Heap::detach_pages`] gives it back
+//!   once it is empty.
+//! * **There is one buddy run per heap**, fixed at attach time. Growing it would mean a second run
+//!   and a lookup by address, which is worth doing when a workload needs it.
 //! * **The bump reuses memory only in the immediate LIFO case.** See [`bump`].
 //! * **`realloc` does not exist.** A growable collection allocates, copies and frees.
 //! * **Most [`context::AllocFlags`] are advisory.** See [`context`] for the table of which, and why
@@ -111,18 +120,22 @@
 
 use core::alloc::Layout;
 
+pub mod buddy;
 pub mod bump;
 pub mod context;
 
 pub mod frames;
 pub mod heap;
+pub mod inject;
 pub mod poison;
 pub mod slab;
 
+pub use buddy::{Buddy, BuddyStats};
 pub use bump::{Bump, BumpStats};
 pub use context::{AllocContext, AllocFlags, NumaNode};
 pub use frames::{FrameSource, NoFrames};
-pub use heap::{Heap, HeapStats};
+pub use heap::{Detach, Heap, HeapStats};
+pub use inject::{Injector, Site};
 pub use mm::AllocError;
 pub use mm::directmap::DirectMap;
 pub use slab::{ClassStats, Slab, SlabStats};

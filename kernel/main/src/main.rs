@@ -10,6 +10,7 @@
 // docs/coding-standards.md; this is the replacement it names.
 #![feature(sync_unsafe_cell)]
 
+mod heap;
 mod space;
 
 use core::cell::SyncUnsafeCell;
@@ -297,7 +298,9 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
         }
     };
 
-    space.and(alloc)
+    space
+        .and(alloc)
+        .and(heap::bring_up(c, &mut frames, &regions[..n]))
 }
 
 /// The largest region of physical memory the kernel will address directly.
