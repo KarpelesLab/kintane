@@ -10,6 +10,7 @@
 // docs/coding-standards.md; this is the replacement it names.
 #![feature(sync_unsafe_cell)]
 
+mod clock;
 mod space;
 
 use core::cell::SyncUnsafeCell;
@@ -143,11 +144,16 @@ fn banner(boot_arg: u64) -> Check {
     // which is precisely the kind of check that cannot change an outcome.
     let switch_ok = arch::context_switch_selftest(c);
 
+    // After interrupts, because the check waits through timer interrupts.
+    c.write_str("\n  clock      ");
+    let clock = clock::check(c);
+
     c.write_str("\n\nreached kmain\n");
     Check::from_ok(paging_ok)
         .and(mem)
         .and(Check::from_ok(irq_ok))
         .and(Check::from_ok(switch_ok))
+        .and(clock)
 }
 
 /// Room for the loader's memory map. QEMU reports a handful of regions; real

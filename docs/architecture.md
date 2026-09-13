@@ -136,6 +136,39 @@ endpoint, a memory region, a device handle — is a `KObject` with refcounting, 
 tag, and a rights mask. This is the substrate the syscall layer exposes as
 capabilities; see [userspace-abi.md](userspace-abi.md).
 
+### `time` — the monotonic clock and timers
+
+Time is split three ways, and only one part touches hardware:
+
+- **Counters** are devices. `hal::ClockSource` is an object-safe trait for a free-running
+  counter: its value, its width, and its rate. The architecture supplies one today:
+  - x86: the TSC, with its rate calibrated at boot against PIT channel 2.
+  - aarch64: the generic counter through `CNTVCT_EL0`, at the rate firmware put in
+    `CNTFRQ_EL0`.
+
+  An HPET, SysTick or RTC driver would provide one the same way.
+- **The clock** (`kernel/time`, `Clock`) turns counter values into nanoseconds as an
+  `Instant`, a `u64` from an origin near boot. The conversion is a multiply and a
+  shift, so the read path has no 64-bit division. Wraps are handled, and so are
+  counters that step backwards. The clock carries its sub-nanosecond remainder, so how
+  often it is read does not change what it reads. It never reads hardware itself and
+  takes no locks.
+- **Timers** (`kernel/time`, `TimerQueue`) are a fixed-capacity deadline heap, with
+  one-shot and periodic entries and handles that go stale rather than naming a reused
+  slot. Periodic deadlines advance from the previous deadline, so late servicing
+  does not accumulate as drift. `next_deadline` and `idle_budget` are what a tickless
+  idle needs. The budget is bounded by `Clock::max_idle`, because a counter must be
+  read at least once per half-wrap.
+
+Programming a timer interrupt for the next deadline is not in `time`. That belongs to
+whoever owns the tick, which is the scheduler working with the interrupt controller.
+Wall-clock time is an offset added on top of the monotonic clock, and does not exist
+yet.
+
+The boot banner's `clock` line checks the real counter on each port. It times ten
+timer interrupts of known period with the clock, and fails if the two disagree by
+more than a wide margin, or if the counter steps backwards.
+
 ### `device` — the device framework
 
 - **Enumeration** from device tree (FDT), ACPI, PCI/PCIe config space, USB, or a

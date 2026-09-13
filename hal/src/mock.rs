@@ -329,6 +329,87 @@ impl IrqChip for MockIrqChip {
     }
 }
 
+// ---- clock sources ----------------------------------------------------------
+//
+// Each profile gets a counter shaped like the hardware it models, because the ways a
+// clock goes wrong depend on that shape. A 64-bit counter at tens of megahertz never
+// wraps in practice and tests whether the multiply overflows. A 24-bit counter at
+// 32 kHz wraps every eight and a half minutes and tests the wrap handling, and the
+// precision at a low rate.
+
+/// A counter whose value a test sets by hand.
+pub struct MockCounter {
+    value: AtomicU64,
+    bits: u32,
+    hz: u64,
+}
+
+impl MockCounter {
+    pub const fn new(bits: u32, hz: u64) -> Self {
+        MockCounter {
+            value: AtomicU64::new(0),
+            bits,
+            hz,
+        }
+    }
+
+    /// Set the raw value. Bits above the counter's width are kept, as real hardware
+    /// may report them, and consumers must ignore them.
+    pub fn set(&self, v: u64) {
+        self.value.store(v, Ordering::SeqCst);
+    }
+
+    /// Move the counter forward, wrapping at its width.
+    pub fn advance(&self, ticks: u64) {
+        let mask = if self.bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.bits) - 1
+        };
+        let v = self.value.load(Ordering::SeqCst);
+        self.value
+            .store(v.wrapping_add(ticks) & mask, Ordering::SeqCst);
+    }
+}
+
+impl ClockSource for MockCounter {
+    fn name(&self) -> &'static str {
+        "mock-counter"
+    }
+    fn read(&self) -> u64 {
+        self.value.load(Ordering::SeqCst)
+    }
+    fn bits(&self) -> u32 {
+        self.bits
+    }
+    fn frequency_hz(&self) -> u64 {
+        self.hz
+    }
+}
+
+/// The clock source a mock profile's hardware would have.
+///
+/// A constructor rather than a static, so that tests running in parallel each get a
+/// counter of their own.
+pub trait MockClock: Arch {
+    fn counter() -> MockCounter;
+}
+
+impl MockClock for MockFull {
+    /// 64 bits at 62.5 MHz: shaped like an Arm generic counter. (QEMU's `virt`
+    /// reports 1 GHz. `kernel/time`'s scale tests cover that rate separately.)
+    fn counter() -> MockCounter {
+        MockCounter::new(64, 62_500_000)
+    }
+}
+
+impl MockClock for MockTiny {
+    /// 24 bits at 32.768 kHz: a watch crystal behind a SysTick-width counter.
+    fn counter() -> MockCounter {
+        MockCounter::new(24, 32_768)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

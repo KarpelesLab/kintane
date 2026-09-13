@@ -1,0 +1,12 @@
+# Time: instants and durations, turning a hardware counter into nanoseconds, and a
+# timer queue. It depends only on `hal`, and only for the `ClockSource` trait.
+# Programming a timer interrupt stays with the architecture and the device layer.
+[unit]
+name = "time"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+[deps]
+units = ["hal"]

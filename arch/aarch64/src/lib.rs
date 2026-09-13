@@ -7,6 +7,7 @@
 #![no_std]
 
 mod boot;
+pub mod clock;
 pub mod context;
 pub mod exception;
 pub mod gic;
@@ -15,6 +16,7 @@ pub mod paging;
 pub mod serial;
 pub mod timer;
 
+pub use clock::{clock_source, spin_with_timer_interrupts};
 use hal::{Arch, Endian, HasCas, HasFpu, HasMmu, HasSmp, IrqNumber};
 pub use serial::EARLY;
 

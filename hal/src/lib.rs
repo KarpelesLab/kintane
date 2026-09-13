@@ -12,6 +12,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod addr;
+pub mod clock;
 pub mod context;
 pub mod paging;
 
@@ -21,6 +22,7 @@ pub mod paging;
 pub mod mock;
 
 pub use addr::{AddrOverflow, KernAddr, PhysAddr, UserAddr};
+pub use clock::ClockSource;
 pub use context::{HasContextSwitch, ThreadEntry};
 pub use paging::{HasPageTables, ImageSections, MapError, PageFlags, PageTableEntry};
 
