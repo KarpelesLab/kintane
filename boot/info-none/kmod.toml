@@ -1,0 +1,14 @@
+# The other unit providing `bootinfo`: platforms where no loader supplies a memory
+# map yet. On aarch64 QEMU parks a device tree in RAM but does not pass a pointer to
+# it on the ELF path, so reading it needs the FDT parser that arrives in Phase 3.
+[unit]
+name = "bootinfo"
+kind = "lib"
+root = "src/lib.rs"
+layer = "core"
+
+[deps]
+units = ["boot_protocol"]
+
+[config]
+requires = "!(ARCH_X86_64 || ARCH_I686)"

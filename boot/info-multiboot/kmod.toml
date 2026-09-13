@@ -1,0 +1,13 @@
+# One of two units providing the name `bootinfo`. The configuration selects which,
+# so the kernel image depends on the role and never on which loader ran.
+[unit]
+name = "bootinfo"
+kind = "lib"
+root = "src/lib.rs"
+layer = "core"
+
+[deps]
+units = ["boot_protocol", "multiboot"]
+
+[config]
+requires = "ARCH_X86_64 || ARCH_I686"

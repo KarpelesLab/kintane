@@ -282,3 +282,20 @@ pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
     c.write_str(", timer IRQ taken");
     true
 }
+
+/// The physical range the kernel image occupies, as `[start, end)`.
+///
+/// The frame allocator must be told about this before it hands anything out: the
+/// loader's memory map describes the machine, not what is already living in it, and
+/// nothing in a multiboot map says "the kernel is here".
+pub fn image_range() -> (u64, u64) {
+    unsafe extern "C" {
+        static __kernel_start: u8;
+        static __kernel_end: u8;
+    }
+    // Taking addresses of linker symbols, never reading through them: the symbols
+    // mark positions and have no value of their own.
+    let start = (&raw const __kernel_start) as usize as u64;
+    let end = (&raw const __kernel_end) as usize as u64;
+    (start, end)
+}

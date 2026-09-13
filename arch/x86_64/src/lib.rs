@@ -4,9 +4,20 @@
 //! linked per image, so everything here is statically known and fully monomorphized
 //! at every call site in the layers above.
 
+// IDT entry points. The calling convention differs from every other ABI on the
+// machine — the CPU has already pushed a frame the callee must `iret` from, and the
+// callee owns every register — so it cannot be expressed as a normal `extern`. There
+// is no stable alternative short of hand-written assembly trampolines for 256
+// vectors. Listed in toolchain.toml's permitted unstable surface.
+#![feature(abi_x86_interrupt)]
 #![no_std]
 
 mod boot;
+mod exception;
+mod idt;
+pub mod interrupt;
+pub mod pic;
+pub mod pit;
 pub mod serial;
 
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};
@@ -130,6 +141,22 @@ pub fn exit_emulator(ok: bool) -> ! {
 /// port. Returns `true` when the path is demonstrably live: a handler ran and
 /// control returned.
 pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    interrupt::selftest(c)
+}
+
+/// The physical range the kernel image occupies, as `[start, end)`.
+///
+/// The frame allocator must be told about this before it hands anything out: the
+/// loader's memory map describes the machine, not what is already living in it, and
+/// nothing in a multiboot map says "the kernel is here".
+pub fn image_range() -> (u64, u64) {
+    unsafe extern "C" {
+        static __kernel_start: u8;
+        static __kernel_end: u8;
+    }
+    // Taking addresses of linker symbols, never reading through them: the symbols
+    // mark positions and have no value of their own.
+    let start = (&raw const __kernel_start) as usize as u64;
+    let end = (&raw const __kernel_end) as usize as u64;
+    (start, end)
 }

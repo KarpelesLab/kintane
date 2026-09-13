@@ -4,7 +4,8 @@ kind = "bin"
 root = "src/main.rs"
 layer = "kernel"
 
-# `arch` is provided by whichever architecture the configuration selects. The image
-# names the role, not the machine.
+# `arch` and `bootinfo` are both provider names: several units declare each, and the
+# configuration selects one. The image names the role, never the machine or the
+# loader.
 [deps]
-units = ["hal", "arch", "boot_protocol"]
+units = ["hal", "arch", "boot_protocol", "bootinfo", "mm"]
