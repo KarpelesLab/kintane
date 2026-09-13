@@ -221,7 +221,8 @@ extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
     <crate::Aarch64 as hal::Arch>::halt()
 }
 
-fn write_dec(c: &dyn EarlyConsole, mut v: u64) {
+/// Write `v` in decimal. Shared with the context switch selftest.
+pub(crate) fn write_dec(c: &dyn EarlyConsole, mut v: u64) {
     if v == 0 {
         c.write_bytes(b"0");
         return;
@@ -236,7 +237,8 @@ fn write_dec(c: &dyn EarlyConsole, mut v: u64) {
     c.write_bytes(&buf[i..]);
 }
 
-fn write_hex(c: &dyn EarlyConsole, v: u64) {
+/// Write `v` as sixteen hex digits. Shared with the context switch's fatal path.
+pub(crate) fn write_hex(c: &dyn EarlyConsole, v: u64) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut buf = [0u8; 18];
     buf[0] = b'0';

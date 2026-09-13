@@ -7,6 +7,7 @@
 #![no_std]
 
 mod boot;
+pub mod context;
 pub mod exception;
 pub mod gic;
 pub mod irq;
@@ -354,7 +355,9 @@ pub fn image_sections() -> hal::ImageSections {
 ///
 /// Returns `true` only if control reached the new thread *and* came back, with the
 /// callee-saved registers the original thread was holding intact.
+///
+/// The work, and the reasoning about which registers that has to mean on AArch64, is in
+/// [`context`].
 pub fn context_switch_selftest(c: &dyn hal::EarlyConsole) -> bool {
-    c.write_str("not implemented on this port");
-    false
+    context::selftest(c)
 }
