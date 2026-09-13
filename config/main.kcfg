@@ -113,9 +113,24 @@ config QEMU_EXIT
         form executes HLT #0xF000, which is UNDEFINED without a debugger
         attached — so this must be off in anything that ships.
 
+config BOOT_KINBOOT
+    bool "Boot through kinboot-efi"
+    depends on ARCH_X86_64
+    default n
+    help
+        Start the kernel from UEFI firmware through KinTane's own loader,
+        kinboot-efi, which hands over the boot protocol's structure instead
+        of a multiboot one. The build produces a disk image with an EFI
+        system partition holding the loader and the kernel, and QEMU boots
+        it under OVMF rather than with -kernel. See docs/bootloader.md.
+
+        Off, the image is the multiboot kernel QEMU loads directly, which is
+        the faster path for everyday development.
+
 config IMAGE_FORMAT
     string
     readonly
+    default "efi-esp" if BOOT_KINBOOT
     default "multiboot-elf32" if ARCH_X86_64
     default "elf"
     # i686 links as ELF32 already, so the multiboot container needs no rewrite.
@@ -123,7 +138,8 @@ config IMAGE_FORMAT
         How the linked image is packaged for the platform's loader.
         QEMU's multiboot loader refuses an ELF64 container, so on x86_64 the
         image is rewritten to ELF32 after linking. The 64-bit code is untouched
-        and the ELF64 is kept as the debug artifact.
+        and the ELF64 is kept as the debug artifact. `efi-esp` is a disk image
+        whose EFI system partition holds kinboot-efi and the stripped ELF64.
 
 config MOCK_ARCH
     bool "Mock architectures for host testing"

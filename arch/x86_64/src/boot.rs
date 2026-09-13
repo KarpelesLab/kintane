@@ -34,6 +34,27 @@
 //!
 //! Phase 1 replaces the identity map with a high-half mapping, which also changes the
 //! code model in the target specification.
+//!
+//! # The second way in: `kinboot_entry`
+//!
+//! A UEFI loader cannot call `_start`. The firmware runs in long mode and has no 32-bit
+//! code segment to hand over on, so `kinboot-efi` enters at `kinboot_entry` instead,
+//! already in 64-bit mode, with the boot protocol's structure in `rdi`. The loader finds
+//! that address in the `KinTane` ELF note below, not in `e_entry`, which stays `_start`
+//! for multiboot. `boot_protocol::image` describes the note and the entry contract.
+//!
+//! What the 64-bit path does is what the 32-bit path does minus the mode switch, and
+//! for the same reason: nothing the loader set up is ours to keep. The firmware's page
+//! tables live in boot-services memory, which the memory map hands to the frame
+//! allocator as usable, and its GDT and stack are in the same position. So the entry
+//! takes the kernel's own stack, builds the same identity map in the same `.bss`
+//! tables, loads the same bootstrap GDT and reloads `CS` with a far return. From
+//! `kmain`'s point of view the two paths are indistinguishable except for what
+//! `boot_arg` points at, which is what the configuration's `bootinfo` provider reads.
+//!
+//! Two things the loader guarantees make that safe: the image and the structure are
+//! identity-mapped by the firmware's tables while the kernel's are built, and both lie
+//! below 1 GiB, which is all the kernel's bootstrap map covers.
 
 core::arch::global_asm!(
     r#"
@@ -42,6 +63,18 @@ core::arch::global_asm!(
     .long 0x1BADB002
     .long 0x00000000
     .long -(0x1BADB002 + 0x00000000)
+
+/* The boot protocol entry note; see boot_protocol::image. `.quad kinboot_entry` is
+ * the physical address, which is also the link address in this identity-linked image. */
+.section .note.kintane, "a", @note
+.align 4
+    .long 8
+    .long 16
+    .long 1
+    .ascii "KinTane\0"
+    .quad kinboot_entry
+    .long 1
+    .long 0
 
 .section .text.boot, "ax"
 .code32
@@ -113,6 +146,59 @@ long_mode_start:
 .Lhang:
     cli
     hlt
+    jmp .Lhang
+
+/* Entered by a KinTane loader in long mode: rdi = boot information, interrupts off. */
+.globl kinboot_entry
+kinboot_entry:
+    cli
+    cld
+    movq %rdi, %rbx
+    movq $__stack_top, %rsp
+
+    movl $pml4, %edi
+    movl $2048, %ecx
+    xorl %eax, %eax
+    rep stosl
+
+    xorl %ecx, %ecx
+.Lfill_pd64:
+    movq %rcx, %rax
+    shlq $21, %rax
+    orq $0x83, %rax
+    movq %rax, pd(,%rcx,8)
+    incl %ecx
+    cmpl $512, %ecx
+    jne .Lfill_pd64
+
+    movq $pd, %rax
+    orq $0x03, %rax
+    movq %rax, pdpt
+    movq $pdpt, %rax
+    orq $0x03, %rax
+    movq %rax, pml4
+
+    movq $pml4, %rax
+    movq %rax, %cr3
+
+    lgdt gdt64_pointer
+    /* A far return is the only way to load CS in long mode without a far pointer in
+     * memory: push the selector and the target, and return to them. */
+    pushq $0x08
+    leaq .Lkinboot_cs(%rip), %rax
+    pushq %rax
+    lretq
+.Lkinboot_cs:
+    xorl %eax, %eax
+    movw %ax, %ss
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+
+    movq %rbx, %rdi
+    xorq %rbp, %rbp
+    call kmain
     jmp .Lhang
 
 .section .rodata

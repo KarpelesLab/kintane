@@ -1,0 +1,16 @@
+# One of the units providing the name `bootinfo`: images started by a KinTane loader,
+# which hands over the boot protocol's own structure rather than a foreign one to
+# translate. The configuration selects which provider, so the kernel image depends on
+# the role and never on which loader ran.
+[unit]
+name = "bootinfo"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+[deps]
+units = ["boot_protocol"]
+
+[config]
+requires = "BOOT_KINBOOT"

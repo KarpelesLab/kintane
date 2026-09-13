@@ -7,6 +7,7 @@ mod build;
 mod cache;
 mod codegen;
 mod dwarf;
+mod esp;
 mod graph;
 mod hosttest;
 mod kcfg;
@@ -313,6 +314,90 @@ fn dispatch(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Build an image for a target of its own — a bootloader — next to the kernel.
+///
+/// It gets a build of its own: `core`, `compiler_builtins` and the generated config
+/// compiled for its triple, then its dependencies, then itself, all under
+/// `build/<kernel target>/<triple>/`. Sharing nothing compiled with the kernel is the
+/// point, not a cost: the kernel's `boot_protocol` rlib is for a different target and
+/// could not be linked here anyway. The cache keys include the triple, so switching
+/// between the two never serves one target's artifact to the other.
+fn build_foreign_image(
+    kernel: &build::Build,
+    unit: &graph::Unit,
+    ordered: &[graph::Unit],
+) -> Result<PathBuf, String> {
+    let triple = unit.target.clone().unwrap_or_default();
+    let out = kernel.out.parent().unwrap_or(&kernel.out).join(&triple);
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let b = build::Build {
+        root: kernel.root.clone(),
+        tc: kernel.tc.clone(),
+        target_name: triple.clone(),
+        target: build::Target::Builtin(triple.clone()),
+        out,
+        gen_dir: kernel.gen_dir.clone(),
+        cache: cache::Cache::new(kernel.root.join("build/cache"))?,
+        cfgs: kernel.cfgs.clone(),
+        check_cfgs: kernel.check_cfgs.clone(),
+        opt_level: kernel.opt_level.clone(),
+        link_script: None,
+        deny_warnings: false,
+        verbose: kernel.verbose,
+    };
+    println!("\x1b[36mbuilding\x1b[0m {} for {triple}", unit.name);
+
+    let mut built: BTreeMap<String, build::Built> = BTreeMap::new();
+    built.insert("core".into(), b.build_core()?);
+    let cb = ordered
+        .iter()
+        .find(|u| u.name == "compiler_builtins")
+        .ok_or("no compiler_builtins unit in this configuration")?;
+    built.insert(cb.name.clone(), b.build_unit(cb, &built)?);
+    let kconfig = b.build_kconfig(&built["core"], &built["compiler_builtins"])?;
+    built.insert("kconfig".into(), kconfig);
+
+    let mut needed = Vec::new();
+    hosttest::collect_deps(unit, ordered, &mut needed);
+    let mut image = None;
+    for u in needed {
+        if built.contains_key(&u.name) {
+            continue;
+        }
+        let artifact = b.build_unit(u, &built)?;
+        if u.name == unit.name {
+            image = Some(artifact.path.clone());
+        }
+        built.insert(u.name.clone(), artifact);
+    }
+    let image = image.ok_or_else(|| format!("{} was not built", unit.name))?;
+    reject_trap_stubs(&image)?;
+    let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
+    println!("  loader  {} ({size} bytes)", image.display());
+    Ok(image)
+}
+
+/// Refuse a UEFI image that still contains one of `lib/builtins`' trap stubs.
+///
+/// Those stubs exist only to satisfy lld-link, which demands every symbol in every object
+/// it reads, and the linker discards them with the dead code that named them. One that
+/// survives is reachable, and would trap the first time the loader ran that path. The
+/// marker is the string each stub carries after its trapping instruction; see
+/// `lib/builtins/src/uefi_link.rs`.
+fn reject_trap_stubs(image: &Path) -> Result<(), String> {
+    const MARKER: &[u8] = b"KBUILD-UNREACHABLE-INTRINSIC";
+    let bytes = std::fs::read(image).map_err(|e| format!("{}: {e}", image.display()))?;
+    if bytes.windows(MARKER.len()).any(|w| w == MARKER) {
+        return Err(format!(
+            "{} calls a compiler intrinsic that lib/builtins only stubs out\n  \
+             the stub traps; implement the intrinsic in lib/builtins, or stop using what \
+             needs it (see lib/builtins/src/uefi_link.rs)",
+            image.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Walk up from the current directory to the tree root.
 fn find_root() -> Result<PathBuf, String> {
     let mut dir = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -510,7 +595,8 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
 
     let mut image = None;
     for unit in &ordered {
-        if built.contains_key(&unit.name) {
+        // Units with a target of their own are separate images, built below.
+        if built.contains_key(&unit.name) || unit.target.is_some() {
             continue;
         }
         let b2 = b.build_unit(unit, &built)?;
@@ -527,9 +613,18 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         b.cache.misses.get()
     );
 
+    let mut loaders = Vec::new();
+    for unit in ordered.iter().filter(|u| u.target.is_some()) {
+        loaders.push(build_foreign_image(&b, unit, &ordered)?);
+    }
+    if loaders.len() > 1 {
+        return Err("more than one loader is enabled; the configuration should select one".into());
+    }
+
     let linked = image.ok_or("no unit of kind `bin` was built; nothing to boot")?;
     let symbols = b.split_symbols(&linked)?;
-    let image = b.package(res.str("IMAGE_FORMAT"), &linked)?;
+    let image =
+        b.package(res.str("IMAGE_FORMAT"), &linked, loaders.first().map(PathBuf::as_path))?;
     let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
     println!("  linked  {}", linked.display());
     println!("  symbols {}", symbols.display());

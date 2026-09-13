@@ -38,8 +38,10 @@ pub enum Target {
     /// One of our specifications in `targets/`. Its contents are part of every cache key.
     Spec(PathBuf),
     /// A target built into the pinned rustc, named by triple. Its definition is part of
-    /// the toolchain, so the toolchain identity already covers it. Used only by the
-    /// portability check: images are always built from a specification we control.
+    /// the toolchain, so the toolchain identity already covers it. Used by the
+    /// portability check, and for units that name their own target: a bootloader for
+    /// `x86_64-unknown-uefi` is exactly what rustc's built-in target describes, and the
+    /// kernel is never built this way.
     Builtin(String),
 }
 
@@ -58,6 +60,15 @@ impl Target {
                 kb.field("builtin-target", t);
                 Ok(())
             }
+        }
+    }
+
+    /// The extension of a linked image: UEFI applications are PE/COFF, and firmware
+    /// finds them by the `.efi` name.
+    fn image_extension(&self) -> &'static str {
+        match self {
+            Target::Builtin(t) if t.ends_with("-uefi") => "efi",
+            _ => "elf",
         }
     }
 }
@@ -165,7 +176,7 @@ impl Build {
         let crate_name = unit.name.replace('-', "_");
         let filename = match unit.kind {
             Kind::Lib => format!("lib{crate_name}.rlib"),
-            Kind::Bin => format!("{crate_name}.elf"),
+            Kind::Bin => format!("{crate_name}.{}", self.target.image_extension()),
         };
         let dest = self.out.join(&filename);
 
@@ -209,7 +220,22 @@ impl Build {
             args.push(format!("kconfig={}", kconfig.display()));
         }
 
-        if unit.kind == Kind::Bin {
+        // Our own target specifications need our linker scripts. A built-in target brings
+        // its linker configuration with it — for UEFI, lld-link's entry point and
+        // subsystem flags — and a script would be meaningless to it.
+        // lld-link stamps a PE with the link time unless told not to; /Brepro replaces the
+        // stamp with a hash of the output. That is not enough on its own: the PDB rustc asks
+        // for records the path of a temporary directory rustc names at random, the PE's
+        // debug directory carries the PDB's identity, and so the hash differs every build.
+        // So UEFI images are linked without a PDB. Symbols for the loader, like the
+        // kernel's bundle, are a follow-up; see docs/build-system.md#reproducibility.
+        if unit.kind == Kind::Bin && self.target.image_extension() == "efi" {
+            for flag in ["link-arg=/Brepro", "link-arg=/DEBUG:NONE"] {
+                args.push("-C".into());
+                args.push(flag.into());
+            }
+        }
+        if unit.kind == Kind::Bin && matches!(self.target, Target::Spec(_)) {
             let script = self
                 .link_script
                 .as_ref()
@@ -328,8 +354,14 @@ impl Build {
     /// Either way the bootable image is stripped of symbols and debug info. They are in
     /// the bundle [`Build::split_symbols`] wrote, and the kernel never reads its own
     /// symbol table: a backtrace is printed as raw addresses and decoded off the machine.
-    pub fn package(&self, format: &str, linked: &Path) -> Result<PathBuf, String> {
+    pub fn package(
+        &self,
+        format: &str,
+        linked: &Path,
+        loader: Option<&Path>,
+    ) -> Result<PathBuf, String> {
         let (flags, dest): (&[&str], PathBuf) = match format {
+            "efi-esp" => return self.package_esp(linked, loader),
             "" | "elf" => (&["--strip-all"], linked.with_extension("img.elf")),
             "multiboot-elf32" => {
                 (&["--strip-all", "-O", "elf32-i386"], linked.with_extension("mb32.elf"))
@@ -338,6 +370,35 @@ impl Build {
         };
         self.objcopy(flags, linked, &dest)
             .map_err(|e| format!("packaging as {format} failed:\n{e}"))?;
+        Ok(dest)
+    }
+
+    /// A disk image whose EFI system partition holds the loader, where the firmware's
+    /// boot manager looks for a removable medium's default, and the stripped ELF64, where
+    /// the loader looks for the kernel.
+    ///
+    /// The ELF64 rather than the ELF32 the multiboot path needs: kinboot-efi reads 64-bit
+    /// program headers and enters in long mode.
+    fn package_esp(&self, linked: &Path, loader: Option<&Path>) -> Result<PathBuf, String> {
+        let loader =
+            loader.ok_or("the efi-esp image format needs a loader, and none is enabled")?;
+        let kernel = linked.with_extension("img.elf");
+        self.objcopy(&["--strip-all"], linked, &kernel)
+            .map_err(|e| format!("stripping the kernel failed:\n{e}"))?;
+        let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+        let (loader_bytes, kernel_bytes) = (read(loader)?, read(&kernel)?);
+        let disk = crate::esp::disk_image(&[
+            crate::esp::File {
+                path: "EFI/BOOT/BOOTX64.EFI",
+                data: &loader_bytes,
+            },
+            crate::esp::File {
+                path: "KINTANE/KERNEL.ELF",
+                data: &kernel_bytes,
+            },
+        ])?;
+        let dest = linked.with_extension("esp.img");
+        std::fs::write(&dest, disk).map_err(|e| format!("{}: {e}", dest.display()))?;
         Ok(dest)
     }
 
