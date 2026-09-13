@@ -1,0 +1,11 @@
+# Binds scheduling policy (sched) to the architecture's context switch (hal). A unit of
+# its own rather than part of `sched`, so that the run queue keeps depending on nothing.
+[unit]
+name = "thread"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+[deps]
+units = ["hal", "sched"]

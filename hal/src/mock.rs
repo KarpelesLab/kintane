@@ -10,6 +10,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::context::{HasContextSwitch, ThreadEntry};
 use crate::paging::{HasPageTables, PageFlags, PageTableEntry};
 use crate::*;
 
@@ -217,6 +218,60 @@ impl HasPageTables for MockFull {
 
 // Note what is absent: no `impl HasPageTables for MockTiny`. It has no MMU, so a
 // subsystem generic over page tables cannot be instantiated with it at all.
+
+// ---- context switching --------------------------------------------------------------
+//
+// A real context switch cannot happen on the host: there is no second stack to jump to
+// and no way to return into another thread. So the mock *records* instead. Each context
+// carries the tag of the thread it belongs to, and `switch` logs which tag was saved and
+// which was resumed.
+//
+// Note the behavioural difference and why it is acceptable. A real `switch` does not
+// return until something switches back; this one returns at once. For testing a
+// scheduler's *bookkeeping* that is exactly right: the state a scheduler holds
+// immediately after calling `switch` is the state the newly resumed thread observes, and
+// that is what the tests inspect. What this mock cannot test is the switch itself, which
+// is why every architecture proves its own in `context_switch_selftest`.
+
+/// The saved state of a mock thread: just which thread it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MockContext {
+    /// Set by `init` to the argument the thread was started with. The boot thread's
+    /// context is never `init`ed and keeps the default of zero.
+    pub tag: usize,
+    /// Whether `init` has prepared this context to start a thread.
+    pub started: bool,
+}
+
+/// The most recent `(from, to)` tags passed to `switch`, and how many switches happened.
+pub static SWITCHES: AtomicUsize = AtomicUsize::new(0);
+static LAST_FROM: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_TO: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// The tags of the last switch, as `(saved, resumed)`.
+pub fn last_switch() -> (usize, usize) {
+    (LAST_FROM.load(Ordering::SeqCst), LAST_TO.load(Ordering::SeqCst))
+}
+
+impl HasContextSwitch for MockFull {
+    type Context = MockContext;
+    const MIN_STACK: usize = 64;
+    const STACK_ALIGN: usize = 16;
+
+    unsafe fn init(ctx: &mut MockContext, _stack_top: KernAddr, _entry: ThreadEntry, arg: usize) {
+        ctx.tag = arg;
+        ctx.started = true;
+    }
+
+    unsafe fn switch(from: *mut MockContext, to: *const MockContext) {
+        // SAFETY: the contract requires both pointers to be valid, distinct contexts.
+        // The mock only reads their tags.
+        let (f, t) = unsafe { ((*from).tag, (*to).tag) };
+        LAST_FROM.store(f, Ordering::SeqCst);
+        LAST_TO.store(t, Ordering::SeqCst);
+        SWITCHES.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 /// An interrupt controller that records what was asked of it.
 pub struct MockIrqChip {
