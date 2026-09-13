@@ -1,0 +1,13 @@
+# kbuild output
+/build/
+/.config
+/.config.old
+
+# kbuild is the one cargo project in the tree
+/kbuild/target/
+
+# editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
