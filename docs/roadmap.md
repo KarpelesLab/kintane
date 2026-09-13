@@ -8,12 +8,78 @@ demonstrable — something boots, something passes, something fits in a budget �
 
 | Phase | State |
 |---|---|
-| 0 — Build system and first boot | **done** |
-| 1 — The portability spine | **substantially done** — see below |
-| 2 — Core kernel | in progress |
-| 3 onward | not started |
+| 0 — Build system and first boot | **done**, including `kinboot-efi` |
+| 1 — The portability spine | **done**, including `kinboot-bios` |
+| 2 — Core kernel | **every item landed**; the 24-hour stress exit criterion is not yet run |
+| 3 — SMP and the device model | in progress: the device model and FDT-driven drivers |
+| 4 onward | not started |
+
+### The second round of landings
+
+Six more branches landed in parallel. Each passed the same gates as the first round.
+The tree now boots seven presets:
+
+- `x86_64-qemu`, `i686-qemu`, `i686-large` and `aarch64-virt`;
+- `i686-bios` and `x86_64-bios`, from a raw disk through SeaBIOS and `kinboot-bios`;
+- `x86_64-efi`, through OVMF and `kinboot-efi`.
+
+Every preset runs the 35 in-kernel checks and the stack-guard test.
+
+- **Bootloaders.**
+  - `kinboot-bios` is a 440-byte MBR plus a protected-mode stage 2. Stage 2 calls the
+    BIOS through a thunk to enable A20 and read E820 or E801. It checks the kernel ELF
+    against the memory map and a CRC-32 before handing over as a Multiboot 1 loader.
+  - `kinboot-efi` loads the kernel from a FAT ESP that kbuild writes itself. It handles
+    a stale map key at `ExitBootServices` by retrying, and hands over the boot
+    protocol's own tags, which a new `bootinfo` provider reads.
+  - Both disk images are byte-reproducible. kbuild gained per-unit targets and a
+    `loader` layer.
+- **`mm::paged`.** A region map with anonymous and physical backing. Faults zero pages
+  on first touch and map 2 MiB blocks where a region allows. Copy-on-write shares
+  pages through per-frame share counts, and every step fails cleanly when memory runs
+  out. All three ports route kernel page faults through `hal::fault`.
+- **Shared kernel state.** A kernel heap outlives boot behind the lock family, with
+  interrupt-context rules and a fallible `KBox`. One locked clock and timer queue drive
+  one-shot timer interrupts on every port, so the kernel is tickless. A 500 ms idle
+  period costs one interrupt on aarch64 and nine on x86's PIT, against 50 for a tick.
+  Lock-order violations fail debug boots.
+- **Hardening.**
+  - Kernel threads run on guard-paged stacks, and an overflow report names the thread.
+  - i686 reports a real stack overflow from a `#DF` task gate.
+  - Page 0 is unmapped on every port.
+  - A reproducible build ID appears in every banner and backtrace, and
+    `kbuild symbolize` refuses a log from another build.
+- **Device model (Phase 3).**
+  - `kernel/device` binds drivers to device-tree nodes, hands out typed resource
+    claims that cannot overlap, and enforces probe phases as types.
+  - The GIC and PL011 drivers moved to `drivers/`, and the GIC is chosen by
+    `compatible` instead of `GICD_PIDR2`.
+  - aarch64 maps exactly the device windows its drivers claimed.
+  - One image passes on GICv2, GICv3, `max`, v4 with virtualization, and two other
+    CPU models.
+
+Findings from this round:
+
+- **The hardware keeps no stale translations in QEMU.** Two TLB-related fixes cannot be
+  observed under software emulation: reloading the PAE top-level table on i686, and
+  the read-only invalidation on aarch64. They follow the architecture manuals, and
+  nothing here tests them.
+- **A too-coarse slice hid a missing preemption.** The PIT's 55 ms one-shot reach kept
+  workers alternating even with slices removed. The check now also requires an
+  interrupt count.
+- **The `#DF` task gate needs `clts`.** Without it, the first SSE instruction in the
+  report raised `#NM` and the report triple-faulted.
+- **Discovery can hang on a hostile tree.** A device tree that moved the UART used to
+  start the PL011 driver on unassigned memory. Discovery now checks the tree against
+  the running console before any driver starts.
+- **A host test was flaky for months unnoticed.** A `kernel/thread` test asserted on
+  the mock's process-wide switch counter while the harness ran tests in parallel. It
+  surfaced only when the suite ran under a second preset.
 
 ### Phase 2, so far
+
+*(Written after the first round of landings. `mm::paged`, shared kernel state and the
+smaller gaps listed below have since landed; see above.)*
 
 Every Phase 2 item except `mm::paged` has landed on all three tier-1 architectures.
 Each one gates the boot verdict or the host suite, and each check was falsified:
@@ -119,11 +185,11 @@ memory checks it cannot run.
 Not done, and deliberately named rather than quietly folded into "done":
 
 - ~~No page table manipulation or kernel address space.~~ Done in Phase 2: see above.
-- **The GIC drivers are in `arch/aarch64/`**, not `drivers/irqchip/` where
+- ~~The GIC drivers are in `arch/aarch64/`~~ (moved to `drivers/irqchip/` in Phase 3) — not `drivers/irqchip/` where
   [architecture.md](architecture.md) says they belong, because `arch` may not depend
   on the `device` layer and nothing else would reference them yet. They move when the
   device framework can register and find them.
-- **GIC detection reads `GICD_PIDR2`**, which reports the IP revision rather than the
+- ~~GIC detection reads `GICD_PIDR2`~~ (now the device tree's `compatible`), which reports the IP revision rather than the
   programming model — a GICv3 with `GICD_CTLR.ARE == 0` is legitimately a GICv2 and
   still reports 3. The real answer is the device tree's compatible string.
 
