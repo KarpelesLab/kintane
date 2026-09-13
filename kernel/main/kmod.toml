@@ -1,0 +1,11 @@
+[unit]
+name = "kintane"
+kind = "bin"
+root = "src/main.rs"
+layer = "kernel"
+
+[deps]
+units = ["hal", "arch_x86_64", "boot_protocol"]
+
+[config]
+requires = "ARCH_X86_64"

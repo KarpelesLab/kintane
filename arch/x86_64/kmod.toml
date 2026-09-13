@@ -1,0 +1,11 @@
+[unit]
+name = "arch_x86_64"
+kind = "lib"
+root = "src/lib.rs"
+layer = "arch"
+
+[deps]
+units = ["hal"]
+
+[config]
+requires = "ARCH_X86_64"

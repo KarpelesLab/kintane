@@ -1,0 +1,93 @@
+# KinTane top-level configuration.
+
+source "arch.kcfg"
+
+# --- derived build settings -------------------------------------------------
+# Readonly and defaulted per architecture, so there is one place that knows which
+# target specification and linker script an architecture needs.
+
+config TARGET
+    string
+    readonly
+    default "x86_64-kintane" if ARCH_X86_64
+    default "aarch64-kintane" if ARCH_AARCH64
+    default ""
+    help
+        Name of the target specification under targets/.
+
+config LINKER_SCRIPT
+    string
+    readonly
+    default "arch/x86_64/link.ld" if ARCH_X86_64
+    default "arch/aarch64/link.ld" if ARCH_AARCH64
+    default ""
+
+# --- memory model -----------------------------------------------------------
+
+choice MM_MODEL
+    prompt "Memory model"
+    default MM_PAGED if ARCH_HAS_MMU
+    default MM_FLAT
+
+    config MM_PAGED
+        bool "Paged virtual memory"
+        depends on ARCH_HAS_MMU
+
+    config MM_FLAT
+        bool "Flat physical memory"
+        help
+            No address translation. Required on targets without an MMU;
+            selectable on MMU targets for minimal-overhead builds.
+endchoice
+
+# --- kernel ------------------------------------------------------------------
+
+config SMP
+    bool "Symmetric multiprocessing"
+    depends on ARCH_HAS_SMP
+    default y if ARCH_HAS_SMP
+    help
+        Support more than one CPU. Requires an architecture that implements
+        the HasSmp capability.
+
+config NR_CPUS
+    int "Maximum number of CPUs"
+    depends on SMP
+    range 2 4096
+    default 8
+
+config EARLY_CONSOLE
+    bool "Early console"
+    default y
+    help
+        A console available before the device framework exists. On x86 this is
+        the 16550 UART at the legacy COM1 address.
+
+config DEBUG_BUILD
+    bool "Debug build"
+    default n
+    help
+        Lower optimisation, overflow checks, poisoned allocations, and
+        lock-order checking. Separate from debug symbols, which are always
+        produced and always shipped separately.
+
+config QEMU_EXIT
+    bool "QEMU exit device"
+    depends on ARCH_X86_64 || ARCH_I686
+    default n
+    help
+        Let the guest terminate QEMU with a status through isa-debug-exit.
+        This is the result channel the test protocol uses; see docs/testing.md.
+        It writes to an I/O port that does nothing on real hardware, but it has
+        no business in a production image.
+
+config IMAGE_FORMAT
+    string
+    readonly
+    default "multiboot-elf32" if ARCH_X86_64
+    default "elf"
+    help
+        How the linked image is packaged for the platform's loader.
+        QEMU's multiboot loader refuses an ELF64 container, so on x86_64 the
+        image is rewritten to ELF32 after linking. The 64-bit code is untouched
+        and the ELF64 is kept as the debug artifact.

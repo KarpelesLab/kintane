@@ -1,0 +1,8 @@
+[unit]
+name = "hal"
+kind = "lib"
+root = "src/lib.rs"
+layer = "hal"
+
+[deps]
+units = []

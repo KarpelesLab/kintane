@@ -1,0 +1,8 @@
+[unit]
+name = "boot_protocol"
+kind = "lib"
+root = "src/lib.rs"
+layer = "hal"
+
+[deps]
+units = []

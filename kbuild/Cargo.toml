@@ -1,0 +1,17 @@
+# kbuild is the one place in this tree where cargo is used: it is a host tool with
+# no unusual requirements. It has NO dependencies, deliberately — the tool that
+# enforces build reproducibility should itself build offline from nothing but rustc.
+[package]
+name = "kbuild"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "kbuild"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2

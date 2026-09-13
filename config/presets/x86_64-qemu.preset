@@ -1,0 +1,6 @@
+# x86_64 under QEMU q35 — the Phase 0 development and CI configuration.
+ARCH_X86_64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y

@@ -1,0 +1,8 @@
+[unit]
+name = "compiler_builtins"
+kind = "lib"
+root = "src/lib.rs"
+layer = "builtins"
+
+[deps]
+units = []

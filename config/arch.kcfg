@@ -1,0 +1,83 @@
+# Architecture selection and hardware capabilities.
+#
+# ARCH_HAS_* symbols are readonly: they describe what the hardware can do, not what
+# to build. An architecture asserts them with `select`, and everything else depends
+# on them. This is what lets the config system know that SMP is impossible on a
+# Cortex-M without anyone writing that rule down twice.
+#
+# Each one corresponds to a capability trait in the `hal` crate; see
+# docs/portability.md.
+
+config ARCH_HAS_MMU
+    bool
+    readonly
+    help
+        The target has a hardware MMU with page tables.
+        Corresponds to the HasMmu trait.
+
+config ARCH_HAS_MPU
+    bool
+    readonly
+    help
+        The target has a memory protection unit but no address translation.
+
+config ARCH_HAS_SMP
+    bool
+    readonly
+    help
+        The target can execute more than one hardware thread.
+
+config ARCH_HAS_CAS
+    bool
+    readonly
+    help
+        The target has atomic compare-and-swap at machine word width.
+        Without it, lock-free data structures are not offered at all.
+
+config ARCH_HAS_COHERENT_DMA
+    bool
+    readonly
+    help
+        DMA-capable devices see coherent memory; no manual cache maintenance.
+
+config ARCH_HAS_FPU
+    bool
+    readonly
+    help
+        Floating-point state exists and must be saved across context switches.
+
+choice ARCH
+    prompt "Target architecture"
+    default ARCH_X86_64
+
+    config ARCH_X86_64
+        bool "x86-64"
+        select ARCH_HAS_MMU
+        select ARCH_HAS_SMP
+        select ARCH_HAS_CAS
+        select ARCH_HAS_COHERENT_DMA
+        select ARCH_HAS_FPU
+
+    config ARCH_AARCH64
+        bool "AArch64"
+        select ARCH_HAS_MMU
+        select ARCH_HAS_SMP
+        select ARCH_HAS_CAS
+        select ARCH_HAS_FPU
+
+    config ARCH_I686
+        bool "32-bit x86"
+        select ARCH_HAS_MMU
+        select ARCH_HAS_SMP
+        select ARCH_HAS_CAS
+        select ARCH_HAS_COHERENT_DMA
+        select ARCH_HAS_FPU
+
+    config ARCH_ARMV7M
+        bool "ARMv7-M (Cortex-M, no MMU)"
+        select ARCH_HAS_MPU
+
+    config ARCH_RISCV32
+        bool "RISC-V 32-bit (no MMU)"
+        select ARCH_HAS_CAS
+endchoice
