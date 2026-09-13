@@ -20,6 +20,7 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
+
 use hal::{IrqChip, IrqNumber};
 
 /// Write-once storage for the interrupt controller this machine turned out to have.

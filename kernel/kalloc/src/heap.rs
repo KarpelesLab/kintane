@@ -46,10 +46,10 @@ use core::ptr::NonNull;
 
 use hal::{Arch, KernAddr, PhysAddr};
 use mm::AllocError;
+use mm::directmap::DirectMap;
 
 use crate::bump::{Bump, BumpStats};
 use crate::context::AllocContext;
-use mm::directmap::DirectMap;
 use crate::frames::{FrameSource, NoFrames};
 use crate::slab::{self, Slab, SlabStats};
 
@@ -336,11 +336,12 @@ impl<A: Arch> Heap<A> {
 
 #[cfg(test)]
 mod tests {
+    use hal::mock::{MockFull, MockTiny};
+
     use super::*;
     use crate::context::{AllocFlags, NumaNode};
     use crate::hostmem::{HostFrames, HostMemory};
     use crate::poison;
-    use hal::mock::{MockFull, MockTiny};
 
     const ARENA: usize = 128 * 1024;
 
@@ -402,7 +403,13 @@ mod tests {
         let small = expect(f.alloc(24, 8));
         assert_eq!(f.heap.stats().slab.objects_in_use, 1);
         assert_eq!(
-            f.heap.stats().slab.classes.iter().find(|c| c.size == 32).map(|c| c.in_use),
+            f.heap
+                .stats()
+                .slab
+                .classes
+                .iter()
+                .find(|c| c.size == 32)
+                .map(|c| c.in_use),
             Some(1),
             "24 bytes belongs to the 32 class"
         );
@@ -701,10 +708,7 @@ mod tests {
         let mut f = Fixture::<A>::new();
 
         let ctx = AllocContext::KERNEL_ZEROED;
-        let p = expect(
-            f.heap
-                .try_alloc_in(layout(96, 8), ctx, &mut f.src),
-        );
+        let p = expect(f.heap.try_alloc_in(layout(96, 8), ctx, &mut f.src));
         assert_eq!(f.mem.bytes_at(addr_of(p), 96), Some(&[0u8; 96][..]));
 
         // MAY_SLEEP is advisory, so that request is best-effort and counted.
@@ -755,7 +759,11 @@ mod tests {
         let taken = f.src.handed_out();
         assert!(taken > 0);
         for _ in 0..16 {
-            assert!(f.heap.try_alloc(layout(16, 8), AllocContext::ATOMIC).is_ok());
+            assert!(
+                f.heap
+                    .try_alloc(layout(16, 8), AllocContext::ATOMIC)
+                    .is_ok()
+            );
         }
         assert_eq!(f.src.handed_out(), taken);
     }

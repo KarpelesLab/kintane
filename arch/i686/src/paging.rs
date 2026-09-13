@@ -423,7 +423,6 @@ pub fn write_protect_enabled() -> bool {
     }
 }
 
-
 /// Turn on `EFER.NXE` if the CPU has it, and report whether bit 63 is now usable.
 ///
 /// Asks CPUID before touching the MSR on purpose. `EFER` is an AMD64 extension that a
@@ -820,10 +819,7 @@ fn check_flush(c: &dyn EarlyConsole) -> bool {
     // SAFETY: entry 1 is inside the page table, which is live but is not being walked
     // by anything else — this is a uniprocessor with interrupts masked.
     unsafe {
-        store_entry(
-            pt.add(1),
-            Entry::leaf(scratch_phys(1024), PageFlags::KERNEL_DATA, 0),
-        );
+        store_entry(pt.add(1), Entry::leaf(scratch_phys(1024), PageFlags::KERNEL_DATA, 0));
     }
     // SAFETY: the store above is complete and this CPU is the only observer, so the
     // ordering the trait asks the caller to guarantee is satisfied by program order.
@@ -909,11 +905,11 @@ fn check_wide_phys(c: &dyn EarlyConsole) -> bool {
 /// recognise: exactly 4 GiB above the first scratch frame. That frame is filled with a
 /// known value first. Then the probe address is mapped and read:
 ///
-/// * reading the known value back means bit 32 was dropped somewhere between
-///   `PhysAddr` and the page table walker, and the mapping landed on the low frame —
-///   which is precisely the `usize`-as-physical-address bug, caught in the act;
-/// * reading anything else means the translation went 4 GiB up, where this machine
-///   has no RAM and an unclaimed read returns all-ones.
+/// * reading the known value back means bit 32 was dropped somewhere between `PhysAddr` and the
+///   page table walker, and the mapping landed on the low frame — which is precisely the
+///   `usize`-as-physical-address bug, caught in the act;
+/// * reading anything else means the translation went 4 GiB up, where this machine has no RAM and
+///   an unclaimed read returns all-ones.
 ///
 /// If the machine *does* have memory up there, the second write below round-trips and
 /// the probe becomes a genuine above-4-GiB mapping rather than a negative result. The

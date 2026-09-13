@@ -60,6 +60,34 @@ jobs:
       - name: Kernel host tests
         run: ./kbuild/target/release/kbuild test --preset x86_64-qemu
 
+  # "No discussion; the time is better spent elsewhere" — docs/coding-standards.md.
+  # A formatting rule nobody enforces is a rule every author negotiates privately, which
+  # is exactly the discussion that sentence exists to prevent. Nightly rustfmt because
+  # rustfmt.toml uses options that are not stable.
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain with rustfmt
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rustfmt --profile minimal
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            if ! rustfmt +"${{ steps.pin.outputs.channel }}" --edition 2024 --check "$f" >/dev/null; then
+              echo "::error file=$f::not formatted; run rustfmt on it"
+              fail=1
+            fi
+          done < <(git ls-files '*.rs')
+          exit $fail
+
   # The rule that makes the portability claim checkable rather than aspirational:
   # cfg selects modules and crates, never lines inside one.
   lint:

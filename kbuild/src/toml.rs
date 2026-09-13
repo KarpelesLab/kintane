@@ -65,7 +65,11 @@ impl Value {
     pub fn str_array(&self, path: &str) -> Vec<String> {
         self.get_path(path)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -265,9 +269,13 @@ fn parse_value(s: &str) -> Result<(Value, &str), String> {
                 if let Some(r) = rest.strip_prefix('}') {
                     return Ok((Value::Table(t), r));
                 }
-                let (k, r) = rest
-                    .split_once('=')
-                    .ok_or_else(|| if rest.is_empty() { INCOMPLETE.into() } else { String::from("expected `key = value` in inline table") })?;
+                let (k, r) = rest.split_once('=').ok_or_else(|| {
+                    if rest.is_empty() {
+                        INCOMPLETE.into()
+                    } else {
+                        String::from("expected `key = value` in inline table")
+                    }
+                })?;
                 let (v, r) = parse_value(r)?;
                 t.insert(unquote(k.trim()).to_string(), v);
                 rest = r.trim_start();
@@ -281,9 +289,7 @@ fn parse_value(s: &str) -> Result<(Value, &str), String> {
             }
         }
         _ => {
-            let end = s
-                .find([',', ']', '}'])
-                .unwrap_or(s.len());
+            let end = s.find([',', ']', '}']).unwrap_or(s.len());
             let (tok, rest) = s.split_at(end);
             let tok = tok.trim();
             let v = match tok {
@@ -328,10 +334,7 @@ paged = { cfg = "MM_PAGED", files = ["src/paged/a.rs", "src/paged/b.rs"] }
         assert_eq!(v.get_path("unit.level").unwrap().as_int(), Some(3));
         assert_eq!(v.get_path("unit.enabled").unwrap().as_bool(), Some(true));
         assert_eq!(v.str_array("deps.list"), vec!["hal", "kalloc"]);
-        assert_eq!(
-            v.get_path("sources.paged.cfg").unwrap().as_str(),
-            Some("MM_PAGED")
-        );
+        assert_eq!(v.get_path("sources.paged.cfg").unwrap().as_str(), Some("MM_PAGED"));
         assert_eq!(v.str_array("sources.paged.files").len(), 2);
     }
 

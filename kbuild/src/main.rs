@@ -15,10 +15,11 @@ mod sha256;
 mod toml;
 mod toolchain;
 
-use kcfg::resolve::Request;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use kcfg::resolve::Request;
 
 const USAGE: &str = "\
 kbuild — the KinTane build system
@@ -140,17 +141,11 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "config" => {
             let (table, res) = configure(&root, &opts)?;
             let n_on = table.order.iter().filter(|s| res.is_on(s)).count();
-            println!(
-                "configuration resolved: {} symbols, {} enabled",
-                table.order.len(),
-                n_on
-            );
+            println!("configuration resolved: {} symbols, {} enabled", table.order.len(), n_on);
             println!("  written to {}", root.join(".config").display());
             Ok(())
         }
-        "build" => {
-            do_build(&root, &opts).map(|_| ())
-        }
+        "build" => do_build(&root, &opts).map(|_| ()),
         "test" if opts.in_kernel => {
             // A test image: the real selftest provider is linked in, and the guest's
             // exit status is the verdict. Console output is for a human reading a
@@ -206,9 +201,8 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
             let m = qemu::machine_for(&res, &image, &log)?;
             println!("\n\x1b[36mbooting\x1b[0m {} {}\n", m.binary, m.args.join(" "));
-            let outcome = qemu::run(&m, opts.timeout).map_err(|e| {
-                format!("{e}\n  exception trace: {}", log.display())
-            })?;
+            let outcome = qemu::run(&m, opts.timeout)
+                .map_err(|e| format!("{e}\n  exception trace: {}", log.display()))?;
             println!();
             match outcome.code {
                 Some(c) if outcome.passed => {
@@ -233,16 +227,16 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             for v in &violations {
                 eprintln!("{v}\n");
             }
-            Err(format!(
-                "{} cfg-in-body violation(s)",
-                violations.len()
-            ))
+            Err(format!("{} cfg-in-body violation(s)", violations.len()))
         }
         "clean" => {
             let dir = root.join("build");
             if dir.exists() {
                 // The cache lives elsewhere and is deliberately preserved.
-                for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+                for entry in std::fs::read_dir(&dir)
+                    .map_err(|e| e.to_string())?
+                    .flatten()
+                {
                     if entry.file_name() == "cache" {
                         continue;
                     }
@@ -284,9 +278,7 @@ fn configure(root: &Path, opts: &Opts) -> Result<(kcfg::SymbolTable, kcfg::Resol
         let path = root.join("config/presets").join(format!("{p}.preset"));
         if !path.exists() {
             let avail = list_presets(root).join(", ");
-            return Err(format!(
-                "no preset `{p}`\n  available: {avail}"
-            ));
+            return Err(format!("no preset `{p}`\n  available: {avail}"));
         }
         for (k, v) in codegen::read_settings(&path)? {
             requests.push(Request {
@@ -341,10 +333,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     }
     let target_json = root.join("targets").join(format!("{target_name}.json"));
     if !target_json.exists() {
-        return Err(format!(
-            "missing target specification {}",
-            target_json.display()
-        ));
+        return Err(format!("missing target specification {}", target_json.display()));
     }
 
     let build_dir = root.join("build").join(&target_name);
@@ -364,7 +353,11 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         cache: cache::Cache::new(root.join("build/cache"))?,
         cfgs: generated.cfgs,
         check_cfgs: generated.check_cfgs,
-        opt_level: if res.is_on("DEBUG_BUILD") { "1".into() } else { "2".into() },
+        opt_level: if res.is_on("DEBUG_BUILD") {
+            "1".into()
+        } else {
+            "2".into()
+        },
         link_script: {
             let s = res.str("LINKER_SCRIPT");
             (!s.is_empty()).then(|| root.join(s))

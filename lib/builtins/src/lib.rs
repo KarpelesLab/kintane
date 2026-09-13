@@ -174,5 +174,9 @@ pub extern "C" fn __divdi3(a: i64, b: i64) -> i64 {
 pub extern "C" fn __moddi3(a: i64, b: i64) -> i64 {
     // The remainder takes the sign of the dividend, matching Rust's `%`.
     let (_, r) = udivmod64(a.unsigned_abs(), b.unsigned_abs());
-    if a < 0 { (r as i64).wrapping_neg() } else { r as i64 }
+    if a < 0 {
+        (r as i64).wrapping_neg()
+    } else {
+        r as i64
+    }
 }

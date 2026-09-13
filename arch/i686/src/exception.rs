@@ -9,12 +9,12 @@
 //!
 //! Two exceptions are not fatal:
 //!
-//! * **#BP** is a trap, resumable by construction — the pushed EIP is the instruction
-//!   *after* `int3` — so the handler counts it and returns. This is what makes the
-//!   synchronous half of the selftest an observation rather than an inference.
-//! * Nothing else, yet. #PF becomes recoverable when demand paging exists; the shape
-//!   of that is a fault handler that consults the address space and only falls through
-//!   to this reporter when the fault is genuinely unresolvable.
+//! * **#BP** is a trap, resumable by construction — the pushed EIP is the instruction *after*
+//!   `int3` — so the handler counts it and returns. This is what makes the synchronous half of the
+//!   selftest an observation rather than an inference.
+//! * Nothing else, yet. #PF becomes recoverable when demand paging exists; the shape of that is a
+//!   fault handler that consults the address space and only falls through to this reporter when the
+//!   fault is genuinely unresolvable.
 //!
 //! Handlers allocate nothing, take no lock, and call only into the polled UART, in
 //! line with the rule that the interrupt path contains nothing that can fault or
@@ -34,10 +34,12 @@
 //! error-code presence, and the meaning of the #PF error code bits; figure 6-4 for the
 //! stack frame with and without a privilege transition.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use hal::{Arch, EarlyConsole};
+
 use crate::idt::InterruptFrame;
 use crate::serial::{EARLY, write_hex};
-use core::sync::atomic::{AtomicU32, Ordering};
-use hal::{Arch, EarlyConsole};
 
 /// Number of #BP exceptions taken and returned from since boot.
 ///

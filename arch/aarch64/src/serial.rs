@@ -13,6 +13,7 @@
 //! order of work Linux does in its own earlycon.
 
 use core::ptr::{read_volatile, write_volatile};
+
 use hal::EarlyConsole;
 
 /// PL011 #0 on QEMU `virt`. Fixed by the machine model, not discovered.

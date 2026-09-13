@@ -15,7 +15,6 @@ pub mod serial;
 pub mod timer;
 
 use hal::{Arch, Endian, HasCas, HasFpu, HasMmu, HasSmp, IrqNumber};
-
 pub use serial::EARLY;
 
 /// The AArch64 architecture.

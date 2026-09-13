@@ -8,8 +8,8 @@
 //! Three pieces, each with one job:
 //!
 //! * [`rights`] — what a handle permits, and the rule that rights only ever narrow.
-//! * [`handle`] — the per-process table, and the generation counters that stop a
-//!   closed handle from reaching a slot's next occupant.
+//! * [`handle`] — the per-process table, and the generation counters that stop a closed handle from
+//!   reaching a slot's next occupant.
 //! * [`Refcount`] — how long an object lives.
 //!
 //! This layer deliberately does not own object *storage*. There is no heap beneath
@@ -22,10 +22,10 @@
 pub mod handle;
 pub mod rights;
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 pub use handle::{Handle, HandleTable};
 pub use rights::Rights;
-
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// A kernel object's identity.
 ///
@@ -119,12 +119,12 @@ impl ObjectType {
 /// memory ordering, so a wrong ordering here passes every test we can run and fails
 /// on real ARM silicon (see `docs/testing.md#what-qemu-will-not-catch`):
 ///
-/// * `acquire` is `Relaxed`: the caller already holds a reference, so the object is
-///   provably alive and no ordering with its contents is implied.
-/// * `release` is `Release`, so every write made through the dropped reference
-///   happens-before the count reaching zero.
-/// * The last releaser issues an `Acquire` fence before destroying, pairing with
-///   every other releaser's `Release` so their writes are visible to the destructor.
+/// * `acquire` is `Relaxed`: the caller already holds a reference, so the object is provably alive
+///   and no ordering with its contents is implied.
+/// * `release` is `Release`, so every write made through the dropped reference happens-before the
+///   count reaching zero.
+/// * The last releaser issues an `Acquire` fence before destroying, pairing with every other
+///   releaser's `Release` so their writes are visible to the destructor.
 pub struct Refcount(AtomicU32);
 
 /// Why a reference could not be taken.
@@ -161,12 +161,10 @@ impl Refcount {
             if cur == u32::MAX {
                 return Err(RefError::TooManyRefs);
             }
-            match self.0.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .0
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(()),
                 Err(actual) => cur = actual,
             }

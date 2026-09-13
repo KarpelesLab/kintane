@@ -35,10 +35,7 @@ pub const SOURCE: &str = "multiboot";
 /// `boot_arg` must be the value the platform's boot code passed to `kmain` — for
 /// multiboot, the pointer the loader left in `ebx` — and the structure it points at
 /// must still be mapped.
-pub unsafe fn memory_regions(
-    boot_arg: u64,
-    out: &mut [MemoryRegion],
-) -> Result<usize, Error> {
+pub unsafe fn memory_regions(boot_arg: u64, out: &mut [MemoryRegion]) -> Result<usize, Error> {
     // The magic is not available at this point: the boot code keeps only the info
     // pointer. Passing the magic through is a small change to every x86 port and is
     // worth doing when something depends on telling "no loader" from "a loader we do
@@ -64,7 +61,9 @@ pub unsafe fn memory_regions(
             _ => Error::NoMemoryMap,
         })?;
         if n >= out.len() {
-            return Err(Error::TooManyRegions { capacity: out.len() });
+            return Err(Error::TooManyRegions {
+                capacity: out.len(),
+            });
         }
         out[n] = region;
         n += 1;

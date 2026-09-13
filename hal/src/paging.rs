@@ -25,8 +25,9 @@
 //! means the same thing everywhere, and a three-level format is a four-level one with
 //! the top removed rather than with everything renumbered.
 
-use crate::PhysAddr;
 use core::fmt;
+
+use crate::PhysAddr;
 
 /// What a mapping permits, in architecture-neutral terms.
 ///

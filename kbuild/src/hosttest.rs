@@ -15,12 +15,13 @@
 //! has a design problem, which is a conversation worth having at the manifest rather
 //! than discovering later.
 
-use crate::codegen::Generated;
-use crate::graph::Unit;
-use crate::toolchain::Toolchain;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::codegen::Generated;
+use crate::graph::Unit;
+use crate::toolchain::Toolchain;
 
 pub struct Summary {
     pub units: usize,

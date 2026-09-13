@@ -38,10 +38,12 @@
 //! done once, by hand, against a throwaway build; `gdt.rs` records what it showed and
 //! what it did not.
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use hal::{Arch, EarlyConsole, IrqChip, IrqNumber};
+
 use crate::serial::{write_dec, write_hex};
 use crate::{X86_64, exception, gdt, idt, pic, pit};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use hal::{Arch, EarlyConsole, IrqChip, IrqNumber};
 
 /// Install plain (no error code) handlers for a list of vectors.
 ///
@@ -198,23 +200,15 @@ pub fn init() {
             idt::EntryPoint::with_code(exception::double_fault),
             gdt::DF_IST_INDEX,
         );
-        idt::set_gate(
-            13,
-            idt::EntryPoint::with_code(exception::general_protection),
-        );
+        idt::set_gate(13, idt::EntryPoint::with_code(exception::general_protection));
         // #PF is the one vector whose handler may return: it re-executes the faulting
         // instruction after resolving the fault, and falls through to the fatal
         // reporter when it cannot. See `exception::page_fault`.
-        idt::set_gate(
-            14,
-            idt::EntryPoint::resumable_with_code(exception::page_fault),
-        );
+        idt::set_gate(14, idt::EntryPoint::resumable_with_code(exception::page_fault));
 
         // The rest of the architecturally defined range, so that an unexpected one
         // reports itself instead of escalating to a triple fault.
-        reserved_gates!(
-            1, 2, 4, 5, 7, 9, 15, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 31
-        );
+        reserved_gates!(1, 2, 4, 5, 7, 9, 15, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 31);
         reserved_gates_with_code!(10, 11, 12, 17, 21, 29, 30);
 
         // The sixteen PIC lines.

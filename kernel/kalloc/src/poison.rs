@@ -124,10 +124,7 @@ mod tests {
         // SAFETY: as above.
         unsafe { fill_freed(ptr, 16) };
         let want = if ENABLED { FREED } else { 0 };
-        assert!(
-            buf.iter().all(|b| *b == want),
-            "poisoning must follow ENABLED exactly"
-        );
+        assert!(buf.iter().all(|b| *b == want), "poisoning must follow ENABLED exactly");
     }
 
     #[test]

@@ -5,12 +5,13 @@
 //! declared. Note that `-Z build-std` never appears: that is a *cargo* feature, and
 //! since we call rustc ourselves, compiling `core` is simply compiling a crate.
 
-use crate::cache::{Cache, KeyBuilder};
-use crate::graph::{Kind, Unit};
-use crate::toolchain::Toolchain;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::cache::{Cache, KeyBuilder};
+use crate::graph::{Kind, Unit};
+use crate::toolchain::Toolchain;
 
 pub struct Build {
     pub root: PathBuf,
@@ -129,11 +130,7 @@ impl Build {
     }
 
     /// Build one unit against already-built dependencies.
-    pub fn build_unit(
-        &self,
-        unit: &Unit,
-        deps: &BTreeMap<String, Built>,
-    ) -> Result<Built, String> {
+    pub fn build_unit(&self, unit: &Unit, deps: &BTreeMap<String, Built>) -> Result<Built, String> {
         let crate_name = unit.name.replace('-', "_");
         let filename = match unit.kind {
             Kind::Lib => format!("lib{crate_name}.rlib"),

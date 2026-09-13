@@ -276,13 +276,7 @@ impl<A: Arch> Eq for FrameRange<A> {}
 
 impl<A: Arch> fmt::Debug for FrameRange<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "FrameRange<{}>({}, {} frames)",
-            A::NAME,
-            self.start.start(),
-            self.count
-        )
+        write!(f, "FrameRange<{}>({}, {} frames)", A::NAME, self.start.start(), self.count)
     }
 }
 
@@ -336,8 +330,9 @@ impl<A: Arch> ExactSizeIterator for FrameIter<A> {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use hal::mock::{MockFull, MockTiny};
+
+    use super::*;
 
     /// Everything below is written in units of frames rather than bytes, which is
     /// what lets one body of assertions hold for a 4096-byte page and a 256-byte one.
@@ -399,10 +394,7 @@ mod tests {
         let base = addr_of::<A>(7);
         assert_eq!(Frame::<A>::from_start(base).map(|f| f.number()), Ok(7));
         let unaligned = expect(base.checked_add(1).map_err(AllocError::from));
-        assert_eq!(
-            Frame::<A>::from_start(unaligned),
-            Err(AllocError::Misaligned)
-        );
+        assert_eq!(Frame::<A>::from_start(unaligned), Err(AllocError::Misaligned));
     }
 
     #[test]
@@ -420,10 +412,7 @@ mod tests {
             let f = expect(Frame::<A>::from_number(n));
             assert_eq!(f.number(), n);
             assert!(f.start().is_aligned(Frame::<A>::bytes()));
-            assert_eq!(
-                f.end().map(|e| e.raw()),
-                Ok(f.start().raw() + Frame::<A>::bytes())
-            );
+            assert_eq!(f.end().map(|e| e.raw()), Ok(f.start().raw() + Frame::<A>::bytes()));
             assert_eq!(f.next().map(|x| x.number()), Ok(n + 1));
         }
     }
@@ -492,10 +481,7 @@ mod tests {
 
     fn empty_ranges_are_rejected<A: Arch>() {
         let start = expect(Frame::<A>::from_number(1));
-        assert_eq!(
-            FrameRange::new(start, 0).map(|r| r.count()),
-            Err(AllocError::EmptyRequest)
-        );
+        assert_eq!(FrameRange::new(start, 0).map(|r| r.count()), Err(AllocError::EmptyRequest));
     }
 
     #[test]

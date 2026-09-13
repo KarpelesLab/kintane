@@ -25,10 +25,10 @@
 
 use hal::paging::{HasPageTables, ImageSections, MapError, PageFlags};
 use hal::{Arch, EarlyConsole, PhysAddr};
+use mm::DirectMap;
 use mm::frame::Frame;
 use mm::paged::{AddressSpace, FrameSource};
 use mm::phys::FrameAllocator;
-use mm::DirectMap;
 
 /// Adapts the frame allocator to what the walker needs.
 ///
@@ -214,12 +214,7 @@ fn plan(
         // boundaries that would be wrong in a way nothing would notice.
         let (start, end) = s.text;
         p.push(dm_start, start.min(dm_end), PageFlags::KERNEL_DATA, "below image");
-        p.push(
-            start,
-            end,
-            PageFlags::KERNEL_DATA | PageFlags::EXECUTE,
-            "image (unsplit)",
-        );
+        p.push(start, end, PageFlags::KERNEL_DATA | PageFlags::EXECUTE, "image (unsplit)");
         p.push(end, dm_end, PageFlags::KERNEL_DATA, "above image");
         return Ok(p.n);
     }
@@ -294,7 +289,11 @@ fn check<A: HasPageTables>(
     // no-execute half is only demanded when it can be delivered — and the report says
     // plainly which half is holding, so a partial guarantee is never read as a full one.
     let nx = A::can_forbid_execute();
-    let exec_deny = if nx { PageFlags::EXECUTE } else { PageFlags::empty() };
+    let exec_deny = if nx {
+        PageFlags::EXECUTE
+    } else {
+        PageFlags::empty()
+    };
 
     // The property W^X exists for: nothing is both writable and executable.
     for seg in segs {
@@ -325,18 +324,8 @@ fn check<A: HasPageTables>(
         }
     };
 
-    ok &= probe(
-        s.text.0,
-        PageFlags::EXECUTE,
-        PageFlags::WRITE,
-        "text",
-    );
-    ok &= probe(
-        s.rodata.0,
-        PageFlags::READ,
-        PageFlags::WRITE.union(exec_deny),
-        "rodata",
-    );
+    ok &= probe(s.text.0, PageFlags::EXECUTE, PageFlags::WRITE, "text");
+    ok &= probe(s.rodata.0, PageFlags::READ, PageFlags::WRITE.union(exec_deny), "rodata");
     ok &= probe(s.data.0, PageFlags::WRITE, exec_deny, "data");
 
     // The guard page must not resolve at all. This is the whole point of it: an
@@ -349,7 +338,11 @@ fn check<A: HasPageTables>(
                 ok = false;
             }
         }
-        c.write_str(if nx { "W^X over " } else { "no-write only (CPU has no NX) over " });
+        c.write_str(if nx {
+            "W^X over "
+        } else {
+            "no-write only (CPU has no NX) over "
+        });
     } else {
         c.write_str(if nx {
             "W^X (no guard page on this port) over "
@@ -380,9 +373,21 @@ fn describe(e: MapError) -> &'static str {
 }
 
 fn write_flags(c: &dyn EarlyConsole, f: PageFlags) {
-    c.write_str(if f.contains(PageFlags::READ) { "r" } else { "-" });
-    c.write_str(if f.contains(PageFlags::WRITE) { "w" } else { "-" });
-    c.write_str(if f.contains(PageFlags::EXECUTE) { "x" } else { "-" });
+    c.write_str(if f.contains(PageFlags::READ) {
+        "r"
+    } else {
+        "-"
+    });
+    c.write_str(if f.contains(PageFlags::WRITE) {
+        "w"
+    } else {
+        "-"
+    });
+    c.write_str(if f.contains(PageFlags::EXECUTE) {
+        "x"
+    } else {
+        "-"
+    });
 }
 
 fn write_kib(c: &dyn EarlyConsole, bytes: u64) {

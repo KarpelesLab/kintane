@@ -5,8 +5,9 @@
 //! all dependencies. A hit is a hardlink, so "rebuild all five tier-1 targets" stays
 //! cheap — which is what makes gating every merge on every target affordable.
 
-use crate::sha256::{hex, Sha256};
 use std::path::{Path, PathBuf};
+
+use crate::sha256::{Sha256, hex};
 
 pub struct Cache {
     dir: PathBuf,
@@ -106,8 +107,7 @@ impl KeyBuilder {
             let rel = f.strip_prefix(dir).unwrap_or(&f);
             self.h.update(rel.to_string_lossy().as_bytes());
             self.h.update(b"\0");
-            let data =
-                std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+            let data = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
             self.h.update(&(data.len() as u64).to_le_bytes());
             self.h.update(&data);
         }

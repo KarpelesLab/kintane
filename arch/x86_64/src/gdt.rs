@@ -53,22 +53,19 @@
 //! the tree:
 //!
 //! 1. **RSP pointed past the end of the identity map, then pushed.** The trace reads
-//!    `check_exception old: 0xffffffff new 0xe` (a #PF on the write), then
-//!    `check_exception old: 0xe new 0xe` escalating to `v=08`, and the #DF report
-//!    comes out over the serial console naming `rsp 0x0000000080000000` and
-//!    `cr2 0x000000007ffffff8`. With the IST index changed to 0 and nothing else
-//!    touched, the same run ends `check_exception old: 0x8 new 0xe` — the double fault
-//!    could not be delivered either — and QEMU shuts down with no output at all. That
-//!    is the mechanism working, and the control confirming it is the IST that made the
-//!    difference.
+//!    `check_exception old: 0xffffffff new 0xe` (a #PF on the write), then `check_exception old:
+//!    0xe new 0xe` escalating to `v=08`, and the #DF report comes out over the serial console
+//!    naming `rsp 0x0000000080000000` and `cr2 0x000000007ffffff8`. With the IST index changed to 0
+//!    and nothing else touched, the same run ends `check_exception old: 0x8 new 0xe` — the double
+//!    fault could not be delivered either — and QEMU shuts down with no output at all. That is the
+//!    mechanism working, and the control confirming it is the IST that made the difference.
 //!
-//! 2. **A genuine unbounded recursion off the boot stack**, which at the time did *not*
-//!    produce a clean report, for a reason worth recording. `boot.rs` then put `pml4`,
-//!    `pdpt` and `pd` in `.bss` immediately *below* `stack_bottom`, and there was no
-//!    guard page. So an overflowing stack walked straight into the page tables the
-//!    machine was running on and unmapped everything, including this file's IST stack,
-//!    which is in the same `.bss`. The run ended in an endless #PF/#DF alternation
-//!    rather than a report.
+//! 2. **A genuine unbounded recursion off the boot stack**, which at the time did *not* produce a
+//!    clean report, for a reason worth recording. `boot.rs` then put `pml4`, `pdpt` and `pd` in
+//!    `.bss` immediately *below* `stack_bottom`, and there was no guard page. So an overflowing
+//!    stack walked straight into the page tables the machine was running on and unmapped
+//!    everything, including this file's IST stack, which is in the same `.bss`. The run ended in an
+//!    endless #PF/#DF alternation rather than a report.
 //!
 //! The IST was therefore necessary and not sufficient. What makes a stack overflow
 //! *diagnosable* rather than merely survivable is a guard page below the stack, so that

@@ -19,8 +19,9 @@
 //! source "arch.kcfg"
 //! ```
 
-use super::*;
 use std::path::{Path, PathBuf};
+
+use super::*;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -160,9 +161,9 @@ fn parse_file(
             }
 
             "bool" | "tristate" | "int" | "string" => {
-                let sym = cur.as_ref().ok_or_else(|| {
-                    err(format!("`{kw}` outside of a `config` block"))
-                })?;
+                let sym = cur
+                    .as_ref()
+                    .ok_or_else(|| err(format!("`{kw}` outside of a `config` block")))?;
                 let sy = table.symbols.get_mut(sym).unwrap();
                 sy.kind = match kw {
                     "bool" => Kind::Bool,
@@ -184,14 +185,17 @@ fn parse_file(
                         continue;
                     }
                 }
-                let sym = cur.as_ref().ok_or_else(|| err("`prompt` outside a block".into()))?;
+                let sym = cur
+                    .as_ref()
+                    .ok_or_else(|| err("`prompt` outside a block".into()))?;
                 table.symbols.get_mut(sym).unwrap().prompt = Some(p);
             }
 
             "depends" => {
-                let cond = rest.trim().strip_prefix("on ").ok_or_else(|| {
-                    err("expected `depends on <expression>`".into())
-                })?;
+                let cond = rest
+                    .trim()
+                    .strip_prefix("on ")
+                    .ok_or_else(|| err("expected `depends on <expression>`".into()))?;
                 let e = expr::parse(cond).map_err(|m| err(m))?;
                 match (&cur, &cur_choice) {
                     (Some(sym), _) => table.symbols.get_mut(sym).unwrap().depends = Some(e),
@@ -251,8 +255,12 @@ fn parse_file(
                 if parts.len() != 2 {
                     return Err(err("expected `range <low> <high>`".into()));
                 }
-                let lo = parts[0].parse::<i64>().map_err(|_| err("bad range low".into()))?;
-                let hi = parts[1].parse::<i64>().map_err(|_| err("bad range high".into()))?;
+                let lo = parts[0]
+                    .parse::<i64>()
+                    .map_err(|_| err("bad range low".into()))?;
+                let hi = parts[1]
+                    .parse::<i64>()
+                    .map_err(|_| err("bad range high".into()))?;
                 if lo > hi {
                     return Err(err(format!("range low {lo} exceeds high {hi}")));
                 }
@@ -267,7 +275,9 @@ fn parse_file(
             }
 
             "help" => {
-                let sym = cur.clone().ok_or_else(|| err("`help` outside a block".into()))?;
+                let sym = cur
+                    .clone()
+                    .ok_or_else(|| err("`help` outside a block".into()))?;
                 let mut text = String::new();
                 while i < lines.len() {
                     let l = lines[i];
@@ -284,8 +294,7 @@ fn parse_file(
                     text.push('\n');
                     i += 1;
                 }
-                table.symbols.get_mut(&sym).unwrap().help =
-                    Some(text.trim().to_string());
+                table.symbols.get_mut(&sym).unwrap().help = Some(text.trim().to_string());
             }
 
             other => {
@@ -373,8 +382,9 @@ fn unquote(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

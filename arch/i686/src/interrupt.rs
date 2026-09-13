@@ -70,10 +70,12 @@
 //! IRQ 0). Each reports a counter the handler incremented. If the counter did not
 //! move, the selftest fails — it never concludes success from the absence of a crash.
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use hal::{Arch, EarlyConsole, IrqChip, IrqNumber};
+
 use crate::serial::{write_dec, write_hex};
 use crate::{I686, exception, idt, pic, pit};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use hal::{Arch, EarlyConsole, IrqChip, IrqNumber};
 
 /// Install plain (no error code) handlers for a list of vectors.
 ///
@@ -220,17 +222,12 @@ pub fn init() {
         idt::set_gate(3, idt::EntryPoint::plain(exception::breakpoint));
         idt::set_gate(6, idt::EntryPoint::diverging(exception::invalid_opcode));
         idt::set_gate(8, idt::EntryPoint::with_code(exception::double_fault));
-        idt::set_gate(
-            13,
-            idt::EntryPoint::with_code(exception::general_protection),
-        );
+        idt::set_gate(13, idt::EntryPoint::with_code(exception::general_protection));
         idt::set_gate(14, idt::EntryPoint::with_code(exception::page_fault));
 
         // The rest of the architecturally defined range, so that an unexpected one
         // reports itself instead of escalating to a triple fault.
-        reserved_gates!(
-            1, 2, 4, 5, 7, 9, 15, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 31
-        );
+        reserved_gates!(1, 2, 4, 5, 7, 9, 15, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 31);
         reserved_gates_with_code!(10, 11, 12, 17, 21, 29, 30);
 
         // The sixteen PIC lines.

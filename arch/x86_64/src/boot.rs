@@ -5,13 +5,13 @@
 //! architecture and has to be done in this order:
 //!
 //! 1. Take a stack and stash the multiboot info pointer, which arrives in `ebx`.
-//! 2. Build page tables. Long mode requires paging to be enabled *before* it can be
-//!    entered, so there is no way to defer this to Rust. We identity-map the first
-//!    1 GiB with 2 MiB pages: three tables, one loop, and enough to reach `kmain`.
-//! 3. Enable PAE (`CR4.PAE`), set `EFER.LME`, load `CR3`, then enable paging
-//!    (`CR0.PG`). Setting LME only arms long mode; it activates when paging comes on.
-//! 4. Load a GDT with a 64-bit code segment and far-jump to reload `CS`. Until that
-//!    jump the CPU is in 32-bit compatibility mode.
+//! 2. Build page tables. Long mode requires paging to be enabled *before* it can be entered, so
+//!    there is no way to defer this to Rust. We identity-map the first 1 GiB with 2 MiB pages:
+//!    three tables, one loop, and enough to reach `kmain`.
+//! 3. Enable PAE (`CR4.PAE`), set `EFER.LME`, load `CR3`, then enable paging (`CR0.PG`). Setting
+//!    LME only arms long mode; it activates when paging comes on.
+//! 4. Load a GDT with a 64-bit code segment and far-jump to reload `CS`. Until that jump the CPU is
+//!    in 32-bit compatibility mode.
 //!
 //! The GDT below is the bootstrap one and stops being the live table early: `gdt.rs`
 //! replaces it during interrupt bring-up with a table that also describes a TSS, so

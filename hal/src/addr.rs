@@ -175,10 +175,7 @@ mod tests {
         assert!(!a.is_aligned(0x1000));
         assert!(PhysAddr::new(0x2000).is_aligned(0x1000));
         // Already-aligned addresses must not move.
-        assert_eq!(
-            PhysAddr::new(0x2000).align_up(0x1000).unwrap(),
-            PhysAddr::new(0x2000)
-        );
+        assert_eq!(PhysAddr::new(0x2000).align_up(0x1000).unwrap(), PhysAddr::new(0x2000));
     }
 
     #[test]

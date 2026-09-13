@@ -6,9 +6,10 @@
 //! version recorded in `toolchain.toml`. So we locate a candidate rustc, ask it who it
 //! is, and accept it on identity regardless of what it is called locally.
 
-use crate::toml;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::toml;
 
 #[derive(Debug, Clone)]
 pub struct Pin {
@@ -133,10 +134,7 @@ pub fn verify(root: &Path) -> Result<Toolchain, String> {
                 lib_src,
             });
         }
-        tried.push(format!(
-            "{candidate}: {} ({})",
-            info.release, info.commit_hash
-        ));
+        tried.push(format!("{candidate}: {} ({})", info.release, info.commit_hash));
     }
 
     Err(format!(
@@ -198,7 +196,5 @@ fn sysroot(rustc: &Path) -> Result<PathBuf, String> {
         .args(["--print", "sysroot"])
         .output()
         .map_err(|e| format!("cannot run rustc: {e}"))?;
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&out.stdout).trim().to_string(),
-    ))
+    Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string()))
 }

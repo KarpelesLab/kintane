@@ -4,9 +4,10 @@
 //! typed by hand. See `docs/testing.md` — in particular the result channels, which
 //! exist so that a test's verdict never has to be scraped out of console output.
 
-use crate::kcfg::Resolution;
 use std::path::Path;
 use std::process::Command;
+
+use crate::kcfg::Resolution;
 
 pub struct Machine {
     pub binary: &'static str,
@@ -23,7 +24,11 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     });
     let cpu = {
         let c = res.str("QEMU_CPU");
-        if c.is_empty() { "max".to_string() } else { c.to_string() }
+        if c.is_empty() {
+            "max".to_string()
+        } else {
+            c.to_string()
+        }
     };
 
     if res.is_on("ARCH_X86_64") {
@@ -32,13 +37,20 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         return Ok(Machine {
             binary: "qemu-system-x86_64",
             args: vec![
-                s("-machine"), s("q35"),
-                s("-cpu"), cpu,
-                s("-m"), mem,
-                s("-kernel"), image.display().to_string(),
-                s("-device"), s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
-                s("-serial"), s("stdio"),
-                s("-display"), s("none"),
+                s("-machine"),
+                s("q35"),
+                s("-cpu"),
+                cpu,
+                s("-m"),
+                mem,
+                s("-kernel"),
+                image.display().to_string(),
+                s("-device"),
+                s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
+                s("-serial"),
+                s("stdio"),
+                s("-display"),
+                s("none"),
                 // A triple fault must be a visible failure, not a reboot loop that
                 // reads as a timeout.
                 //
@@ -49,8 +61,10 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 s("-no-reboot"),
                 // Exception and guest-error tracing goes to a file, not stderr, so a
                 // failure leaves evidence without burying the console output.
-                s("-d"), s("int,guest_errors"),
-                s("-D"), log.display().to_string(),
+                s("-d"),
+                s("int,guest_errors"),
+                s("-D"),
+                log.display().to_string(),
             ],
             success_code: (0x10 << 1) | 1,
         });
@@ -62,16 +76,25 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             args: vec![
                 // i440FX rather than q35: this target exists for legacy PCs, and
                 // testing it on a modern chipset would defeat the point.
-                s("-machine"), s("pc"),
-                s("-cpu"), cpu,
-                s("-m"), mem,
-                s("-kernel"), image.display().to_string(),
-                s("-device"), s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
-                s("-serial"), s("stdio"),
-                s("-display"), s("none"),
+                s("-machine"),
+                s("pc"),
+                s("-cpu"),
+                cpu,
+                s("-m"),
+                mem,
+                s("-kernel"),
+                image.display().to_string(),
+                s("-device"),
+                s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
+                s("-serial"),
+                s("stdio"),
+                s("-display"),
+                s("none"),
                 s("-no-reboot"),
-                s("-d"), s("int,guest_errors"),
-                s("-D"), log.display().to_string(),
+                s("-d"),
+                s("int,guest_errors"),
+                s("-D"),
+                log.display().to_string(),
             ],
             success_code: (0x10 << 1) | 1,
         });
@@ -81,16 +104,25 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         return Ok(Machine {
             binary: "qemu-system-aarch64",
             args: vec![
-                s("-machine"), s("virt,gic-version=3"),
-                s("-cpu"), cpu,
-                s("-m"), mem,
-                s("-kernel"), image.display().to_string(),
-                s("-semihosting-config"), s("enable=on,target=native"),
-                s("-serial"), s("stdio"),
-                s("-display"), s("none"),
+                s("-machine"),
+                s("virt,gic-version=3"),
+                s("-cpu"),
+                cpu,
+                s("-m"),
+                mem,
+                s("-kernel"),
+                image.display().to_string(),
+                s("-semihosting-config"),
+                s("enable=on,target=native"),
+                s("-serial"),
+                s("stdio"),
+                s("-display"),
+                s("none"),
                 s("-no-reboot"),
-                s("-d"), s("int,guest_errors"),
-                s("-D"), log.display().to_string(),
+                s("-d"),
+                s("int,guest_errors"),
+                s("-D"),
+                log.display().to_string(),
             ],
             success_code: 0,
         });

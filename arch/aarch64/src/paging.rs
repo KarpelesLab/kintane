@@ -55,11 +55,11 @@
 //!
 //! Two regions, both identity, so that enabling the MMU does not move anything:
 //!
-//! - `0x0000_0000..0x4000_0000` as one 1 GiB Device-nGnRnE block. That is where
-//!   QEMU `virt` puts the PL011, the GIC distributor and redistributors, and the
-//!   flash — everything the kernel reaches by MMIO.
-//! - `0x4000_0000..0x8000_0000` as 512 × 2 MiB Normal write-back blocks. RAM begins
-//!   at `0x4000_0000` on `virt` and the image is linked at `0x4008_0000`.
+//! - `0x0000_0000..0x4000_0000` as one 1 GiB Device-nGnRnE block. That is where QEMU `virt` puts
+//!   the PL011, the GIC distributor and redistributors, and the flash — everything the kernel
+//!   reaches by MMIO.
+//! - `0x4000_0000..0x8000_0000` as 512 × 2 MiB Normal write-back blocks. RAM begins at
+//!   `0x4000_0000` on `virt` and the image is linked at `0x4008_0000`.
 //!
 //! The second is deliberately larger than the RAM QEMU is usually given, so that
 //! changing `-m` does not unmap the kernel. Mapping unbacked addresses as Normal
@@ -92,12 +92,14 @@
 //! ("Translation table descriptor formats"), D8.4 ("Memory access control"),
 //! D19.2.107 (`MAIR_EL1`), D19.2.145 (`TCR_EL1`), D19.2.120 (`SCTLR_EL1`).
 
-use crate::Aarch64;
 use core::cell::UnsafeCell;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use hal::paging::{level_index, HasPageTables, MapError, PageFlags, PageTableEntry};
+
+use hal::paging::{HasPageTables, MapError, PageFlags, PageTableEntry, level_index};
 use hal::{Arch, EarlyConsole, HasMmu, PhysAddr};
+
+use crate::Aarch64;
 
 // --- descriptor bits ------------------------------------------------------------
 
@@ -894,10 +896,7 @@ pub fn selftest(c: &dyn EarlyConsole) -> bool {
     // ends are checked because the refinement is per 2 MiB block and an image that grew
     // past the tables reserved for it would lose only its tail.
     let (img_start, img_end) = crate::image_range();
-    match (
-        leaf_level(img_start as usize),
-        leaf_level(img_end.saturating_sub(1) as usize),
-    ) {
+    match (leaf_level(img_start as usize), leaf_level(img_end.saturating_sub(1) as usize)) {
         (Some(0), Some(0)) => c.write_str(", image mapped at 4 KiB"),
         _ => {
             c.write_str(", image not mapped at 4 KiB");

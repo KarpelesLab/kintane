@@ -18,14 +18,14 @@
 //!
 //! The two files describe the same idea and not the same hardware structure:
 //!
-//! * A gate is **8 bytes, not 16**. There is no IST field and no upper 32 bits of
-//!   offset; the byte that x86-64 spends on IST is a must-be-zero byte here.
-//! * The type nibble means a *32-bit* interrupt gate (`0xE` with the D bit set), and
-//!   the 16-bit gate types (`0x6`/`0x7`) exist alongside it. `0x8E` happens to be the
-//!   right flags byte on both targets for different reasons, which is exactly the kind
-//!   of coincidence worth writing down rather than relying on silently.
-//! * The `lidt` operand carries a 32-bit base, so the pseudo-descriptor is six bytes
-//!   rather than ten.
+//! * A gate is **8 bytes, not 16**. There is no IST field and no upper 32 bits of offset; the byte
+//!   that x86-64 spends on IST is a must-be-zero byte here.
+//! * The type nibble means a *32-bit* interrupt gate (`0xE` with the D bit set), and the 16-bit
+//!   gate types (`0x6`/`0x7`) exist alongside it. `0x8E` happens to be the right flags byte on both
+//!   targets for different reasons, which is exactly the kind of coincidence worth writing down
+//!   rather than relying on silently.
+//! * The `lidt` operand carries a 32-bit base, so the pseudo-descriptor is six bytes rather than
+//!   ten.
 //!
 //! Reference: Intel SDM Vol. 3A, §6.11 (IDT descriptors) and figure 6-2 (32-bit gate
 //! format).

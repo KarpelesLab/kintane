@@ -29,13 +29,12 @@
 //!
 //! Contention means different things on the two machines, and the gates say so:
 //!
-//! - With CAS, a caller that loses the race is another CPU, which will be able to use
-//!   the value shortly. It waits.
-//! - With interrupts masked on a single-CPU machine, nothing else *can* be running, so
-//!   a caller that finds an initialisation in progress can only be the initialiser
-//!   itself, re-entering through its own closure. Nobody will ever finish it. Waiting
-//!   would hang the machine in a loop that looks like progress, so it stops the CPU
-//!   instead ([`Arch::halt`]).
+//! - With CAS, a caller that loses the race is another CPU, which will be able to use the value
+//!   shortly. It waits.
+//! - With interrupts masked on a single-CPU machine, nothing else *can* be running, so a caller
+//!   that finds an initialisation in progress can only be the initialiser itself, re-entering
+//!   through its own closure. Nobody will ever finish it. Waiting would hang the machine in a loop
+//!   that looks like progress, so it stops the CPU instead ([`Arch::halt`]).
 //!
 //! That difference is not a tuning knob; it follows from the capability, which is the
 //! whole argument of `docs/portability.md` in four lines of code.
@@ -322,10 +321,12 @@ pub type IrqOnce<T, A> = Once<T, IrqGate<A>>;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use hal::mock::{MockFull, MockTiny};
+
     use super::*;
     use crate::testing::{interrupts_enabled, serial};
-    use hal::mock::{MockFull, MockTiny};
-    use std::sync::atomic::AtomicUsize;
 
     // Both profiles run the same test bodies. The gate is the only difference, which
     // is the claim this module is making: the state machine is written once.

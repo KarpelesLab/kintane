@@ -42,20 +42,19 @@
 //! checking):
 //!
 //! 1. **A lock shared with an interrupt handler is taken with interrupts masked** —
-//!    [`SpinLock::lock_irqsave`] or [`IrqLock::lock`], never [`SpinLock::lock`]. The
-//!    classic deadlock is one CPU taking a lock, being interrupted, and the handler
-//!    taking the same lock; no amount of spinning resolves it because the holder
-//!    cannot be scheduled.
-//! 2. **No lock is held across a call that can block or sleep.** Nothing in this unit
-//!    sleeps; sleeping locks arrive with the scheduler and are a different type.
-//! 3. **Guards are released on the CPU that took them.** Enforced: every guard here is
-//!    `!Send`, so a guard cannot be moved to another thread or CPU. For the
-//!    interrupt-masking guards this is a soundness requirement — a saved interrupt
-//!    state belongs to the CPU that saved it — and not merely a convention.
-//! 4. **Re-entering a held lock is a bug, and it is treated as one.** [`IrqLock`]
-//!    detects it and stops the CPU rather than handing out a second `&mut` to the same
-//!    data, which would be undefined behaviour. [`SpinLock`] cannot detect it without
-//!    an owner field and deadlocks instead, like every other kernel's spinlock.
+//!    [`SpinLock::lock_irqsave`] or [`IrqLock::lock`], never [`SpinLock::lock`]. The classic
+//!    deadlock is one CPU taking a lock, being interrupted, and the handler taking the same lock;
+//!    no amount of spinning resolves it because the holder cannot be scheduled.
+//! 2. **No lock is held across a call that can block or sleep.** Nothing in this unit sleeps;
+//!    sleeping locks arrive with the scheduler and are a different type.
+//! 3. **Guards are released on the CPU that took them.** Enforced: every guard here is `!Send`, so
+//!    a guard cannot be moved to another thread or CPU. For the interrupt-masking guards this is a
+//!    soundness requirement — a saved interrupt state belongs to the CPU that saved it — and not
+//!    merely a convention.
+//! 4. **Re-entering a held lock is a bug, and it is treated as one.** [`IrqLock`] detects it and
+//!    stops the CPU rather than handing out a second `&mut` to the same data, which would be
+//!    undefined behaviour. [`SpinLock`] cannot detect it without an owner field and deadlocks
+//!    instead, like every other kernel's spinlock.
 //!
 //! # Memory ordering
 //!
@@ -65,23 +64,21 @@
 //!
 //! What this unit relies on:
 //!
-//! - **Rust's atomic orderings, not [`hal::Arch::memory_barrier`].** `Acquire` and
-//!   `Release` on the lock word are what order the critical section's *ordinary*
-//!   loads and stores, on every architecture, and they are honoured by the compiler
-//!   as well as the hardware. `memory_barrier` is a full hardware fence for ordering
-//!   the compiler's model cannot express at all — MMIO and DMA — and using it here
-//!   would be both too strong and, on its own, too weak: it does not stop the
-//!   optimiser hoisting a plain load out of a critical section.
-//! - **Acquire on the way in, Release on the way out.** The releasing store
-//!   synchronises-with the acquiring load that observes it, which is what makes the
-//!   next holder see everything the previous one wrote. Every ordering in this unit is
-//!   justified at its call site; none is `SeqCst`, because a lock needs pairwise
-//!   synchronisation and not a total order, and `SeqCst` would hide which pairing was
-//!   intended.
-//! - **Nothing relies on `irq_save` being a compiler barrier.** It may well be one on
-//!   every architecture we have, but that is a property of somebody else's inline
-//!   assembly. Where interrupt masking is the exclusion mechanism, the flag protecting
-//!   the data still carries `Acquire`/`Release` (see [`irq::IrqLock`]).
+//! - **Rust's atomic orderings, not [`hal::Arch::memory_barrier`].** `Acquire` and `Release` on the
+//!   lock word are what order the critical section's *ordinary* loads and stores, on every
+//!   architecture, and they are honoured by the compiler as well as the hardware. `memory_barrier`
+//!   is a full hardware fence for ordering the compiler's model cannot express at all — MMIO and
+//!   DMA — and using it here would be both too strong and, on its own, too weak: it does not stop
+//!   the optimiser hoisting a plain load out of a critical section.
+//! - **Acquire on the way in, Release on the way out.** The releasing store synchronises-with the
+//!   acquiring load that observes it, which is what makes the next holder see everything the
+//!   previous one wrote. Every ordering in this unit is justified at its call site; none is
+//!   `SeqCst`, because a lock needs pairwise synchronisation and not a total order, and `SeqCst`
+//!   would hide which pairing was intended.
+//! - **Nothing relies on `irq_save` being a compiler barrier.** It may well be one on every
+//!   architecture we have, but that is a property of somebody else's inline assembly. Where
+//!   interrupt masking is the exclusion mechanism, the flag protecting the data still carries
+//!   `Acquire`/`Release` (see [`irq::IrqLock`]).
 //!
 //! None of this is verified by the host tests below, and it cannot be: the host is
 //! x86-64 and TSO hides exactly these mistakes. It is verified by review, which is why
@@ -105,13 +102,12 @@ pub mod spin;
 #[cfg(test)]
 mod testing;
 
-pub use irq::{IrqGuard, IrqLock, IrqLockGuard};
-pub use once::{CasGate, CasOnce, Claim, IrqGate, IrqOnce, Once, OnceGate};
-pub use spin::{SpinGuard, SpinIrqGuard, SpinLock};
-
 /// Re-exported from `hal`, where the capability traits live.
 ///
 /// It was first written here, next to its only user, which made it unimplementable by
 /// any real architecture — see the note on its definition. The bound keeps its name,
 /// so nothing else in this unit changed when it moved.
 pub use hal::UniProcessor;
+pub use irq::{IrqGuard, IrqLock, IrqLockGuard};
+pub use once::{CasGate, CasOnce, Claim, IrqGate, IrqOnce, Once, OnceGate};
+pub use spin::{SpinGuard, SpinIrqGuard, SpinLock};

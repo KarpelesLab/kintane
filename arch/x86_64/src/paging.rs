@@ -20,18 +20,16 @@
 //!
 //! ## Two bits that are not what they look like
 //!
-//! * **Bit 7** is PS ("this entry maps a huge page") at levels 1 and 2, and PAT at
-//!   level 0, where there is nothing to be huge. Reading it without knowing the level
-//!   turns a 4 KiB page with a non-default memory type into a 2 MiB page, which is why
-//!   [`hal::PageTableEntry::is_leaf`] and `flags` take a level. It is reserved at
-//!   level 3 and must be zero there.
-//! * **Bit 63** is NX, and it is *reserved* unless `EFER.NXE` is set. Setting a
-//!   reserved bit is not ignored: the next walk that reaches the entry raises #PF with
-//!   the RSVD bit set in the error code, from an entry that looks perfectly valid.
-//!   [`init`] enables NXE when CPUID says the CPU has NX, and [`Entry::leaf`] refuses
-//!   to emit bit 63 until that has happened — so the failure mode of forgetting to
-//!   call `init` is a mapping that is executable when it should not be, which is
-//!   reported, rather than a reserved-bit fault, which is not.
+//! * **Bit 7** is PS ("this entry maps a huge page") at levels 1 and 2, and PAT at level 0, where
+//!   there is nothing to be huge. Reading it without knowing the level turns a 4 KiB page with a
+//!   non-default memory type into a 2 MiB page, which is why [`hal::PageTableEntry::is_leaf`] and
+//!   `flags` take a level. It is reserved at level 3 and must be zero there.
+//! * **Bit 63** is NX, and it is *reserved* unless `EFER.NXE` is set. Setting a reserved bit is not
+//!   ignored: the next walk that reaches the entry raises #PF with the RSVD bit set in the error
+//!   code, from an entry that looks perfectly valid. [`init`] enables NXE when CPUID says the CPU
+//!   has NX, and [`Entry::leaf`] refuses to emit bit 63 until that has happened — so the failure
+//!   mode of forgetting to call `init` is a mapping that is executable when it should not be, which
+//!   is reported, rather than a reserved-bit fault, which is not.
 //!
 //! ## And one bit that is not in the tables at all
 //!
@@ -56,14 +54,16 @@
 //! interaction. CPUID leaf 0x8000_0001 is SDM Vol. 2A, `CPUID`, and AMD APM Vol. 3
 //! appendix E.
 
-use crate::serial::{write_dec, write_hex};
-use crate::{X86_64, interrupt};
 use core::arch::asm;
 use core::arch::x86_64::__cpuid;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, compiler_fence};
+
 use hal::paging::{HasPageTables, MapError, PageFlags, PageTableEntry, level_index, level_size};
 use hal::{Arch, EarlyConsole, HasMmu, PhysAddr};
+
+use crate::serial::{write_dec, write_hex};
+use crate::{X86_64, interrupt};
 
 // This module is compiled only for x86-64, where `usize` is exactly the width of a
 // physical address register. Every `usize`/`u64` conversion below is therefore
@@ -872,20 +872,18 @@ static TEST_FRAME: TestFrame = TestFrame(UnsafeCell::new([0; 4096]));
 /// Four independent demonstrations, each reported separately and each an observation
 /// rather than an inference:
 ///
-/// 1. **alias** — a write through one virtual address is read back through a second
-///    one that maps the same frame, and through the frame's own identity address.
-///    Neither test address exists under the boot tables, so this also proves CR3 now
-///    names ours.
-/// 2. **1G** — the same value is read back through a level-2 leaf, which exercises the
-///    PS bit at a level where it means something. Skipped with a report when CPUID
-///    says the CPU has no 1 GiB pages, which is the one thing `leaf_allowed` must not
-///    assume.
-/// 3. **ro** — a write through a read-only mapping raises #PF with a write-protection
-///    error code, and the trap handler's fixup makes the retry succeed. The fault is
-///    counted, so "no fault happened" is a failure and not a pass.
-/// 4. **nx** — a call into a non-executable mapping raises #PF with the
-///    instruction-fetch bit set. This one is the direct evidence that `EFER.NXE` took
-///    effect, and it is skipped with a report, not silently, when NX is unavailable.
+/// 1. **alias** — a write through one virtual address is read back through a second one that maps
+///    the same frame, and through the frame's own identity address. Neither test address exists
+///    under the boot tables, so this also proves CR3 now names ours.
+/// 2. **1G** — the same value is read back through a level-2 leaf, which exercises the PS bit at a
+///    level where it means something. Skipped with a report when CPUID says the CPU has no 1 GiB
+///    pages, which is the one thing `leaf_allowed` must not assume.
+/// 3. **ro** — a write through a read-only mapping raises #PF with a write-protection error code,
+///    and the trap handler's fixup makes the retry succeed. The fault is counted, so "no fault
+///    happened" is a failure and not a pass.
+/// 4. **nx** — a call into a non-executable mapping raises #PF with the instruction-fetch bit set.
+///    This one is the direct evidence that `EFER.NXE` took effect, and it is skipped with a report,
+///    not silently, when NX is unavailable.
 ///
 /// Returns true only if every check that ran observed what it was looking for.
 pub fn selftest(c: &dyn EarlyConsole) -> bool {

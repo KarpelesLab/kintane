@@ -90,18 +90,18 @@
 //!
 //! Stated plainly so nobody has to discover it:
 //!
-//! * **Nothing is ever returned to the frame allocator.** A slab block whose objects
-//!   are all free stays a slab block; a bump region stays a bump region. The
-//!   bookkeeping to do it exists ([`bump::Bump`] records each region's physical start
-//!   and frame count) but no caller wants it yet.
+//! * **Nothing is ever returned to the frame allocator.** A slab block whose objects are all free
+//!   stays a slab block; a bump region stays a bump region. The bookkeeping to do it exists
+//!   ([`bump::Bump`] records each region's physical start and frame count) but no caller wants it
+//!   yet.
 //! * **The bump reuses memory only in the immediate LIFO case.** See [`bump`].
 //! * **`realloc` does not exist.** A growable collection allocates, copies and frees.
-//! * **Most [`context::AllocFlags`] are advisory.** See [`context`] for the table of
-//!   which, and why each one is in the type before it is honoured.
-//! * **The slab holds at most [`slab::MAX_BLOCKS`] blocks**, because its metadata is
-//!   an array inside the allocator rather than a header inside each block. That is a
-//!   deliberate trade: it keeps the slab free of `unsafe` reads and writes into heap
-//!   memory. Past the limit, small objects fall back to the bump.
+//! * **Most [`context::AllocFlags`] are advisory.** See [`context`] for the table of which, and why
+//!   each one is in the type before it is honoured.
+//! * **The slab holds at most [`slab::MAX_BLOCKS`] blocks**, because its metadata is an array
+//!   inside the allocator rather than a header inside each block. That is a deliberate trade: it
+//!   keeps the slab free of `unsafe` reads and writes into heap memory. Past the limit, small
+//!   objects fall back to the bump.
 
 // `no_std` except under the host test harness, which needs `std` to link `libtest`.
 #![cfg_attr(not(test), no_std)]
@@ -121,10 +121,10 @@ pub mod slab;
 
 pub use bump::{Bump, BumpStats};
 pub use context::{AllocContext, AllocFlags, NumaNode};
-pub use mm::directmap::DirectMap;
 pub use frames::{FrameSource, NoFrames};
 pub use heap::{Heap, HeapStats};
 pub use mm::AllocError;
+pub use mm::directmap::DirectMap;
 pub use slab::{ClassStats, Slab, SlabStats};
 
 /// Reject a layout no allocator here could honour, before any state is touched.
@@ -132,13 +132,13 @@ pub use slab::{ClassStats, Slab, SlabStats};
 /// [`Layout`] already guarantees a power-of-two alignment and a size that does not
 /// overflow when rounded up to it, so this adds exactly two rules of our own:
 ///
-/// * **A zero-sized request is an error**, not a dangling pointer. `alloc`'s answer
-///   is to hand back `align` as a pointer, which is fine when the caller is a Rust
-///   collection that knows never to dereference it and is a trap when the caller is
-///   a driver that does. There is nothing to free, so there is nothing to return.
-/// * **A size that cannot be rounded up to its own alignment is an error**, which is
-///   `Layout`'s rule restated in our terms so the failure is `Overflow` here rather
-///   than a wrap inside the bump's cursor arithmetic.
+/// * **A zero-sized request is an error**, not a dangling pointer. `alloc`'s answer is to hand back
+///   `align` as a pointer, which is fine when the caller is a Rust collection that knows never to
+///   dereference it and is a trap when the caller is a driver that does. There is nothing to free,
+///   so there is nothing to return.
+/// * **A size that cannot be rounded up to its own alignment is an error**, which is `Layout`'s
+///   rule restated in our terms so the failure is `Overflow` here rather than a wrap inside the
+///   bump's cursor arithmetic.
 ///
 /// Everything else — an alignment larger than a page, a size larger than the machine
 /// — is rejected later by whichever allocator could not satisfy it, and reported as

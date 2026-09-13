@@ -4,20 +4,19 @@
 //! frames, on request, or an error. That is a narrower interface than
 //! `mm::FrameAllocator`, and naming it has three consequences worth the trait:
 //!
-//! * The heap does not need to know how a frame allocator is *built*. Construction
-//!   takes a boot memory map and a caller-supplied bitmap, neither of which is any of
-//!   the heap's business, and depending on the type would drag `boot_protocol` into
-//!   this unit's dependency list for no reason.
-//! * The heap does not hold a frame allocator. It borrows one for the duration of a
-//!   call that might need to grow. `mm`'s allocator is a `&mut self` structure behind
-//!   whatever lock `kernel/sync` selected, and `mm::paged` needs it for page tables
-//!   too, so a heap that owned it would be a heap that had taken the machine's frames
-//!   hostage. Passing it per call also states the lock order in the signature: heap
-//!   first, frames second.
-//! * The host tests get to hand the heap frames that correspond to real memory on the
-//!   machine running the tests. That is not a convenience — it is what lets the
-//!   allocator's *pointers* be exercised, poison be read back, and alignment be
-//!   checked against an address rather than against arithmetic.
+//! * The heap does not need to know how a frame allocator is *built*. Construction takes a boot
+//!   memory map and a caller-supplied bitmap, neither of which is any of the heap's business, and
+//!   depending on the type would drag `boot_protocol` into this unit's dependency list for no
+//!   reason.
+//! * The heap does not hold a frame allocator. It borrows one for the duration of a call that might
+//!   need to grow. `mm`'s allocator is a `&mut self` structure behind whatever lock `kernel/sync`
+//!   selected, and `mm::paged` needs it for page tables too, so a heap that owned it would be a
+//!   heap that had taken the machine's frames hostage. Passing it per call also states the lock
+//!   order in the signature: heap first, frames second.
+//! * The host tests get to hand the heap frames that correspond to real memory on the machine
+//!   running the tests. That is not a convenience — it is what lets the allocator's *pointers* be
+//!   exercised, poison be read back, and alignment be checked against an address rather than
+//!   against arithmetic.
 
 use hal::Arch;
 use mm::{AllocError, FrameAllocator, FrameRange};
@@ -64,8 +63,9 @@ impl<A: Arch> FrameSource<A> for NoFrames {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use hal::mock::{MockFull, MockTiny};
+
+    use super::*;
 
     fn a_source_with_nothing_in_it_is_exhausted<A: Arch>() {
         let mut src = NoFrames;

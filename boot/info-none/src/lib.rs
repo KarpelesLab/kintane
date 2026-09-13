@@ -31,9 +31,6 @@ pub const SOURCE: &str = "none yet";
 /// # Safety
 /// Takes the same contract as the other provider so the signatures match; it
 /// dereferences nothing.
-pub unsafe fn memory_regions(
-    _boot_arg: u64,
-    _out: &mut [MemoryRegion],
-) -> Result<usize, Error> {
+pub unsafe fn memory_regions(_boot_arg: u64, _out: &mut [MemoryRegion]) -> Result<usize, Error> {
     Err(Error::NoLoader)
 }

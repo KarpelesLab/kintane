@@ -7,13 +7,22 @@
 //! selects modules inside the source, not file lists in the build manifest — which is
 //! the same rule, enforced by there being no other option.
 
-use crate::kcfg::{expr, Resolution, Tri};
-use crate::toml;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::kcfg::{Resolution, Tri, expr};
+use crate::toml;
+
 /// Layer ranks. A unit may depend only on units of equal or lower rank.
-const LAYERS: &[&str] = &["builtins", "hal", "arch", "core", "device", "subsystem", "kernel"];
+const LAYERS: &[&str] = &[
+    "builtins",
+    "hal",
+    "arch",
+    "core",
+    "device",
+    "subsystem",
+    "kernel",
+];
 
 pub fn layer_rank(name: &str) -> Option<usize> {
     LAYERS.iter().position(|l| *l == name)
@@ -63,7 +72,9 @@ impl Unit {
 pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
     let mut units = Vec::new();
     // Directories that never contain kernel units.
-    let skip: BTreeSet<&str> = ["build", "target", ".git", "docs", "kbuild"].into_iter().collect();
+    let skip: BTreeSet<&str> = ["build", "target", ".git", "docs", "kbuild"]
+        .into_iter()
+        .collect();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -86,8 +97,8 @@ pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
 }
 
 fn parse_unit(manifest: &Path) -> Result<Unit, String> {
-    let src = std::fs::read_to_string(manifest)
-        .map_err(|e| format!("{}: {e}", manifest.display()))?;
+    let src =
+        std::fs::read_to_string(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
     let v = toml::parse(&src).map_err(|e| format!("{}: {e}", manifest.display()))?;
     let at = |m: &str| format!("{}: {m}", manifest.display());
 
@@ -97,7 +108,11 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
         .ok_or_else(|| at("missing `unit.name`"))?
         .to_string();
 
-    let kind = match v.get_path("unit.kind").and_then(|x| x.as_str()).unwrap_or("lib") {
+    let kind = match v
+        .get_path("unit.kind")
+        .and_then(|x| x.as_str())
+        .unwrap_or("lib")
+    {
         "lib" => Kind::Lib,
         "bin" => Kind::Bin,
         other => return Err(at(&format!("unknown unit kind `{other}`"))),
@@ -106,7 +121,11 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
     let root = v
         .get_path("unit.root")
         .and_then(|x| x.as_str())
-        .unwrap_or(if kind == Kind::Bin { "src/main.rs" } else { "src/lib.rs" })
+        .unwrap_or(if kind == Kind::Bin {
+            "src/main.rs"
+        } else {
+            "src/lib.rs"
+        })
         .to_string();
 
     let layer = v
@@ -115,10 +134,7 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
         .ok_or_else(|| at("missing `unit.layer`"))?
         .to_string();
     if layer_rank(&layer).is_none() {
-        return Err(at(&format!(
-            "unknown layer `{layer}`; expected one of {}",
-            LAYERS.join(", ")
-        )));
+        return Err(at(&format!("unknown layer `{layer}`; expected one of {}", LAYERS.join(", "))));
     }
 
     let requires = match v.get_path("config.requires").and_then(|x| x.as_str()) {
@@ -305,10 +321,7 @@ mod tests {
 
     #[test]
     fn upward_dependencies_are_rejected() {
-        let units = vec![
-            unit("hal", "hal", &["mm"]),
-            unit("mm", "core", &[]),
-        ];
+        let units = vec![unit("hal", "hal", &["mm"]), unit("mm", "core", &[])];
         let e = plan(units, &Resolution::default()).unwrap_err();
         assert!(e.contains("layering violation"), "{e}");
     }
@@ -331,10 +344,7 @@ mod tests {
 
     #[test]
     fn cycles_are_named() {
-        let units = vec![
-            unit("a", "core", &["b"]),
-            unit("b", "core", &["a"]),
-        ];
+        let units = vec![unit("a", "core", &["b"]), unit("b", "core", &["a"])];
         let e = plan(units, &Resolution::default()).unwrap_err();
         assert!(e.contains("dependency cycle"), "{e}");
     }
@@ -351,9 +361,11 @@ mod tests {
         b.dir = PathBuf::from("arch/b");
 
         // Neither selected: both filtered out, nothing to build.
-        assert!(plan(vec![a.clone(), b.clone()], &Resolution::default())
-            .unwrap()
-            .is_empty());
+        assert!(
+            plan(vec![a.clone(), b.clone()], &Resolution::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

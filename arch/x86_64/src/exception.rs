@@ -9,17 +9,16 @@
 //!
 //! Two exceptions are not fatal:
 //!
-//! * **#BP** is a trap, resumable by construction — the pushed RIP is the instruction
-//!   *after* `int3` — so the handler counts it and returns. This is what makes the
-//!   synchronous half of the selftest an observation rather than an inference.
-//! * **#PF**, but only when something has declared in advance that it expects a fault
-//!   at a specific page. That is the shape demand paging needs in Phase 1 — consult
-//!   something that knows about the address, resolve it, return and let the
-//!   instruction re-execute — and `paging::on_page_fault` is its first and very small
-//!   instance, used by the paging selftest so that "this mapping is read-only" can be
-//!   demonstrated rather than asserted. Every other page fault still falls through to
-//!   the reporter below, which is what makes an expected fault distinguishable from a
-//!   real one instead of making all of them survivable.
+//! * **#BP** is a trap, resumable by construction — the pushed RIP is the instruction *after*
+//!   `int3` — so the handler counts it and returns. This is what makes the synchronous half of the
+//!   selftest an observation rather than an inference.
+//! * **#PF**, but only when something has declared in advance that it expects a fault at a specific
+//!   page. That is the shape demand paging needs in Phase 1 — consult something that knows about
+//!   the address, resolve it, return and let the instruction re-execute — and
+//!   `paging::on_page_fault` is its first and very small instance, used by the paging selftest so
+//!   that "this mapping is read-only" can be demonstrated rather than asserted. Every other page
+//!   fault still falls through to the reporter below, which is what makes an expected fault
+//!   distinguishable from a real one instead of making all of them survivable.
 //!
 //! Handlers allocate nothing, take no lock, and call only into the polled UART, in
 //! line with the rule that the interrupt path contains nothing that can fault or
@@ -28,10 +27,12 @@
 //! Reference: Intel SDM Vol. 3A, §6.15 (exception reference) for vector numbers,
 //! error-code presence, and the meaning of the #PF error code bits.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use hal::{Arch, EarlyConsole};
+
 use crate::idt::InterruptFrame;
 use crate::serial::{EARLY, write_hex};
-use core::sync::atomic::{AtomicU32, Ordering};
-use hal::{Arch, EarlyConsole};
 
 /// Number of #BP exceptions taken and returned from since boot.
 ///

@@ -23,7 +23,6 @@ pub mod pit;
 pub mod serial;
 
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};
-
 pub use serial::EARLY;
 
 /// The x86-64 architecture.
@@ -201,9 +200,6 @@ pub fn image_sections() -> hal::ImageSections {
         text: (at(&raw const __text_start), at(&raw const __text_end)),
         rodata: (at(&raw const __rodata_start), at(&raw const __rodata_end)),
         data: (at(&raw const __data_start), at(&raw const __data_end)),
-        stack_guard: (
-            at(&raw const __stack_guard_start),
-            at(&raw const __stack_guard_end),
-        ),
+        stack_guard: (at(&raw const __stack_guard_start), at(&raw const __stack_guard_end)),
     }
 }

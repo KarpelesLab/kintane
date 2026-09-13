@@ -32,13 +32,12 @@
 //! This is a weaker method than reading the device tree, and the difference matters on
 //! real hardware rather than under QEMU:
 //!
-//! - PIDR2 identifies the *IP revision*, not the programming model in force. A GICv3
-//!   configured with `GICD_CTLR.ARE == 0` is legitimately driven as a GICv2, and PIDR2
-//!   still says 3.
-//! - The distributor's address is hardcoded to `virt`'s, exactly as the PL011's is in
-//!   `serial`. On any other board the probe reads whatever is at `0x08000000`.
-//! - A board that puts nothing at that address at all, and does not abort the read,
-//!   reads zero and is reported as having no GIC — which is right, but by luck.
+//! - PIDR2 identifies the *IP revision*, not the programming model in force. A GICv3 configured
+//!   with `GICD_CTLR.ARE == 0` is legitimately driven as a GICv2, and PIDR2 still says 3.
+//! - The distributor's address is hardcoded to `virt`'s, exactly as the PL011's is in `serial`. On
+//!   any other board the probe reads whatever is at `0x08000000`.
+//! - A board that puts nothing at that address at all, and does not abort the read, reads zero and
+//!   is reported as having no GIC — which is right, but by luck.
 //!
 //! Reading the DTB `compatible` string is the correct answer and arrives with the
 //! device framework in Phase 3.
@@ -60,6 +59,7 @@
 //! interface system registers).
 
 use core::ptr::{read_volatile, write_volatile};
+
 use hal::{IrqChip, IrqNumber};
 
 /// The distributor, at the address QEMU's `virt` machine fixes it at.
@@ -139,7 +139,11 @@ unsafe fn interrupt_lines(gicd: usize) -> u32 {
     // SAFETY: reading TYPER has no side effects.
     let typer = unsafe { read32(gicd + GICD_TYPER) };
     let lines = ((typer & 0x1f) + 1) * 32;
-    if lines > FIRST_SPECIAL_IRQ { FIRST_SPECIAL_IRQ } else { lines }
+    if lines > FIRST_SPECIAL_IRQ {
+        FIRST_SPECIAL_IRQ
+    } else {
+        lines
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -238,7 +242,11 @@ impl IrqChip for Gicv2 {
         // no SGIs, so the CPU field is discarded here; it has to be carried back to
         // EOIR once it can be non-zero.
         let id = iar & 0x3ff;
-        if id >= FIRST_SPECIAL_IRQ { None } else { Some(IrqNumber(id)) }
+        if id >= FIRST_SPECIAL_IRQ {
+            None
+        } else {
+            Some(IrqNumber(id))
+        }
     }
 
     fn eoi(&self, irq: IrqNumber) {
@@ -436,7 +444,11 @@ impl IrqChip for Gicv3 {
         unsafe { core::arch::asm!("mrs {}, icc_iar1_el1", out(reg) iar, options(nostack)) };
         // GICv3 widens the ID field to 24 bits to make room for LPIs.
         let id = (iar & 0xff_ffff) as u32;
-        if id >= FIRST_SPECIAL_IRQ { None } else { Some(IrqNumber(id)) }
+        if id >= FIRST_SPECIAL_IRQ {
+            None
+        } else {
+            Some(IrqNumber(id))
+        }
     }
 
     fn eoi(&self, irq: IrqNumber) {
@@ -459,11 +471,17 @@ impl IrqChip for Gicv3 {
 // ---------------------------------------------------------------------------------
 
 /// The v2 driver, bound to the addresses QEMU's `virt` machine uses.
-static GICV2: Gicv2 = Gicv2 { gicd: GICD_BASE, gicc: GICC_BASE };
+static GICV2: Gicv2 = Gicv2 {
+    gicd: GICD_BASE,
+    gicc: GICC_BASE,
+};
 
 /// The v3 driver, likewise. Both are constructed unconditionally; only one is ever
 /// initialised, and which one is not known until [`detect`] has run.
-static GICV3: Gicv3 = Gicv3 { gicd: GICD_BASE, gicr: GICR_BASE };
+static GICV3: Gicv3 = Gicv3 {
+    gicd: GICD_BASE,
+    gicr: GICR_BASE,
+};
 
 /// Identify the interrupt controller at `gicd` and return a driver for it.
 ///

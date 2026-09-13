@@ -16,15 +16,14 @@
 //!
 //! What that costs, stated rather than discovered later:
 //!
-//! - Every waiter spins on the same cache line (`now_serving`), so a release
-//!   invalidates it on all of them: O(n) coherence traffic per handoff. An MCS lock
-//!   fixes this by giving each waiter its own line to spin on, at the price of a
-//!   per-waiter queue node — which needs either an allocator or per-CPU storage, and
-//!   this unit is below both. It is the right upgrade when a lock shows up in a
-//!   profile, not before.
-//! - A ticket lock cannot be abandoned: a holder that is descheduled stalls everyone
-//!   behind it. Kernel spinlocks are held with preemption disabled, so this does not
-//!   apply here, and it is why this type must never be handed to userspace.
+//! - Every waiter spins on the same cache line (`now_serving`), so a release invalidates it on all
+//!   of them: O(n) coherence traffic per handoff. An MCS lock fixes this by giving each waiter its
+//!   own line to spin on, at the price of a per-waiter queue node — which needs either an allocator
+//!   or per-CPU storage, and this unit is below both. It is the right upgrade when a lock shows up
+//!   in a profile, not before.
+//! - A ticket lock cannot be abandoned: a holder that is descheduled stalls everyone behind it.
+//!   Kernel spinlocks are held with preemption disabled, so this does not apply here, and it is why
+//!   this type must never be handed to userspace.
 //! - Two words instead of one.
 //!
 //! # Which machines get this
@@ -131,12 +130,7 @@ impl<T, A: Arch + HasCas> SpinLock<T, A> {
         // failure costs nothing and keeps one rule instead of two; nothing is read
         // from the lock on the failure path.
         self.next
-            .compare_exchange(
-                ticket,
-                ticket.wrapping_add(1),
-                Ordering::Acquire,
-                Ordering::Acquire,
-            )
+            .compare_exchange(ticket, ticket.wrapping_add(1), Ordering::Acquire, Ordering::Acquire)
             .ok()
             .map(|_| SpinGuard {
                 lock: self,
@@ -252,9 +246,10 @@ impl<T, A: Arch + HasCas> DerefMut for SpinIrqGuard<'_, T, A> {
 
 #[cfg(test)]
 mod tests {
+    use hal::mock::MockFull;
+
     use super::*;
     use crate::testing::{interrupts_enabled, serial};
-    use hal::mock::MockFull;
 
     // `SpinLock<T, MockTiny>` does not compile: `MockTiny` has no `HasCas`, so there is
     // no compare-and-swap to build this out of. That is the bound doing its job, and
@@ -274,10 +269,7 @@ mod tests {
 
         assert!(!lock.is_locked());
         assert_eq!(*lock.lock(), 42);
-        assert!(
-            !lock.is_locked(),
-            "the temporary guard released at end of statement"
-        );
+        assert!(!lock.is_locked(), "the temporary guard released at end of statement");
     }
 
     #[test]

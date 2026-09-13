@@ -1,7 +1,8 @@
 //! Helpers shared by this unit's host tests. Compiled only under `cfg(test)`.
 
-use hal::Arch;
 use std::sync::{Mutex, MutexGuard};
+
+use hal::Arch;
 
 /// Serialises the tests that observe interrupt state.
 ///

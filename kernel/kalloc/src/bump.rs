@@ -50,10 +50,10 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use hal::{Arch, KernAddr, PhysAddr};
+use mm::directmap::DirectMap;
 use mm::{AllocError, Frame, FrameRange};
 
 use crate::context::AllocContext;
-use mm::directmap::DirectMap;
 use crate::frames::FrameSource;
 use crate::{check_layout, narrow, poison, widen};
 
@@ -481,11 +481,12 @@ impl<A: Arch> Bump<A> {
 
 #[cfg(test)]
 mod tests {
+    use hal::mock::{MockFull, MockTiny};
+
     use super::*;
     use crate::context::AllocFlags;
     use crate::hostmem::HostMemory;
     use crate::poison;
-    use hal::mock::{MockFull, MockTiny};
 
     /// 128 KiB: 32 frames on `MockFull` and 512 on `MockTiny`, which is enough for
     /// every scenario here and small enough to allocate per test.
@@ -777,10 +778,7 @@ mod tests {
         let s = b.stats();
         assert_eq!(s.in_use, 48, "the loop must not have grown the live set");
         assert_eq!(s.reclaimed, 64);
-        assert_eq!(
-            s.regions, 1,
-            "nor reached for memory after the first allocation"
-        );
+        assert_eq!(s.regions, 1, "nor reached for memory after the first allocation");
     }
 
     #[test]
@@ -830,9 +828,11 @@ mod tests {
         expect(b.grow(&mut src, 4096));
 
         // A pointer into an entirely different region of host memory.
-        let foreign = expect(other.direct_map().ptr_at(
-            expect(other.direct_map().to_virt(PhysAddr::new(64))),
-        ));
+        let foreign = expect(
+            other
+                .direct_map()
+                .ptr_at(expect(other.direct_map().to_virt(PhysAddr::new(64)))),
+        );
         #[allow(unsafe_code)]
         // SAFETY: the call is expected to reject the pointer without writing to it,
         // which is the property under test; `foreign` is live memory either way.
@@ -903,10 +903,7 @@ mod tests {
             page.saturating_mul(taken),
             "an arena is always a whole number of frames"
         );
-        assert!(
-            taken >= 2,
-            "a byte past a page costs a whole second frame at least"
-        );
+        assert!(taken >= 2, "a byte past a page costs a whole second frame at least");
         assert_eq!(s.regions, 1, "one growth is one region");
         assert_eq!(s.headroom, s.arena_bytes);
 

@@ -42,7 +42,6 @@ pub mod pit;
 pub mod serial;
 
 use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};
-
 pub use serial::EARLY;
 
 /// The 32-bit x86 architecture.

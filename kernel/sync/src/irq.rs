@@ -2,16 +2,14 @@
 //!
 //! Two things live here, and they are not the same thing:
 //!
-//! - [`IrqGuard`] — an RAII interrupt mask. Available on *every* architecture, because
-//!   every architecture can mask its own interrupts. It gives exclusion against
-//!   interrupt handlers **on the CPU it runs on**, and nothing more. On a
-//!   multiprocessor that is still useful and still necessary: it is half of
-//!   [`SpinLock::lock_irqsave`](crate::SpinLock::lock_irqsave), the other half being a
-//!   lock that handles the other CPUs.
-//! - [`IrqLock`] — a whole lock built out of nothing but that mask, for machines with
-//!   no compare-and-swap to build a real one from. Correct only where the mask is the
-//!   whole story, which is why it is bounded by [`UniProcessor`] rather than by
-//!   [`Arch`].
+//! - [`IrqGuard`] — an RAII interrupt mask. Available on *every* architecture, because every
+//!   architecture can mask its own interrupts. It gives exclusion against interrupt handlers **on
+//!   the CPU it runs on**, and nothing more. On a multiprocessor that is still useful and still
+//!   necessary: it is half of [`SpinLock::lock_irqsave`](crate::SpinLock::lock_irqsave), the other
+//!   half being a lock that handles the other CPUs.
+//! - [`IrqLock`] — a whole lock built out of nothing but that mask, for machines with no
+//!   compare-and-swap to build a real one from. Correct only where the mask is the whole story,
+//!   which is why it is bounded by [`UniProcessor`] rather than by [`Arch`].
 //!
 //! Confusing the two is the bug the bound exists to prevent.
 
@@ -218,9 +216,10 @@ impl<T, A: UniProcessor> Drop for IrqLockGuard<'_, T, A> {
 
 #[cfg(test)]
 mod tests {
+    use hal::mock::{MockFull, MockTiny};
+
     use super::*;
     use crate::testing::{interrupts_enabled, serial};
-    use hal::mock::{MockFull, MockTiny};
 
     // Every test in this module asserts on interrupt state, and the mocks keep that
     // state in a process-wide static (`hal/src/mock.rs`). The test harness runs tests
@@ -305,10 +304,7 @@ mod tests {
         // A failed `try_lock` must not leave interrupts masked: it takes the mask to
         // test the flag, so the early return has to drop it.
         assert!(lock.try_lock().is_none());
-        assert!(
-            !interrupts_enabled::<MockTiny>(),
-            "the first guard is still held"
-        );
+        assert!(!interrupts_enabled::<MockTiny>(), "the first guard is still held");
         drop(held);
         assert!(interrupts_enabled::<MockTiny>());
         assert!(lock.try_lock().is_some());

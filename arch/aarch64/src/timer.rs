@@ -84,10 +84,6 @@ pub fn stop() {
     // else. Safe to call whether or not the timer was running, which matters because
     // the interrupt handler calls it without knowing.
     unsafe {
-        core::arch::asm!(
-            "msr cntp_ctl_el0, xzr",
-            "isb",
-            options(nomem, nostack, preserves_flags)
-        );
+        core::arch::asm!("msr cntp_ctl_el0, xzr", "isb", options(nomem, nostack, preserves_flags));
     }
 }

@@ -22,7 +22,7 @@
 
 use boot_protocol::MemoryRegion;
 use hal::{Arch, EarlyConsole, PhysAddr};
-use mm::phys::{bitmap_bytes, FrameAllocator};
+use mm::phys::{FrameAllocator, bitmap_bytes};
 
 /// Whether this build contains in-kernel tests.
 pub const PRESENT: bool = true;
@@ -36,7 +36,8 @@ struct Report<'a> {
 
 impl Report<'_> {
     fn check(&mut self, name: &str, ok: bool) {
-        self.c.write_str(if ok { "\n    ok   " } else { "\n    FAIL " });
+        self.c
+            .write_str(if ok { "\n    ok   " } else { "\n    FAIL " });
         self.c.write_str(name);
         if ok {
             self.passed += 1;
@@ -57,11 +58,7 @@ impl Report<'_> {
 }
 
 /// Run every in-kernel check. Returns true only if all of them passed.
-pub fn run_all<A: Arch>(
-    c: &dyn EarlyConsole,
-    boot_arg: u64,
-    reserved: &[(u64, u64)],
-) -> bool {
+pub fn run_all<A: Arch>(c: &dyn EarlyConsole, boot_arg: u64, reserved: &[(u64, u64)]) -> bool {
     let mut r = Report {
         c,
         passed: 0,
@@ -94,10 +91,7 @@ fn arch_constants<A: Arch>(r: &mut Report) {
     );
     // A 32-bit port claiming more physical bits than u64 can hold, or a 64-bit one
     // claiming 32, both indicate a copied constant.
-    r.check(
-        "name is set",
-        !A::NAME.is_empty(),
-    );
+    r.check("name is set", !A::NAME.is_empty());
 }
 
 /// Masking interrupts must actually mask them, and restoring must actually restore.
@@ -320,10 +314,7 @@ fn memory<A: Arch>(r: &mut Report, boot_arg: u64, reserved: &[(u64, u64)]) {
         }
     }
     r.check("frames free without error", freed);
-    r.check(
-        "accounting returns to where it started",
-        frames.stats().free == before,
-    );
+    r.check("accounting returns to where it started", frames.stats().free == before);
 }
 
 const STORE_BYTES: usize = kconfig::FRAME_BITMAP_KIB * 1024;

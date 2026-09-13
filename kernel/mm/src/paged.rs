@@ -35,10 +35,12 @@
 // `activate`) and two calls to `flush_tlb`.
 #![allow(unsafe_code)]
 
-use crate::DirectMap;
 use core::marker::PhantomData;
-use hal::paging::{level_index, level_size, HasPageTables, MapError, PageFlags, PageTableEntry};
+
 use hal::PhysAddr;
+use hal::paging::{HasPageTables, MapError, PageFlags, PageTableEntry, level_index, level_size};
+
+use crate::DirectMap;
 
 /// Where intermediate page tables come from.
 ///
@@ -113,9 +115,7 @@ impl<A: HasPageTables> AddressSpace<A> {
 
     fn entry_ptr(&self, table: PhysAddr, index: usize) -> Result<*mut A::Entry, MapError> {
         let size = core::mem::size_of::<A::Entry>();
-        let byte = index
-            .checked_mul(size)
-            .ok_or(MapError::BadPhysAddr)?;
+        let byte = index.checked_mul(size).ok_or(MapError::BadPhysAddr)?;
         let phys = table
             .checked_add(byte as u64)
             .map_err(|_| MapError::BadPhysAddr)?;
@@ -380,12 +380,7 @@ impl<A: HasPageTables> AddressSpace<A> {
     }
 
     /// Change the permissions on an existing mapping, leaving the frames alone.
-    pub fn protect(
-        &mut self,
-        virt: usize,
-        len: usize,
-        flags: PageFlags,
-    ) -> Result<(), MapError> {
+    pub fn protect(&mut self, virt: usize, len: usize, flags: PageFlags) -> Result<(), MapError> {
         let page = A::PAGE_SIZE;
         if virt % page != 0 || len % page != 0 {
             return Err(MapError::Misaligned);

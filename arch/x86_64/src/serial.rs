@@ -6,6 +6,7 @@
 //! before the lock types exist would be the wrong order.
 
 use core::arch::asm;
+
 use hal::EarlyConsole;
 
 const COM1: u16 = 0x3F8;

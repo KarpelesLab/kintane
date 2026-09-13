@@ -32,23 +32,22 @@
 //! Here the state is a `u64` bitmap in a descriptor that lives **outside** the heap,
 //! in this struct. The consequences, in order of how much they matter:
 //!
-//! * The allocator never reads or writes heap memory except to poison it and to zero
-//!   it on request. A buffer overrun damages the caller's neighbour and nothing else,
-//!   and the block's own accounting stays trustworthy enough to report it.
-//! * **A double free is detected**, always, in every build: the bit is already clear.
-//!   A free-list implementation would have to walk the list to know.
-//! * An interior or misaligned pointer is detected, because the offset within the
-//!   block must be an exact multiple of the class size.
-//! * A block holds at most 64 objects, one per bit. For the small classes that is
-//!   less than a page's worth, which costs a little more bookkeeping per byte of heap
-//!   and buys the three properties above.
-//! * The descriptors are a fixed array, so there are at most [`MAX_BLOCKS`] blocks.
-//!   That is the real limit this design imposes, and it is the one to lift first —
-//!   with a descriptor allocated from the heap itself, once there is a heap to
-//!   allocate it from, which is precisely the bootstrap ordering problem this whole
-//!   unit exists to solve. Until then, running out is
-//!   [`AllocError::Exhausted`](mm::AllocError::Exhausted) and the
-//!   [`Heap`](crate::Heap) falls back to serving the object from the arena.
+//! * The allocator never reads or writes heap memory except to poison it and to zero it on request.
+//!   A buffer overrun damages the caller's neighbour and nothing else, and the block's own
+//!   accounting stays trustworthy enough to report it.
+//! * **A double free is detected**, always, in every build: the bit is already clear. A free-list
+//!   implementation would have to walk the list to know.
+//! * An interior or misaligned pointer is detected, because the offset within the block must be an
+//!   exact multiple of the class size.
+//! * A block holds at most 64 objects, one per bit. For the small classes that is less than a
+//!   page's worth, which costs a little more bookkeeping per byte of heap and buys the three
+//!   properties above.
+//! * The descriptors are a fixed array, so there are at most [`MAX_BLOCKS`] blocks. That is the
+//!   real limit this design imposes, and it is the one to lift first — with a descriptor allocated
+//!   from the heap itself, once there is a heap to allocate it from, which is precisely the
+//!   bootstrap ordering problem this whole unit exists to solve. Until then, running out is
+//!   [`AllocError::Exhausted`](mm::AllocError::Exhausted) and the [`Heap`](crate::Heap) falls back
+//!   to serving the object from the arena.
 //!
 //! # Classes
 //!
@@ -72,9 +71,9 @@ use core::ptr::NonNull;
 
 use hal::{KernAddr, PhysAddr};
 use mm::AllocError;
+use mm::directmap::DirectMap;
 
 use crate::context::AllocContext;
-use mm::directmap::DirectMap;
 use crate::poison;
 
 /// The size classes, ascending. Each is also the alignment that class guarantees.
@@ -512,12 +511,13 @@ impl Slab {
 
 #[cfg(test)]
 mod tests {
+    use hal::Arch;
+    use hal::mock::{MockFull, MockTiny};
+
     use super::*;
     use crate::context::AllocFlags;
     use crate::hostmem::{HostFrames, HostMemory};
     use crate::{Bump, poison};
-    use hal::Arch;
-    use hal::mock::{MockFull, MockTiny};
 
     const ARENA: usize = 128 * 1024;
 
@@ -640,7 +640,10 @@ mod tests {
             let n = objects_per_block(class);
             let mut seen: Vec<usize> = Vec::new();
             for _ in 0..n {
-                let p = expect(f.slab.try_take(class, f.mem.direct_map(), AllocContext::ATOMIC));
+                let p = expect(
+                    f.slab
+                        .try_take(class, f.mem.direct_map(), AllocContext::ATOMIC),
+                );
                 let a = addr_of(p);
                 assert_eq!(a % class, 0, "class {class} gave {a:#x}");
                 assert!(!seen.contains(&a), "class {class} handed out {a:#x} twice");
@@ -698,11 +701,10 @@ mod tests {
         let n = objects_per_block(64);
         let mut held = Vec::new();
         for _ in 0..n {
-            held.push(expect(f.slab.try_take(
-                64,
-                f.mem.direct_map(),
-                AllocContext::ATOMIC,
-            )));
+            held.push(expect(
+                f.slab
+                    .try_take(64, f.mem.direct_map(), AllocContext::ATOMIC),
+            ));
         }
         assert_eq!(f.slab.stats().objects_in_use, n);
 
@@ -717,12 +719,11 @@ mod tests {
         assert_eq!(r, Ok(()));
         assert_eq!(f.slab.stats().objects_in_use, n - 1);
 
-        let again = expect(f.slab.try_take(64, f.mem.direct_map(), AllocContext::ATOMIC));
-        assert_eq!(
-            addr_of(again),
-            addr_of(returned),
-            "the only free object must be the freed one"
+        let again = expect(
+            f.slab
+                .try_take(64, f.mem.direct_map(), AllocContext::ATOMIC),
         );
+        assert_eq!(addr_of(again), addr_of(returned), "the only free object must be the freed one");
         assert_eq!(f.slab.stats().objects_in_use, n);
     }
 
@@ -745,7 +746,10 @@ mod tests {
         let reserved = f.bump.stats().in_use;
 
         for _ in 0..1000 {
-            let p = expect(f.slab.try_take(128, f.mem.direct_map(), AllocContext::ATOMIC));
+            let p = expect(
+                f.slab
+                    .try_take(128, f.mem.direct_map(), AllocContext::ATOMIC),
+            );
             #[allow(unsafe_code)]
             // SAFETY: allocated on the previous line at class 128, freed once.
             let r = unsafe { f.slab.dealloc(p, 128, AllocContext::ATOMIC) };
@@ -777,9 +781,18 @@ mod tests {
         f.reserve(16 * 1024);
         expect(f.add_block(64));
 
-        let before = expect(f.slab.try_take(64, f.mem.direct_map(), AllocContext::ATOMIC));
-        let target = expect(f.slab.try_take(64, f.mem.direct_map(), AllocContext::ATOMIC));
-        let after = expect(f.slab.try_take(64, f.mem.direct_map(), AllocContext::ATOMIC));
+        let before = expect(
+            f.slab
+                .try_take(64, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
+        let target = expect(
+            f.slab
+                .try_take(64, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
+        let after = expect(
+            f.slab
+                .try_take(64, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
         for p in [before, after] {
             #[allow(unsafe_code)]
             // SAFETY: a live 64-byte object from this slab, not otherwise referenced.
@@ -829,7 +842,10 @@ mod tests {
         expect(f.add_block(32));
         let ctx = AllocContext::ATOMIC.with(AllocFlags::ZERO);
 
-        let p = expect(f.slab.try_take(32, f.mem.direct_map(), AllocContext::ATOMIC));
+        let p = expect(
+            f.slab
+                .try_take(32, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
         #[allow(unsafe_code)]
         // SAFETY: a live 32-byte object from this slab, not otherwise referenced.
         unsafe {
@@ -861,7 +877,10 @@ mod tests {
         let mut f = Fixture::<A>::new();
         f.reserve(16 * 1024);
         expect(f.add_block(64));
-        let p = expect(f.slab.try_take(64, f.mem.direct_map(), AllocContext::ATOMIC));
+        let p = expect(
+            f.slab
+                .try_take(64, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
 
         #[allow(unsafe_code)]
         // SAFETY: a live 64-byte object from this slab, freed once here.
@@ -889,7 +908,10 @@ mod tests {
 
         // The right object, the wrong class. Clearing a bit computed from the wrong
         // class would free a different object.
-        let q = expect(f.slab.try_take(64, f.mem.direct_map(), AllocContext::ATOMIC));
+        let q = expect(
+            f.slab
+                .try_take(64, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
         #[allow(unsafe_code)]
         // SAFETY: expected to be rejected on the class check, before any write.
         let r = unsafe { f.slab.dealloc(q, 32, AllocContext::ATOMIC) };
@@ -942,7 +964,11 @@ mod tests {
         assert!(!f.slab.has_room());
         assert_eq!(
             f.slab
-                .add_block(16, KernAddr::new(f.mem.direct_map().virt_base().raw()), f.mem.direct_map())
+                .add_block(
+                    16,
+                    KernAddr::new(f.mem.direct_map().virt_base().raw()),
+                    f.mem.direct_map()
+                )
                 .err(),
             Some(AllocError::Exhausted)
         );
@@ -999,18 +1025,24 @@ mod tests {
         expect(f.add_block(32));
         expect(f.add_block(256));
 
-        let _a = expect(f.slab.try_take(32, f.mem.direct_map(), AllocContext::ATOMIC));
-        let _b = expect(f.slab.try_take(256, f.mem.direct_map(), AllocContext::ATOMIC));
-        let _c = expect(f.slab.try_take(256, f.mem.direct_map(), AllocContext::ATOMIC));
+        let _a = expect(
+            f.slab
+                .try_take(32, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
+        let _b = expect(
+            f.slab
+                .try_take(256, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
+        let _c = expect(
+            f.slab
+                .try_take(256, f.mem.direct_map(), AllocContext::ATOMIC),
+        );
 
         let s = f.slab.stats();
         assert_eq!(s.blocks, 2);
         assert_eq!(s.objects_in_use, 3);
         assert_eq!(s.bytes_in_use, 32 + 256 + 256);
-        assert_eq!(
-            s.bytes_reserved,
-            32 * objects_per_block(32) + 256 * objects_per_block(256)
-        );
+        assert_eq!(s.bytes_reserved, 32 * objects_per_block(32) + 256 * objects_per_block(256));
         assert_eq!(s.allocations, 3);
 
         for c in s.classes {

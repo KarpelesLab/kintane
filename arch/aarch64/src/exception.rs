@@ -39,8 +39,9 @@
 //! Reference: Arm Architecture Reference Manual for A-profile, DDI 0487, D1.10
 //! ("Exception entry") and D17.2.144 (`VBAR_EL1`).
 
-use crate::serial::EARLY;
 use hal::EarlyConsole;
+
+use crate::serial::EARLY;
 
 core::arch::global_asm!(
     r#"

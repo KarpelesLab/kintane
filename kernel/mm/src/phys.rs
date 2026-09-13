@@ -597,8 +597,9 @@ fn clamp(lo: u64, hi: u64, base: u64, limit: u64) -> Result<core::ops::Range<usi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use hal::mock::{MockFull, MockTiny};
+
+    use super::*;
 
     /// Backing store for the tests. Large enough for any span they build: the
     /// largest is 1024 frames, needing 2 x 128 bytes.
@@ -733,17 +734,11 @@ mod tests {
         // The kernel may not abort because memory ran out, and it may not abort on
         // the fifth attempt either.
         for _ in 0..4 {
-            assert_eq!(
-                a.alloc_frame().map(|f| f.number()),
-                Err(AllocError::Exhausted)
-            );
+            assert_eq!(a.alloc_frame().map(|f| f.number()), Err(AllocError::Exhausted));
         }
         assert_eq!(a.stats().free, 0);
         assert_eq!(a.stats().used, 64);
-        assert_eq!(
-            a.alloc_contiguous(1).map(|r| r.count()),
-            Err(AllocError::Exhausted)
-        );
+        assert_eq!(a.alloc_contiguous(1).map(|r| r.count()), Err(AllocError::Exhausted));
     }
 
     #[test]
@@ -836,11 +831,7 @@ mod tests {
         let mut store = [0u8; STORE];
         let mut a = expect(FrameAllocator::<A>::new(&map, &mut store));
         assert_eq!(a.stats().total, 32);
-        assert_eq!(
-            a.stats().span,
-            48,
-            "the span covers the hole; the pool does not"
-        );
+        assert_eq!(a.stats().span, 48, "the span covers the hole; the pool does not");
 
         for _ in 0..32 {
             let n = expect(a.alloc_frame()).number();
@@ -849,10 +840,7 @@ mod tests {
                 "frame {n} came out of the hole"
             );
         }
-        assert_eq!(
-            a.alloc_frame().map(|f| f.number()),
-            Err(AllocError::Exhausted)
-        );
+        assert_eq!(a.alloc_frame().map(|f| f.number()), Err(AllocError::Exhausted));
     }
 
     #[test]
@@ -982,10 +970,7 @@ mod tests {
             FrameAllocator::<A>::new(&sub_frame, &mut store).err(),
             Some(AllocError::NoUsableMemory)
         );
-        assert_eq!(
-            bitmap_bytes::<A>(&sub_frame),
-            Err(AllocError::NoUsableMemory)
-        );
+        assert_eq!(bitmap_bytes::<A>(&sub_frame), Err(AllocError::NoUsableMemory));
         assert_eq!(bitmap_bytes::<A>(&[]), Err(AllocError::NoUsableMemory));
 
         // Usable memory that is entirely reserved is refused too: an allocator with
@@ -1110,10 +1095,7 @@ mod tests {
         for _ in 0..63 {
             assert_ne!(expect(a.alloc_frame()).number(), 16);
         }
-        assert_eq!(
-            a.alloc_frame().map(|f| f.number()),
-            Err(AllocError::Exhausted)
-        );
+        assert_eq!(a.alloc_frame().map(|f| f.number()), Err(AllocError::Exhausted));
 
         // Reserving outside the span is a no-op, not an error.
         assert_eq!(a.reserve(addr::<A>(1000), Frame::<A>::bytes()), Ok(0));
@@ -1274,10 +1256,7 @@ mod tests {
         for slot in held.iter_mut() {
             *slot = Some(expect(a.alloc_frame()));
         }
-        assert_eq!(
-            a.alloc_contiguous(3).map(|r| r.count()),
-            Err(AllocError::Exhausted)
-        );
+        assert_eq!(a.alloc_contiguous(3).map(|r| r.count()), Err(AllocError::Exhausted));
         for i in 20..23 {
             if let Some(Some(f)) = held.get(i) {
                 expect(a.free_frame(*f));
@@ -1301,10 +1280,7 @@ mod tests {
     fn zero_length_requests_are_refused<A: Arch>() {
         let mut store = [0u8; STORE];
         let mut a = expect(FrameAllocator::<A>::new(&simple::<A>(), &mut store));
-        assert_eq!(
-            a.alloc_contiguous(0).map(|r| r.count()),
-            Err(AllocError::EmptyRequest)
-        );
+        assert_eq!(a.alloc_contiguous(0).map(|r| r.count()), Err(AllocError::EmptyRequest));
         assert_eq!(a.stats().free, 64);
     }
 
@@ -1358,11 +1334,7 @@ mod tests {
         let map = [region::<A>(base_frame, 64, MemoryKind::Usable)];
         let mut store = [0u8; STORE];
         let mut a = expect(FrameAllocator::<A>::new(&map, &mut store));
-        assert_eq!(
-            a.stats().span,
-            64,
-            "the bitmap covers the memory, not the gap below it"
-        );
+        assert_eq!(a.stats().span, 64, "the bitmap covers the memory, not the gap below it");
         assert_eq!(a.stats().total, 64);
 
         let f = expect(a.alloc_frame());

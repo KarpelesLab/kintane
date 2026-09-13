@@ -204,10 +204,14 @@ impl Iterator for MemoryMapIter {
         // it as anything else risks an unbounded walk.
         let stride = (raw.size as usize).checked_add(4);
         let Some(stride) = stride else {
-            return Some(Err(Error::MalformedEntry { offset: self.offset }));
+            return Some(Err(Error::MalformedEntry {
+                offset: self.offset,
+            }));
         };
         if stride < ENTRY_MIN || stride == 0 {
-            return Some(Err(Error::MalformedEntry { offset: self.offset }));
+            return Some(Err(Error::MalformedEntry {
+                offset: self.offset,
+            }));
         }
         self.offset += stride;
 
@@ -301,7 +305,12 @@ mod tests {
             (0xFFFC_0000, 0x0004_0000, 2),
         ]);
         let h = handover(&f, n);
-        let mut regions = [MemoryRegion { start: 0, len: 0, kind: 0, _reserved: 0 }; 8];
+        let mut regions = [MemoryRegion {
+            start: 0,
+            len: 0,
+            kind: 0,
+            _reserved: 0,
+        }; 8];
         let mut n_regions = 0;
         for r in unsafe { h.memory_regions() }.unwrap() {
             regions[n_regions] = r.unwrap();
@@ -334,10 +343,7 @@ mod tests {
         let h = handover(&f, n);
         let mut it = unsafe { h.memory_regions() }.unwrap();
         assert!(it.next().unwrap().is_ok());
-        assert_eq!(
-            it.next().unwrap().unwrap_err(),
-            Error::MalformedEntry { offset: 24 }
-        );
+        assert_eq!(it.next().unwrap().unwrap_err(), Error::MalformedEntry { offset: 24 });
     }
 
     #[test]
@@ -356,16 +362,11 @@ mod tests {
             mmap: [0; 24 * 4],
         };
         let h = Handover {
-            info: unsafe {
-                core::ptr::read_unaligned(f.info.as_ptr() as *const MultibootInfo)
-            },
+            info: unsafe { core::ptr::read_unaligned(f.info.as_ptr() as *const MultibootInfo) },
             mmap: None,
         };
         assert!(!h.has_memory_map());
-        assert!(matches!(
-            unsafe { h.memory_regions() }.map(|_| ()),
-            Err(Error::NoMemoryMap)
-        ));
+        assert!(matches!(unsafe { h.memory_regions() }.map(|_| ()), Err(Error::NoMemoryMap)));
     }
 
     #[test]

@@ -7,9 +7,9 @@
 //!
 //! What is left still has to be assembly, and still has a fixed order:
 //!
-//! 1. Take our own GDT. Multiboot guarantees flat segments on entry but explicitly
-//!    does *not* guarantee the loader's GDT stays in memory the kernel may not reuse,
-//!    so we load one we own and far-jump to reload `CS` before anything else.
+//! 1. Take our own GDT. Multiboot guarantees flat segments on entry but explicitly does *not*
+//!    guarantee the loader's GDT stays in memory the kernel may not reuse, so we load one we own
+//!    and far-jump to reload `CS` before anything else.
 //! 2. Take a stack and stash the multiboot info pointer, which arrives in `ebx`.
 //! 3. Build PAE page tables and identity-map the low 4 GiB with 2 MiB pages.
 //! 4. Enable PAE (`CR4.PAE`), load `CR3`, then enable paging (`CR0.PG`).

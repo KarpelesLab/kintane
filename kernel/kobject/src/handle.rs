@@ -17,9 +17,10 @@
 //! cost is one table entry after 2^20 open/close cycles; the benefit is that the ABA
 //! case does not exist rather than being improbable.
 
+use core::fmt;
+
 use crate::rights::Rights;
 use crate::{ObjectId, ObjectType};
-use core::fmt;
 
 /// Bits of the handle value used for the slot index.
 const INDEX_BITS: u32 = 12;
@@ -332,10 +333,7 @@ mod tests {
 
         // A handle without DUPLICATE cannot be duplicated — including the one we
         // just made by narrowing it away.
-        assert!(matches!(
-            t.duplicate(d2, Rights::READ),
-            Err(Error::AccessDenied { .. })
-        ));
+        assert!(matches!(t.duplicate(d2, Rights::READ), Err(Error::AccessDenied { .. })));
     }
 
     #[test]
@@ -343,9 +341,7 @@ mod tests {
         // A program handed a narrowed handle must not be able to recover the
         // authority that was taken from it.
         let mut t = table();
-        let h = t
-            .insert(obj(1), ObjectType::Channel, Rights::ALL)
-            .unwrap();
+        let h = t.insert(obj(1), ObjectType::Channel, Rights::ALL).unwrap();
         let given = t.duplicate(h, Rights::READ | Rights::DUPLICATE).unwrap();
         let onward = t.duplicate(given, Rights::ALL).unwrap();
         let r = t.get(onward).unwrap().rights;
@@ -357,10 +353,7 @@ mod tests {
     fn transfer_requires_the_right_and_removes_the_handle() {
         let mut t = table();
         let no_transfer = t.insert(obj(1), ObjectType::Channel, Rights::READ).unwrap();
-        assert!(matches!(
-            t.transfer_out(no_transfer),
-            Err(Error::AccessDenied { .. })
-        ));
+        assert!(matches!(t.transfer_out(no_transfer), Err(Error::AccessDenied { .. })));
 
         let h = t
             .insert(obj(2), ObjectType::Channel, Rights::READ | Rights::TRANSFER)
@@ -393,10 +386,7 @@ mod tests {
         for i in 0..8 {
             t.insert(obj(i), ObjectType::Channel, Rights::READ).unwrap();
         }
-        assert_eq!(
-            t.insert(obj(99), ObjectType::Channel, Rights::READ),
-            Err(Error::TableFull)
-        );
+        assert_eq!(t.insert(obj(99), ObjectType::Channel, Rights::READ), Err(Error::TableFull));
         assert_eq!(t.len(), 8);
     }
 

@@ -38,8 +38,9 @@
 //! ICW1 → ICW2 → ICW3 → ICW4 is fixed by the chip, which latches them positionally on
 //! consecutive writes to the data port.
 
-use crate::serial::{inb, outb};
 use hal::{IrqChip, IrqNumber};
+
+use crate::serial::{inb, outb};
 
 const MASTER_CMD: u16 = 0x20;
 const MASTER_DATA: u16 = 0x21;

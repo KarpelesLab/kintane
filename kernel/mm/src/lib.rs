@@ -52,11 +52,9 @@ pub mod paged;
 pub mod phys;
 
 pub use directmap::DirectMap;
-
 pub use frame::{Frame, FrameIter, FrameRange};
-pub use phys::{FrameAllocator, FrameStats, bitmap_bytes};
-
 use hal::AddrOverflow;
+pub use phys::{FrameAllocator, FrameStats, bitmap_bytes};
 
 /// Why an allocation, a free, or the construction of an allocator did not succeed.
 ///

@@ -7,21 +7,19 @@
 //! `paging::aarch64_mmu_init` does, called from the bottom of this file. What is left
 //! in assembly is the handful of things that genuinely cannot be expressed in Rust:
 //!
-//! 1. **Park the secondary CPUs.** QEMU releases every `-smp` CPU at the same entry
-//!    point. Without the MPIDR check below they would all race through `.bss`
-//!    zeroing and share one stack. They spin in `wfe` until the SMP bring-up path
-//!    exists to claim them.
-//! 2. **Descend to EL1 if we came up at EL2.** QEMU's `virt` machine starts the
-//!    kernel at EL1 unless it was given `virtualization=on`, in which case the same
-//!    image lands at EL2 instead. That is a machine-configuration detail, not an
-//!    architecture one, so the code handles both rather than asserting one.
-//! 3. **Zero `.bss`, then take a stack.** Nothing before the stack switch needs a
-//!    stack — the descent to EL1 goes through system registers and `eret`, and the
-//!    zeroing loop uses registers only. The translation tables live in `.bss`, so the
-//!    zeroing is what makes every descriptor start out invalid. The stack itself is
-//!    not in `.bss`: it sits above a guard page in its own `.stack` section (see
-//!    `link.ld`), and is therefore neither zeroed nor adjacent to anything an overflow
-//!    could quietly corrupt.
+//! 1. **Park the secondary CPUs.** QEMU releases every `-smp` CPU at the same entry point. Without
+//!    the MPIDR check below they would all race through `.bss` zeroing and share one stack. They
+//!    spin in `wfe` until the SMP bring-up path exists to claim them.
+//! 2. **Descend to EL1 if we came up at EL2.** QEMU's `virt` machine starts the kernel at EL1
+//!    unless it was given `virtualization=on`, in which case the same image lands at EL2 instead.
+//!    That is a machine-configuration detail, not an architecture one, so the code handles both
+//!    rather than asserting one.
+//! 3. **Zero `.bss`, then take a stack.** Nothing before the stack switch needs a stack — the
+//!    descent to EL1 goes through system registers and `eret`, and the zeroing loop uses registers
+//!    only. The translation tables live in `.bss`, so the zeroing is what makes every descriptor
+//!    start out invalid. The stack itself is not in `.bss`: it sits above a guard page in its own
+//!    `.stack` section (see `link.ld`), and is therefore neither zeroed nor adjacent to anything an
+//!    overflow could quietly corrupt.
 //!
 //! Register state on entry is whatever QEMU left. Its ELF path is documented as
 //! "assume that raw images are Linux kernels and ELF images are not", so unlike the

@@ -8,9 +8,10 @@
 //! The rule this supports, from `docs/testing.md`: **a subsystem that cannot be
 //! tested against `MockArch` has a design problem.**
 
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
 use crate::paging::{HasPageTables, PageFlags, PageTableEntry};
 use crate::*;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// A full-featured machine: MMU, SMP, atomics, coherent DMA, floating point.
 /// Models the x86_64 and aarch64 end of the range.

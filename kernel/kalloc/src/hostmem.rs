@@ -18,9 +18,9 @@
 use core::marker::PhantomData;
 
 use hal::{Arch, KernAddr, PhysAddr};
+use mm::directmap::DirectMap;
 use mm::{AllocError, Frame, FrameRange};
 
-use mm::directmap::DirectMap;
 use crate::frames::FrameSource;
 use crate::widen;
 
@@ -151,8 +151,9 @@ impl<A: Arch> FrameSource<A> for HostFrames<A> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use hal::mock::{MockFull, MockTiny};
+
+    use super::*;
 
     fn the_window_covers_the_buffer<A: Arch>() {
         let mem = HostMemory::new(64 * 1024);

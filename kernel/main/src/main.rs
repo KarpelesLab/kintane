@@ -12,12 +12,12 @@
 
 mod space;
 
+use core::cell::SyncUnsafeCell;
 
 use arch::Cpu;
 use boot_protocol::{MemoryKind, MemoryRegion};
-use core::cell::SyncUnsafeCell;
 use hal::{Arch, EarlyConsole, HasMmu};
-use mm::phys::{bitmap_bytes, FrameAllocator};
+use mm::phys::{FrameAllocator, bitmap_bytes};
 
 /// Entry from the architecture's boot code, which has already established a stack,
 /// whatever execution mode the target needs, and an identity mapping.
@@ -132,7 +132,12 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
     c.write_str("\n  memory map ");
     c.write_str(bootinfo::SOURCE);
 
-    let mut regions = [MemoryRegion { start: 0, len: 0, kind: 0, _reserved: 0 }; MAX_REGIONS];
+    let mut regions = [MemoryRegion {
+        start: 0,
+        len: 0,
+        kind: 0,
+        _reserved: 0,
+    }; MAX_REGIONS];
     // SAFETY: `boot_arg` is the value the architecture's boot code passed to `kmain`,
     // which is exactly the contract `memory_regions` states. The structure it names is
     // in loader memory, which is still mapped and not yet reclaimed.
@@ -198,7 +203,9 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
     // a single frame is handed out — without this the allocator's first answer is
     // physical zero, which is exactly what it was before this reservation existed.
     let (img_start, img_end) = arch::image_range();
-    let reserved_low = frames.reserve(hal::PhysAddr::new(0), LOW_MEMORY).unwrap_or(0);
+    let reserved_low = frames
+        .reserve(hal::PhysAddr::new(0), LOW_MEMORY)
+        .unwrap_or(0);
     let reserved_img = frames
         .reserve(hal::PhysAddr::new(img_start), img_end.saturating_sub(img_start))
         .unwrap_or(0);

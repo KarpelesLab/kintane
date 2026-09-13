@@ -53,8 +53,20 @@ impl Val {
         match self {
             Val::Tri(t) => *t,
             // A non-empty int or string is truthy when named in an expression.
-            Val::Int(i) => if *i != 0 { Tri::Y } else { Tri::N },
-            Val::Str(s) => if !s.is_empty() { Tri::Y } else { Tri::N },
+            Val::Int(i) => {
+                if *i != 0 {
+                    Tri::Y
+                } else {
+                    Tri::N
+                }
+            }
+            Val::Str(s) => {
+                if !s.is_empty() {
+                    Tri::Y
+                } else {
+                    Tri::N
+                }
+            }
         }
     }
 

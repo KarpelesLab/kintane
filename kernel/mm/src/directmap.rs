@@ -53,14 +53,13 @@
 //!
 //! Two ways, both expected:
 //!
-//! * **The kernel moves to the high half.** Nothing here changes except the argument
-//!   at the one construction site, which is the whole point.
-//! * **The heap needs memory that is not direct-mapped** — a vmalloc-style region
-//!   stitched together from non-adjacent frames, or a target with no direct map at
-//!   all. Then this type is no longer sufficient, and the replacement is an
-//!   `AddressSpace` handle from `mm::paged` that can map a frame on request. The
-//!   allocators above take the mapping as a parameter precisely so that swapping it
-//!   is a change to a type parameter rather than to their logic.
+//! * **The kernel moves to the high half.** Nothing here changes except the argument at the one
+//!   construction site, which is the whole point.
+//! * **The heap needs memory that is not direct-mapped** — a vmalloc-style region stitched together
+//!   from non-adjacent frames, or a target with no direct map at all. Then this type is no longer
+//!   sufficient, and the replacement is an `AddressSpace` handle from `mm::paged` that can map a
+//!   frame on request. The allocators above take the mapping as a parameter precisely so that
+//!   swapping it is a change to a type parameter rather than to their logic.
 
 // Re-enabled for exactly one operation: `KernAddr::as_ptr`, which is `unsafe`
 // because forming a pointer is a promise about what may later be done with it. It
@@ -188,7 +187,9 @@ impl DirectMap {
     /// machine's memory and outside anything a 32-bit kernel can address directly,
     /// and saying so is better than handing back a truncated pointer.
     pub fn to_virt(self, phys: PhysAddr) -> Result<KernAddr, AllocError> {
-        let off = phys.diff(self.phys_base).map_err(|_| AllocError::Unmanaged)?;
+        let off = phys
+            .diff(self.phys_base)
+            .map_err(|_| AllocError::Unmanaged)?;
         if off >= self.len {
             return Err(AllocError::Unmanaged);
         }
@@ -204,7 +205,9 @@ impl DirectMap {
     /// # Errors
     /// [`AllocError::Unmanaged`] if `virt` is outside the window.
     pub fn to_phys(self, virt: KernAddr) -> Result<PhysAddr, AllocError> {
-        let off = virt.diff(self.virt_base).map_err(|_| AllocError::Unmanaged)?;
+        let off = virt
+            .diff(self.virt_base)
+            .map_err(|_| AllocError::Unmanaged)?;
         let off = widen(off);
         if off >= self.len {
             return Err(AllocError::Unmanaged);
@@ -251,11 +254,7 @@ impl DirectMap {
 
 impl fmt::Debug for DirectMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "DirectMap({} -> {}, {:#x} bytes)",
-            self.phys_base, self.virt_base, self.len
-        )
+        write!(f, "DirectMap({} -> {}, {:#x} bytes)", self.phys_base, self.virt_base, self.len)
     }
 }
 
@@ -282,32 +281,16 @@ mod tests {
     fn an_offset_map_is_the_same_code_with_a_different_argument() {
         // The high-half shape, scaled down so it fits a 32-bit host's pointer too.
         let m = expect(DirectMap::with_offset(0x8000_0000, 0x1000));
-        assert_eq!(
-            expect(m.to_virt(PhysAddr::new(0x40))),
-            KernAddr::new(0x8000_0040)
-        );
-        assert_eq!(
-            expect(m.to_phys(KernAddr::new(0x8000_0040))),
-            PhysAddr::new(0x40)
-        );
+        assert_eq!(expect(m.to_virt(PhysAddr::new(0x40))), KernAddr::new(0x8000_0040));
+        assert_eq!(expect(m.to_phys(KernAddr::new(0x8000_0040))), PhysAddr::new(0x40));
     }
 
     #[test]
     fn a_window_that_does_not_start_at_zero_round_trips() {
         // The ARM board shape: RAM at 0x4000_0000, mapped at a low kernel address.
-        let m = expect(DirectMap::new(
-            PhysAddr::new(0x4000_0000),
-            KernAddr::new(0x1000),
-            0x2000,
-        ));
-        assert_eq!(
-            expect(m.to_virt(PhysAddr::new(0x4000_0100))),
-            KernAddr::new(0x1100)
-        );
-        assert_eq!(
-            expect(m.to_phys(KernAddr::new(0x1100))),
-            PhysAddr::new(0x4000_0100)
-        );
+        let m = expect(DirectMap::new(PhysAddr::new(0x4000_0000), KernAddr::new(0x1000), 0x2000));
+        assert_eq!(expect(m.to_virt(PhysAddr::new(0x4000_0100))), KernAddr::new(0x1100));
+        assert_eq!(expect(m.to_phys(KernAddr::new(0x1100))), PhysAddr::new(0x4000_0100));
         // Below the window is not "offset zero"; it is outside.
         assert_eq!(m.to_virt(PhysAddr::new(0x3FFF_FFFF)), Err(AllocError::Unmanaged));
         assert!(!m.covers_phys(PhysAddr::new(0x3FFF_FFFF)));

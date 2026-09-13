@@ -101,10 +101,7 @@ impl AllocFlags {
 
     /// The flags this allocator cannot currently act on. See the module docs.
     pub const fn advisory(self) -> Self {
-        AllocFlags(
-            self.0
-                & (Self::MAY_SLEEP.0 | Self::DMA32.0 | Self::DMA_COHERENT.0),
-        )
+        AllocFlags(self.0 & (Self::MAY_SLEEP.0 | Self::DMA32.0 | Self::DMA_COHERENT.0))
     }
 }
 
@@ -302,7 +299,9 @@ mod tests {
             );
         }
         assert!(
-            AllocContext::ATOMIC.on_node(NumaNode::new(1)).is_best_effort(),
+            AllocContext::ATOMIC
+                .on_node(NumaNode::new(1))
+                .is_best_effort(),
             "there is no NUMA topology, so a node request is best-effort"
         );
         assert!(!AllocContext::ATOMIC.on_node(NumaNode::ANY).is_best_effort());

@@ -11,6 +11,7 @@
 //! driver it moves to `drivers/` and is shared there, behind the device framework.
 
 use core::arch::asm;
+
 use hal::EarlyConsole;
 
 const COM1: u16 = 0x3F8;

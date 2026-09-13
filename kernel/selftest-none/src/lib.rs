@@ -11,10 +11,6 @@ use hal::{Arch, EarlyConsole};
 pub const PRESENT: bool = false;
 
 /// Runs nothing and reports success, so the caller needs no special case.
-pub fn run_all<A: Arch>(
-    _c: &dyn EarlyConsole,
-    _boot_arg: u64,
-    _reserved: &[(u64, u64)],
-) -> bool {
+pub fn run_all<A: Arch>(_c: &dyn EarlyConsole, _boot_arg: u64, _reserved: &[(u64, u64)]) -> bool {
     true
 }

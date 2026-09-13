@@ -207,7 +207,8 @@ fn strip_noise(s: &str) -> String {
             '"' if !in_char => in_str = !in_str,
             '\'' if !in_str => {
                 // A lifetime is not a character literal.
-                let is_lifetime = i + 1 < b.len() && (b[i + 1].is_alphabetic() || b[i + 1] == '_')
+                let is_lifetime = i + 1 < b.len()
+                    && (b[i + 1].is_alphabetic() || b[i + 1] == '_')
                     && !(i + 2 < b.len() && b[i + 2] == '\'');
                 if !is_lifetime {
                     in_char = !in_char;
@@ -238,9 +239,7 @@ mod tests {
 
     #[test]
     fn cfg_inside_a_function_is_rejected() {
-        let v = check(
-            "fn schedule(&mut self) {\n    #[cfg(CONFIG_SMP)]\n    self.steal();\n}\n",
-        );
+        let v = check("fn schedule(&mut self) {\n    #[cfg(CONFIG_SMP)]\n    self.steal();\n}\n");
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].line, 2);
         assert_eq!(v[0].context, "a function body");
@@ -261,16 +260,16 @@ mod tests {
 
     #[test]
     fn nested_blocks_inside_a_function_still_count() {
-        let v = check(
-            "fn f() {\n    if x {\n        #[cfg(CONFIG_SMP)]\n        g();\n    }\n}\n",
-        );
+        let v = check("fn f() {\n    if x {\n        #[cfg(CONFIG_SMP)]\n        g();\n    }\n}\n");
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].context, "a function body");
     }
 
     #[test]
     fn cfg_in_a_match_arm_is_rejected() {
-        let v = check("fn f() {\n    match x {\n        #[cfg(CONFIG_SMP)]\n        A => 1,\n    }\n}\n");
+        let v = check(
+            "fn f() {\n    match x {\n        #[cfg(CONFIG_SMP)]\n        A => 1,\n    }\n}\n",
+        );
         assert_eq!(v.len(), 1, "{v:?}");
     }
 
@@ -321,7 +320,10 @@ mod tests {
         assert!(
             v.is_empty(),
             "cfg-in-body violations:\n{}",
-            v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\n")
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }

@@ -5,8 +5,9 @@
 //! for it, so `.config` plus a source tree is a reproducible build, and so a conflict
 //! can be explained as a chain rather than as "cannot satisfy constraints".
 
-use super::*;
 use std::collections::BTreeMap;
+
+use super::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reason {
@@ -105,10 +106,7 @@ pub struct Request {
 
 const MAX_ROUNDS: usize = 100;
 
-pub fn resolve(
-    table: &SymbolTable,
-    requests: &[Request],
-) -> Result<Resolution, Vec<ResolveError>> {
+pub fn resolve(table: &SymbolTable, requests: &[Request]) -> Result<Resolution, Vec<ResolveError>> {
     let mut errors = Vec::new();
 
     // --- validate and type the requests ---
@@ -118,8 +116,7 @@ pub fn resolve(
             errors.push(ResolveError {
                 msg: format!("unknown configuration symbol `{}`", r.symbol),
                 chain: vec![format!("requested by {}", r.source)],
-                hint: nearest(table, &r.symbol)
-                    .map(|n| format!("did you mean `{n}`?")),
+                hint: nearest(table, &r.symbol).map(|n| format!("did you mean `{n}`?")),
             });
             continue;
         };
@@ -210,7 +207,10 @@ pub fn resolve(
                 (
                     Val::zero(sym.kind),
                     Reason::DependsUnmet(
-                        sym.depends.as_ref().map(|d| d.to_string()).unwrap_or_default(),
+                        sym.depends
+                            .as_ref()
+                            .map(|d| d.to_string())
+                            .unwrap_or_default(),
                     ),
                 )
             } else if sym.choice.is_some() {
@@ -258,7 +258,11 @@ pub fn resolve(
             {
                 Some((*m).clone())
             } else if let Some(d) = choice.defaults.iter().find(|d| {
-                let cond_ok = d.cond.as_ref().map(|c| eval(c, &res) != Tri::N).unwrap_or(true);
+                let cond_ok = d
+                    .cond
+                    .as_ref()
+                    .map(|c| eval(c, &res) != Tri::N)
+                    .unwrap_or(true);
                 cond_ok
                     && match &d.value {
                         Val::Str(n) => usable.iter().any(|m| *m == n),
@@ -286,7 +290,11 @@ pub fn resolve(
                         }
                     } else if visible == Tri::N {
                         Reason::DependsUnmet(
-                            choice.depends.as_ref().map(|d| d.to_string()).unwrap_or_default(),
+                            choice
+                                .depends
+                                .as_ref()
+                                .map(|d| d.to_string())
+                                .unwrap_or_default(),
                         )
                     } else {
                         Reason::Chosen(cname.clone())
@@ -347,14 +355,14 @@ pub fn resolve(
                 errors.push(ResolveError {
                     msg: format!("cannot set {name}={}", want.display()),
                     chain,
-                    hint: Some(format!(
-                        "enable its dependencies first, or leave {name} unset"
-                    )),
+                    hint: Some(format!("enable its dependencies first, or leave {name} unset")),
                 })
             }
             Reason::Chosen(c) => errors.push(ResolveError {
                 msg: format!("cannot set {name}={}", want.display()),
-                chain: vec![format!("{name} belongs to choice {c}, which selected another member")],
+                chain: vec![format!(
+                    "{name} belongs to choice {c}, which selected another member"
+                )],
                 hint: Some(format!("set exactly one member of {c} to y")),
             }),
             other => errors.push(ResolveError {
@@ -423,7 +431,12 @@ fn eval(e: &Expr, res: &Resolution) -> Tri {
 fn first_matching_default(sym: &Symbol, res: &Resolution) -> Option<Val> {
     sym.defaults
         .iter()
-        .find(|d| d.cond.as_ref().map(|c| eval(c, res) != Tri::N).unwrap_or(true))
+        .find(|d| {
+            d.cond
+                .as_ref()
+                .map(|c| eval(c, res) != Tri::N)
+                .unwrap_or(true)
+        })
         .map(|d| d.value.clone())
 }
 
@@ -456,17 +469,15 @@ fn distance(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn table(src: &str) -> SymbolTable {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "kcfg-resolve-{}-{n}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("kcfg-resolve-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.kcfg");
         std::fs::File::create(&p)

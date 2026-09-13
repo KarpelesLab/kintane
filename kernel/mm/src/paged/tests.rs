@@ -10,11 +10,13 @@
 
 extern crate std;
 
-use super::*;
+use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::vec::Vec;
+
 use hal::mock::{MockFull, TLB_FLUSHES};
 use hal::{Arch, KernAddr};
-use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::vec::Vec;
+
+use super::*;
 
 const PAGE: usize = MockFull::PAGE_SIZE;
 const TWO_MIB: usize = 2 * 1024 * 1024;
@@ -52,12 +54,8 @@ impl Mem {
     }
 
     fn direct(&self) -> DirectMap {
-        DirectMap::new(
-            PhysAddr::new(0),
-            KernAddr::new(self.buf as usize),
-            self.len,
-        )
-        .expect("direct map")
+        DirectMap::new(PhysAddr::new(0), KernAddr::new(self.buf as usize), self.len)
+            .expect("direct map")
     }
 }
 
@@ -140,14 +138,8 @@ fn misaligned_requests_are_refused() {
     let (mut mem, mut space) = setup(64);
     let p = PhysAddr::new(0x9_0000);
     let f = PageFlags::KERNEL_DATA;
-    assert_eq!(
-        space.map(V + 1, p, PAGE, f, &mut mem),
-        Err(MapError::Misaligned)
-    );
-    assert_eq!(
-        space.map(V, p, PAGE - 1, f, &mut mem),
-        Err(MapError::Misaligned)
-    );
+    assert_eq!(space.map(V + 1, p, PAGE, f, &mut mem), Err(MapError::Misaligned));
+    assert_eq!(space.map(V, p, PAGE - 1, f, &mut mem), Err(MapError::Misaligned));
     assert_eq!(
         space.map(V, PhysAddr::new(0x9_0001), PAGE, f, &mut mem),
         Err(MapError::Misaligned)
@@ -174,7 +166,9 @@ fn mapping_over_an_existing_mapping_is_refused() {
     // An accidental overlap is a bug; a caller that means it can unmap first.
     let (mut mem, mut space) = setup(64);
     let f = PageFlags::KERNEL_DATA;
-    space.map(V, PhysAddr::new(0x9_0000), PAGE, f, &mut mem).unwrap();
+    space
+        .map(V, PhysAddr::new(0x9_0000), PAGE, f, &mut mem)
+        .unwrap();
     assert_eq!(
         space.map(V, PhysAddr::new(0xA_0000), PAGE, f, &mut mem),
         Err(MapError::AlreadyMapped)
@@ -219,7 +213,9 @@ fn a_table_still_in_use_is_not_reclaimed() {
     // other still lives in.
     let (mut mem, mut space) = setup(64);
     let f = PageFlags::KERNEL_DATA;
-    space.map(V, PhysAddr::new(0x9_0000), PAGE, f, &mut mem).unwrap();
+    space
+        .map(V, PhysAddr::new(0x9_0000), PAGE, f, &mut mem)
+        .unwrap();
     space
         .map(V + PAGE, PhysAddr::new(0xA_0000), PAGE, f, &mut mem)
         .unwrap();
@@ -261,10 +257,7 @@ fn a_misaligned_large_range_falls_back_to_small_pages() {
     space
         .map(v, PhysAddr::new(PAGE as u64), TWO_MIB, PageFlags::KERNEL_DATA, &mut mem)
         .unwrap();
-    assert!(
-        mem.allocs > 2,
-        "small pages need leaf tables the huge-page case does not"
-    );
+    assert!(mem.allocs > 2, "small pages need leaf tables the huge-page case does not");
     assert_eq!(space.translate(v).unwrap().0, PhysAddr::new(PAGE as u64));
 }
 
@@ -289,7 +282,9 @@ fn descending_through_a_huge_page_is_refused_rather_than_guessed() {
 fn protect_changes_permissions_and_keeps_the_frame() {
     let (mut mem, mut space) = setup(64);
     let p = PhysAddr::new(0x9_0000);
-    space.map(V, p, PAGE, PageFlags::KERNEL_DATA, &mut mem).unwrap();
+    space
+        .map(V, p, PAGE, PageFlags::KERNEL_DATA, &mut mem)
+        .unwrap();
     assert!(space.translate(V).unwrap().1.contains(PageFlags::WRITE));
 
     space.protect(V, PAGE, PageFlags::KERNEL_RODATA).unwrap();
@@ -302,10 +297,7 @@ fn protect_changes_permissions_and_keeps_the_frame() {
 #[test]
 fn protecting_something_absent_is_an_error() {
     let (_mem, mut space) = setup(64);
-    assert_eq!(
-        space.protect(V, PAGE, PageFlags::KERNEL_RODATA),
-        Err(MapError::NotMapped)
-    );
+    assert_eq!(space.protect(V, PAGE, PageFlags::KERNEL_RODATA), Err(MapError::NotMapped));
 }
 
 #[test]
@@ -358,13 +350,7 @@ fn mapping_several_pages_covers_all_of_them() {
     let (mut mem, mut space) = setup(64);
     let n = 5;
     space
-        .map(
-            V,
-            PhysAddr::new(0x9_0000),
-            PAGE * n,
-            PageFlags::KERNEL_DATA,
-            &mut mem,
-        )
+        .map(V, PhysAddr::new(0x9_0000), PAGE * n, PageFlags::KERNEL_DATA, &mut mem)
         .unwrap();
     for i in 0..n {
         assert_eq!(
