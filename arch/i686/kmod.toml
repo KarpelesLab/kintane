@@ -5,7 +5,7 @@ root = "src/lib.rs"
 layer = "arch"
 
 [deps]
-units = ["hal"]
+units = ["hal", "unwind"]
 
 [config]
 requires = "ARCH_I686"

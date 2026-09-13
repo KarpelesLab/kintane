@@ -212,6 +212,52 @@ jobs:
           done
           exit $fail
 
+      # A backtrace is read only after something has gone wrong, which is the worst time
+      # to learn it stopped decoding. Each architecture crashes on purpose, once by panic
+      # and once by fault, and the decoded report must name the functions it came from.
+      # The bootable image must also carry no symbols: they belong in the bundle.
+      - name: Crash reports decode against the symbol bundle
+        run: |
+          set -uo pipefail
+          rustc="rustup run ${{ steps.pin.outputs.channel }} rustc"
+          host=$($rustc -vV | sed -n 's/^host: //p')
+          nm="$($rustc --print sysroot)/lib/rustlib/$host/bin/llvm-nm"
+          fail=0
+          for name in x86_64-qemu i686-qemu aarch64-virt; do
+            case $name in
+              x86_64-qemu) image=build/x86_64-kintane/out/kintane.mb32.elf ;;
+              i686-qemu) image=build/i686-kintane/out/kintane.img.elf ;;
+              aarch64-virt) image=build/aarch64-kintane/out/kintane.img.elf ;;
+            esac
+            for crash in PANIC:kintane::crash::nested_panic FAULT:arch::backtrace::undefined_instruction; do
+              kind=${crash%%:*}
+              want=${crash#*:}
+              echo "::group::$name CRASH_$kind"
+              ./kbuild/target/release/kbuild run --preset "$name" --set "CRASH_$kind=y" \
+                --timeout 20 > build/crash.log 2>&1
+              cat build/crash.log
+              if grep -q "symbolized backtrace" build/crash.log \
+                && grep -q "$want" build/crash.log \
+                && grep -q "kintane::crash::outer" build/crash.log \
+                && grep -q "kernel/main/src/crash.rs:" build/crash.log; then
+                echo "decoded: $name CRASH_$kind"
+              else
+                echo "::error title=crash report not decoded::$name CRASH_$kind"
+                fail=1
+              fi
+              echo "::endgroup::"
+            done
+            # llvm-nm exits non-zero on a file with no symbols, which is the good case.
+            syms=$("$nm" "$image" 2>&1 || true)
+            if [ -f "$image" ] && [[ "$syms" == *"no symbols"* ]]; then
+              echo "stripped: $image"
+            else
+              echo "::error title=image carries symbols::$image"
+              fail=1
+            fi
+          done
+          exit $fail
+
       # A failure that cannot be investigated from CI output alone is itself a
       # harness bug, so the exception traces and images are kept.
       - name: Collect failure artifacts
@@ -221,7 +267,9 @@ jobs:
           name: build-artifacts
           path: |
             build/*/qemu.log
+            build/*/console.log
             build/*/out/*.elf
+            build/*/out/*.debug
             build/*/gen/config.rs
             .config
           if-no-files-found: ignore

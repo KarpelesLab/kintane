@@ -1,0 +1,11 @@
+[unit]
+name = "unwind"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+# `hal`, not `core`, because the architecture's fault reporters print a backtrace,
+# and an `arch` unit may depend only on layers at or below its own.
+layer = "hal"
+
+[deps]
+units = ["hal"]

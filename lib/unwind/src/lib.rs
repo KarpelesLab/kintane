@@ -1,0 +1,398 @@
+//! A bounded frame-pointer unwinder, for panic and fault reports.
+//!
+//! Every kernel crate is built with `-C force-frame-pointers=yes`, so each function
+//! that has a frame keeps a *frame record* on the stack: the caller's frame pointer
+//! and the return address into the caller, at fixed offsets from its own frame
+//! pointer. Following the saved frame pointers from record to record gives the chain
+//! of return addresses. That is the whole algorithm. Everything else in this crate is
+//! about following that chain on a stack that may be corrupt, because a backtrace is
+//! wanted most when the stack is the thing that went wrong.
+//!
+//! # What the walk refuses to do
+//!
+//! It never reads memory it has not first shown to be inside the stack it was given.
+//! It stops, and says why, on:
+//!
+//! * a null frame pointer — the normal end, because every port's `_start` zeroes it;
+//! * a frame pointer that is not a multiple of the word size;
+//! * a frame record that does not lie entirely inside the stack bounds;
+//! * a frame pointer that does not increase — stacks grow down, so a caller's record is always
+//!   above its callee's, and a chain that goes sideways or down is a loop or garbage;
+//! * a depth limit, so a chain that stays plausible for ever still ends.
+//!
+//! The monotonic rule is what makes a looping stack terminate: a cycle has to come back
+//! down at some point. The depth limit covers a long, strictly increasing chain of
+//! garbage that never leaves the bounds.
+//!
+//! # What it prints
+//!
+//! Raw addresses, one per line, in a format meant for `kbuild symbolize` to grep:
+//!
+//! ```text
+//! backtrace:
+//!   bt pc 0x0000000000104f2a
+//!   bt 0 0x0000000000103512
+//!   bt 1 0x00000000001034f0
+//!   bt end: null frame
+//! ```
+//!
+//! `pc` is an exact address: the instruction that faulted. The numbered entries are
+//! return addresses, one instruction past a call, and the symbolizer looks up the byte
+//! before each. The image carries no symbols. They are in the separate symbol bundle
+//! kbuild writes next to it, which is what lets a report from a stripped image be
+//! decoded later (`docs/build-system.md#deliverables`).
+//!
+//! The crate depends only on `hal`, and not on any architecture. The frame layout is a
+//! value the port supplies, and memory is reached through [`Memory`]. So the walk runs
+//! on the host against synthetic stacks, including corrupt ones.
+
+#![cfg_attr(not(test), no_std)]
+
+#[cfg(test)]
+mod tests;
+
+use hal::{EarlyConsole, ImageSections};
+
+/// Where a frame record keeps its two words, relative to the frame pointer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Layout {
+    /// Size of a saved frame pointer and of a return address, in bytes.
+    pub word: usize,
+    /// Offset of the caller's saved frame pointer.
+    pub saved_fp: usize,
+    /// Offset of the return address into the caller.
+    pub return_address: usize,
+}
+
+impl Layout {
+    /// The layout every current port uses: the saved frame pointer at the frame
+    /// pointer, the return address one word above it. `push rbp; mov rbp, rsp` on
+    /// x86_64, the same with `ebp` on i686, and the `{x29, x30}` pair that AAPCS64
+    /// requires `x29` to point at.
+    pub const fn frame_record(word: usize) -> Layout {
+        Layout {
+            word,
+            saved_fp: 0,
+            return_address: word,
+        }
+    }
+
+    /// Bytes from the frame pointer to the end of the record.
+    fn span(&self) -> usize {
+        let hi = if self.saved_fp > self.return_address {
+            self.saved_fp
+        } else {
+            self.return_address
+        };
+        hi + self.word
+    }
+}
+
+/// Read access to the memory a stack lives in.
+///
+/// Returns `None` rather than faulting for an address it cannot read. The walk checks
+/// bounds before it asks, so an implementation that is also bounds-checked gives two
+/// independent guards.
+pub trait Memory {
+    /// The word at `addr`, `layout.word` bytes wide, in the target's byte order.
+    fn read_word(&self, addr: usize) -> Option<usize>;
+}
+
+/// Why a walk ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stop {
+    /// The frame pointer was zero: the outermost frame, and the one normal ending.
+    NullFrame,
+    /// The frame pointer was not a multiple of the word size.
+    Misaligned,
+    /// The frame record was not entirely inside the stack.
+    OutsideStack,
+    /// The saved frame pointer did not lie above the frame that saved it.
+    NotIncreasing,
+    /// The memory reader could not read an address the bounds allowed.
+    Unreadable,
+    /// The walk reached its depth limit.
+    DepthLimit,
+}
+
+impl Stop {
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Stop::NullFrame => "null frame",
+            Stop::Misaligned => "misaligned frame pointer",
+            Stop::OutsideStack => "frame outside the stack",
+            Stop::NotIncreasing => "frame pointer did not increase",
+            Stop::Unreadable => "unreadable frame",
+            Stop::DepthLimit => "depth limit",
+        }
+    }
+}
+
+/// Frames reported before a walk gives up. Enough for any real kernel call chain; a
+/// deeper one is recursion, and its first frames are the part worth reading.
+pub const MAX_DEPTH: usize = 32;
+
+/// A walk up a frame-pointer chain, yielding return addresses, innermost first.
+///
+/// After the iterator ends, [`Walk::stop`] says why.
+pub struct Walk<'m, M: Memory> {
+    mem: &'m M,
+    layout: Layout,
+    /// `[lo, hi)`: the stack the walk may read.
+    lo: usize,
+    hi: usize,
+    fp: usize,
+    /// The frame pointer of the record last read, to check the chain climbs.
+    prev: Option<usize>,
+    depth: usize,
+    stop: Option<Stop>,
+}
+
+impl<'m, M: Memory> Walk<'m, M> {
+    /// Walk from frame pointer `fp`, reading only inside `[lo, hi)`.
+    pub fn new(mem: &'m M, layout: Layout, lo: usize, hi: usize, fp: usize) -> Self {
+        Walk {
+            mem,
+            layout,
+            lo,
+            hi,
+            fp,
+            prev: None,
+            depth: 0,
+            stop: None,
+        }
+    }
+
+    /// Why the walk ended, once it has.
+    pub fn stop(&self) -> Option<Stop> {
+        self.stop
+    }
+
+    fn end(&mut self, why: Stop) -> Option<usize> {
+        self.stop = Some(why);
+        None
+    }
+}
+
+impl<M: Memory> Iterator for Walk<'_, M> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.stop.is_some() {
+            return None;
+        }
+        let fp = self.fp;
+        if fp == 0 {
+            return self.end(Stop::NullFrame);
+        }
+        if self.prev.is_some_and(|p| fp <= p) {
+            return self.end(Stop::NotIncreasing);
+        }
+        if self.depth >= MAX_DEPTH {
+            return self.end(Stop::DepthLimit);
+        }
+        if self.layout.word == 0 || fp % self.layout.word != 0 {
+            return self.end(Stop::Misaligned);
+        }
+        // Checked arithmetic: a frame pointer near the top of the address space must be
+        // rejected, not wrapped around into a small address that happens to pass.
+        let inside = fp >= self.lo
+            && fp
+                .checked_add(self.layout.span())
+                .is_some_and(|end| end <= self.hi);
+        if !inside {
+            return self.end(Stop::OutsideStack);
+        }
+
+        let (Some(ra), Some(saved)) = (
+            self.mem.read_word(fp + self.layout.return_address),
+            self.mem.read_word(fp + self.layout.saved_fp),
+        ) else {
+            return self.end(Stop::Unreadable);
+        };
+
+        self.prev = Some(fp);
+        self.fp = saved;
+        self.depth += 1;
+        Some(ra)
+    }
+}
+
+/// Memory the kernel reads directly: one address range, checked on every read.
+pub struct Region {
+    lo: usize,
+    hi: usize,
+}
+
+impl Region {
+    /// # Safety
+    /// Every byte of `[lo, hi)` must be mapped and readable for as long as this value
+    /// exists, and must hold data the reader may observe — a stack that is being
+    /// unwound, which nothing else is writing.
+    pub const unsafe fn new(lo: usize, hi: usize) -> Region {
+        Region { lo, hi }
+    }
+}
+
+impl Memory for Region {
+    fn read_word(&self, addr: usize) -> Option<usize> {
+        let end = addr.checked_add(core::mem::size_of::<usize>())?;
+        if addr < self.lo || end > self.hi {
+            return None;
+        }
+        // SAFETY: `[addr, end)` is inside `[lo, hi)`, which the constructor's caller
+        // promised is readable. Unaligned, because the bound check does not establish
+        // alignment and a misaligned read must not become undefined behaviour.
+        Some(unsafe { core::ptr::read_unaligned(addr as *const usize) })
+    }
+}
+
+/// The stack regions of the image: its read-write data, less the guard page.
+///
+/// Every stack the kernel has today is in there: the boot stack, the x86_64 `#DF`
+/// stack, and the context-switch selftest's thread stacks. The guard page is cut out
+/// because it is meant to be unmapped, and reading it would fault inside the fault
+/// report. What is left may be two pieces, and a walk is confined to the piece its
+/// first frame is in, so a chain cannot cross the guard in either direction.
+pub fn image_stacks(s: &ImageSections) -> [(usize, usize); 2] {
+    let as_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+    let (lo, hi) = (as_usize(s.data.0), as_usize(s.data.1));
+    let (glo, ghi) = (as_usize(s.stack_guard.0), as_usize(s.stack_guard.1));
+    if glo >= ghi || ghi <= lo || glo >= hi {
+        // No guard, or not inside the data: nothing to cut out.
+        return [(lo, hi), (0, 0)];
+    }
+    [(lo, glo.max(lo)), (ghi.min(hi), hi)]
+}
+
+/// Print a backtrace from frame pointer `fp`, confined to the image's stacks.
+///
+/// `pc`, when given, is printed first as the exact faulting instruction. `skip` frames
+/// are walked and checked but not printed: the report's own frames, which say only
+/// that a report was made.
+///
+/// # Safety
+/// The regions `image_stacks(sections)` returns must be mapped and readable, which is
+/// the case for as long as the kernel's image is mapped at all.
+pub unsafe fn print(
+    c: &dyn EarlyConsole,
+    layout: Layout,
+    sections: &ImageSections,
+    fp: usize,
+    pc: Option<usize>,
+    skip: usize,
+) {
+    c.write_str("\nbacktrace:\n");
+    if let Some(pc) = pc {
+        c.write_str("  bt pc ");
+        write_addr(c, pc);
+        c.write_str("\n");
+    }
+    let Some(&(lo, hi)) = image_stacks(sections)
+        .iter()
+        .find(|(lo, hi)| (*lo..*hi).contains(&fp))
+    else {
+        c.write_str("  bt end: frame pointer ");
+        write_addr(c, fp);
+        c.write_str(" is not in any known stack\n");
+        return;
+    };
+    if layout.word != core::mem::size_of::<usize>() {
+        // `Region` reads native words; a layout that disagrees would read garbage.
+        c.write_str("  bt end: frame layout does not match the pointer width\n");
+        return;
+    }
+    // SAFETY: forwarded from this function's contract.
+    let mem = unsafe { Region::new(lo, hi) };
+    let mut walk = Walk::new(&mem, layout, lo, hi, fp);
+    let mut n = 0usize;
+    for ra in walk.by_ref() {
+        if n >= skip {
+            c.write_str("  bt ");
+            write_dec(c, n - skip);
+            c.write_str(" ");
+            write_addr(c, ra);
+            c.write_str("\n");
+        }
+        n += 1;
+    }
+    c.write_str("  bt end: ");
+    c.write_str(walk.stop().map(Stop::describe).unwrap_or("?"));
+    c.write_str("\n");
+}
+
+/// What a walk over the kernel's own stack found, for a check to judge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Chain {
+    /// Return addresses read.
+    pub frames: usize,
+    /// Why the walk ended.
+    pub stop: Stop,
+    /// The first return address outside `.text`, if any. A frame-pointer chain whose
+    /// return addresses are not code has been followed through something that is not
+    /// a frame record.
+    pub stray: Option<usize>,
+}
+
+/// Walk from `fp` over the image's stacks without printing, for a selftest.
+///
+/// # Safety
+/// As for [`print`].
+pub unsafe fn chain(layout: Layout, sections: &ImageSections, fp: usize) -> Chain {
+    let as_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+    let text = as_usize(sections.text.0)..as_usize(sections.text.1);
+    let Some(&(lo, hi)) = image_stacks(sections)
+        .iter()
+        .find(|(lo, hi)| (*lo..*hi).contains(&fp))
+    else {
+        return Chain {
+            frames: 0,
+            stop: Stop::OutsideStack,
+            stray: None,
+        };
+    };
+    // SAFETY: forwarded from this function's contract.
+    let mem = unsafe { Region::new(lo, hi) };
+    let mut walk = Walk::new(&mem, layout, lo, hi, fp);
+    let mut stray = None;
+    let mut frames = 0;
+    for ra in walk.by_ref() {
+        frames += 1;
+        if stray.is_none() && !text.contains(&ra) {
+            stray = Some(ra);
+        }
+    }
+    Chain {
+        frames,
+        stop: walk.stop().unwrap_or(Stop::DepthLimit),
+        stray,
+    }
+}
+
+/// An address at full pointer width, so every line of a report has the same shape.
+fn write_addr(c: &dyn EarlyConsole, v: usize) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digits = core::mem::size_of::<usize>() * 2;
+    let mut buf = [0u8; 2 + 16];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..digits {
+        let shift = (digits - 1 - i) * 4;
+        buf[2 + i] = DIGITS[(v >> shift) & 0xf];
+    }
+    c.write_bytes(&buf[..2 + digits]);
+}
+
+fn write_dec(c: &dyn EarlyConsole, mut v: usize) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    c.write_bytes(&buf[i..]);
+}

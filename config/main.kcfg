@@ -154,6 +154,25 @@ config STACK_GUARD_TEST
         and reported" is a property of the running machine. Only the second
         is worth having; see docs/testing.md.
 
+# Crash on purpose once boot has finished, from a known nested function, so the
+# crash report can be checked end to end: the kernel prints raw return addresses,
+# and `kbuild symbolize` must name the function. A backtrace is only ever needed
+# when something has already gone wrong, which is exactly when an untested one
+# turns out not to work.
+choice CRASH_TEST
+    prompt "Deliberate crash after boot"
+    default CRASH_NONE
+
+    config CRASH_NONE
+        bool "No deliberate crash"
+
+    config CRASH_PANIC
+        bool "Panic from a nested function"
+
+    config CRASH_FAULT
+        bool "Undefined instruction from a nested function"
+endchoice
+
 config FRAME_BITMAP_KIB
     int "Boot-time frame bitmap reserve (KiB)"
     range 4 4096

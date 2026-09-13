@@ -324,27 +324,46 @@ impl Build {
     /// The ELF64 stays on disk as the debug artifact. That split is the one the
     /// deliverables in docs/build-system.md describe: a stripped bootable image plus
     /// separately shipped symbols.
+    ///
+    /// Either way the bootable image is stripped of symbols and debug info. They are in
+    /// the bundle [`Build::split_symbols`] wrote, and the kernel never reads its own
+    /// symbol table: a backtrace is printed as raw addresses and decoded off the machine.
     pub fn package(&self, format: &str, linked: &Path) -> Result<PathBuf, String> {
-        match format {
-            "" | "elf" => Ok(linked.to_path_buf()),
+        let (flags, dest): (&[&str], PathBuf) = match format {
+            "" | "elf" => (&["--strip-all"], linked.with_extension("img.elf")),
             "multiboot-elf32" => {
-                let objcopy = self.tc.tool("llvm-objcopy")?;
-                let dest = linked.with_extension("mb32.elf");
-                let out = Command::new(&objcopy)
-                    .args(["-O", "elf32-i386"])
-                    .arg(linked)
-                    .arg(&dest)
-                    .output()
-                    .map_err(|e| format!("cannot run llvm-objcopy: {e}"))?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "packaging as {format} failed:\n{}",
-                        String::from_utf8_lossy(&out.stderr)
-                    ));
-                }
-                Ok(dest)
+                (&["--strip-all", "-O", "elf32-i386"], linked.with_extension("mb32.elf"))
             }
-            other => Err(format!("unknown image format `{other}`")),
+            other => return Err(format!("unknown image format `{other}`")),
+        };
+        self.objcopy(flags, linked, &dest)
+            .map_err(|e| format!("packaging as {format} failed:\n{e}"))?;
+        Ok(dest)
+    }
+
+    /// Write the symbol bundle: the linked image's symbol table and DWARF, without its
+    /// code. `<image>.debug`, next to the linked ELF.
+    ///
+    /// This is what `kbuild symbolize` reads, and the thing to keep from a build whose
+    /// crash reports someone may need to decode later.
+    pub fn split_symbols(&self, linked: &Path) -> Result<PathBuf, String> {
+        let dest = linked.with_extension("debug");
+        self.objcopy(&["--only-keep-debug"], linked, &dest)
+            .map_err(|e| format!("extracting symbols failed:\n{e}"))?;
+        Ok(dest)
+    }
+
+    fn objcopy(&self, flags: &[&str], from: &Path, to: &Path) -> Result<(), String> {
+        let objcopy = self.tc.tool("llvm-objcopy")?;
+        let out = Command::new(&objcopy)
+            .args(flags)
+            .arg(from)
+            .arg(to)
+            .output()
+            .map_err(|e| format!("cannot run llvm-objcopy: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned());
         }
+        Ok(())
     }
 }

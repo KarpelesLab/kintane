@@ -189,6 +189,7 @@ kbuild build [--target T]                 build the kernel image
 kbuild modules                            build loadable modules
 kbuild image [--format elf|bin|uki|uimage]  package a bootable artifact
 kbuild symbols                            extract the separate debug-symbol bundle
+kbuild symbolize [--preset P] [log]       decode a guest backtrace against the symbol bundle
 kbuild run [--machine M]                  boot the image under QEMU
 kbuild test [--host|--target]             run the test suites
 kbuild lint                               cfg-in-body and the other rules rustc cannot express
@@ -307,3 +308,50 @@ A release produces:
 
 Images are stripped by default. The symbol bundle is what makes a crash report from
 the field decodable without shipping debug info to every device.
+
+### What a build produces today
+
+The release packaging above is ahead of the code. What `kbuild build` writes to
+`build/<target>/out/`:
+
+- `kintane.elf` — the linked image, with symbols and DWARF. The debug artifact, and the
+  file the reproducibility check hashes.
+- `kintane.debug` — the symbol bundle: `llvm-objcopy --only-keep-debug` of the linked
+  image. It holds the symbol table and DWARF and no code, and it is what
+  `kbuild symbolize` reads.
+- `kintane.mb32.elf` (x86_64) or `kintane.img.elf` (everything else) — the bootable
+  image, `--strip-all`. It has no symbol table, and CI checks that.
+
+The kernel never reads its own symbols. A panic or fatal exception prints raw return
+addresses (`lib/unwind`), and decoding happens off the machine:
+
+```
+$ kbuild run --preset aarch64-virt --set CRASH_PANIC=y
+kernel panic: /kintane/kernel/main/src/crash.rs:25
+backtrace:
+  bt 0 0x0000000040209298
+  bt 1 0x0000000040202b74
+  ...
+symbolized backtrace (build/aarch64-kintane/out/kintane.debug)
+   #0  0x0000000040209298  core::panicking::panic_fmt+0x28  /rust/lib/rustlib/src/rust/library/core/src/panicking.rs:80
+   #1  0x0000000040202b74  kintane::crash::nested_panic+0x20  kernel/main/src/crash.rs:25
+   #2  0x0000000040202b8c  kintane::crash::outer+0xc  kernel/main/src/crash.rs:18
+   ...
+```
+
+`kbuild run` and `kbuild test --target` decode a backtrace automatically when the
+guest's console contains one, and keep the console in `build/<target>/console.log`.
+`kbuild symbolize` decodes that file, or any log given to it.
+
+Function names come from the pinned `llvm-nm`, which demangles v0 symbols. File and
+line come from kbuild's own reader for `.debug_line`, because the `llvm-tools` component
+ships neither `llvm-symbolizer` nor `llvm-addr2line`, and a symbolizer taken from the host
+would be an unpinned input. That reader was checked against `llvm-objdump --line-numbers`
+on every instruction of the x86_64 and i686 kernels (DWARF 4), and on a DWARF 5 sample.
+Its limit is inlining. It reports the innermost line an address was compiled from, but
+not the chain of inlined calls that led there, because that chain is in `.debug_info`,
+which it does not read.
+
+Nothing yet ties a log to the build that produced it. Decoding an old log against a newer
+bundle gives confident, wrong names. Until the image carries a build ID that the kernel
+prints and `symbolize` compares, decode against the build that produced the log.

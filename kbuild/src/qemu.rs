@@ -4,8 +4,9 @@
 //! typed by hand. See `docs/testing.md` — in particular the result channels, which
 //! exist so that a test's verdict never has to be scraped out of console output.
 
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::kcfg::Resolution;
 
@@ -134,35 +135,67 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
 pub struct Outcome {
     pub code: Option<i32>,
     pub passed: bool,
+    /// The guest never signalled and was killed.
+    pub timed_out: bool,
+    /// Everything the guest wrote to its serial console.
+    ///
+    /// Kept for decoding a backtrace after the fact, never for deciding the verdict,
+    /// which is the exit status alone.
+    pub console: Vec<u8>,
 }
 
+/// Boot, passing the console through as it arrives and keeping a copy.
+///
+/// A guest that never signals is killed after `timeout_secs` and reported through
+/// `timed_out` rather than as an error, because the console it printed first is exactly
+/// what explains the hang: a fault report halts the CPU and never reaches the exit port.
 pub fn run(m: &Machine, timeout_secs: u64) -> Result<Outcome, String> {
     let mut child = Command::new(m.binary)
         .args(&m.args)
+        .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}\nis QEMU installed?", m.binary))?;
 
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let code = status.code();
-                return Ok(Outcome {
-                    code,
-                    passed: code == Some(m.success_code),
-                });
+    let mut pipe = child
+        .stdout
+        .take()
+        .ok_or("QEMU's console was not captured")?;
+    let tee = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut out = std::io::stdout();
+        // Ends when QEMU exits or is killed and its end of the pipe closes.
+        while let Ok(n) = pipe.read(&mut buf) {
+            if n == 0 {
+                break;
             }
+            let _ = out.write_all(&buf[..n]);
+            let _ = out.flush();
+            kept.extend_from_slice(&buf[..n]);
+        }
+        kept
+    });
+
+    let start = std::time::Instant::now();
+    let (code, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status.code(), false),
             Ok(None) => {
                 if start.elapsed().as_secs() >= timeout_secs {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "timed out after {timeout_secs}s with no exit signal from the guest"
-                    ));
+                    break (None, true);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => return Err(format!("waiting for QEMU: {e}")),
         }
-    }
+    };
+    let console = tee.join().unwrap_or_default();
+    Ok(Outcome {
+        code,
+        passed: !timed_out && code == Some(m.success_code),
+        timed_out,
+        console,
+    })
 }
