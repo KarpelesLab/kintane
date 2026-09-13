@@ -255,6 +255,27 @@ The SDK is checked the same way. CI builds it, copies the round-trip module's so
 outside the tree, builds it with the SDK's `build-module.sh`, and requires the result to
 be byte-identical to the module kbuild built in the tree.
 
+### 2a. The userspace slice
+
+On x86_64 and aarch64 (`USERSPACE`, on by default) every boot runs the native userspace
+check: it builds three processes from the embedded `user/init` program, enters ring 3 /
+EL0, and grades each by its exit code — `main` returns `0x2a` when every step behaved,
+`forge` returns the count of refused forged-handle attempts, and `fault` is *killed* at a
+write to kernel memory. The program reports what it observed and the kernel compares, so
+the grader is not the code under test. See
+[userspace-abi.md](userspace-abi.md#as-built--the-native-vertical-slice).
+
+Falsified (each mutation on x86_64, then restored):
+
+| Mutation | Result |
+|---|---|
+| `debug_write` skips the `WRITE`-rights check | `main` fails at the console-rights step (`0x102`) |
+| `enter_user` does not set `TSS.rsp0` | a demand fault from ring 3 lands on a stale stack; `main` and `forge` are killed |
+| `copy_from_user` skips its validation | reading the program's bad pointer faults the *kernel*: `#PF`, halted |
+
+The ABI table and the ELF loader are also host-tested (`lib/abi`, `kernel/elf`), the
+loader against fuzzed and truncated files.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

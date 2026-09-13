@@ -62,6 +62,20 @@ config NR_CPUS
     range 2 4096
     default 8
 
+config USERSPACE
+    bool "Native userspace"
+    depends on (ARCH_X86_64 || ARCH_AARCH64) && MM_PAGED
+    default y
+    help
+        Unprivileged processes: per-process address spaces, the native
+        system call ABI (lib/abi), and the first user program (user/init),
+        which the kernel embeds and runs at boot to check the whole path.
+
+        Requires a port that implements hal::HasUserMode, which today is
+        x86_64 and aarch64, and a paged memory model: a process's address
+        space is its own page tables. A kernel without it is tasks in the
+        kernel, which is what docs/userspace-abi.md says a small build is.
+
 config EARLY_CONSOLE
     bool "Early console"
     default y

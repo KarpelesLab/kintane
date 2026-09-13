@@ -26,6 +26,28 @@ pub fn paging_selftest(c: &dyn EarlyConsole) -> Check {
     Check::from_ok(paging_ok)
 }
 
+/// The native userspace slice: build a process, enter ring 3, grade it by its exit code.
+/// Passed when USERSPACE is off, so `memory()` calls it unconditionally. Two definitions
+/// keep the `cfg` at item level.
+#[cfg(CONFIG_USERSPACE)]
+pub fn userspace_check(
+    c: &dyn EarlyConsole,
+    frames: &mut mm::phys::FrameAllocator<'static, Cpu>,
+    live: Live,
+) -> Check {
+    crate::userproc::check(c, frames, live)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn userspace_check(
+    c: &dyn EarlyConsole,
+    frames: &mut mm::phys::FrameAllocator<'static, Cpu>,
+    live: Live,
+) -> Check {
+    let _ = (c, frames, live);
+    Check::Passed
+}
+
 /// Demand paging over a window of the live kernel space.
 pub fn demand_check(
     c: &dyn EarlyConsole,

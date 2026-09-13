@@ -651,6 +651,29 @@ fn leaf_level(va: usize) -> Option<u8> {
     }
 }
 
+/// The permission flags of the leaf mapping `va` in the live tables, or `None` if nothing
+/// maps it. For the user-copy pre-check: it needs USER and, for a write, WRITE.
+pub(crate) fn user_leaf_flags(va: usize) -> Option<PageFlags> {
+    let mut table = phys_to_ptr(Aarch64::root());
+    let mut level = <Aarch64 as HasMmu>::LEVELS - 1;
+    loop {
+        let index = level_index::<Aarch64>(va, level);
+        // SAFETY: as `leaf_level`.
+        let e = unsafe { read_entry(table, index) };
+        if !e.is_present() {
+            return None;
+        }
+        if e.is_leaf(level) {
+            return Some(e.flags(level));
+        }
+        if level == 0 {
+            return None;
+        }
+        table = phys_to_ptr(e.address());
+        level -= 1;
+    }
+}
+
 // --- bringing the MMU up --------------------------------------------------------
 
 /// `SCTLR_EL1.M`, `.C` and `.I`: translation, the data cache and the instruction cache.

@@ -99,6 +99,11 @@ pub struct Context {
     /// x30: where the switch returns to when this context is resumed.
     lr: u64,
     sp: u64,
+    /// For a thread that runs user code: the kernel stack its traps land on, and the root
+    /// of its address space. Both zero for a kernel-only thread, past the saved registers
+    /// so the assembly offsets (which stop at `sp`, 0x60) are unchanged.
+    pub(crate) user_kernel_stack: u64,
+    pub(crate) user_root: u64,
 }
 
 impl Context {
@@ -118,6 +123,8 @@ impl Context {
             fp: 0,
             lr: 0,
             sp: 0,
+            user_kernel_stack: 0,
+            user_root: 0,
         }
     }
 }

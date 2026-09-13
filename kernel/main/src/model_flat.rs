@@ -37,6 +37,11 @@ pub fn write_translation(c: &dyn EarlyConsole) {
     c.write_str("none (flat memory model)");
 }
 
+/// No userspace on a flat kernel: USERSPACE depends on MM_PAGED. Always `Passed`.
+pub fn userspace_check<F, L>(_c: &dyn EarlyConsole, _frames: F, _live: L) -> Check {
+    Check::Passed
+}
+
 /// The banner's `pagetable` line.
 pub fn paging_selftest(c: &dyn EarlyConsole) -> Check {
     c.write_str("skipped: no MMU, so there are no page tables");

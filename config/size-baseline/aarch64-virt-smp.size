@@ -1,32 +1,36 @@
 # kbuild size report for preset aarch64-virt-smp. Rewrite with `kbuild size --preset aarch64-virt-smp --update-baseline`.
-section .bss 126976
-section .data 76776
-section .rodata 16384
+section .bss 151552
+section .data 79048
+section .rodata 131072
 section .stack 16384
 section .stack_guard 4096
-section .text 172032
+section .text 212992
 section .thread_stacks 393216
-crate (anonymous) text 0 rodata 2051 data 0 bss 0
-crate (unmangled) text 6256 rodata 0 data 0 bss 32
+crate (anonymous) text 0 rodata 2229 data 0 bss 0
+crate (unmangled) text 6664 rodata 0 data 0 bss 32
 crate __rustc text 172 rodata 0 data 0 bss 0
-crate arch text 10384 rodata 0 data 1160 bss 65813
+crate abi text 1552 rodata 0 data 0 bss 0
+crate arch text 11420 rodata 0 data 1160 bss 65901
 crate bootinfo text 1544 rodata 0 data 0 bss 0
 crate buildid text 252 rodata 32 data 0 bss 0
 crate cmdline text 1448 rodata 0 data 0 bss 0
-crate core text 7308 rodata 0 data 0 bss 0
+crate core text 8024 rodata 0 data 0 bss 0
 crate device text 14512 rodata 0 data 0 bss 0
+crate elf text 2564 rodata 0 data 0 bss 0
 crate fdt text 7076 rodata 0 data 0 bss 0
 crate gic text 4152 rodata 0 data 0 bss 224
 crate hal text 592 rodata 0 data 0 bss 0
-crate kalloc text 12516 rodata 0 data 0 bss 0
-crate kintane text 46268 rodata 48 data 4220 bss 40160
-crate mm text 21380 rodata 0 data 0 bss 0
+crate ipc text 1688 rodata 16 data 0 bss 0
+crate kalloc text 12364 rodata 0 data 0 bss 0
+crate kintane text 63732 rodata 80 data 6492 bss 62868
+crate kobject text 2876 rodata 0 data 0 bss 0
+crate mm text 30212 rodata 0 data 0 bss 0
 crate pl011 text 1140 rodata 0 data 80 bss 24
 crate platform text 8936 rodata 32 data 70224 bss 1736
-crate sched text 960 rodata 0 data 0 bss 0
+crate sched text 3232 rodata 0 data 0 bss 0
 crate strip_suffix text 52 rodata 0 data 0 bss 0
-crate sync text 9608 rodata 32 data 1088 bss 2176
-crate thread text 3052 rodata 0 data 0 bss 0
+crate sync text 10136 rodata 32 data 1088 bss 2176
+crate thread text 8296 rodata 0 data 0 bss 0
 crate time text 2860 rodata 0 data 0 bss 0
 crate unwind text 2500 rodata 0 data 0 bss 0
-total 805864
+total 988360

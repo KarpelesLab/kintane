@@ -1,31 +1,36 @@
 # kbuild size report for preset x86_64-qemu. Rewrite with `kbuild size --preset x86_64-qemu --update-baseline`.
-section .bss 167936
-section .data 98336
+section .bss 188416
+section .data 116944
 section .note.kintane 36
-section .rodata 20440
+section .rodata 81880
 section .stack 16384
-section .text 200704
+section .text 270336
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 2162 data 0 bss 0
-crate (unmangled) text 1203 rodata 0 data 0 bss 0
+crate (anonymous) text 0 rodata 2231 data 0 bss 0
+crate (unmangled) text 2763 rodata 0 data 0 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
+crate abi text 2575 rodata 0 data 0 bss 0
 crate acpi text 5696 rodata 0 data 0 bss 0
-crate arch text 31714 rodata 0 data 361 bss 90393
-crate bootinfo text 1377 rodata 0 data 0 bss 0
+crate arch text 32376 rodata 0 data 361 bss 90497
+crate bootinfo text 2574 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
-crate core text 9560 rodata 0 data 0 bss 0
+crate core text 15320 rodata 3002 data 0 bss 0
 crate device text 17750 rodata 0 data 0 bss 0
+crate elf text 2383 rodata 0 data 0 bss 0
 crate hal text 531 rodata 0 data 0 bss 0
-crate kalloc text 13891 rodata 0 data 0 bss 0
-crate kintane text 49226 rodata 48 data 4220 bss 37799
-crate mm text 24994 rodata 0 data 0 bss 0
-crate multiboot text 444 rodata 0 data 0 bss 0
+crate ipc text 1513 rodata 16 data 0 bss 0
+crate kalloc text 13946 rodata 0 data 0 bss 0
+crate kintane text 67361 rodata 48 data 22828 bss 55728
+crate kobject text 2603 rodata 0 data 0 bss 0
+crate mm text 33710 rodata 0 data 0 bss 0
+crate module text 18553 rodata 0 data 0 bss 0
+crate multiboot text 604 rodata 0 data 0 bss 0
 crate platform text 16321 rodata 192 data 92624 bss 1672
-crate sched text 1300 rodata 0 data 0 bss 0
+crate sched text 3385 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
-crate sync text 8912 rodata 32 data 1088 bss 272
-crate thread text 3070 rodata 0 data 0 bss 0
+crate sync text 9345 rodata 32 data 1088 bss 272
+crate thread text 6694 rodata 0 data 0 bss 0
 crate time text 2782 rodata 0 data 0 bss 0
 crate unwind text 3206 rodata 0 data 0 bss 0
-total 765980
+total 936140

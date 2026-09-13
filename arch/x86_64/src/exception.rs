@@ -107,8 +107,61 @@ pub extern "x86-interrupt" fn page_fault(frame: InterruptFrame, code: u64) {
     if crate::paging::on_page_fault(cr2(), code) || crate::fault::route(cr2(), code) {
         return;
     }
+    if from_user(&frame) {
+        user_page_fault(cr2(), code, frame.rip);
+        return;
+    }
     fatal(Some(14), Some(code), &frame)
 }
+
+/// A fault whose saved CS is a ring-3 selector came from user code.
+fn from_user(frame: &InterruptFrame) -> bool {
+    frame.cs & 3 == 3
+}
+
+/// A page fault taken in ring 3: resolve it against the faulting process, or kill the
+/// process. Never returns to `fatal`, which would halt the whole kernel for one program.
+#[cfg(CONFIG_USERSPACE)]
+fn user_page_fault(cr2: u64, code: u64, rip: u64) {
+    use hal::fault::{Access, PageFault};
+    let access = if code & (1 << 4) != 0 {
+        Access::Execute
+    } else if code & (1 << 1) != 0 {
+        Access::Write
+    } else {
+        Access::Read
+    };
+    #[allow(clippy::as_conversions)]
+    let fault = PageFault {
+        addr: cr2 as usize,
+        access,
+    };
+    if crate::user::user_fault(fault) {
+        return;
+    }
+    crate::user::kill(hal::user::UserTrap::Page {
+        fault,
+        pc: rip as usize,
+    })
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+fn user_page_fault(_cr2: u64, _code: u64, _rip: u64) {}
+
+/// End the process if `frame` is a ring-3 exception; return otherwise. Diverges on a kill.
+#[cfg(CONFIG_USERSPACE)]
+fn kill_if_user(vector: Option<u8>, frame: &InterruptFrame) {
+    if frame.cs & 3 == 3 {
+        crate::user::kill(hal::user::UserTrap::Exception {
+            code: u64::from(vector.unwrap_or(0xff)),
+            pc: frame.rip as usize,
+        });
+    }
+}
+
+/// No userspace port: every exception is the kernel's.
+#[cfg(not(CONFIG_USERSPACE))]
+fn kill_if_user(_vector: Option<u8>, _frame: &InterruptFrame) {}
 
 /// Any other vector below 32 that does not push an error code.
 ///
@@ -138,6 +191,11 @@ pub extern "x86-interrupt" fn unexpected(frame: InterruptFrame) -> ! {
 /// and keeps the stack it needs small, which matters when the reason we got here is
 /// that something ran out of stack.
 fn fatal(vector: Option<u8>, code: Option<u64>, frame: &InterruptFrame) -> ! {
+    // An exception in ring 3 is the running process's problem, not the kernel's: end the
+    // process and let the kernel go on. `kill_if_user` diverges when it does; it is a no-op
+    // without a userspace port, or before a user handler is installed.
+    kill_if_user(vector, frame);
+
     let c: &dyn EarlyConsole = &EARLY;
 
     c.write_str("\n\n*** cpu exception ");

@@ -197,11 +197,11 @@ __exc_common:
 /// `repr(C)` and the offsets in the assembly above are one definition split across two
 /// languages; changing either without the other is silent memory corruption.
 #[repr(C)]
-struct TrapFrame {
+pub(crate) struct TrapFrame {
     /// `x0` through `x30`, indexed by register number.
-    x: [u64; 31],
+    pub(crate) x: [u64; 31],
     /// Address the exception will return to.
-    elr: u64,
+    pub(crate) elr: u64,
     /// Processor state to restore on return.
     spsr: u64,
     /// Syndrome — the reason for a synchronous exception.
@@ -219,6 +219,32 @@ const VEC_CURRENT_SPX_IRQ: u64 = 5;
 /// Vector index for "current EL with `SP_ELx`, synchronous": where a kernel page fault
 /// arrives.
 const VEC_CURRENT_SPX_SYNC: u64 = 4;
+
+/// Handle a synchronous exception from a lower EL (a system call or fault from EL0).
+/// Returns `true` if it took it. The two definitions keep the `cfg` at item level.
+///
+/// # Safety
+/// `frame` is the live exception frame.
+#[cfg(CONFIG_USERSPACE)]
+unsafe fn try_user_sync(index: u64, frame: *mut TrapFrame) -> bool {
+    // Vector 8 is "lower EL, AArch64, synchronous".
+    if index != 8 {
+        return false;
+    }
+    // SAFETY: forwarded; `frame` is live.
+    let (esr, far) = unsafe { ((*frame).esr, (*frame).far) };
+    unsafe { crate::user::on_lower_sync(esr, far, frame) };
+    true
+}
+
+/// No userspace port: nothing from a lower EL to take.
+///
+/// # Safety
+/// None; matches the userspace form's signature.
+#[cfg(not(CONFIG_USERSPACE))]
+unsafe fn try_user_sync(_index: u64, _frame: *mut TrapFrame) -> bool {
+    false
+}
 
 /// Install the vector table in `VBAR_EL1`.
 ///
@@ -255,6 +281,14 @@ pub unsafe fn install_vectors() {
 extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
     if index == VEC_CURRENT_SPX_IRQ {
         crate::irq::dispatch();
+        return;
+    }
+
+    // A synchronous exception from a lower EL (index 8) is a system call or a fault from a
+    // user process, handled without ever reaching the fatal path — which would halt the
+    // kernel for a program's mistake. `try_user_sync` is a no-op without a userspace port.
+    // SAFETY: `frame` is the live exception frame.
+    if unsafe { try_user_sync(index, frame) } {
         return;
     }
 

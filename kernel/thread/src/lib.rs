@@ -625,6 +625,21 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
         Ok(())
     }
 
+    /// The saved context of a thread that is not running, for architecture state beyond
+    /// the registers [`HasContextSwitch::init`] prepares: `hal::HasUserMode::bind` records
+    /// a user thread's kernel stack and address space here, before it first runs.
+    ///
+    /// Refused for the running thread, whose context is not saved and would be overwritten
+    /// by the next switch away from it.
+    pub fn context_mut(&mut self, id: ThreadId) -> Result<&mut A::Context, Error> {
+        let slot = self.slot_of_id(id)?;
+        match self.meta[slot].map(|m| m.state) {
+            Some(State::Running) => Err(Error::WrongState(State::Running)),
+            Some(_) => Ok(&mut self.contexts[slot]),
+            None => Err(Error::NoSuchThread),
+        }
+    }
+
     /// Free an exited thread's slot so it can be reused.
     ///
     /// Separate from `exit` because a thread cannot free the stack it is standing on;
@@ -1010,6 +1025,21 @@ mod tests {
         // `block` picks the head of the queue, which is the running thread itself.
         assert_eq!(block(&mut t), Err(Error::InvariantBroken));
         assert_eq!(SWITCHES.load(Ordering::SeqCst), before, "no self-switch was attempted");
+    }
+
+    #[test]
+    fn only_a_thread_that_is_not_running_exposes_its_context() {
+        let _serial = serial();
+        let mut t: Threads<MockFull, 8> = Threads::new(p(5));
+        let a = spawn(&mut t, 11, 4);
+        assert_eq!(t.context_mut(a).map(|c| c.tag), Ok(11), "a ready thread's context");
+        assert_eq!(
+            t.context_mut(ThreadId::new(0)).map(|_| ()),
+            Err(Error::WrongState(State::Running)),
+            "the running thread's context is not saved, so it must not be edited"
+        );
+        assert_eq!(t.context_mut(ThreadId::new(99)).map(|_| ()), Err(Error::NoSuchThread));
+        t.check().unwrap();
     }
 
     #[test]

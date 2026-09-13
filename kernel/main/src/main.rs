@@ -44,6 +44,9 @@ mod stress;
 #[path = "stress_off.rs"]
 mod stress;
 mod timekeeping;
+// The native userspace slice: only on a paged kernel with a userspace port.
+#[cfg(CONFIG_USERSPACE)]
+mod userproc;
 
 // The memory model's part of bring-up: the kernel address space, demand paging and the
 // test modes that need a guard page on a paged kernel; the flat region allocator on one
@@ -494,6 +497,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(heap::bring_up(c, &mut frames, &regions[..n]))
         .and(model::demand_check(c, &mut frames, live))
         .and(model::module_check(c, &mut frames, live, boot_arg))
+        .and(model::userspace_check(c, &mut frames, live))
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(stress::reserve(c, &mut frames, &regions[..n], live));
     (space, live)
