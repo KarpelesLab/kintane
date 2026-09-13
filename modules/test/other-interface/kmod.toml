@@ -1,0 +1,13 @@
+# A module built against an interface where one function's signature differs from the
+# kernel's. The boot check requires the loader to refuse it and name the function.
+[unit]
+name = "test-other-interface"
+kind = "module"
+root = "src/lib.rs"
+layer = "subsystem"
+
+[deps]
+units = ["module"]
+
+[config]
+requires = "MODULE_TEST"

@@ -130,6 +130,7 @@ fn build_loader(
         opt_level: "s".into(),
         link_script: Some(dir.join("loader/link.ld")),
         deny_warnings: true,
+        bitcode: false,
         verbose,
     };
 
@@ -194,6 +195,7 @@ fn build_loader(
         check_cfgs: Vec::new(),
         opt_level: "s".into(),
         deny_warnings: true,
+        bitcode: false,
         verbose,
     };
     let chaintest = Unit {

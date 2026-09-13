@@ -281,12 +281,20 @@ fn x86_boot_media(res: &Resolution, image: &Path) -> Vec<String> {
     } else {
         // QEMU's multiboot loader passes this after the image's file name, as GRUB would;
         // `boot/info-multiboot` drops that leading path.
-        vec![
+        let mut args = vec![
             "-kernel".into(),
             image.display().to_string(),
             "-append".into(),
             crate::bootcfg::kernel_command_line(res),
-        ]
+        ];
+        // The module bundle, as a multiboot boot module: QEMU loads it into guest memory
+        // and lists it in the handover, the way GRUB does with a `module` line.
+        let bundle = image.with_file_name(crate::modules::BUNDLE);
+        if res.is_on("MODULES") && bundle.exists() {
+            args.push("-initrd".into());
+            args.push(bundle.display().to_string());
+        }
+        args
     }
 }
 

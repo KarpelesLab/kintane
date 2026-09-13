@@ -107,10 +107,14 @@ that changes a verdict has a test that fails if the rule is removed.
   Kconfig it is a warning, and the result is a symbol that is on without what it needs.
   Only `bool` and `tristate` symbols can be selected, never a choice member: a choice
   already decides its member.
-- **`tristate` and modules.** `m` is meaningful only while `MODULES` is `y`, and no
-  `.kcfg` declares `MODULES` yet, because the loader is Phase 4 work.
-  - Asking for `m` (preset, `--set` or `menuconfig`) is an error that says modules do not
-    exist. A module quietly becoming built-in code is not what was asked for.
+- **`tristate` and modules.** `m` is meaningful only while `MODULES` is `y`, which today
+  means an x86-64 kernel with `MM_PAGED`; see [modules.md](modules.md#as-built).
+  - Asking for `m` while `MODULES` is not `y` (preset, `--set` or `menuconfig`) is an error
+    naming why. A module quietly becoming built-in code is not what was asked for.
+  - With `MODULES=y`, an `m` enables exactly the units of kind `module` it gates. A library
+    unit enabled by `m` is an error (it would be linked in as `y`), and so is a module unit
+    whose condition is `y` (it cannot be linked in at all). A tristate that should only ever
+    be a module caps itself with `depends on ... && m`, as `MODULE_TEST` does.
   - `default m`, or a `select` from an `m` symbol, is built in. The recorded reason says
     so ("it would be m (...), and MODULES is not y").
   - `depends on` limits a tristate to its condition's value: a driver on an `m` bus can
@@ -247,6 +251,11 @@ level = "core"
 once per unit with explicit `--extern` paths. No transitive dependency is visible
 unless declared.
 
+A unit's `kind` is `lib`, `bin` (the kernel image, or an image for a target of its own),
+or `module`: a loadable module, built after the kernel against its configuration, into a
+relocatable object the kernel loads at run time. A module links only units at `core` or
+below, and nothing links a module. See [modules.md](modules.md#as-built).
+
 ### Building `core`
 
 Every target builds `core` (and `compiler_builtins`) from the pinned toolchain's
@@ -303,7 +312,7 @@ kbuild menuconfig [--preset P]            interactive configuration; saves menuc
 kbuild randconfig-build --count K --seed S  build sampled configurations, report each failure
 kbuild randconfig-build --allyes|--allno  build every preset's boundary configuration
 kbuild build [--target T]                 build the kernel image
-kbuild modules                            build loadable modules
+kbuild modules [--preset P]               build the kernel, its modules, and the bundle
 kbuild image [--format elf|bin|uki|uimage]  package a bootable artifact
 kbuild symbols                            extract the separate debug-symbol bundle
 kbuild symbolize [--preset P] [log]       decode a guest backtrace against the symbol bundle
@@ -315,7 +324,7 @@ kbuild stress --duration 10m              run the stress image, killing it if it
 kbuild size --preset P [--compare REF|FILE] [--save FILE] [--update-baseline]
                                           sections and per-crate sizes, against the preset's
                                           SIZE_BUDGET_KIB and a baseline report
-kbuild sdk                                produce a module SDK for this config
+kbuild sdk [--preset P]                   build, then write the module SDK to build/<target>/sdk
 ```
 
 ## Toolchain policy
@@ -460,6 +469,12 @@ The release packaging above is ahead of the code. What `kbuild build` writes to
   `build/x86_64-kintane/x86_64-unknown-uefi/kinboot_efi.efi` — `KINTANE/BOOT.CFG`, the boot
   entries, and `KINTANE/KERNEL.ELF`, the stripped ELF64. The ELF64 rather than the ELF32:
   the loader enters in long mode. With `CHAIN_TEST` it also holds `EFI/KINTANE/CHAIN.EFI`.
+
+- With `MODULES` and at least one module unit at `m`: `modules/<name>.kmod`, one
+  relocatable object per module, and `modules.kmb`, the bundle that carries them. A
+  `-kernel` boot passes the bundle with `-initrd`. The modules' own builds, compiled with
+  bitcode, are under `build/<target>/modules/`, one directory per configuration they were
+  built against. See [modules.md](modules.md#building-one).
 
 Both disk images carry the same boot entries, written by `kbuild/src/bootcfg.rs` from
 `CMDLINE`, `BOOT_MODE`, `BOOT_MENU_TIMEOUT` and `CHAIN_TEST`. A `-kernel` boot gets the

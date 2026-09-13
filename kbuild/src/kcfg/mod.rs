@@ -193,8 +193,7 @@ pub struct Menu {
 }
 
 /// The symbol that switches loadable modules on. A `tristate` may resolve to `m` only
-/// while this is `y`. No `.kcfg` declares it yet, because the module loader is Phase 4
-/// work, so today every `m` is either refused or built in; see `resolve`.
+/// while this is `y`; otherwise every `m` is either refused or built in, see `resolve`.
 pub const MODULES: &str = "MODULES";
 
 #[derive(Debug, Default)]

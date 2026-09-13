@@ -30,6 +30,11 @@ pub struct Build {
     pub link_script: Option<PathBuf>,
     /// Kernel units only; `core` is the toolchain's code and its warnings are not ours.
     pub deny_warnings: bool,
+    /// Keep LLVM bitcode in every rlib. Module builds need it: a module is linked with
+    /// link-time optimisation, which reads the bitcode of `core` and of every crate the
+    /// module uses, so that only the code the module reaches ends up in it. The kernel
+    /// does not, and bitcode would only make its rlibs larger.
+    pub bitcode: bool,
     pub verbose: bool,
 }
 
@@ -99,7 +104,11 @@ impl Build {
             "-C".into(),
             "force-frame-pointers=yes".into(),
             "-C".into(),
-            "embed-bitcode=no".into(),
+            if self.bitcode {
+                "embed-bitcode=yes".into()
+            } else {
+                "embed-bitcode=no".into()
+            },
         ];
         // No build directory in the binary: same source must produce the same bytes
         // on any machine. See docs/build-system.md#reproducibility.
@@ -171,25 +180,40 @@ impl Build {
         Ok(Built { path: dest, key })
     }
 
-    /// Build one unit against already-built dependencies.
-    pub fn build_unit(&self, unit: &Unit, deps: &BTreeMap<String, Built>) -> Result<Built, String> {
+    /// Every argument rustc is given for `unit`, except the output path. `kbuild sdk`
+    /// writes these into its module build script, so a module built from the SDK is built
+    /// exactly as one built in the tree.
+    pub fn unit_args(
+        &self,
+        unit: &Unit,
+        deps: &BTreeMap<String, Built>,
+    ) -> Result<Vec<String>, String> {
         let crate_name = unit.name.replace('-', "_");
-        let filename = match unit.kind {
-            Kind::Lib => format!("lib{crate_name}.rlib"),
-            Kind::Bin => format!("{crate_name}.{}", self.target.image_extension()),
-        };
-        let dest = self.out.join(&filename);
-
         let mut args = self.common();
         args.extend([
             "--crate-type".into(),
             match unit.kind {
                 Kind::Lib => "rlib".into(),
                 Kind::Bin => "bin".into(),
+                // A static library, so rustc links the module's crate with everything it
+                // uses from `core` and its dependencies; fat LTO in one codegen unit, so that
+                // is only what the module reaches. `modules.rs` turns the archive into one
+                // relocatable object.
+                Kind::Module => "staticlib".into(),
             },
             "--crate-name".into(),
             crate_name.clone(),
         ]);
+        if unit.kind == Kind::Module {
+            for flag in ["lto=fat", "codegen-units=1"] {
+                args.push("-C".into());
+                args.push(flag.into());
+            }
+            // A module's own sources are named by module, not by where they were built, so
+            // one built from the SDK outside the tree has the same bytes as one built in it.
+            args.push("--remap-path-prefix".into());
+            args.push(format!("{}=/module/{}", unit.dir.display(), unit.name));
+        }
 
         for c in &self.cfgs {
             args.push("--cfg".into());
@@ -250,6 +274,20 @@ impl Build {
 
         args.extend(unit.rustflags.iter().map(|f| self.expand(f)));
         args.push(unit.root_path().display().to_string());
+        Ok(args)
+    }
+
+    /// Build one unit against already-built dependencies.
+    pub fn build_unit(&self, unit: &Unit, deps: &BTreeMap<String, Built>) -> Result<Built, String> {
+        let crate_name = unit.name.replace('-', "_");
+        let filename = match unit.kind {
+            Kind::Lib => format!("lib{crate_name}.rlib"),
+            Kind::Bin => format!("{crate_name}.{}", self.target.image_extension()),
+            Kind::Module => format!("lib{crate_name}.a"),
+        };
+        let dest = self.out.join(&filename);
+
+        let mut args = self.unit_args(unit, deps)?;
 
         let mut kb = KeyBuilder::new(&self.tc.identity());
         kb.field("unit", &unit.name)

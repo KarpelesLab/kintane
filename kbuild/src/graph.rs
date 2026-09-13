@@ -32,12 +32,16 @@ pub fn layer_rank(name: &str) -> Option<usize> {
     LAYERS.iter().position(|l| *l == name)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Compiled to an rlib and linked into something else.
     Lib,
     /// The final linked kernel image.
     Bin,
+    /// A loadable module: built after the kernel, against its configuration, into a
+    /// relocatable object the kernel loads at run time. Enabled only by a tristate at `m`;
+    /// see `plan` and `kbuild/src/modules.rs`.
+    Module,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +127,7 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
     {
         "lib" => Kind::Lib,
         "bin" => Kind::Bin,
+        "module" => Kind::Module,
         other => return Err(at(&format!("unknown unit kind `{other}`"))),
     };
 
@@ -156,6 +161,9 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
         .get_path("unit.target")
         .and_then(|x| x.as_str())
         .map(String::from);
+    if kind == Kind::Module && requires.is_none() {
+        return Err(at("a module unit needs `config.requires`: the tristate whose `m` builds it"));
+    }
     if target.is_some() && kind != Kind::Bin {
         return Err(at("`unit.target` is for images; a library is built for whoever links it"));
     }
@@ -181,15 +189,42 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
 /// Drop units the configuration excludes, check dependencies and layering, and
 /// return the units in an order where every dependency precedes its dependents.
 pub fn plan(units: Vec<Unit>, res: &Resolution) -> Result<Vec<Unit>, String> {
-    let active: Vec<Unit> = units
-        .into_iter()
-        .filter(|u| {
-            u.requires
-                .as_ref()
-                .map(|e| e.eval(&|n| res.tri(n), &|n| literal(res, n)) != Tri::N)
-                .unwrap_or(true)
-        })
-        .collect();
+    let mut active: Vec<Unit> = Vec::new();
+    for u in units {
+        let level = u
+            .requires
+            .as_ref()
+            .map(|e| e.eval(&|n| res.tri(n), &|n| literal(res, n)))
+            .unwrap_or(Tri::Y);
+        // `m` means "a loadable module", so it enables exactly the units that can be one.
+        // A library at `m` would be linked in as though it were `y`, which is not what was
+        // asked for; a module at `y` has no way to be linked into the image at all.
+        match (u.kind, level) {
+            (_, Tri::N) => continue,
+            (Kind::Module, Tri::M) => {}
+            (Kind::Module, _) => {
+                return Err(format!(
+                    "`{}` can only be built as a loadable module, but its condition is y\n  \
+                     declared at {}\n  \
+                     set the tristate in its `config.requires` to m",
+                    u.name,
+                    u.manifest.display()
+                ));
+            }
+            (_, Tri::M) => {
+                return Err(format!(
+                    "`{}` is enabled by an m, but a {} unit cannot be a loadable module\n  \
+                     declared at {}\n  \
+                     set the tristate in its `config.requires` to y to build it in",
+                    u.name,
+                    if u.kind == Kind::Bin { "bin" } else { "lib" },
+                    u.manifest.display()
+                ));
+            }
+            _ => {}
+        }
+        active.push(u);
+    }
 
     // Exactly one provider per name must survive configuration.
     let mut seen: BTreeMap<&str, &Unit> = BTreeMap::new();
@@ -240,6 +275,32 @@ pub fn plan(units: Vec<Unit>, res: &Resolution) -> Result<Vec<Unit>, String> {
                     u.name,
                     dep.name,
                     dep.target.as_deref().unwrap_or_default(),
+                    u.manifest.display()
+                ));
+            }
+            // A module is loaded at run time; nothing can link against it. And a module
+            // reaches the kernel only through the module interface, so it may not link a
+            // copy of the kernel's own crates that hold state: nothing at `arch` or above
+            // `core`, where a second copy would be a second, unrelated instance.
+            if dep.kind == Kind::Module {
+                return Err(format!(
+                    "`{}` depends on `{}`, a loadable module, which nothing links against\n  \
+                     declared at {}",
+                    u.name,
+                    dep.name,
+                    u.manifest.display()
+                ));
+            }
+            if u.kind == Kind::Module
+                && (drank > layer_rank("core").unwrap_or(0) || dep.layer == "arch")
+            {
+                return Err(format!(
+                    "module `{}` depends on `{}` ({}); a module links only units at `core` \
+                     or below, and reaches the kernel through its module interface\n  \
+                     declared at {}",
+                    u.name,
+                    dep.name,
+                    dep.layer,
                     u.manifest.display()
                 ));
             }
@@ -439,6 +500,54 @@ mod tests {
         let units = vec![unit("a", "core", &["nope"])];
         let e = plan(units, &Resolution::default()).unwrap_err();
         assert!(e.contains("not in this configuration"), "{e}");
+    }
+
+    fn tri(values: &[(&str, Tri)]) -> Resolution {
+        let mut r = Resolution::default();
+        for (k, v) in values {
+            r.values.insert(k.to_string(), crate::kcfg::Val::Tri(*v));
+        }
+        r
+    }
+
+    #[test]
+    fn m_enables_exactly_the_units_that_can_be_modules() {
+        let mut module = unit("hello", "subsystem", &["api"]);
+        module.kind = Kind::Module;
+        module.requires = Some(expr::parse("HELLO").unwrap());
+        let units = || vec![module.clone(), unit("api", "core", &[])];
+
+        let ordered = plan(units(), &tri(&[("HELLO", Tri::M)])).unwrap();
+        assert!(ordered.iter().any(|u| u.name == "hello"));
+        assert!(
+            plan(units(), &tri(&[("HELLO", Tri::N)]))
+                .unwrap()
+                .iter()
+                .all(|u| u.name != "hello")
+        );
+        let e = plan(units(), &tri(&[("HELLO", Tri::Y)])).unwrap_err();
+        assert!(e.contains("can only be built as a loadable module"), "{e}");
+
+        let mut lib = unit("driver", "device", &[]);
+        lib.requires = Some(expr::parse("DRIVER").unwrap());
+        let e = plan(vec![lib], &tri(&[("DRIVER", Tri::M)])).unwrap_err();
+        assert!(e.contains("a lib unit cannot be a loadable module"), "{e}");
+    }
+
+    #[test]
+    fn nothing_links_a_module_and_a_module_links_nothing_above_core() {
+        let mut module = unit("hello", "subsystem", &[]);
+        module.kind = Kind::Module;
+        module.requires = Some(expr::parse("HELLO").unwrap());
+        let res = tri(&[("HELLO", Tri::M)]);
+
+        let e = plan(vec![module.clone(), unit("kernel", "kernel", &["hello"])], &res).unwrap_err();
+        assert!(e.contains("which nothing links against"), "{e}");
+
+        let mut greedy = module;
+        greedy.deps.push("sched".into());
+        let e = plan(vec![greedy, unit("sched", "subsystem", &[])], &res).unwrap_err();
+        assert!(e.contains("a module links only units at `core` or below"), "{e}");
     }
 
     #[test]

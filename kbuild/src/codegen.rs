@@ -21,7 +21,32 @@ pub struct Generated {
     pub check_cfgs: Vec<String>,
 }
 
-pub fn emit(table: &SymbolTable, res: &Resolution, gen_dir: &Path) -> Result<Generated, String> {
+/// The build identity a module must match to load into this kernel: the toolchain, the
+/// target specification and every configuration symbol's value, as text, so a refusal can
+/// name what differs. The format is `kernel/module/src/identity.rs`'s.
+pub fn identity_text(
+    table: &SymbolTable,
+    res: &Resolution,
+    toolchain: &str,
+    target: &str,
+) -> String {
+    let mut out =
+        format!("kintane-module-identity 1\ntoolchain {toolchain}\ntarget {target}\nconfig\n");
+    for name in &table.order {
+        out.push_str(&format!("{name}={}\n", res.values[name].display()));
+    }
+    out
+}
+
+/// `identity` is [`identity_text`] for this build. It is written into `config.rs` as
+/// `MODULE_IDENTITY` and its hash as `MODULE_IDENTITY_HASH`, which cost nothing in an image
+/// that does not read them.
+pub fn emit(
+    table: &SymbolTable,
+    res: &Resolution,
+    gen_dir: &Path,
+    identity: &str,
+) -> Result<Generated, String> {
     std::fs::create_dir_all(gen_dir).map_err(|e| format!("{}: {e}", gen_dir.display()))?;
 
     let mut out = String::new();
@@ -107,6 +132,14 @@ pub fn emit(table: &SymbolTable, res: &Resolution, gen_dir: &Path) -> Result<Gen
          pub const fn builtin(self) -> bool {\n        \
          matches!(self, Tristate::Builtin)\n    }\n}\n",
     );
+
+    out.push_str(&format!(
+        "\n/// This build's identity; see `kbuild/src/codegen.rs`, `identity_text`.\n\
+         pub const MODULE_IDENTITY: &str = {identity:?};\n\
+         /// SHA-256 of [`MODULE_IDENTITY`].\n\
+         pub const MODULE_IDENTITY_HASH: [u8; 32] = {:?};\n",
+        crate::sha256::digest(identity.as_bytes())
+    ));
 
     let config_rs = gen_dir.join("config.rs");
     write_if_changed(&config_rs, &out)?;

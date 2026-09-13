@@ -368,6 +368,33 @@ config STRESS_SEED
         so a failing run can be replayed with the same sequence of decisions.
         Thread interleaving still depends on timing, which no seed controls.
 
+config MODULES
+    bool "Loadable modules"
+    depends on ARCH_X86_64 && MM_PAGED
+    default y
+    help
+        Build the module loader into the kernel, and let a tristate be m:
+        a unit of kind `module` enabled by it is built as a relocatable
+        object for this kernel build alone, and loaded at run time. See
+        docs/modules.md.
+
+        x86-64 only for now. The loader's relocation code covers AArch64
+        too, but an AArch64 module's calls into the kernel need veneers or
+        a load address within 128 MiB of the image, and neither exists yet.
+
+config MODULE_TEST
+    tristate "Load, call and unload test modules at boot"
+    depends on MODULES && QEMU_EXIT && m
+    default m
+    help
+        Build the test modules under modules/test, pass them to the kernel
+        in a module bundle, and gate the boot on the kernel loading one,
+        calling through it, refusing to unload it while it is referenced,
+        unloading it with every frame given back, and refusing the two that
+        were built for another configuration and another interface.
+
+        Capped at m by its dependency: these are modules or nothing.
+
 # Crash on purpose once boot has finished, from a known nested function, so the
 # crash report can be checked end to end: the kernel prints raw return addresses,
 # and `kbuild symbolize` must name the function. A backtrace is only ever needed

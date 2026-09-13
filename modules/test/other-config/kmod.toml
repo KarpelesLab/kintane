@@ -1,0 +1,20 @@
+# A module built for a configuration that differs from the kernel's in one symbol. The boot
+# check requires the loader to refuse it and to name that symbol.
+[unit]
+name = "test-other-config"
+kind = "module"
+root = "src/lib.rs"
+layer = "subsystem"
+
+[deps]
+units = ["module"]
+
+[config]
+requires = "MODULE_TEST"
+
+# Built against the kernel's configuration with these values changed, and stamped with that
+# configuration's identity. A test facility: a real module is built for the kernel it loads
+# into. `!` is the opposite of the kernel's value, so the module differs from a debug
+# kernel and from a release one alike.
+[module]
+config-overrides = ["DEBUG_BUILD=!"]

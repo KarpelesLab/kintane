@@ -5,12 +5,13 @@
 //! for it, so `.config` plus a source tree is a reproducible build, and so a conflict
 //! can be explained as a chain rather than as "cannot satisfy constraints".
 //!
-//! # Tristates, before modules exist
+//! # Tristates, with and without modules
 //!
 //! A `tristate` is `n`, `m` (built as a loadable module) or `y` (built in). `m` is
-//! only meaningful while [`MODULES`] is `y`, and today no `.kcfg` declares `MODULES`,
-//! because the module loader does not exist yet. The rules are the ones that keep a
-//! configuration honest in the meantime:
+//! only meaningful while [`MODULES`] is `y`, which `config/main.kcfg` allows on x86-64
+//! with `MM_PAGED`. Everywhere else the rules are the ones that keep a configuration
+//! honest without modules. Which units an `m` builds, and what it may not build, is the
+//! crate graph's decision (`graph::plan`), since only it knows which units are modules.
 //!
 //! - **Asking for `m`** — in a preset, `--set` or `menuconfig` — is an error while modules are off.
 //!   A module that silently became built-in code is not what was asked for, and on a small target

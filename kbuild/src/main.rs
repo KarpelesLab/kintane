@@ -16,6 +16,7 @@ mod hosttest;
 mod kcfg;
 mod lint;
 mod menuconfig;
+mod modules;
 mod portable;
 mod qemu;
 mod randconfig;
@@ -55,6 +56,10 @@ COMMANDS:
     portability          compile the hardware-independent units for machines
                          without a port yet (no atomics, no 64-bit atomics, no MMU)
     run                  build, then boot under QEMU
+    modules              build the kernel and its loadable modules, and the bundle
+                         that carries them to it
+    sdk                  build, then write the module SDK for this kernel build to
+                         build/<target>/sdk
     stress --duration <len>
                          build a stress image and run it for <len> of guest time
                          (e.g. 90s, 10m, 24h), failing if its heartbeat stops
@@ -116,6 +121,8 @@ struct Opts {
     update_baseline: bool,
     /// `stress`: seconds of guest time to run for.
     duration: Option<u64>,
+    /// `sdk`: write the module SDK after building.
+    sdk: bool,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -134,6 +141,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         save: None,
         update_baseline: false,
         duration: None,
+        sdk: false,
     };
     let mut random = false;
     let mut seed: Option<u64> = None;
@@ -249,7 +257,12 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             println!("  written to {}", root.join(".config").display());
             Ok(())
         }
-        "build" => do_build(&root, &opts).map(|_| ()),
+        "build" | "modules" => do_build(&root, &opts).map(|_| ()),
+        "sdk" => {
+            let mut sopts = opts.clone();
+            sopts.sdk = true;
+            do_build(&root, &sopts).map(|_| ())
+        }
         "menuconfig" => menuconfig::run(&root, &opts),
         "randconfig-build" => randconfig::run(&root, &opts),
         "size" => size::run(&root, &opts),
@@ -284,7 +297,8 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             let mut topts = opts.clone();
             topts.sets.push(("MOCK_ARCH".into(), "y".into()));
             let (table, res) = configure(&root, &topts)?;
-            let generated = codegen::emit(&table, &res, &root.join("build/host/gen"))?;
+            let identity = codegen::identity_text(&table, &res, &tc.identity(), "host");
+            let generated = codegen::emit(&table, &res, &root.join("build/host/gen"), &identity)?;
             let ordered = graph::plan(graph::discover(&root)?, &res)?;
             let s = hosttest::run(
                 &root,
@@ -461,6 +475,7 @@ fn build_foreign_image(
         opt_level: kernel.opt_level.clone(),
         link_script: None,
         deny_warnings: false,
+        bitcode: false,
         verbose: kernel.verbose,
     };
     println!("\x1b[36mbuilding\x1b[0m {} for {triple}", unit.name);
@@ -692,7 +707,15 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     let gen_dir = build_dir.join("gen");
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
 
-    let generated = codegen::emit(&table, &res, &gen_dir)?;
+    let identity = codegen::identity_text(
+        &table,
+        &res,
+        &tc.identity(),
+        &sha256::hex(&sha256::digest(
+            &std::fs::read(&target_json).map_err(|e| format!("{}: {e}", target_json.display()))?,
+        )),
+    );
+    let generated = codegen::emit(&table, &res, &gen_dir, &identity)?;
 
     let b = build::Build {
         root: root.to_path_buf(),
@@ -714,6 +737,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
             (!s.is_empty()).then(|| root.join(s))
         },
         deny_warnings: false,
+        bitcode: false,
         verbose: opts.verbose,
     };
 
@@ -745,8 +769,12 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
 
     let mut image = None;
     for unit in &ordered {
-        // Units with a target of their own are separate images, built below.
-        if built.contains_key(&unit.name) || unit.target.is_some() {
+        // Units with a target of their own are separate images, and modules are built
+        // against the finished configuration afterwards; both below.
+        if built.contains_key(&unit.name)
+            || unit.target.is_some()
+            || unit.kind == graph::Kind::Module
+        {
             continue;
         }
         let b2 = b.build_unit(unit, &built)?;
@@ -782,6 +810,37 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     } else {
         image
     };
+    // A module asking for another configuration gets this one with its overrides on top.
+    // A `--set` the overridden configuration cannot honour is dropped for that build only:
+    // `LOCKDEP_ABBA_TEST=y` needs the lock checking a module built for `DEBUG_BUILD=n` does
+    // not have. The module still differs from the kernel at the symbol it overrode.
+    let resolve = |extra: &[(String, String)]| {
+        let mut o = opts.clone();
+        o.sets.extend(extra.iter().cloned());
+        loop {
+            match resolve_config(root, &o) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    let refused = o.sets.iter().position(|(k, v)| {
+                        !extra.iter().any(|(ek, _)| ek == k)
+                            && e.contains(&format!("cannot set {k}={v}"))
+                    });
+                    match refused {
+                        Some(i) => {
+                            o.sets.remove(i);
+                        }
+                        None => return Err(e),
+                    }
+                }
+            }
+        }
+    };
+    let target_json = root.join("targets").join(format!("{target_name}.json"));
+    modules::build_all(&b, &table, &res, &target_json, &ordered, &resolve)?;
+    if opts.sdk {
+        let dest = root.join("build").join(&target_name).join("sdk");
+        modules::write_sdk(&b, &table, &res, &target_json, &ordered, &dest)?;
+    }
     let size = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
     println!("  linked  {}", linked.display());
     println!("  symbols {}", symbols.display());

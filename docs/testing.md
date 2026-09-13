@@ -203,6 +203,47 @@ Each verdict was falsified by a mutation confirmed to have applied:
 | kbuild writes a different entry title | kbuild's pinned-fixture tests fail |
 | The parser renames `chain-partition` | four `kinboot-menu` tests fail, the pinned fixture among them |
 
+### Loadable modules
+
+With `MODULE_TEST=m`, the default on x86-64 test builds, kbuild builds the three modules
+under `modules/test` and the bundle that carries them, and a `-kernel` boot passes the
+bundle as a multiboot boot module. The boot then gates on the `modules` line
+([modules.md](modules.md#the-boot-check)):
+
+```
+  modules    3 in the bundle at 0x00000000001ca000
+             test-roundtrip:
+             [test-roundtrip: init]
+             loaded at 0x0000000060000000, 9 relocations, W^X sealed; 42, 72; unload refused while referenced
+             [test-roundtrip: exit]; unloaded
+             0 frames left
+             test-other-config: refused, built with DEBUG_BUILD=n, kernel has y
+             test-other-interface: refused, kt_register_callback is not the kernel's interface ok
+```
+
+The loader's steps are host-tested in `kernel/module`:
+
+- objects built byte by byte;
+- a real module kbuild built, in `kernel/module/testdata`;
+- every byte of a module corrupted three ways, and every truncation, all without a panic.
+
+Each property the boot claims was falsified: the mutation was applied and checked, the
+check failed, and the mutation was restored and compared byte for byte.
+
+| Mutation | What caught it |
+|---|---|
+| `R_X86_64_32` not written | host test; the boot faulted on a null string pointer |
+| unloading ignores references | host test; `UNLOAD NOT REFUSED WHILE REFERENCED` |
+| identity not compared | host test; `test-other-config: LOADED, and must not have` |
+| interface hashes not compared | host test; `test-other-interface: LOADED` |
+| the module list not carved from the memory map | `NO MODULE BUNDLE, though this handover carries one` |
+| unloading does not free frames | `3 frames left` |
+| text sealed writable | `the live tables did not take the module's protections` |
+
+The SDK is checked the same way. CI builds it, copies the round-trip module's source
+outside the tree, builds it with the SDK's `build-module.sh`, and requires the result to
+be byte-identical to the module kbuild built in the tree.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

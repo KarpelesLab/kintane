@@ -133,6 +133,31 @@ impl Handover {
         }
     }
 
+    /// Boot module `index` as `[start, end)` physical addresses, if the loader passed that
+    /// many. A module whose end precedes its start is not returned.
+    ///
+    /// # Safety
+    /// The loader's module list must still be mapped.
+    pub unsafe fn module(&self, index: u32) -> Option<(u32, u32)> {
+        // Bounded: more modules than this is not a handover we believe.
+        const MAX: u32 = 64;
+        if index >= self.module_count().min(MAX) || self.info.mods_addr == 0 {
+            return None;
+        }
+        let at = self.info.mods_addr as usize + index as usize * 16;
+        // SAFETY: the caller guarantees the list is mapped; `index` is below the count the
+        // loader gave, so the 16-byte entry is inside it.
+        let entry = unsafe { core::ptr::read_unaligned(at as *const [u32; 4]) };
+        (entry[1] >= entry[0]).then_some((entry[0], entry[1]))
+    }
+
+    /// Where the loader's module list is, as `[start, end)`, when it passed any modules.
+    pub fn module_list(&self) -> Option<(u32, u32)> {
+        let count = self.module_count().min(64);
+        (count > 0 && self.info.mods_addr != 0)
+            .then(|| (self.info.mods_addr, self.info.mods_addr.saturating_add(count * 16)))
+    }
+
     /// The command line, if the loader supplied one and it is valid UTF-8.
     ///
     /// # Safety
