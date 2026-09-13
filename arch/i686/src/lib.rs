@@ -137,6 +137,9 @@ impl HasMmu for I686 {
 }
 
 impl HasSmp for I686 {
+    // One until the APIC driver brings up a second CPU; see `cpu_id`.
+    const MAX_CPUS: usize = 1;
+
     fn cpu_id() -> u32 {
         // Placeholder until the APIC driver exists in Phase 3. Correct for the
         // uniprocessor Phase 0 build and wrong for any other, which is why SMP is

@@ -57,6 +57,10 @@ impl Arch for MockFull {
     fn halt() -> ! {
         panic!("MockFull::halt() — a host test asked the machine to stop");
     }
+
+    fn cpu_index() -> usize {
+        MOCK_CPU.with(|c| c.get())
+    }
 }
 
 impl HasMmu for MockFull {
@@ -65,9 +69,30 @@ impl HasMmu for MockFull {
 }
 
 impl HasSmp for MockFull {
+    const MAX_CPUS: usize = MOCK_CPUS;
+
     fn cpu_id() -> u32 {
-        0
+        Self::cpu_index() as u32
     }
+}
+
+/// CPUs `MockFull` claims to have. A test plays one of them with [`set_cpu`].
+pub const MOCK_CPUS: usize = 4;
+
+extern crate std;
+
+std::thread_local! {
+    /// Which of `MockFull`'s CPUs the current host thread is playing. A host thread is
+    /// what a CPU is to the tests, so this is per thread rather than a shared static, and
+    /// tests running in parallel cannot see each other's choice.
+    static MOCK_CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Make the current host thread run as `MockFull` CPU `cpu`. Indices at or above
+/// [`MOCK_CPUS`] are accepted, so a test can check what code does with a CPU its storage
+/// has no slot for.
+pub fn set_cpu(cpu: usize) {
+    MOCK_CPU.with(|c| c.set(cpu));
 }
 
 impl HasCas for MockFull {}

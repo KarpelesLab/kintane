@@ -181,6 +181,7 @@ hand:
 | i686 (`i686-qemu`) | `qemu-system-i386` | `pc` (i440FX) | `-kernel` | `isa-debug-exit` |
 | i686 (`i686-bios`) | `qemu-system-i386` | `pc` (i440FX), raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
+| aarch64 (`aarch64-virt-smp`) | `qemu-system-aarch64` | `virt`, `-smp 4` | `-kernel`, secondaries through PSCI | semihosting |
 | armv7m | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none | semihosting |
 | riscv32 | `qemu-system-riscv32` | `virt` | `-bios none` | `sifive_test` |
 
@@ -197,6 +198,13 @@ The `x86_64-qemu` preset boots the same kernel with `-kernel` and stays the fast
 for everyday work. The two differ only in how the kernel is entered and where its
 memory map comes from, and a kernel built for the loader fails its boot check if the
 handover is missing — a lost `rdi` must not read as "no memory map on this port".
+
+The `aarch64-virt-smp` preset is the `aarch64-virt` kernel with `SMP=y` and
+`QEMU_SMP=4`. `QEMU_SMP` is both the `-smp` given to QEMU and the CPU count the kernel
+requires the device tree to report. So a run that loses the option fails, instead of
+passing an SMP check on one CPU. Its `smp` banner line is described in
+[architecture.md](architecture.md#smp). It runs every mode the other aarch64 preset runs.
+The one-CPU preset reports that line as skipped: `SMP=n`, so nothing was started.
 
 QEMU also ships system emulators for `m68k`, `sparc`, `sh4`, `mips`, `alpha`, `hppa`,
 and `ppc` — every architecture in the

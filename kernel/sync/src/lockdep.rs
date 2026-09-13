@@ -63,9 +63,12 @@
 //!
 //! So where the stack lives is chosen by build:
 //!
-//! - **Kernel images:** one stack. That is correct only while one CPU runs kernel code, which is
-//!   true of every image this tree builds today. It becomes a per-CPU variable when secondary CPUs
-//!   are brought up in Phase 3, and until then an SMP image must not turn this on.
+//! - **Kernel images:** one stack per CPU, in [`crate::percpu::PerCpu`] storage indexed by
+//!   [`hal::Arch::cpu_index`]. There is one slot per configured CPU (`NR_CPUS`), and a CPU with no
+//!   slot has its locks go untracked rather than recorded on another CPU's stack. The SMP bring-up
+//!   check on aarch64 proves the stacks are separate: one CPU holds a lock while another takes a
+//!   second one, which a shared stack records as an ordering that a later, legitimate nesting then
+//!   reports as an inversion.
 //! - **Host tests** (`MOCK_ARCH`): one stack per thread, since a host thread is what a CPU is to
 //!   the tests. The tracker logic is the same code either way; only the storage differs.
 //!
@@ -503,28 +506,46 @@ mod busy {
     }
 }
 
-/// A kernel image's held stack: one, for the one CPU that runs kernel code.
+/// A kernel image's held stacks: one per CPU, in per-CPU storage.
 #[cfg(not(CONFIG_MOCK_ARCH))]
 mod context {
     use core::cell::UnsafeCell;
 
+    use hal::Arch;
+
     use super::Stack;
+    use crate::percpu::{PerCpu, Pinned};
 
     struct Cell(UnsafeCell<Stack>);
 
     // SAFETY: reached only through `with_stack`, whose callers hold the tracker's `busy`
-    // flag with interrupts masked, so one context at a time — given one CPU in the
-    // kernel, which is this module's stated limit.
+    // flag with interrupts masked. `busy` admits one holder across every CPU, so even two
+    // CPUs that wrongly shared a slot would take turns at it rather than race.
     unsafe impl Sync for Cell {}
 
-    static STACK: Cell = Cell(UnsafeCell::new(Stack::new()));
+    /// Slots: the configuration's CPU count, and one on a build without SMP. The only
+    /// bound this module has is `Arch`, so the count cannot come from `HasSmp::MAX_CPUS`.
+    /// It does not need to: no CPU at or past `NR_CPUS` is ever started.
+    const CPUS: usize = if kconfig::NR_CPUS > 1 {
+        kconfig::NR_CPUS
+    } else {
+        1
+    };
 
+    static STACKS: PerCpu<Cell, CPUS> =
+        PerCpu::sized([const { Cell(UnsafeCell::new(Stack::new())) }; CPUS]);
+
+    /// Run `f` on the running CPU's stack. `None` for a CPU with no slot, whose locks go
+    /// untracked rather than being recorded as another CPU's.
+    ///
     /// # Safety
     /// The caller holds the tracker's `busy` flag with interrupts masked.
-    pub(super) unsafe fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> R {
-        // SAFETY: by the caller's contract, nothing else reaches `STACK` meanwhile, and
+    pub(super) unsafe fn with_stack<A: Arch, R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
+        let pin = Pinned::<A>::new();
+        let cell = STACKS.get(&pin)?;
+        // SAFETY: by the caller's contract, nothing else reaches any stack meanwhile, and
         // the reference does not escape `f`.
-        f(unsafe { &mut *STACK.0.get() })
+        Some(f(unsafe { &mut *cell.0.get() }))
     }
 }
 
@@ -543,8 +564,8 @@ mod context {
 
     /// # Safety
     /// None needed here; the signature matches the kernel's version.
-    pub(super) unsafe fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> R {
-        STACK.with_borrow_mut(f)
+    pub(super) unsafe fn with_stack<A, R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
+        Some(STACK.with_borrow_mut(f))
     }
 }
 
@@ -574,9 +595,9 @@ fn with_global<A: Arch, R>(f: impl FnOnce(&mut Order, &mut Stack) -> R) -> Optio
     // SAFETY: `busy` is held and interrupts are masked, which is the contract of both
     // `order` (see the `Sync` impl) and `with_stack`. Neither reference escapes `f`,
     // which is tracker code and does not panic, so `leave` below always runs.
-    let r = unsafe { context::with_stack(|stack| f(&mut *GLOBAL.order.get(), stack)) };
+    let r = unsafe { context::with_stack::<A, _>(|stack| f(&mut *GLOBAL.order.get(), stack)) };
     GLOBAL.busy.leave();
-    Some(r)
+    r
 }
 
 /// A blocking acquisition of the lock at `instance`. Called before the lock is taken,

@@ -150,15 +150,24 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
 
     if res.is_on("ARCH_AARCH64") {
+        // `-smp` only when asked, so a one-CPU preset's command line is what it was.
+        let smp = match res.int("QEMU_SMP") {
+            n if n > 1 => vec![s("-smp"), n.to_string()],
+            _ => Vec::new(),
+        };
         return Ok(Machine {
             binary: "qemu-system-aarch64",
-            args: vec![
+            args: [
                 s("-machine"),
                 s("virt,gic-version=3"),
                 s("-cpu"),
                 cpu,
                 s("-m"),
                 mem,
+            ]
+            .into_iter()
+            .chain(smp)
+            .chain([
                 s("-kernel"),
                 image.display().to_string(),
                 s("-semihosting-config"),
@@ -172,7 +181,8 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 s("int,guest_errors"),
                 s("-D"),
                 log.display().to_string(),
-            ],
+            ])
+            .collect(),
             success_code: 0,
         });
     }

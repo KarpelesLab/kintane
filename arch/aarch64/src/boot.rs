@@ -7,9 +7,11 @@
 //! `paging::aarch64_mmu_init` does, called from the bottom of this file. What is left
 //! in assembly is the handful of things that genuinely cannot be expressed in Rust:
 //!
-//! 1. **Park the secondary CPUs.** QEMU releases every `-smp` CPU at the same entry point. Without
-//!    the MPIDR check below they would all race through `.bss` zeroing and share one stack. They
-//!    spin in `wfe` until the SMP bring-up path exists to claim them.
+//! 1. **Park any other CPU that arrives here.** A loader that releases every CPU at the ELF entry
+//!    would otherwise have them all race through `.bss` zeroing and share one stack. QEMU `virt`
+//!    does not: its secondaries stay off until PSCI `CPU_ON`, which starts them at
+//!    `__secondary_entry` instead (see `smp`). A CPU parked here spins in `wfe` and is never
+//!    started.
 //! 2. **Descend to EL1 if we came up at EL2.** QEMU's `virt` machine starts the kernel at EL1
 //!    unless it was given `virtualization=on`, in which case the same image lands at EL2 instead.
 //!    That is a machine-configuration detail, not an architecture one, so the code handles both
@@ -44,6 +46,10 @@ _start:
 
     // Carry whatever the loader left in x0 through to kmain.
     mov     x19, x0
+
+    // No per-CPU block yet. TPIDR_EL1's reset value is UNKNOWN, and `cpu_index` reads a
+    // block through it; zero is the one value it answers without reading.
+    msr     tpidr_el1, xzr
 
     // Aff2:Aff1:Aff0 of zero identifies the boot CPU on every machine we target.
     // The rest have nothing to do until SMP bring-up exists.

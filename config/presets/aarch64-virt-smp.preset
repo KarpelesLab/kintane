@@ -1,0 +1,15 @@
+# aarch64 under QEMU's `virt` machine with four CPUs.
+#
+# The same kernel as aarch64-virt, with SMP on: the boot CPU starts the other three
+# through PSCI, and the `smp` line of the banner proves each came online with its own
+# CPU number, takes its own timer interrupts, answers an IPI, keeps its own per-CPU
+# counter, and holds locks on its own lock-order stack. QEMU_SMP is both the `-smp`
+# QEMU is given and the count the kernel requires the device tree to report, so a run
+# that lost the option fails instead of passing on one CPU.
+ARCH_AARCH64=y
+SMP=y
+NR_CPUS=8
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+QEMU_SMP=4

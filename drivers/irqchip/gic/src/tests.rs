@@ -179,3 +179,40 @@ fn v2_init_programs_the_distributor_and_cpu_interface() {
     assert_eq!(cpu.get(0x00), 1, "CPU interface enabled");
     assert_eq!(cpu.get(0x10), 30, "EOI names the claimed ID");
 }
+
+#[test]
+#[allow(unsafe_code)]
+fn v2_sgis_keep_their_sender_until_eoi() {
+    let dist = Window::new(0x1000);
+    let cpu = Window::new(0x100);
+    let chip = v2::over(dist.registers(), cpu.registers());
+    // SGI 1 from CPU interface 2.
+    cpu.set(0x0C, (2 << 10) | 1);
+    let claimed = chip.claim().unwrap();
+    assert_eq!(claimed, IrqNumber((2 << 10) | 1), "the sender is part of the claim");
+    assert_eq!(chip.id(claimed), IrqNumber(1), "and not part of which interrupt it is");
+    chip.eoi(claimed);
+    assert_eq!(cpu.get(0x10), (2 << 10) | 1, "EOIR takes IAR's value back, sender included");
+}
+
+#[test]
+#[allow(unsafe_code)]
+fn v2_ipis_route_by_the_interface_bit_each_cpu_reads() {
+    let dist = Window::new(0x1000);
+    let cpu = Window::new(0x100);
+    let chip = v2::over(dist.registers(), cpu.registers());
+    // What CPU interface 3 reads from its banked ITARGETSR0.
+    dist.set(0x800, 0x0808_0808);
+    // SAFETY: plain memory.
+    let token = unsafe { chip.init_cpu() };
+    assert_eq!(token, Some(0x08));
+    assert_eq!(cpu.get(0x00), 1, "the banked CPU interface is enabled");
+    assert_eq!(dist.get(GICD_IPRIORITYR + 28), DEFAULT_PRIORITY_WORD, "banked PPI priorities");
+    chip.send_ipi(IrqNumber(1), 0x08);
+    assert_eq!(dist.get(0xF00), (0x08 << 16) | 1, "GICD_SGIR: target list, then the ID");
+
+    // A uniprocessor GICv2 reads its targets as zero and has nowhere to send an IPI.
+    dist.set(0x800, 0);
+    // SAFETY: plain memory.
+    assert_eq!(unsafe { chip.init_cpu() }, None);
+}

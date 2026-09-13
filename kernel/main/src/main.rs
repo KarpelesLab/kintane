@@ -256,6 +256,11 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     c.write_str("\n  backtrace  ");
     let backtrace_ok = backtrace_check(c);
 
+    c.write_str("\n  smp        ");
+    // SAFETY: once, masked, after the kernel space and interrupt path are up and the
+    // preemption check has stopped the tick: `start_secondaries`'s contract.
+    let smp = unsafe { platform::start_secondaries(c) }.map_or(Check::Skipped, Check::from_ok);
+
     // Last, so it sees every lock the checks above took.
     c.write_str("\n  lockdep    ");
     let lockdep = lockcheck::verdict(c);
@@ -269,6 +274,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(clock)
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))
+        .and(smp)
         .and(lockdep);
     (verdict, live)
 }

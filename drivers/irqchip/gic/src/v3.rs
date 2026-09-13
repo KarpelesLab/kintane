@@ -121,11 +121,111 @@ impl Gicv3 {
         }
     }
 
-    /// This CPU's SGI_base frame, as an offset into the redistributor window.
-    fn sgi(&self, offset: usize) -> usize {
-        GICR_SGI_FRAME + offset
+    /// The offset of the redistributor whose `GICR_TYPER` names `affinity`, packed as
+    /// `Aff3.Aff2.Aff1.Aff0`.
+    ///
+    /// One pair of frames per CPU, one after another, the last marked by `TYPER.Last`
+    /// (IHI 0069 §12.11.37). Found by affinity rather than assumed to be in CPU order: the
+    /// order is the firmware's, and the tree's `/cpus` order is no promise about it.
+    fn redistributor(&self, affinity: u32) -> Option<usize> {
+        let mut rd = 0usize;
+        // Bounded by the window: every pass moves one pair of frames on.
+        while rd.checked_add(GICR_FRAMES_LEN)? <= self.gicr.len() {
+            if self.gicr.read32(rd + GICR_TYPER + 4) == affinity {
+                return Some(rd);
+            }
+            if self.gicr.read32(rd + GICR_TYPER) & GICR_TYPER_LAST != 0 {
+                return None;
+            }
+            rd += GICR_FRAMES_LEN;
+        }
+        None
+    }
+
+    /// The calling CPU's redistributor.
+    fn local(&self) -> Option<usize> {
+        self.redistributor(this_cpu_affinity())
+    }
+
+    /// Wake the calling CPU's redistributor and program its SGIs and PPIs as Group 1 at
+    /// the default priority. Clears their enables and pending state only when `clear`,
+    /// which the first initialisation does and a later one on the same CPU must not.
+    fn init_local(&self, clear: bool) -> Option<usize> {
+        let rd = self.local()?;
+        // Wake it. It comes out of reset asleep and forwards nothing until ChildrenAsleep
+        // clears.
+        let waker = self.gicr.read32(rd + GICR_WAKER);
+        self.gicr
+            .write32(rd + GICR_WAKER, waker & !GICR_WAKER_PROCESSOR_SLEEP);
+        let mut spins = 0u32;
+        while self.gicr.read32(rd + GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+            if spins == SPIN_LIMIT {
+                // Still asleep: nothing programmed below would be delivered. Saying so
+                // is what makes a missing wake visible, because QEMU's emulation delivers
+                // to a sleeping redistributor anyway and hardware does not.
+                return None;
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+
+        let sgi = rd + GICR_SGI_FRAME;
+        if clear {
+            self.gicr.write32(sgi + GICR_ICENABLER0, 0xffff_ffff);
+            self.gicr.write32(sgi + GICR_ICPENDR0, 0xffff_ffff);
+        }
+        self.gicr.write32(sgi + GICR_IGROUPR0, 0xffff_ffff);
+        for i in (0..32).step_by(4) {
+            self.gicr
+                .write32(sgi + GICR_IPRIORITYR + i, DEFAULT_PRIORITY_WORD);
+        }
+
+        // SAFETY: the caller guarantees interrupts are masked on this CPU. ICC_SRE_EL1.SRE
+        // selects the system-register interface over the (absent) memory-mapped one; every
+        // ICC_* access after this is only architecturally defined once it is set and an
+        // `isb` has retired. SRE is write-once-then-RAO on an implementation with no
+        // memory-mapped interface, so this is a read-modify-write rather than a plain
+        // store. This driver is only bound to a node the tree calls a GICv3, which is what
+        // guarantees the CPU implements these registers at all. The registers are banked
+        // per CPU, so this prepares the calling CPU's interface and no other.
+        unsafe {
+            let mut sre: u64;
+            core::arch::asm!("mrs {}, icc_sre_el1", out(reg) sre, options(nomem, nostack));
+            sre |= 1;
+            core::arch::asm!("msr icc_sre_el1, {}", "isb", in(reg) sre, options(nomem, nostack));
+
+            // Priority mask wide open, no priority grouping, Group 1 enabled — the
+            // system-register equivalents of the three GICC writes in the v2 driver.
+            core::arch::asm!(
+                "msr icc_pmr_el1, {pmr}",
+                "msr icc_bpr1_el1, xzr",
+                "msr icc_igrpen1_el1, {en}",
+                "isb",
+                pmr = in(reg) 0xffu64,
+                en = in(reg) 1u64,
+                options(nomem, nostack)
+            );
+        }
+        Some(rd)
     }
 }
+
+/// The calling CPU's MPIDR affinity, packed as `GICR_TYPER` reports it: `Aff3.Aff2.Aff1.Aff0`.
+fn this_cpu_affinity() -> u32 {
+    let mpidr: u64;
+    // SAFETY: MPIDR_EL1 is readable at EL1 and reading it has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
+    }
+    let aff3 = (mpidr >> 32) & 0xff;
+    let low = mpidr & 0xff_ffff;
+    ((aff3 << 24) | low) as u32
+}
+
+/// `GICR_TYPER`, a 64-bit register whose upper half is the affinity value.
+const GICR_TYPER: usize = 0x0008;
+/// `GICR_TYPER.Last`: this is the final redistributor in the region.
+const GICR_TYPER_LAST: u32 = 1 << 4;
 
 impl IrqChip for Gicv3 {
     unsafe fn init(&self) {
@@ -156,58 +256,20 @@ impl IrqChip for Gicv3 {
             .write32(GICD_CTLR, GICD_CTLR_ARE | GICD_CTLR_ENABLE_GRP1 | GICD_CTLR_ENABLE_GRP0);
         self.wait_rwp();
 
-        // Wake this CPU's redistributor. It comes out of reset asleep and forwards nothing
-        // until ChildrenAsleep clears.
-        let waker = self.gicr.read32(GICR_WAKER);
-        self.gicr
-            .write32(GICR_WAKER, waker & !GICR_WAKER_PROCESSOR_SLEEP);
-        let mut spins = 0u32;
-        while self.gicr.read32(GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 && spins < SPIN_LIMIT {
-            spins += 1;
-            core::hint::spin_loop();
-        }
-
-        // Per-CPU SGI and PPI configuration, including the timer PPI.
-        self.gicr.write32(self.sgi(GICR_ICENABLER0), 0xffff_ffff);
-        self.gicr.write32(self.sgi(GICR_ICPENDR0), 0xffff_ffff);
-        self.gicr.write32(self.sgi(GICR_IGROUPR0), 0xffff_ffff);
-        for i in (0..32).step_by(4) {
-            self.gicr
-                .write32(self.sgi(GICR_IPRIORITYR + i), DEFAULT_PRIORITY_WORD);
-        }
-
-        // SAFETY: the caller guarantees interrupts are masked and that this is the only
-        // initialisation. ICC_SRE_EL1.SRE selects the system-register interface over the
-        // (absent) memory-mapped one; every ICC_* access after this is only
-        // architecturally defined once it is set and an `isb` has retired. SRE is
-        // write-once-then-RAO on an implementation with no memory-mapped interface, so
-        // this is a read-modify-write rather than a plain store. This driver is only bound
-        // to a node the tree calls a GICv3, which is what guarantees the CPU implements
-        // these registers at all.
-        unsafe {
-            let mut sre: u64;
-            core::arch::asm!("mrs {}, icc_sre_el1", out(reg) sre, options(nomem, nostack));
-            sre |= 1;
-            core::arch::asm!("msr icc_sre_el1, {}", "isb", in(reg) sre, options(nomem, nostack));
-
-            // Priority mask wide open, no priority grouping, Group 1 enabled — the
-            // system-register equivalents of the three GICC writes in the v2 driver.
-            core::arch::asm!(
-                "msr icc_pmr_el1, {pmr}",
-                "msr icc_bpr1_el1, xzr",
-                "msr icc_igrpen1_el1, {en}",
-                "isb",
-                pmr = in(reg) 0xffu64,
-                en = in(reg) 1u64,
-                options(nomem, nostack)
-            );
-        }
+        // The booting CPU's redistributor and CPU interface, from a clean slate. A tree
+        // whose redistributor region does not hold this CPU's frames leaves nothing to
+        // enable an SGI or PPI on; the interrupt selftest then reports the timer silent.
+        let _ = self.init_local(true);
     }
 
     fn enable(&self, irq: IrqNumber) {
         if irq.0 < PPI_LIMIT {
-            // Write-1-to-set on this CPU's redistributor, which `init` has woken.
-            self.gicr.write32(self.sgi(GICR_ISENABLER0), 1 << irq.0);
+            // Write-1-to-set on the calling CPU's redistributor: SGIs and PPIs are private,
+            // so enabling one means enabling it here.
+            if let Some(rd) = self.local() {
+                self.gicr
+                    .write32(rd + GICR_SGI_FRAME + GICR_ISENABLER0, 1 << irq.0);
+            }
         } else {
             self.gicd
                 .write32(GICD_ISENABLER + word(irq.0), 1 << (irq.0 % 32));
@@ -216,10 +278,40 @@ impl IrqChip for Gicv3 {
 
     fn disable(&self, irq: IrqNumber) {
         if irq.0 < PPI_LIMIT {
-            self.gicr.write32(self.sgi(GICR_ICENABLER0), 1 << irq.0);
+            if let Some(rd) = self.local() {
+                self.gicr
+                    .write32(rd + GICR_SGI_FRAME + GICR_ICENABLER0, 1 << irq.0);
+            }
         } else {
             self.gicd
                 .write32(GICD_ICENABLER + word(irq.0), 1 << (irq.0 % 32));
+        }
+    }
+
+    unsafe fn init_cpu(&self) -> Option<u64> {
+        self.init_local(false)?;
+        Some(u64::from(this_cpu_affinity()))
+    }
+
+    fn send_ipi(&self, irq: IrqNumber, target: u64) {
+        // ICC_SGI1R_EL1 (IHI 0069 §12.2.23): Aff3, Aff2 and Aff1 name a cluster, and a
+        // 16-bit target list names CPUs in it by Aff0. An Aff0 of 16 or more is reached
+        // through the range selector, which picks which sixteen the list covers.
+        let aff0 = target & 0xff;
+        let aff1 = (target >> 8) & 0xff;
+        let aff2 = (target >> 16) & 0xff;
+        let aff3 = (target >> 24) & 0xff;
+        let value = (aff3 << 48)
+            | ((aff0 >> 4) << 44)
+            | (aff2 << 32)
+            | (u64::from(irq.0 & 0xf) << 24)
+            | (aff1 << 16)
+            | (1 << (aff0 & 0xf));
+        // SAFETY: writing ICC_SGI1R_EL1 raises a Group 1 SGI on the CPUs named and has no
+        // other effect. It is accessible because `init` set ICC_SRE_EL1.SRE on this CPU,
+        // and the kernel sends IPIs only from CPUs `init` or `init_cpu` prepared.
+        unsafe {
+            core::arch::asm!("msr icc_sgi1r_el1, {}", in(reg) value, options(nomem, nostack));
         }
     }
 

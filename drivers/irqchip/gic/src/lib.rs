@@ -24,10 +24,18 @@
 //!
 //! # What is deliberately not here
 //!
-//! No SGIs, no SPI affinity routing, no priority grouping, no LPIs or ITS, and one
-//! redistributor — CPU 0's, at the start of the region, which is where a uniprocessor
-//! `virt` machine puts it. Finding each CPU's frame by `GICR_TYPER` affinity arrives with
-//! secondary CPUs.
+//! No SPI affinity routing (every SPI is delivered where reset put it, CPU 0 on `virt`),
+//! no priority grouping, and no LPIs or ITS.
+//!
+//! # More than one CPU
+//!
+//! What is per CPU is prepared on that CPU, by `IrqChip::init_cpu`: on a GICv3 the
+//! redistributor whose `GICR_TYPER` affinity matches the CPU's MPIDR, found by walking the
+//! region rather than assumed to be at an index, plus the CPU interface's system
+//! registers; on a GICv2 the banked CPU interface and banked SGI and PPI priorities. SGI
+//! and PPI enables act on the calling CPU's copy. IPIs are SGIs, addressed with the token
+//! `init_cpu` returned on the target: an affinity value on a GICv3, the CPU interface bit
+//! on a GICv2, which routes by interface number rather than MPIDR.
 //!
 //! References: Arm GIC Architecture Specification, GICv2 (IHI 0048B) §4.3 and §4.4;
 //! GICv3/v4 (IHI 0069) §12.9 (distributor), §12.11 (redistributor), §12.3 (CPU

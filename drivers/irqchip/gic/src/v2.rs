@@ -145,11 +145,16 @@ impl IrqChip for Gicv2 {
         // Reading IAR is the acknowledge — the side effect the trait documents `claim` as
         // performing — so this is the only read of the register.
         let iar = self.gicc.read32(GICC_IAR);
-        // Bits 12:10 are the source CPU for an SGI and bits 9:0 the ID. No SGIs are sent
-        // yet, so the CPU field is discarded; it has to be carried back to EOIR once it
-        // can be non-zero.
-        let id = iar & 0x3ff;
-        (id < FIRST_SPECIAL_IRQ).then_some(IrqNumber(id))
+        // Bits 12:10 are the source CPU for an SGI and bits 9:0 the ID. For an SGI the
+        // source is kept: EOIR must be written with the value IAR returned, sender and
+        // all (IHI 0048B §4.4.5), and two CPUs raising the same SGI are two interrupts.
+        // `id` is how the caller learns which one it was. For anything else the field is
+        // zero by the specification, and discarded in case a controller disagrees.
+        let id = iar & ID_MASK;
+        if id >= FIRST_SPECIAL_IRQ {
+            return None;
+        }
+        Some(IrqNumber(if id < SGI_LIMIT { iar & SGI_MASK } else { id }))
     }
 
     fn eoi(&self, irq: IrqNumber) {
@@ -162,7 +167,54 @@ impl IrqChip for Gicv2 {
     fn name(&self) -> &'static str {
         "GICv2"
     }
+
+    unsafe fn init_cpu(&self) -> Option<u64> {
+        // `GICD_ITARGETSR0` through `3` are banked per CPU and read as that CPU's own
+        // interface bit, replicated in each byte. That bit is the only name an SGI can be
+        // sent to: a GICv2 routes by CPU interface number, which is not the MPIDR. A
+        // uniprocessor implementation reads them as zero, which means there is no one to
+        // send to.
+        let mask = self.gicd.read32(GICD_ITARGETSR) & 0xff;
+
+        // SGIs and PPIs are banked in the distributor too, so this CPU's copies of their
+        // priorities are still at reset. Enables are left alone, per the trait.
+        for i in (0..SGI_PPI_LIMIT).step_by(4) {
+            self.gicd
+                .write32(GICD_IPRIORITYR + i as usize, DEFAULT_PRIORITY_WORD);
+        }
+        // The CPU interface is banked as a whole: the same three writes `init` makes.
+        self.gicc.write32(GICC_PMR, 0xff);
+        self.gicc.write32(GICC_BPR, 7);
+        self.gicc.write32(GICC_CTLR, 1);
+
+        (mask != 0).then_some(u64::from(mask))
+    }
+
+    fn send_ipi(&self, irq: IrqNumber, target: u64) {
+        // TargetListFilter 0, "the CPUs in the target list"; the list is the interface
+        // bitmask `init_cpu` read on that CPU.
+        let list = (target & 0xff) as u32;
+        self.gicd
+            .write32(GICD_SGIR, (list << 16) | (irq.0 & (SGI_LIMIT - 1)));
+    }
+
+    fn id(&self, claimed: IrqNumber) -> IrqNumber {
+        IrqNumber(claimed.0 & ID_MASK)
+    }
 }
+
+/// `GICC_IAR.InterruptID`.
+const ID_MASK: u32 = 0x3ff;
+/// `GICC_IAR.CPUID` and `InterruptID` together: an SGI as it has to be acknowledged.
+const SGI_MASK: u32 = 0x1fff;
+/// IDs 0..16 are software-generated.
+const SGI_LIMIT: u32 = 16;
+/// IDs 0..32 are banked per CPU.
+const SGI_PPI_LIMIT: u32 = 32;
+/// `GICD_ITARGETSR0`, whose first four words are banked per CPU.
+const GICD_ITARGETSR: usize = 0x800;
+/// `GICD_SGIR`: write-only, raises an SGI.
+const GICD_SGIR: usize = 0xF00;
 
 /// A GICv2 over test memory, so the register sequence can be checked on the host.
 #[cfg(test)]

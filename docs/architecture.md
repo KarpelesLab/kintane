@@ -292,8 +292,9 @@ Generic subsystems, which cannot name the machine, take a `LockFamily` type para
 `LockClass`. In debug builds (`DEBUG_LOCKDEP`) the order classes are taken in is
 recorded, and an inversion is reported the first time both orders have been seen,
 without the deadlock having to happen. Re-taking a held lock stops the CPU. When
-checking is off, a lock carries no class and pays nothing. The held-lock stack is
-global until secondary CPUs exist, and becomes per-CPU with them.
+checking is off, a lock carries no class and pays nothing. The order classes are taken
+in is shared by every CPU. The held-lock stack is per-CPU (`sync::percpu`), since what
+one CPU holds says nothing about what another may take.
 
 Sleeping locks (mutex, rwlock, semaphore) sit above the scheduler and exist only in
 builds that have one.
@@ -445,8 +446,8 @@ Pluggable policy behind a trait, with the config selecting one or more:
 - A general-purpose fair scheduler with per-CPU runqueues, load balancing, and idle
   balancing for SMP builds.
 
-Per-CPU data is a `HasSmp`-gated abstraction; a uniprocessor build resolves
-`per_cpu!(X)` to a plain static with no indirection.
+Per-CPU data is `sync::PerCpu`, a `HasSmp`-gated abstraction; a uniprocessor build
+gets one slot, which is a plain static with an index of zero. See [SMP](#smp) below.
 
 #### What exists today
 
@@ -526,6 +527,105 @@ Not yet:
   stops the timer and runs the in-kernel suite and the test modes on the boot thread
   alone, which those modes still assume.
 - Nothing but the checks creates threads.
+
+### SMP
+
+Phase 3 starts on aarch64. With `SMP=y`, the boot CPU starts every CPU the device tree
+lists, up to `NR_CPUS` and the port's `HasSmp::MAX_CPUS`, and each one it starts runs
+an idle loop. There is still one scheduler, and it is the boot CPU's.
+
+**A CPU's number.** Hardware names a CPU sparsely: an MPIDR on Arm, an APIC ID on x86.
+The kernel names it densely, 0 being the boot CPU, because per-CPU storage is an array.
+`hal::Arch::cpu_index` answers "which CPU am I" on every port. It defaults to 0, and a
+port that starts a second CPU overrides it. `HasSmp::cpu_id` returns the same number.
+On aarch64 the answer is read through `TPIDR_EL1`, which each CPU points at its own
+block in `arch/aarch64/src/smp.rs`.
+
+**Per-CPU data.** `sync::PerCpu<T, N>` holds one `T` per CPU. Its constructors are the
+gate:
+
+- `PerCpu::new::<A: HasSmp>` refuses at build time a storage with fewer slots than
+  `A::MAX_CPUS`.
+- `PerCpu::uniprocessor::<A: UniProcessor>` has one slot.
+
+A slot is reached only through a `sync::Pinned<A>`. It masks interrupts *before* it
+reads the CPU number, and the reference borrows from it, so a slot cannot be used after
+a preemption that might have moved the thread. Every slot must be `Sync`, so a port that
+got its CPU numbering wrong causes a logic error the bring-up check looks for, never
+undefined behaviour. Lock-order checking keeps each CPU's held-lock stack in one.
+
+**Bring-up** (`arch/aarch64/src/smp.rs`, driven by `kernel/platform/fdt/src/smp.rs`):
+
+1. The platform reads `/cpus` (`device_type = "cpu"`, `reg` as the MPIDR) and the PSCI
+   node's conduit (`hvc` or `smc`) during discovery.
+2. For each CPU, `smp::start` claims a guarded thread-stack slot named after the CPU and
+   captures the boot CPU's `MAIR_EL1`, `TCR_EL1`, `TTBR0_EL1` and `SCTLR_EL1`. It then
+   calls PSCI `CPU_ON` with `__secondary_entry` and the CPU's block as the context.
+3. The secondary descends from EL2 if firmware started it there. It takes its stack,
+   sets `TPIDR_EL1`, loads the boot CPU's translation registers, enables its MMU on the
+   one kernel address space, and installs its vectors.
+4. It prepares its part of the interrupt controller through `IrqChip::init_cpu`. On a
+   GICv3 that is its own redistributor, found by `GICR_TYPER` affinity, woken, and
+   refused if it will not wake, plus the ICC system registers. On a GICv2 it is the
+   banked CPU interface and SGI/PPI priorities.
+5. It enables its two IPIs and its generic timer at 100 Hz, and reports in.
+
+**IPIs** are SGIs. SGI 0 runs a function on the target and SGI 1 is a reschedule,
+delivered and counted. `IrqChip::send_ipi` takes the routing token the target's
+`init_cpu` returned: an affinity value on a GICv3, and a CPU interface bit on a GICv2,
+which routes by interface number rather than MPIDR. A GICv2 SGI is acknowledged with its
+sender, so `claim` keeps it and `IrqChip::id` strips it.
+
+**The check.** On the `aarch64-virt-smp` preset, the `smp` line in the banner gates the
+exit status. It requires all of the following:
+
+- the tree lists exactly `QEMU_SMP` CPUs;
+- each CPU reports its own number through both interfaces, asked on itself;
+- each secondary takes its own timer interrupts;
+- a function-call IPI reaches each secondary, runs there, and a reschedule IPI comes
+  back;
+- each CPU's `PerCpu` counter holds its own count;
+- one CPU holding a lock while another takes a second one records no ordering between
+  them, which a shared held-lock stack would.
+
+These mutations each made the boot fail:
+
+- two CPUs sharing a block;
+- IPIs sent to the boot CPU's token;
+- every CPU programming the first redistributor;
+- a skipped redistributor wake;
+- a single lock-order stack;
+- a `-smp` smaller than the configuration.
+
+The skipped wake is only visible because `init_cpu` refuses a redistributor that stays
+asleep: QEMU delivers to one anyway.
+
+**What the single-CPU scheduler assumes, and what SMP has to change:**
+
+- **Exclusion is the interrupt mask.** The thread table, the timer queue and the kernel
+  heap are safe to touch with interrupts masked because one CPU runs them. The heap and
+  timekeeping locks are `Spin`, which is correct on SMP, but the thread table is reached
+  through a raw pointer under a mask and needs a real lock, or per-CPU run queues, before
+  a second CPU schedules.
+- **One run queue, one idle thread, one tick.** The tick hook belongs to the boot CPU:
+  a secondary's timer interrupt is counted in its block and never reaches it. Per-CPU
+  run queues, a per-CPU idle thread and a per-CPU tick come together.
+- **No migration.** A thread runs where it was spawned. `Pinned` is only sound across a
+  migrating scheduler if a thread never blocks while pinned, which is the stated rule
+  but not yet a checked one.
+- **Wake-ups do not cross CPUs.** Waking a thread queued on another CPU will need the
+  reschedule IPI, which today is only counted.
+- **TLB invalidation is inner-shareable** (`tlbi ...is`), which reaches every CPU in the
+  system. It is correct for shared kernel mappings. It is not a shootdown protocol, and
+  user address spaces will need one.
+
+Also not yet:
+
+- the overflow path's reporting stack is one for all CPUs, so two simultaneous stack
+  overflows would share it;
+- SPIs are all delivered to CPU 0;
+- CPUs are never stopped or hot-unplugged;
+- x86 has `HasSmp::MAX_CPUS = 1` until the APIC driver exists.
 
 ## Boot flow
 

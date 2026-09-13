@@ -658,6 +658,9 @@ pub unsafe extern "C" fn aarch64_mmu_init() {
     // with all four DAIF bits masked, and no interrupt source has been enabled.
     unsafe { crate::exception::install_vectors() };
 
+    // SAFETY: on the boot CPU, from `_start`, long before a secondary exists.
+    unsafe { crate::smp::adopt_boot_cpu() };
+
     let root = phys_to_ptr(PhysAddr::new(page_addr(&TABLES[T_ROOT])));
     let low = PhysAddr::new(page_addr(&TABLES[T_LOW]));
     let ram = PhysAddr::new(page_addr(&TABLES[T_RAM]));

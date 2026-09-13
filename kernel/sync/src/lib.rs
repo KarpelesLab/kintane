@@ -101,6 +101,7 @@ pub mod family;
 pub mod irq;
 pub mod lockdep;
 pub mod once;
+pub mod percpu;
 #[cfg(target_has_atomic = "32")]
 pub mod spin;
 
@@ -121,5 +122,6 @@ pub use lockdep::LockClass;
 #[cfg(target_has_atomic = "8")]
 pub use once::{CasGate, CasOnce};
 pub use once::{Claim, IrqGate, IrqOnce, Once, OnceGate};
+pub use percpu::{PerCpu, Pinned};
 #[cfg(target_has_atomic = "32")]
 pub use spin::{SpinGuard, SpinIrqGuard, SpinLock};

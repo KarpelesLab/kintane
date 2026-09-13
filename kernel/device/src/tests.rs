@@ -578,3 +578,50 @@ fn a_boot_cell_is_written_once_and_never_again() {
     assert_eq!(*first, 1);
     assert_eq!(cell.get(), Some(&1));
 }
+
+// --- CPUs and firmware interfaces --------------------------------------------------
+
+/// `virt` with `-smp 4`, for the CPU nodes; otherwise the same machine as `VIRT_V3`.
+const VIRT_V3_SMP4: &[u8] = include_bytes!("testdata/qemu-virt-gicv3-smp4-128m.dtb");
+
+#[test]
+fn virt_smp_cpus_are_read_by_identifier_not_as_windows() {
+    let f = fdt(VIRT_V3_SMP4);
+    let mut fx = Fixture::new();
+    let tree = DeviceTree::build(&f, &mut fx.nodes).unwrap();
+    let cpus = at(&tree, "/cpus");
+    let ids: Vec<u64> = tree
+        .children(cpus)
+        .filter(|&c| tree.string(c, b"device_type") == Some(b"cpu"))
+        .map(|c| tree.reg_address(c, 0).unwrap())
+        .collect();
+    assert_eq!(ids, [0, 1, 2, 3]);
+    // `cpu-map` is a child of `/cpus` too, and is not a CPU.
+    assert_eq!(tree.children(cpus).count(), 5);
+    for c in tree
+        .children(cpus)
+        .filter(|&c| tree.node(c).name().starts_with(b"cpu@"))
+    {
+        assert_eq!(tree.string(c, b"enable-method"), Some(&b"psci"[..]));
+        assert!(matches!(tree.mmio(c, 0), Err(Error::NotMemoryMapped { .. })));
+    }
+}
+
+#[test]
+fn property_reads_what_the_model_does_not_record() {
+    let f = fdt(VIRT_V3_SMP4);
+    let mut fx = Fixture::new();
+    let tree = DeviceTree::build(&f, &mut fx.nodes).unwrap();
+    let psci = at(&tree, "/psci");
+    assert!(tree.node(psci).is_compatible("arm,psci-0.2"));
+    assert_eq!(tree.string(psci, b"method"), Some(&b"hvc"[..]));
+    assert_eq!(tree.property(psci, b"cpu_on"), Some(&0xc400_0003u32.to_be_bytes()[..]));
+    assert_eq!(tree.property(psci, b"absent"), None);
+    // A child's property is not its parent's: `/cpus` has no `reg`, and every `cpu@N`
+    // below it does.
+    let cpus = at(&tree, "/cpus");
+    assert_eq!(tree.property(cpus, b"reg"), None);
+    assert_eq!(tree.property(cpus, b"#address-cells"), Some(&1u32.to_be_bytes()[..]));
+    // A list is not one string.
+    assert_eq!(tree.string(psci, b"compatible"), None);
+}

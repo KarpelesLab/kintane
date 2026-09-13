@@ -11,7 +11,7 @@ root = "src/lib.rs"
 layer = "kernel"
 
 [deps]
-units = ["hal", "arch", "bootinfo", "device", "gic", "pl011"]
+units = ["hal", "arch", "bootinfo", "device", "gic", "pl011", "sync"]
 
 [config]
 requires = "ARCH_AARCH64"

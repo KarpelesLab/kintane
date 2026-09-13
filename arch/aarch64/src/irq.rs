@@ -14,11 +14,11 @@
 //!
 //! # Concurrency
 //!
-//! There is none. The build is uniprocessor, the controller is installed once with
-//! interrupts masked, and nothing ever replaces it. The tick counter is an atomic
-//! anyway, because it is written by an interrupt handler and read by the code that was
-//! interrupted, and the compiler must not be allowed to conclude the read is loop-
-//! invariant.
+//! Every CPU dispatches through here, each with its own interrupts masked. The controller
+//! is installed once, before any secondary is started, and never replaced, so readers on
+//! every CPU see one value. The tick counter and the hook are the boot CPU's: a timer
+//! interrupt on a secondary is counted in that CPU's block by `smp` and goes no further.
+//! SGIs are the IPIs `smp` sends, and are handled there on whichever CPU took them.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -90,9 +90,10 @@ pub(crate) fn dispatch() {
     // indistinguishable from a hang. Anything still pending is taken on the next entry.
     let mut ticked = false;
     for _ in 0..MAX_PER_ENTRY {
-        let Some(irq) = chip.claim() else { break };
-        ticked |= handle(irq);
-        chip.eoi(irq);
+        let Some(claimed) = chip.claim() else { break };
+        ticked |= handle(chip.id(claimed));
+        // The claimed value, not the ID: a GICv2 SGI is acknowledged with its sender.
+        chip.eoi(claimed);
     }
     // After the loop, so every interrupt claimed on this entry has had its EOI before
     // the hook can switch threads. See `tick`.
@@ -107,7 +108,17 @@ const MAX_PER_ENTRY: u32 = 16;
 
 /// Handle one claimed interrupt. Returns whether it was a timer tick.
 fn handle(irq: IrqNumber) -> bool {
+    if irq.0 < crate::smp::SGI_LIMIT {
+        crate::smp::on_ipi(irq.0);
+        return false;
+    }
     if irq.0 == crate::timer::PPI {
+        // A secondary's generic timer is its own, and its ticks are not the scheduler's:
+        // counting them here, and not below, keeps the hook and `TIMER_TICKS` the boot
+        // CPU's alone.
+        if crate::smp::on_secondary_tick() {
+            return false;
+        }
         // The timer's condition is level-sensitive: without this the line stays
         // asserted, EOI re-delivers immediately, and the machine never leaves the
         // handler. Re-arming moves the deadline into the future, which deasserts it as

@@ -269,6 +269,17 @@ config QEMU_MEMORY_MB
     range 8 65536
     default 128
 
+config QEMU_SMP
+    int "CPUs under QEMU"
+    depends on QEMU_EXIT
+    range 1 8
+    default 1
+    help
+        How many CPUs the emulated machine has. The kernel reads the same
+        number: a boot that finds a different count in the device tree
+        fails, so a run that silently lost its `-smp` cannot pass as an SMP
+        test on one CPU.
+
 config QEMU_CPU
     string "CPU model under QEMU"
     depends on QEMU_EXIT

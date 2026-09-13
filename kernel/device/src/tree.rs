@@ -707,6 +707,50 @@ impl<'a, 's> DeviceTree<'a, 's> {
         }
         None
     }
+
+    /// Any property of `id`, by name, as its raw bytes.
+    ///
+    /// For the properties the model does not record, because only one consumer asks: a CPU
+    /// node's `enable-method`, the PSCI node's `method`. Walks the blob's tokens from the
+    /// node's own `BeginNode`, which is bounded by the node's properties, since a node's
+    /// properties precede its children (§5.4.1).
+    pub fn property(&self, id: NodeId, name: &[u8]) -> Option<&'a [u8]> {
+        let begin = self.node(id).offset;
+        let mut tokens = self.fdt.tokens();
+        let _ = tokens
+            .find(|t| matches!(t, Ok(Token::BeginNode { offset, .. }) if *offset == begin))?;
+        for token in tokens {
+            match token.ok()? {
+                Token::Property { name: n, value, .. } if n == name => return Some(value),
+                Token::Property { .. } => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// A property of `id` holding exactly one string, without its terminating NUL.
+    pub fn string(&self, id: NodeId, name: &[u8]) -> Option<&'a [u8]> {
+        one_string(self.property(id, name)?)
+    }
+
+    /// The `index`th `reg` address of `id` exactly as written, on its parent's bus and not
+    /// translated.
+    ///
+    /// For buses whose `reg` is an identifier rather than a location, where [`Self::mmio`]
+    /// rightly refuses: under `/cpus`, a CPU's `reg` is its hardware ID, an MPIDR affinity
+    /// value on Arm (Devicetree Specification §3.8).
+    pub fn reg_address(&self, id: NodeId, index: usize) -> Result<u64, Error> {
+        let (reg, ac, entry) = self.reg_entries(id)?;
+        let raw = reg
+            .chunks_exact(entry)
+            .nth(index)
+            .ok_or(Error::NoSuchEntry { node: id, index })?;
+        let addr = raw
+            .get(..cell_bytes(ac))
+            .ok_or(Error::NoSuchEntry { node: id, index })?;
+        cells_value(addr).map_err(|()| Error::ValueTooWide { node: id })
+    }
 }
 
 /// An interrupt as its controller describes it: the controller and its cells.

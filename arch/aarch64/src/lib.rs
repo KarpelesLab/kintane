@@ -16,6 +16,7 @@ pub mod irq;
 pub mod kspace;
 pub mod paging;
 pub mod serial;
+pub mod smp;
 pub mod tick;
 pub mod timer;
 
@@ -92,6 +93,10 @@ impl Arch for Aarch64 {
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     }
 
+    fn cpu_index() -> usize {
+        smp::cpu_index()
+    }
+
     fn halt() -> ! {
         loop {
             // SAFETY: masking DAIF and executing `wfi` stops this CPU until an
@@ -121,22 +126,12 @@ impl HasMmu for Aarch64 {
 }
 
 impl HasSmp for Aarch64 {
+    const MAX_CPUS: usize = smp::MAX_CPUS;
+
     fn cpu_id() -> u32 {
-        let mpidr: u64;
-        // SAFETY: MPIDR_EL1 is readable at EL1 and reading it has no side effects.
-        unsafe {
-            core::arch::asm!(
-                "mrs {}, mpidr_el1",
-                out(reg) mpidr,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        // Aff0 is the CPU index on every machine this port targets, including
-        // `virt` below sixteen CPUs. It is *not* a dense index in general — real
-        // hardware numbers clusters in Aff1 and Aff2 — so this becomes a lookup
-        // through a per-CPU table built at bring-up, in Phase 3. Until then the only
-        // supported build is uniprocessor and the answer is always zero.
-        (mpidr & 0xff) as u32
+        // The logical index `smp` assigned when it started this CPU, not the MPIDR: an
+        // MPIDR is sparse, and Aff0 alone is not even unique once a board has two clusters.
+        smp::cpu_index() as u32
     }
 }
 

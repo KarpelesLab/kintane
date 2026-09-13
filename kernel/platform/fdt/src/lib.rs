@@ -20,6 +20,8 @@
 #![no_std]
 #![feature(sync_unsafe_cell)]
 
+mod smp;
+
 use core::cell::SyncUnsafeCell;
 
 use device::driver::{self, best_match};
@@ -93,6 +95,8 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         }
     };
     let mut resources = Resources::new(mmio, irqs);
+    // SAFETY: once, on the boot path, as this function is.
+    unsafe { smp::record(&tree) };
 
     write_usize(c, tree.len());
     c.write_str(" nodes;");
@@ -265,7 +269,22 @@ pub fn device_windows() -> Option<&'static [DeviceWindow]> {
     WINDOWS.get().and_then(|(windows, n)| windows.get(..*n))
 }
 
-fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
+/// Start the CPUs the tree lists beyond the boot CPU, and prove each one is a CPU of its
+/// own: its own logical number, its own timer interrupts, an IPI answered from it, its own
+/// per-CPU counter, and its own lock-order stack.
+///
+/// `None` on a build without SMP whose tree agrees with the run about how many CPUs there
+/// are: nothing was started, so nothing was checked. `Some(false)` for any failure.
+///
+/// # Safety
+/// Once, from `kmain`, on the boot CPU with interrupts masked, after the kernel address
+/// space is installed and the interrupt path is up, and with no scheduler tick running.
+pub unsafe fn start_secondaries(c: &dyn EarlyConsole) -> Option<bool> {
+    // SAFETY: the caller's contract.
+    unsafe { smp::start_secondaries(c) }
+}
+
+pub(crate) fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     loop {
@@ -279,7 +298,7 @@ fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
     c.write_bytes(&buf[i..]);
 }
 
-fn write_hex(c: &dyn EarlyConsole, v: u64) {
+pub(crate) fn write_hex(c: &dyn EarlyConsole, v: u64) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut buf = [0u8; 18];
     buf[0] = b'0';

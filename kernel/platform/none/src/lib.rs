@@ -19,6 +19,15 @@ pub unsafe fn discover(c: &dyn EarlyConsole, _boot_arg: u64) -> Option<bool> {
     None
 }
 
+/// No other CPU is started on these ports yet. Returns `None`: nothing was checked.
+///
+/// # Safety
+/// None required; `unsafe` only so both providers have one signature.
+pub unsafe fn start_secondaries(c: &dyn EarlyConsole) -> Option<bool> {
+    c.write_str("one CPU; this port starts no others yet");
+    None
+}
+
 /// Device memory the kernel touches after its own tables are installed: whatever the
 /// architecture names. Always known here, so never `None`.
 pub fn device_windows() -> Option<&'static [DeviceWindow]> {

@@ -60,6 +60,22 @@ pub trait Arch: Sized + 'static {
 
     /// Stop this CPU permanently.
     fn halt() -> !;
+
+    /// The logical number of the CPU this code is running on: dense, 0 for the CPU the
+    /// machine booted on, and below [`HasSmp::MAX_CPUS`] on a port that has it.
+    ///
+    /// On `Arch` rather than on [`HasSmp`] because code that must work on every machine
+    /// needs to ask it: lock-order checking keeps what each CPU holds apart, and it runs
+    /// under every lock type, uniprocessor ones included. A port that runs one CPU keeps
+    /// this default. A port that starts a second **must** override it, and its
+    /// [`HasSmp::cpu_id`] must return the same number. Nothing can make the compiler
+    /// check that, so each SMP port's bring-up checks it on every CPU instead.
+    ///
+    /// Answers for the instant it is read. Code that uses the answer to reach per-CPU
+    /// state must not migrate in between, which is what `sync::percpu::Pinned` is for.
+    fn cpu_index() -> usize {
+        0
+    }
 }
 
 /// The target has a hardware MMU with page tables.
@@ -91,6 +107,14 @@ pub trait HasMpu: Arch {
     note = "per-CPU data and IPIs are dead weight on a uniprocessor build"
 )]
 pub trait HasSmp: Arch {
+    /// The most CPUs this port can bring up. Every [`HasSmp::cpu_id`] it returns is
+    /// below this, so per-CPU storage with this many slots never misses.
+    const MAX_CPUS: usize;
+
+    /// The running CPU's logical number: the same value as [`Arch::cpu_index`].
+    ///
+    /// Not a hardware identifier. An aarch64 MPIDR or an x86 APIC ID is sparse, and
+    /// arrays are not; the port maps one to the other when it brings a CPU up.
     fn cpu_id() -> u32;
 }
 
@@ -152,6 +176,38 @@ pub trait IrqChip: Sync {
 
     /// Name for diagnostics, e.g. "GICv3".
     fn name(&self) -> &'static str;
+
+    /// Prepare the part of the controller that belongs to the calling CPU, on that CPU:
+    /// a GICv3 redistributor and CPU interface, a GICv2's banked registers.
+    ///
+    /// Returns the token [`IrqChip::send_ipi`] routes to this CPU with, which only the
+    /// controller knows how to form (an affinity value on a GICv3, a CPU interface bitmask
+    /// on a GICv2), or `None` when this controller cannot direct an interrupt at one CPU.
+    /// It leaves alone the enables of interrupts already enabled on this CPU, so calling it
+    /// on the CPU [`IrqChip::init`] already prepared is harmless.
+    ///
+    /// The default is a controller with no per-CPU part and no IPIs, which is every
+    /// uniprocessor one.
+    ///
+    /// # Safety
+    /// On the CPU being prepared, with its interrupts masked, after [`IrqChip::init`].
+    unsafe fn init_cpu(&self) -> Option<u64> {
+        None
+    }
+
+    /// Raise inter-processor interrupt `irq` on the CPU whose [`IrqChip::init_cpu`]
+    /// returned `target`. Does nothing on a controller with no IPIs.
+    fn send_ipi(&self, irq: IrqNumber, target: u64) {
+        let _ = (irq, target);
+    }
+
+    /// The interrupt that a value [`IrqChip::claim`] returned names, without whatever the
+    /// controller attached to it. A GICv2 reports an SGI's sender above the ID, and
+    /// [`IrqChip::eoi`] must be given the value with the sender still in it. This is the
+    /// part that says which interrupt it was.
+    fn id(&self, claimed: IrqNumber) -> IrqNumber {
+        claimed
+    }
 }
 
 /// An architecture with exactly one hardware thread, where masking interrupts is
