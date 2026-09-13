@@ -71,6 +71,7 @@ pub fn run_all<A: Arch>(c: &dyn EarlyConsole, boot_arg: u64, reserved: &[(u64, u
     atomics(&mut r);
     wide_arithmetic(&mut r);
     memory::<A>(&mut r, boot_arg, reserved);
+    lock_order::<A>(&mut r);
 
     c.write_str("\n    ");
     write_dec(c, r.passed as u64);
@@ -337,4 +338,51 @@ fn write_dec(c: &dyn EarlyConsole, mut v: u64) {
         v /= 10;
     }
     c.write_bytes(&buf[i..]);
+}
+
+// ---- lock-order checking ------------------------------------------------------------
+
+/// Enough classes that the ones used below sit above bit 32 of the reachability
+/// bitmap. Elements of one static array have distinct addresses, which is what a class
+/// is compared by.
+static LOCK_CLASSES: [sync::LockClass; 48] = [const { sync::LockClass::new("selftest") }; 48];
+
+/// Lock-order checking's tracker, on the real instruction set.
+///
+/// The host tests cover the logic. What they cannot cover is that logic compiled for
+/// this target: the bitmap is `u64` shifts and masks, which a 32-bit target lowers to
+/// multi-word code, and a class above bit 31 is exactly where a truncated shift would
+/// lose an edge and miss an inversion. So the classes here are registered past 32 first.
+fn lock_order<A: Arch>(r: &mut Report) {
+    use sync::lockdep::{Tracker, Violation};
+
+    let mut t = Tracker::new();
+    let mut registered = true;
+    for (i, class) in LOCK_CLASSES.iter().enumerate() {
+        registered &= t.acquire(class, i).is_ok() && t.release(class, i).is_ok();
+    }
+    let (Some(outer), Some(inner)) = (LOCK_CLASSES.get(40), LOCK_CLASSES.get(47)) else {
+        r.check("lock order: classes above bit 32 exist", false);
+        return;
+    };
+
+    let nested = t.acquire(outer, 1).is_ok()
+        && t.acquire(inner, 2).is_ok()
+        && t.release(inner, 2).is_ok()
+        && t.release(outer, 1).is_ok();
+    r.check(
+        "lock order: a consistent nesting is not reported",
+        registered && nested && t.report().count == 0,
+    );
+
+    let inverted = t.acquire(inner, 2).is_ok()
+        && matches!(t.acquire(outer, 1), Err(Violation::Inversion { .. }));
+    r.check("lock order: an inversion above bit 32 is reported", inverted);
+
+    // Nothing in the image takes classed locks in a bad order before the tests run, and
+    // in a build without checking this is zero by construction.
+    r.check(
+        "lock order: nothing reported since boot",
+        sync::lockdep::report::<A>().count == 0,
+    );
 }

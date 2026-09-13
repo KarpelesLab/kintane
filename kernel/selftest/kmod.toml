@@ -5,7 +5,7 @@ root = "src/lib.rs"
 layer = "subsystem"
 
 [deps]
-units = ["hal", "boot_protocol", "bootinfo", "mm"]
+units = ["hal", "boot_protocol", "bootinfo", "mm", "sync"]
 
 [config]
 requires = "INKERNEL_TESTS"

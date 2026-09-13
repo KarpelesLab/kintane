@@ -82,6 +82,15 @@ pub enum Error {
     TableFull,
 }
 
+/// Why [`HandleTable::transfer_out_many`] moved nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransferError {
+    /// The handle at `index` in the list is invalid or lacks `TRANSFER`.
+    Handle { index: usize, error: Error },
+    /// The handle at `index` already appears earlier in the list.
+    Duplicate { index: usize },
+}
+
 /// What a live handle names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Entry {
@@ -135,6 +144,16 @@ impl<const N: usize> HandleTable<N> {
 
     pub fn is_empty(&self) -> bool {
         self.live == 0
+    }
+
+    /// How many more handles [`HandleTable::insert`] would accept right now: slots that
+    /// are neither occupied nor retired. Retired slots are invisible from outside, so
+    /// this is the only way to know in advance whether `k` inserts will all succeed.
+    pub fn free_slots(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.entry.is_none() && !s.retired)
+            .count()
     }
 
     /// Install an object, returning the handle that names it.
@@ -206,15 +225,19 @@ impl<const N: usize> HandleTable<N> {
         }
         let entry = slot.entry.take().ok_or(Error::BadHandle)?;
         self.live -= 1;
+        Self::advance(slot);
+        Ok(entry)
+    }
 
-        // Advance the generation, or retire the slot rather than let it wrap.
+    /// Advance a just-vacated slot's generation, or retire the slot rather than let the
+    /// generation wrap.
+    fn advance(slot: &mut Slot) {
         let next = (slot.generation >> INDEX_BITS).wrapping_add(1);
         if next >= MAX_GENERATION {
             slot.retired = true;
         } else {
             slot.generation = next << INDEX_BITS;
         }
-        Ok(entry)
     }
 
     /// Duplicate a handle, narrowing its rights.
@@ -245,6 +268,72 @@ impl<const N: usize> HandleTable<N> {
             });
         }
         self.close(h)
+    }
+
+    /// Remove every handle in `handles` in order to send them elsewhere, **all or
+    /// nothing**.
+    ///
+    /// Each handle needs `TRANSFER`, and none may appear twice. If any check fails,
+    /// nothing has changed and the error names the first offending position. Otherwise
+    /// every handle is closed and `sink` receives `(index, entry)` for each, in list
+    /// order.
+    ///
+    /// The two phases are why this exists rather than a loop over
+    /// [`HandleTable::transfer_out`]. That loop fails part-way on the first bad handle,
+    /// or on the second copy of a handle it has already moved, and a caller then has to
+    /// put back what moved — under new handle values, and fallibly, since a slot just
+    /// vacated may have retired. Here every check runs before anything moves, and the
+    /// moving cannot fail: `&mut self` is held throughout, so nothing checked can change
+    /// before it is used.
+    pub fn transfer_out_many(
+        &mut self,
+        handles: impl Iterator<Item = Handle> + Clone,
+        mut sink: impl FnMut(usize, Entry),
+    ) -> Result<(), TransferError> {
+        self.check_transfer_out_many(handles.clone())?;
+        for (index, h) in handles.enumerate() {
+            // Checked above: live, of this generation, and not listed earlier, so not
+            // vacated by an earlier iteration. A `None` cannot happen; it is skipped
+            // rather than unwrapped because this layer does not panic.
+            let Some(slot) = self.slots.get_mut(h.index()) else {
+                continue;
+            };
+            let Some(entry) = slot.entry.take() else {
+                continue;
+            };
+            self.live -= 1;
+            Self::advance(slot);
+            sink(index, entry);
+        }
+        Ok(())
+    }
+
+    /// The checks [`HandleTable::transfer_out_many`] makes, without moving anything.
+    ///
+    /// For callers with checks of their own to make between validating and moving:
+    /// they can report every failure before touching anything else, then move.
+    pub fn check_transfer_out_many(
+        &self,
+        handles: impl Iterator<Item = Handle> + Clone,
+    ) -> Result<(), TransferError> {
+        for (index, h) in handles.clone().enumerate() {
+            let entry = self
+                .get(h)
+                .map_err(|error| TransferError::Handle { index, error })?;
+            if !entry.rights.contains(Rights::TRANSFER) {
+                return Err(TransferError::Handle {
+                    index,
+                    error: Error::AccessDenied {
+                        required: Rights::TRANSFER,
+                        held: entry.rights,
+                    },
+                });
+            }
+            if handles.clone().take(index).any(|earlier| earlier == h) {
+                return Err(TransferError::Duplicate { index });
+            }
+        }
+        Ok(())
     }
 
     /// Every live entry, for accounting and for tearing a process down.
@@ -362,6 +451,115 @@ mod tests {
         assert_eq!(e.object, obj(2));
         // Gone from this table: a transferred handle cannot be in two at once.
         assert_eq!(t.get(h), Err(Error::BadHandle));
+    }
+
+    /// A table of 8 holding `movable` transferable handles and one that is not.
+    fn with_handles(movable: u64) -> (HandleTable<8>, Vec<Handle>, Handle) {
+        let mut t = table();
+        let hs = (0..movable)
+            .map(|i| {
+                t.insert(obj(i), ObjectType::Event, Rights::READ | Rights::TRANSFER)
+                    .unwrap()
+            })
+            .collect();
+        let stuck = t.insert(obj(99), ObjectType::Event, Rights::READ).unwrap();
+        (t, hs, stuck)
+    }
+
+    fn entries_of(t: &HandleTable<8>, hs: &[Handle]) -> Vec<Result<Entry, Error>> {
+        hs.iter().map(|&h| t.get(h)).collect()
+    }
+
+    #[test]
+    fn transfer_out_many_moves_every_handle_in_order() {
+        let (mut t, hs, _) = with_handles(3);
+        let expected: Vec<Entry> = hs.iter().map(|&h| t.get(h).unwrap()).collect();
+        let mut got = Vec::new();
+        t.transfer_out_many(hs.iter().copied(), |i, e| got.push((i, e)))
+            .unwrap();
+        assert_eq!(got, expected.into_iter().enumerate().collect::<Vec<_>>());
+        for &h in &hs {
+            assert_eq!(t.get(h), Err(Error::BadHandle));
+        }
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn transfer_out_many_moves_nothing_when_a_later_handle_fails() {
+        // The failure is last, so a version that moved as it checked would already
+        // have moved the first three.
+        let (mut t, hs, stuck) = with_handles(3);
+        let before = entries_of(&t, &hs);
+        let mut list = hs.clone();
+        list.push(stuck);
+        let mut sunk = 0;
+        assert_eq!(
+            t.transfer_out_many(list.iter().copied(), |_, _| sunk += 1),
+            Err(TransferError::Handle {
+                index: 3,
+                error: Error::AccessDenied {
+                    required: Rights::TRANSFER,
+                    held: Rights::READ,
+                },
+            })
+        );
+        assert_eq!(sunk, 0);
+        assert_eq!(entries_of(&t, &hs), before, "same handles, same entries");
+        assert_eq!(t.len(), 4);
+
+        let stale = hs[1];
+        t.close(stale).unwrap();
+        let before = entries_of(&t, &[hs[0], hs[2]]);
+        assert_eq!(
+            t.transfer_out_many([hs[0], hs[2], stale].into_iter(), |_, _| sunk += 1),
+            Err(TransferError::Handle {
+                index: 2,
+                error: Error::BadHandle
+            })
+        );
+        assert_eq!(sunk, 0);
+        assert_eq!(entries_of(&t, &[hs[0], hs[2]]), before);
+    }
+
+    #[test]
+    fn transfer_out_many_refuses_a_handle_listed_twice() {
+        // One at a time, both copies pass their check, and the second `transfer_out`
+        // then fails after the first has moved.
+        let (mut t, hs, _) = with_handles(2);
+        let before = entries_of(&t, &hs);
+        assert_eq!(
+            t.transfer_out_many([hs[0], hs[1], hs[0]].into_iter(), |_, _| {}),
+            Err(TransferError::Duplicate { index: 2 })
+        );
+        assert_eq!(entries_of(&t, &hs), before);
+    }
+
+    #[test]
+    fn transfer_out_many_of_nothing_is_a_no_op() {
+        let (mut t, _, _) = with_handles(2);
+        t.transfer_out_many(core::iter::empty(), |_, _| unreachable!())
+            .unwrap();
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn free_slots_counts_what_insert_would_accept() {
+        let mut t: HandleTable<4> = HandleTable::new();
+        assert_eq!(t.free_slots(), 4);
+        let hs: Vec<Handle> = (0..3)
+            .map(|i| t.insert(obj(i), ObjectType::Event, Rights::READ).unwrap())
+            .collect();
+        assert_eq!(t.free_slots(), 1);
+        t.close(hs[0]).unwrap();
+        assert_eq!(t.free_slots(), 2);
+
+        // A retired slot is not free, though it is not occupied either.
+        let mut one: HandleTable<1> = HandleTable::new();
+        while let Ok(h) = one.insert(obj(1), ObjectType::Event, Rights::READ) {
+            one.close(h).unwrap();
+        }
+        assert!(one.is_empty());
+        assert_eq!(one.free_slots(), 0);
     }
 
     #[test]

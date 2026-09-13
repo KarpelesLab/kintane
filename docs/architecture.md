@@ -121,6 +121,14 @@ Lock types are selected by architecture capability, not by `#ifdef`:
 - No CAS → interrupt-masking critical sections; lock-free data structures are simply
   not offered, and code requiring them carries a `HasCas` bound.
 
+Generic subsystems, which cannot name the machine, take a `LockFamily` type parameter
+(`Spin<A>` or `Irq<A>`) and let the kernel image choose. Every lock can carry a
+`LockClass`. In debug builds (`DEBUG_LOCKDEP`) the order classes are taken in is
+recorded, and an inversion is reported the first time both orders have been seen,
+without the deadlock having to happen. Re-taking a held lock stops the CPU. When
+checking is off, a lock carries no class and pays nothing. The held-lock stack is
+global until secondary CPUs exist, and becomes per-CPU with them.
+
 Sleeping locks (mutex, rwlock, semaphore) sit above the scheduler and exist only in
 builds that have one.
 

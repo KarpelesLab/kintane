@@ -40,11 +40,13 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
+use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hal::{Arch, HasCas};
 
 use crate::irq::IrqGuard;
+use crate::lockdep::{self, ClassTag, LockClass};
 
 /// A mutual-exclusion lock that spins, built on compare-and-swap.
 ///
@@ -59,6 +61,8 @@ pub struct SpinLock<T, A: Arch + HasCas> {
     next: AtomicUsize,
     /// The ticket whose turn it is. Only the holder writes this.
     now_serving: AtomicUsize,
+    /// Its lock-order class. Zero-sized in a build without lock-order checking.
+    class: ClassTag,
     data: UnsafeCell<T>,
     /// `fn() -> A` rather than `A`: a tag, never stored, and the lock's auto traits
     /// should not depend on what the marker type happens to be.
@@ -75,20 +79,41 @@ unsafe impl<T: Send, A: Arch + HasCas> Sync for SpinLock<T, A> {}
 unsafe impl<T: Send, A: Arch + HasCas> Send for SpinLock<T, A> {}
 
 impl<T, A: Arch + HasCas> SpinLock<T, A> {
-    /// A new, unlocked lock. `const`, so it can be a `static` with no initialiser.
+    /// A new, unlocked lock that lock-order checking does not see. `const`, so it can
+    /// be a `static` with no initialiser.
     pub const fn new(value: T) -> Self {
+        Self::build(value, None)
+    }
+
+    /// A new, unlocked lock of class `class`, checked for lock order in debug builds.
+    pub const fn with_class(value: T, class: &'static LockClass) -> Self {
+        Self::build(value, Some(class))
+    }
+
+    const fn build(value: T, class: Option<&'static LockClass>) -> Self {
         SpinLock {
             next: AtomicUsize::new(0),
             now_serving: AtomicUsize::new(0),
+            class: ClassTag::new(class),
             data: UnsafeCell::new(value),
             _arch: PhantomData,
         }
+    }
+
+    /// This lock's identity for lock-order checking. Stable while it matters: a held
+    /// lock is borrowed by its guard, so it cannot move.
+    fn instance(&self) -> usize {
+        ptr::from_ref(self).addr()
     }
 
     /// Take the lock, spinning until it is this caller's turn.
     ///
     /// Leaves interrupts alone; see the type's documentation for when that is wrong.
     pub fn lock(&self) -> SpinGuard<'_, T, A> {
+        // Before drawing a ticket: re-taking a held lock is caught here and stops the
+        // CPU, instead of spinning for ever below. A no-op without a class.
+        lockdep::acquire::<A>(&self.class, self.instance());
+
         // `Relaxed` on the ticket draw. Drawing a ticket orders nothing by itself and
         // publishes nothing: it is a queue position, and the data the lock guards is
         // not touched until the wait below succeeds. The synchronisation happens
@@ -132,10 +157,13 @@ impl<T, A: Arch + HasCas> SpinLock<T, A> {
         self.next
             .compare_exchange(ticket, ticket.wrapping_add(1), Ordering::Acquire, Ordering::Acquire)
             .ok()
-            .map(|_| SpinGuard {
-                lock: self,
-                ticket,
-                _not_send: PhantomData,
+            .map(|_| {
+                lockdep::acquire_try::<A>(&self.class, self.instance());
+                SpinGuard {
+                    lock: self,
+                    ticket,
+                    _not_send: PhantomData,
+                }
             })
     }
 
@@ -202,6 +230,10 @@ impl<T, A: Arch + HasCas> DerefMut for SpinGuard<'_, T, A> {
 
 impl<T, A: Arch + HasCas> Drop for SpinGuard<'_, T, A> {
     fn drop(&mut self) {
+        // While still held. Released first, another CPU could take the lock and report
+        // it before this record is gone.
+        lockdep::release::<A>(&self.lock.class, self.lock.instance());
+
         // `Release`: everything written inside the critical section must be visible to
         // the next holder *before* it observes its turn, and this store is what that
         // holder's `Acquire` load synchronises with. This is the one line where a

@@ -49,32 +49,29 @@
 //! it was — the same handle values, the same rights. How:
 //!
 //! **Send** validates first and moves second. Phase one checks, without changing
-//! anything, what `transfer_out` would check for every listed handle (live, has
-//! `TRANSFER`) plus what it cannot check one handle at a time (no handle listed twice;
-//! no endpoint of this channel). Only then is the channel lock taken, the peer checked
+//! anything, everything kobject's `transfer_out_many` checks (every listed handle live
+//! and carrying `TRANSFER`, none listed twice) plus the one thing it cannot know about
+//! (no endpoint of this channel). Only then is the channel lock taken, the peer checked
 //! for openness and the destination slot **reserved**; only after the reservation do
-//! handles move, under the same lock, into the reserved slot. The table has been
-//! exclusively borrowed across both phases, so nothing can change between the check and
-//! the move. A full queue is discovered before any handle has moved and needs no undo.
+//! handles move, under the same lock, into the reserved slot, through
+//! `transfer_out_many`, which moves every handle or none. The table has been exclusively
+//! borrowed across both phases, so nothing can change between the check and the move.
+//! A full queue is discovered before any handle has moved and needs no undo.
 //!
-//! **Receive** installs first and dequeues second. The handles are inserted into the
-//! receiver's table while the message still holds them; if the table fills part-way,
-//! the handles already inserted are closed and the message is left untouched at the
-//! front of the queue ([`Error::NoRoom`]). Only when every insert has succeeded does the
-//! queue drop its copies.
+//! **Receive** checks for room first, installs second and dequeues third. The receiver's
+//! table is asked how many handles it can still take (`free_slots`, which counts retired
+//! slots out) before anything is inserted, so a table without room fails with
+//! [`Error::NoRoom`] having touched nothing. The handles are then inserted while the
+//! message still holds them, and only when every insert has succeeded does the queue
+//! drop its copies.
 //!
 //! What this does **not** achieve, precisely:
 //!
-//! - The send commit loop calls `transfer_out`, which returns a `Result`. Phase one makes that
-//!   failure impossible, but kobject has no two-phase transfer that would let the type system know
-//!   it. The failure arm exists, asserts in debug builds, and on release builds reinstalls what it
-//!   moved — under *new* handle values, and fallibly if a just-vacated slot retired. An
-//!   all-or-nothing `transfer_out_many` (or a validation token whose commit is infallible) in
-//!   kobject would remove the arm.
-//! - Receive's rollback closes the handles it had installed, which advances those slots'
-//!   generations. No handle value was ever returned for them, so nothing observable is lost, but
-//!   repeated `NoRoom` failures bring those slots nearer retirement. A `HandleTable::free_slots` in
-//!   kobject would let receive check first and remove the churn.
+//! - Send's commit and receive's inserts still return `Result`s that the checks before them make
+//!   impossible. Each failure arm is asserted in debug builds and leaves the queue intact. On send,
+//!   nothing has moved when `transfer_out_many` fails, so its arm is only a return. On receive, the
+//!   arm closes the handles it had installed, which advances those slots' generations; no handle
+//!   value was ever returned for them.
 //! - A "receiver's table is full" failure is a **receive** failure, not a send failure. Messages
 //!   are queued: the sender cannot know which table will receive them, and by the time it matters
 //!   the sender's handles have correctly left it. The guarantee on that path is that the message
@@ -125,9 +122,10 @@
 //! # Locking
 //!
 //! One lock per channel, over both inboxes and both reference counts. Which lock is a
-//! type parameter, [`LockFamily`], selected by architecture capability — see [`lock`]
-//! for why a generic subsystem needs that and cannot pick by trait bound. Both families
-//! run the critical section with interrupts masked.
+//! type parameter, [`LockFamily`], selected by architecture capability — see
+//! [`sync::family`] for why a generic subsystem needs that and cannot pick by trait
+//! bound. Both families run the critical section with interrupts masked. Every channel's
+//! lock is of class [`CHANNEL_LOCK`], so debug builds check the order it is taken in.
 //!
 //! **Lock order: the caller's handle table, then the channel.** `send`, `receive` and
 //! `duplicate` operate on the table while holding the channel lock; the table is passed
@@ -150,12 +148,15 @@
 
 mod channel;
 mod inbox;
-pub mod lock;
 
 #[cfg(test)]
 mod tests;
 
-pub use channel::{Channel, ENDPOINT_RIGHTS, Error, Received, Side, Status, Transfer};
+pub use channel::{
+    CHANNEL_LOCK, Channel, ENDPOINT_RIGHTS, Error, Received, Side, Status, Transfer,
+};
+/// The lock families live in `sync`, where every generic subsystem finds the same ones.
+/// Re-exported because they appear in this unit's signatures.
 #[cfg(target_has_atomic = "32")]
-pub use lock::Spin;
-pub use lock::{Irq, LockFamily};
+pub use sync::Spin;
+pub use sync::{Irq, LockFamily};
