@@ -4,6 +4,38 @@ Phases are ordered by dependency, not by calendar. Each has **exit criteria** th
 demonstrable — something boots, something passes, something fits in a budget — because
 "mostly done" is not a state a kernel phase can be in.
 
+## Status
+
+| Phase | State |
+|---|---|
+| 0 — Build system and first boot | **done** |
+| 1 — The portability spine | in progress |
+| 2 onward | not started |
+
+**Phase 0 closed** with `kbuild run --preset x86_64-qemu` building an x86_64 kernel
+from source, booting it under QEMU, and exiting on the guest's own signal (exit 33,
+which is `(0x10 << 1) | 1` from `isa-debug-exit`). Cold build 4.9s, warm 0.22s on the
+content-addressed cache.
+
+Three things the documentation had wrong until the code existed, now corrected in
+place:
+
+- QEMU's multiboot loader **refuses an ELF64 container** outright, so the image is
+  repackaged to ELF32 after linking. The ELF64 survives as the debug artifact, which
+  is the image/symbols split the deliverables already described — arriving a phase
+  earlier than planned.
+- `-no-shutdown` suppresses `isa-debug-exit` and turns every passing test into a
+  timeout. It reads as a natural companion to `-no-reboot` and is not one.
+- `naked_functions` was cited as a reason nightly is required and has been stable
+  since 1.88. The real reasons are in
+  [build-system.md](build-system.md#engine-a-pinned-nightly).
+
+Carried into Phase 1 as known-incomplete: `compiler_builtins` is byte-at-a-time and
+needs real intrinsics as the kernel grows; `HasSmp::cpu_id` returns a constant 0,
+correct only while every preset sets `SMP=n`; and the image is identity-mapped at
+1 MiB, so the move to the high half also flips the x86_64 code model back to
+`kernel`.
+
 The sequencing has one governing idea: **prove the portability claim before building
 anything on top of it.** Phase 1 adds a second and third architecture while the
 kernel is still small enough to restructure. Phase 4 scales down to a target with no

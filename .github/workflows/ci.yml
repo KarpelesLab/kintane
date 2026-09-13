@@ -1,0 +1,152 @@
+# The merge gate.
+#
+# The portability claim in docs/portability.md is only credible if it is checked
+# continuously: every merge builds every tier-1 target, and boots the ones that have a
+# QEMU machine. Gates 1, 3 and 4 in docs/testing.md#merge-gates are what this file is.
+#
+# Presets are discovered rather than listed, so adding config/presets/<name>.preset
+# adds it to the gate automatically and there is no second place to forget to update.
+
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The toolchain pin is checked on its own, first, because every other failure is
+  # ambiguous until we know the compiler is the one we intended.
+  toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        name: Read the pinned channel from toolchain.toml
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "pinned channel: $channel"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - name: Build kbuild
+        run: cargo build --release --manifest-path kbuild/Cargo.toml
+      - name: Verify the pin
+        run: ./kbuild/target/release/kbuild toolchain
+
+  # Host tests: kbuild's own suite. The kernel's host tests join this once
+  # `kbuild test --host` exists.
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --manifest-path kbuild/Cargo.toml
+
+  # Every tier-1 target, every preset, every merge.
+  build-and-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-system-arm qemu-system-misc
+          qemu-system-x86_64 --version | head -1
+      - name: Build kbuild
+        run: cargo build --release --manifest-path kbuild/Cargo.toml
+
+      - name: Build every preset
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in config/presets/*.preset; do
+            name=$(basename "$p" .preset)
+            echo "::group::build $name"
+            if ./kbuild/target/release/kbuild build --preset "$name"; then
+              echo "build ok: $name"
+            else
+              echo "::error title=build failed::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - name: Boot every preset under QEMU
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in config/presets/*.preset; do
+            name=$(basename "$p" .preset)
+            echo "::group::boot $name"
+            # The guest signals its own result through a real exit channel
+            # (isa-debug-exit / semihosting), so a pass is an exit status and never
+            # a string scraped out of console output. See docs/testing.md.
+            if ./kbuild/target/release/kbuild run --preset "$name" --timeout 60; then
+              echo "boot ok: $name"
+            else
+              echo "::error title=boot failed::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      # A failure that cannot be investigated from CI output alone is itself a
+      # harness bug, so the exception traces and images are kept.
+      - name: Collect failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            build/*/qemu.log
+            build/*/out/*.elf
+            build/*/gen/config.rs
+            .config
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Reproducibility is a property we must not lose quietly: the same source and
+  # config must produce the same bytes. Building twice in separate directories and
+  # comparing hashes is the cheapest possible check of that.
+  reproducible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - run: cargo build --release --manifest-path kbuild/Cargo.toml
+      - name: Build twice from scratch and compare
+        run: |
+          set -euo pipefail
+          ./kbuild/target/release/kbuild build --preset x86_64-qemu
+          a=$(sha256sum build/x86_64-kintane/out/kintane.elf | cut -d' ' -f1)
+          rm -rf build
+          ./kbuild/target/release/kbuild build --preset x86_64-qemu
+          b=$(sha256sum build/x86_64-kintane/out/kintane.elf | cut -d' ' -f1)
+          echo "first:  $a"
+          echo "second: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error title=not reproducible::the same source produced different bytes"
+            exit 1
+          fi
