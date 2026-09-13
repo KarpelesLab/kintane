@@ -612,18 +612,21 @@ gets one slot, which is a plain static with an index of zero. See [SMP](#smp) be
 
 #### What exists today
 
-The fixed-priority scheduler runs on x86_64, i686 and aarch64, on one CPU. It is three
-pieces, split where the knowledge actually is:
+The fixed-priority scheduler runs on x86_64, i686, aarch64 and riscv32, and on every CPU
+of `aarch64-virt-smp` (see [the SMP scheduler](#the-smp-scheduler)). It is three pieces,
+split where the knowledge actually is:
 
 - **`kernel/sched`** is the policy: 32 priority levels, round robin within a level,
-  and the highest runnable level always wins. It depends on nothing.
+  and the highest runnable level always wins. Its `balance` module decides, for a
+  multiprocessor, which CPU's queue a thread joins. It depends on nothing.
 - **`hal::HasContextSwitch`**, implemented in each `arch/<name>/context.rs`, is the
   mechanism: save the callee-saved registers, load another thread's.
-- **`kernel/thread`** binds the two into a thread table with four checked invariants.
-  The operations that switch (`yield_now`, `block`, `exit`) take a raw table pointer
-  and do their bookkeeping under a reference that ends *before* the switch. A thread
-  is suspended in the middle of such a call, and the thread that resumes calls into the
-  same table; with `&mut self` that is two live exclusive references to one object.
+- **`kernel/thread`** binds the two into a thread table with five checked invariants,
+  and one run queue per CPU (one, by default). The operations that switch (`yield_on`,
+  `block_on`, `exit_on`) take a raw table pointer and do their bookkeeping under a
+  reference that ends *before* the switch. A thread is suspended in the middle of such
+  a call, and the thread that resumes calls into the same table; with `&mut self` that
+  is two live exclusive references to one object.
 
 **Preemption is `yield_now` called from the timer interrupt.** Each port's `tick`
 module drives a one-shot timer (PIT mode 0 on x86, the generic timer on aarch64) and
@@ -650,8 +653,9 @@ conditions make this sound, and each port's `tick` module states them:
    saves the XMM registers as well, which was confirmed in the disassembly because the
    kernel runs with SSE.
 3. **Interrupts are masked for every table access**, by the CPU in the handler and
-   explicitly in thread code. That is the Phase 2 exclusion on one CPU. A new thread
-   starts masked, because a switch always happens masked, and unmasking is its first act.
+   explicitly in thread code, and on a multiprocessor the scheduler lock is held too. A
+   new thread starts masked, because a switch always happens masked, and unmasking is its
+   first act.
 
 The idle thread runs at priority 0 and waits for an interrupt with a race-free
 check-then-halt (`sti; hlt` on x86, `wfi` then unmask on aarch64).
@@ -698,9 +702,9 @@ Once they are done, `kmain` decides what the image does next:
 
 - **A test image** (`QEMU_EXIT`) reports its verdict and stops, as before.
 - **Any other image** calls `persist::run`, provided bring-up passed. That calls
-  `preempt::resume`, which re-enables the one-shot timer with the scheduler's hook and
-  unmasks. Boot is then one thread among the others, at the priority the checks gave
-  it, and idle is still in the table.
+  `preempt::resume`, which re-enables the one-shot timer with the scheduler's hook,
+  hands every started secondary to the scheduler, and unmasks. Boot is then one thread
+  among the others, at the priority the checks gave it, and idle is still in the table.
   - A normal image then has boot sleep, printing `uptime N s` every ten seconds. That
     is how a boot with no result channel shows it did not just halt.
   - A `STRESS_TEST` image makes boot the stress auditor instead
@@ -719,8 +723,9 @@ Not yet:
 ### SMP
 
 Phase 3 starts on aarch64. With `SMP=y`, the boot CPU starts every CPU the device tree
-lists, up to `NR_CPUS` and the port's `HasSmp::MAX_CPUS`, and each one it starts runs
-an idle loop. There is still one scheduler, and it is the boot CPU's.
+lists, up to `NR_CPUS` and the port's `HasSmp::MAX_CPUS`. Each one it starts runs an
+idle loop until the scheduler is handed every CPU after bring-up, and from then on each
+schedules threads from its own run queue ([the SMP scheduler](#the-smp-scheduler)).
 
 **A CPU's number.** Hardware names a CPU sparsely: an MPIDR on Arm, an APIC ID on x86.
 The kernel names it densely, 0 being the boot CPU, because per-CPU storage is an array.
@@ -758,8 +763,8 @@ undefined behaviour. Lock-order checking keeps each CPU's held-lock stack in one
    banked CPU interface and SGI/PPI priorities.
 5. It enables its two IPIs and its generic timer at 100 Hz, and reports in.
 
-**IPIs** are SGIs. SGI 0 runs a function on the target and SGI 1 is a reschedule,
-delivered and counted. `IrqChip::send_ipi` takes the routing token the target's
+**IPIs** are SGIs. SGI 0 runs a function on the target, SGI 1 is a reschedule, and
+SGI 2 is a TLB shootdown. `IrqChip::send_ipi` takes the routing token the target's
 `init_cpu` returned: an affinity value on a GICv3, and a CPU interface bit on a GICv2,
 which routes by interface number rather than MPIDR. A GICv2 SGI is acknowledged with its
 sender, so `claim` keeps it and `IrqChip::id` strips it.
@@ -788,24 +793,114 @@ These mutations each made the boot fail:
 The skipped wake is only visible because `init_cpu` refuses a redistributor that stays
 asleep: QEMU delivers to one anyway.
 
-**What the single-CPU scheduler assumes, and what SMP has to change:**
+#### What a port provides: `hal::HasIpi`
 
-- **Exclusion is the interrupt mask.** The thread table, the timer queue and the kernel
-  heap are safe to touch with interrupts masked because one CPU runs them. The heap and
-  timekeeping locks are `Spin`, which is correct on SMP, but the thread table is reached
-  through a raw pointer under a mask and needs a real lock, or per-CPU run queues, before
-  a second CPU schedules.
-- **One run queue, one idle thread, one tick.** The tick hook belongs to the boot CPU:
-  a secondary's timer interrupt is counted in its block and never reaches it. Per-CPU
-  run queues, a per-CPU idle thread and a per-CPU tick come together.
-- **No migration.** A thread runs where it was spawned. `Pinned` is only sound across a
-  migrating scheduler if a thread never blocks while pinned, which is the stated rule
-  but not yet a checked one.
-- **Wake-ups do not cross CPUs.** Waking a thread queued on another CPU will need the
-  reschedule IPI, which today is only counted.
-- **TLB invalidation is inner-shareable** (`tlbi ...is`), which reaches every CPU in the
-  system. It is correct for shared kernel mappings. It is not a shootdown protocol, and
-  user address spaces will need one.
+The scheduler and the shootdown reach other CPUs only through `hal::HasIpi`, so a second
+SMP port plugs in by implementing it:
+
+- `cpu_online` and `send_ipi`, with `Ipi::Call`, `Ipi::Reschedule` and `Ipi::TlbFlush`;
+- `call_on`, the boot-path function call;
+- `set_tlb_flush_handler`, which the port runs for every `Ipi::TlbFlush`;
+- `set_tlb_shootdown`, which the port's `flush_tlb` calls after invalidating locally;
+- `flush_tlb_local`, the invalidation a shootdown target makes;
+- `release_secondaries`, which hands every started CPU to the scheduler's entry point.
+  From then on the port runs the scheduler's hook after that CPU's timer interrupts and
+  reschedule IPIs, exactly as after the boot CPU's timer interrupts.
+
+The kernel side is `kernel/main/src/mp_smp.rs`, selected by `SMP` with the paged memory
+model. A kernel without them gets `mp_up.rs`, which is one run queue, no lock, no IPIs
+and no shootdown, so a uniprocessor build pays for none of this.
+
+#### The SMP scheduler
+
+After bring-up, `preempt::resume` releases every secondary into `preempt::join`, where
+the code running on it becomes that CPU's idle thread in the one thread table.
+
+- **One lock, held across the switch.** The table has a run queue per CPU and one lock,
+  `sched.table` (`mp_smp.rs`). The thread that switches away takes it, and the thread
+  the switch resumes releases it, or `thread_start` does for a thread's first run. Held
+  any shorter, another CPU could pick the leaving thread while its registers were still
+  being saved. The lock serialises every context switch in the machine. That costs a few
+  hundred instructions per switch on up to eight CPUs, and splitting it per run queue
+  later changes no scheduling decision, because those already live in `sched::balance`.
+  The lock is a `SpinLock<()>` taken with `lock_handoff` and released with
+  `unlock_handoff`, because a guard cannot be dropped on another thread's stack.
+- **Placement.** A woken thread goes back to its last CPU if that CPU is idle, else to any
+  idle CPU it may use, else back to its last CPU if it outranks what runs there, else to
+  the least-loaded CPU it may use. The CPU that wakes it sends a reschedule IPI when the
+  thread would run or share a slice where it landed. Affinity masks
+  (`Threads::set_affinity`) are never overruled.
+- **Balancing.** Every timer interrupt and every pass of an idle loop lets a CPU pull the
+  highest-priority ready thread it may run from the busiest other CPU. A pull happens
+  when this CPU is idle and the other has a thread waiting, or when the other carries at
+  least two more threads. The margin of two is what stops a thread bouncing. A CPU with a
+  thread waiting sends a reschedule IPI to an idle CPU, because an idle secondary sleeps
+  until something interrupts it.
+- **Time.** The boot CPU keeps time: only it arms its timer for the earliest sleeper, and
+  it records that arming under the timer queue's lock. A secondary arms only its slice,
+  or one full arming (2.15 s) when idle. A thread that sleeps on a secondary with a
+  deadline before the boot CPU's arming sends the boot CPU a reschedule IPI. The design
+  makes a missing IPI visible, as a wake-up seconds late. If every CPU woke for every
+  expiry, the same bug would hide in milliseconds. That held for the wake-placement IPI,
+  whose removal failed the stress run. It did not hold for the kick to the boot CPU: the
+  stress run keeps the boot CPU too busy for its removal to matter, so that kick is
+  argued and untested.
+- **Sleeping.** A thread takes the scheduler lock before it arms its timer, and releases
+  it only after it has blocked. A timer interrupt on another CPU wakes sleepers under that
+  lock, so it cannot find the timer due while the thread is still running.
+
+The core decisions are host-tested: `sched::balance` for placement, reschedule and pull
+decisions, and convergence without bouncing; `kernel/thread` for multi-CPU yields,
+wakes, affinity, balancing and 20,000 random operations with every invariant checked.
+
+**The proof** is the stress run on `aarch64-virt-smp` ([testing](testing.md#3a-stress)).
+Its heartbeat reports iterations per CPU, migrations, pulls, IPIs and shootdowns. Its
+audit fails if the two never-blocking heap workloads spend a whole second on one CPU. It
+also fails if any shootdown was answered by the wrong CPUs. Each of the following
+mutations made the run fail:
+
+- **No reschedule IPI for a cross-CPU wake:** a workload did not reach its checkpoint.
+- **Balancing disabled:** both heap workloads on one CPU, at the first audit.
+- **The scheduler lock removed:** a thread vanished, and a workload never checked in.
+
+#### TLB shootdown
+
+A mapping removed or downgraded on one CPU is still usable through every other CPU's
+cached translation until that CPU flushes too. The port's `flush_tlb` invalidates locally
+and calls `shootdown::shoot` (`kernel/main/src/shootdown.rs`):
+
+1. The initiator masks interrupts and takes `tlb.shootdown` with `try_lock`, in a loop
+   that answers any request addressed to it meanwhile, so two simultaneous initiators
+   cannot each wait for the other.
+2. It publishes the address and target set in `mm::tlb::Shootdown`, and sends
+   `Ipi::TlbFlush` to every online CPU but itself.
+3. Each target flushes, then clears its bit.
+4. The initiator waits for no bits, then checks that the CPUs that answered are exactly
+   the online CPUs other than itself, recomputed rather than trusted from what it sent.
+
+On aarch64 the local flush is now `tlbi vaae1` / `vmalle1`, not the `...is` broadcast
+forms. On real hardware the broadcast would be a legitimate shootdown by itself, and Linux
+uses it. It is not used here, so that one protocol with acknowledgements serves every
+port, including those whose TLBs have no broadcast form. It also means a shootdown that
+misses a CPU cannot be quietly covered by the broadcast.
+
+**The rule that keeps the wait from deadlocking:** the initiator may wait with interrupts
+masked, so no lock it holds across a shootdown may be waited for by another CPU with
+interrupts masked. See [memory-model.md](memory-model.md).
+
+**The check.** On `aarch64-virt-smp` the `shootdown` banner line gates the exit status:
+
+1. A page is mapped at a free address, and every secondary reads it through an IPI, so
+   each caches the translation.
+2. The page is unmapped, its frame is refilled as if reused, and a second frame is mapped
+   at the same address.
+3. Every secondary reads the address again, and must see the second frame.
+4. Every shootdown must have been answered by exactly the right CPUs.
+
+Skipping CPU 3 in the target set failed both halves: CPU 3 read the reused frame through
+its stale translation, and the books recorded wrong answers. The stale read is observable
+because QEMU's TCG keeps a software TLB per CPU and empties it only for the CPU a guest
+invalidate ran on. The bookkeeping half does not depend on the emulator.
 
 Also not yet:
 
@@ -813,7 +908,13 @@ Also not yet:
   overflows would share it;
 - SPIs are all delivered to CPU 0;
 - CPUs are never stopped or hot-unplugged;
-- x86 has `HasSmp::MAX_CPUS = 1` until the APIC driver exists.
+- x86 has `HasSmp::MAX_CPUS = 1` and no `HasIpi` until the APIC driver exists;
+- timers are one queue, so the boot CPU takes every expiry and wakes sleepers for every
+  CPU;
+- the scheduler lock is one lock for every run queue;
+- a shootdown targets every online CPU, including ones that cannot have cached the
+  translation, and flushes one page per request. `mm::vm` operations on many pages pay
+  one round of IPIs per page.
 
 ## Boot flow
 

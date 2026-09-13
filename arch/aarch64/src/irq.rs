@@ -16,9 +16,11 @@
 //!
 //! Every CPU dispatches through here, each with its own interrupts masked. The controller
 //! is installed once, before any secondary is started, and never replaced, so readers on
-//! every CPU see one value. The tick counter and the hook are the boot CPU's: a timer
-//! interrupt on a secondary is counted in that CPU's block by `smp` and goes no further.
-//! SGIs are the IPIs `smp` sends, and are handled there on whichever CPU took them.
+//! every CPU see one value. The tick counter is the boot CPU's. Until `smp::release`, so
+//! is the hook: a timer interrupt on a secondary is counted in that CPU's block by `smp`
+//! and goes no further. After it, every CPU's timer interrupts and reschedule IPIs run
+//! the hook on the CPU that took them. SGIs are the IPIs `smp` sends, and are handled
+//! there on whichever CPU took them.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -106,18 +108,18 @@ pub(crate) fn dispatch() {
 /// code a chance to run again.
 const MAX_PER_ENTRY: u32 = 16;
 
-/// Handle one claimed interrupt. Returns whether it was a timer tick.
+/// Handle one claimed interrupt. Returns whether the scheduler's hook should run after
+/// it: a timer tick, or a reschedule IPI once the scheduler owns every CPU.
 fn handle(irq: IrqNumber) -> bool {
     if irq.0 < crate::smp::SGI_LIMIT {
-        crate::smp::on_ipi(irq.0);
-        return false;
+        return crate::smp::on_ipi(irq.0);
     }
     if irq.0 == crate::timer::PPI {
-        // A secondary's generic timer is its own, and its ticks are not the scheduler's:
-        // counting them here, and not below, keeps the hook and `TIMER_TICKS` the boot
-        // CPU's alone.
-        if crate::smp::on_secondary_tick() {
-            return false;
+        // A secondary's generic timer is its own until the scheduler is given the CPU, and
+        // counting its ticks there, not below, keeps `TIMER_TICKS` the boot CPU's alone.
+        // Once released, a secondary's tick reaches the hook too.
+        if let Some(run_hook) = crate::smp::on_secondary_tick() {
+            return run_hook;
         }
         // The timer's condition is level-sensitive: without this the line stays
         // asserted, EOI re-delivers immediately, and the machine never leaves the

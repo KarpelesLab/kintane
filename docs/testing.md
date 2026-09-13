@@ -356,8 +356,47 @@ hook, which re-armed the same deadline, so the bug became a hang again. The thir
 unmasks explicitly and removes the hook while it watches, and it reports FAILED on the
 unsigned limit.
 
-Every merge runs a 20-second stress smoke on each tier-1 architecture, which keeps the
-image building and passing its first audits. A nightly workflow
+**On several CPUs** (`aarch64-virt-smp`) the scheduler runs every CPU and the same
+workloads spread across them. Two more checks join the audit there:
+
+- **Spread.** The two heap workloads never block, so only balancing moves them off the CPU that
+  spawned them. If both ran on a single CPU for a whole interval, the audit fails.
+- **Shootdowns.** Every TLB shootdown since boot was answered by exactly the online CPUs other than
+  the initiator, and none stalled.
+
+The heartbeat adds iterations per CPU, migrations, pulls, reschedule IPIs and shootdowns:
+
+```
+stress heartbeat 30/30 s: heap 2506153 (refused 157179), ipc 2223464, sleeps 1135
+  (latest +87075 us), vm 9531 (faults 97703, copies 19064, huge 2383), pages 13732,
+  cpus 4 [1763522 1883534 1753371 1577052] migrations 954 (pulls 445),
+  ipis 23720 (idle kicks 127), shootdowns 250201, audits 30 ok
+```
+
+| Mutation | Result |
+|---|---|
+| No reschedule IPI for a wake placed on another CPU | "a workload did not reach a checkpoint: ping" at 3 s |
+| Balancing disabled | "both never-blocking heap workloads ran on one CPU for a whole interval" at 1 s |
+| The scheduler lock removed | "a workload did not reach a checkpoint: heap B" at 1 s |
+
+The first works because an idle secondary no longer wakes for every timer in the
+kernel (see [architecture.md](architecture.md#the-smp-scheduler)). A woken thread
+placed on it without an IPI waits for a full arming of its timer, seconds, instead of
+milliseconds.
+
+**Not falsified:** the reschedule IPI a secondary sends the boot CPU when it arms a timer
+earlier than the boot CPU's next wake-up. Removing it still passed a 20-second run. The
+stress workloads keep the boot CPU busy with slices, so it never sleeps long enough for
+the missing kick to matter. The mechanism is argued in `timekeeping::program`, and nothing
+here tests it.
+
+An 8-minute run on `aarch64-virt-smp` passed all 480 audits: 40 million heap iterations,
+33 million channel round trips, 151 thousand vm cycles, 16,504 migrations, 447,737
+reschedule IPIs and 3.97 million shootdowns. The four CPUs completed 27.9, 27.6, 26.0 and
+24.9 million workload iterations.
+
+Every merge runs a 20-second stress smoke on each tier-1 architecture and on
+`aarch64-virt-smp`, which keeps the image building and passing its first audits. A nightly workflow
 (`.github/workflows/stress.yml`) runs 30 minutes per tier-1 preset,
 and takes a duration input when dispatched by hand. The 24-hour run is that dispatch
 with `24h`. GitHub-hosted runners cap a job at six hours, so it needs a self-hosted
@@ -413,9 +452,10 @@ handover is missing — a lost `rdi` must not read as "no memory map on this por
 The `aarch64-virt-smp` preset is the `aarch64-virt` kernel with `SMP=y` and
 `QEMU_CPUS=4`. `QEMU_CPUS` is both the `-smp` given to QEMU and the CPU count the kernel
 requires the device tree to report. So a run that loses the option fails, instead of
-passing an SMP check on one CPU. Its `smp` banner line is described in
-[architecture.md](architecture.md#smp). It runs every mode the other aarch64 preset runs.
-The one-CPU preset reports that line as skipped: `SMP=n`, so nothing was started.
+passing an SMP check on one CPU. Its `smp` and `shootdown` banner lines are described in
+[architecture.md](architecture.md#smp). It runs every mode the other aarch64 preset runs,
+and the stress run, where the scheduler works across all four CPUs. The one-CPU preset
+reports both lines as skipped: `SMP=n`, so nothing was started.
 
 Every x86 row also gets two CPUs (`QEMU_CPUS`) and, with `QEMU_PCI_TEST_DEVICE`, a
 `pci-testdev` behind a bridge: a PCI Express root port on q35, a PCI-to-PCI bridge on pc.

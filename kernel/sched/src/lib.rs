@@ -27,6 +27,8 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+pub mod balance;
 pub mod runqueue;
 
+pub use balance::{CpuLoad, CpuSet};
 pub use runqueue::{Error, Priority, RunQueue, ThreadId};

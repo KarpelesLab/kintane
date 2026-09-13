@@ -56,7 +56,7 @@ use mm::phys::FrameAllocator;
 use time::{Duration, Instant};
 
 use crate::preempt::{self, sleep_until};
-use crate::{Check, Live, finish, timekeeping, write_usize};
+use crate::{Check, Live, finish, mp, timekeeping, write_usize};
 
 /// How often the auditor stops everything and checks.
 const AUDIT_EVERY: Duration = Duration::from_nanos(1_000_000_000);
@@ -140,31 +140,50 @@ fn failure(w: usize) -> Option<&'static str> {
     core::str::from_utf8(bytes).ok()
 }
 
-/// Count one completed iteration of `w`.
+/// Iterations completed on each CPU, all workloads together.
+static ON_CPU: [AtomicU64; mp::CPUS] = [const { AtomicU64::new(0) }; mp::CPUS];
+
+/// For each workload, the CPUs it completed an iteration on since the last audit, as bits.
+static SEEN_ON: [AtomicU64; WORKLOADS] = [const { AtomicU64::new(0) }; WORKLOADS];
+
+/// Count one completed iteration of `w`, and where it ran.
 pub fn progress(w: Workload) {
     PROGRESS[w as usize].fetch_add(1, Ordering::Relaxed);
+    // Masked for the read only: which CPU completed the iteration, not which one the
+    // thread is on by the time the counters are written.
+    let irq = Cpu::irq_save();
+    let cpu = Cpu::cpu_index().min(mp::CPUS - 1);
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { Cpu::irq_restore(irq) };
+    ON_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+    SEEN_ON[w as usize].fetch_or(1 << cpu, Ordering::AcqRel);
 }
 
 /// Whether the auditor is asking workloads to stop.
 pub fn park_requested() -> bool {
-    PARK.load(Ordering::Relaxed)
+    PARK.load(Ordering::Acquire)
 }
 
 /// A checkpoint: if the auditor asked, stop here, reporting where, until it is done.
+///
+/// The store that reports the stop is `Release`, and the auditor's load of it is
+/// `Acquire`. So when the auditor sees a workload parked, it also sees everything that
+/// workload wrote before parking, on whichever CPU it ran: the handle tables, the frame
+/// pools, the progress counters. See `docs/memory-model.md`.
 pub fn checkpoint(w: Workload, state: Parked) {
     if !park_requested() {
         return;
     }
-    PARKED[w as usize].store(state as u8, Ordering::Relaxed);
+    PARKED[w as usize].store(state as u8, Ordering::Release);
     while park_requested() {
         sleep_until(timekeeping::now().saturating_add(PARKED_NAP));
     }
-    PARKED[w as usize].store(Parked::Running as u8, Ordering::Relaxed);
+    PARKED[w as usize].store(Parked::Running as u8, Ordering::Release);
 }
 
 /// Where `w` is parked.
 pub fn parked(w: Workload) -> Parked {
-    match PARKED[w as usize].load(Ordering::Relaxed) {
+    match PARKED[w as usize].load(Ordering::Acquire) {
         1 => Parked::Holding,
         2 => Parked::Empty,
         _ => Parked::Running,
@@ -245,7 +264,7 @@ pub fn region() -> (u64, u64) {
 fn all_parked() -> bool {
     PARKED
         .iter()
-        .all(|p| p.load(Ordering::Relaxed) != Parked::Running as u8)
+        .all(|p| p.load(Ordering::Acquire) != Parked::Running as u8)
 }
 
 /// End the run with a failure, saying why.
@@ -287,17 +306,17 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
         let now = timekeeping::now();
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;
 
-        PARK.store(true, Ordering::Relaxed);
+        PARK.store(true, Ordering::Release);
         let deadline = now.saturating_add(PARK_WITHIN);
         while !all_parked() && timekeeping::now() < deadline {
             sleep_until(timekeeping::now().saturating_add(PARKED_NAP));
         }
-        if let Some(w) = (0..WORKLOADS).find(|&w| PARKED[w].load(Ordering::Relaxed) == 0) {
+        if let Some(w) = (0..WORKLOADS).find(|&w| PARKED[w].load(Ordering::Acquire) == 0) {
             audit_failed(c, seconds, "a workload did not reach a checkpoint", NAMES[w]);
         }
         audit(c, seconds, &mut last);
         audits += 1;
-        PARK.store(false, Ordering::Relaxed);
+        PARK.store(false, Ordering::Release);
 
         heartbeat(c, seconds, audits);
         if now >= end {
@@ -352,7 +371,7 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
             c.write_str(name);
             audit_failed(c, seconds, "a workload found something wrong", what);
         }
-        let now = PROGRESS[w].load(Ordering::Relaxed);
+        let now = PROGRESS[w].load(Ordering::Acquire);
         if now == last[w] {
             audit_failed(c, seconds, "a workload made no progress since the last audit", name);
         }
@@ -384,6 +403,29 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
             audit_failed(c, seconds, "lock order", "a violation was recorded");
         }
     }
+    let seen = SEEN_ON.each_ref().map(|s| s.swap(0, Ordering::AcqRel));
+    if preempt::stats().cpus > 1 {
+        // The two heap threads never block, so only balancing moves them off the CPU that
+        // spawned them. On one CPU for a whole audit interval between them means nothing
+        // moved them apart.
+        let busy = seen[Workload::HeapA as usize] | seen[Workload::HeapB as usize];
+        if busy.count_ones() < 2 {
+            audit_failed(
+                c,
+                seconds,
+                "scheduler",
+                "both never-blocking heap workloads ran on one CPU for a whole interval",
+            );
+        }
+    }
+    if mp::shootdown_stats().2 != 0 {
+        audit_failed(
+            c,
+            seconds,
+            "tlb shootdown",
+            "a shootdown was answered by the wrong CPUs, or stalled",
+        );
+    }
 }
 
 fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
@@ -412,6 +454,30 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
     write_usize(c, vm::huge() as usize);
     c.write_str("), pages ");
     write_usize(c, p(Workload::Pages));
+    if mp::CPUS > 1 {
+        let s = preempt::stats();
+        let (shootdowns, _, _) = mp::shootdown_stats();
+        c.write_str(", cpus ");
+        write_usize(c, s.cpus);
+        c.write_str(" [");
+        for (cpu, n) in ON_CPU.iter().enumerate().take(s.cpus.max(1)) {
+            if cpu != 0 {
+                c.write_str(" ");
+            }
+            write_usize(c, n.load(Ordering::Relaxed) as usize);
+        }
+        c.write_str("] migrations ");
+        write_usize(c, s.migrations as usize);
+        c.write_str(" (pulls ");
+        write_usize(c, s.pulls as usize);
+        c.write_str("), ipis ");
+        write_usize(c, s.reschedules as usize + s.timer_kicks as usize);
+        c.write_str(" (idle kicks ");
+        write_usize(c, s.idle_kicks as usize);
+        c.write_str(")");
+        c.write_str(", shootdowns ");
+        write_usize(c, shootdowns);
+    }
     c.write_str(", audits ");
     write_usize(c, audits as usize);
     c.write_str(" ok\n");

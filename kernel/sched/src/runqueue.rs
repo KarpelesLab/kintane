@@ -227,6 +227,16 @@ impl<const N: usize> RunQueue<N> {
         Ok(priority)
     }
 
+    /// Every queued thread, in the order [`RunQueue::pick_next`] would take them: highest
+    /// level first, arrival order within a level.
+    pub fn iter(&self) -> Iter<'_, N> {
+        Iter {
+            queue: self,
+            levels: self.nonempty,
+            cursor: None,
+        }
+    }
+
     fn highest(&self) -> Option<usize> {
         if self.nonempty == 0 {
             return None;
@@ -248,9 +258,56 @@ impl<const N: usize> RunQueue<N> {
     }
 }
 
+/// The queued threads, in pick order. See [`RunQueue::iter`].
+pub struct Iter<'q, const N: usize> {
+    queue: &'q RunQueue<N>,
+    /// Levels not yet started, as bits.
+    levels: u32,
+    /// The next slot in the level being walked.
+    cursor: Option<u16>,
+}
+
+impl<const N: usize> Iterator for Iter<'_, N> {
+    type Item = (ThreadId, Priority);
+
+    fn next(&mut self) -> Option<(ThreadId, Priority)> {
+        // Bounded: each call either yields a slot, which moves the cursor along a list no
+        // longer than N, or clears one of 32 level bits.
+        loop {
+            if let Some(c) = self.cursor {
+                let s = &self.queue.slots[c as usize];
+                self.cursor = s.next;
+                return Some((s.id, s.priority));
+            }
+            if self.levels == 0 {
+                return None;
+            }
+            let level = 31 - self.levels.leading_zeros() as usize;
+            self.levels &= !(1 << level);
+            self.cursor = self.queue.levels[level].head;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iteration_follows_pick_order() {
+        let mut q: RunQueue<8> = RunQueue::new();
+        for (id, prio) in [(1, 3), (2, 7), (3, 3), (4, 0), (5, 7)] {
+            q.enqueue(t(id), p(prio)).unwrap();
+        }
+        let listed: Vec<u32> = q.iter().map(|(id, _)| id.raw()).collect();
+        let mut picked = Vec::new();
+        while let Some((id, _)) = q.pick_next() {
+            picked.push(id.raw());
+        }
+        assert_eq!(listed, [2, 5, 1, 3, 4]);
+        assert_eq!(listed, picked);
+        assert_eq!(q.iter().count(), 0);
+    }
 
     fn t(n: u32) -> ThreadId {
         ThreadId::new(n)

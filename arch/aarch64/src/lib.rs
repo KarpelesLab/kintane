@@ -21,7 +21,7 @@ pub mod tick;
 pub mod timer;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};
-use hal::{Arch, Endian, HasCas, HasFpu, HasMmu, HasSmp, IrqNumber};
+use hal::{Arch, Endian, HasCas, HasFpu, HasIpi, HasMmu, HasSmp, Ipi, IrqNumber};
 pub use serial::EARLY;
 
 /// The AArch64 architecture.
@@ -132,6 +132,45 @@ impl HasSmp for Aarch64 {
         // The logical index `smp` assigned when it started this CPU, not the MPIDR: an
         // MPIDR is sparse, and Aff0 alone is not even unique once a board has two clusters.
         smp::cpu_index() as u32
+    }
+}
+
+impl HasIpi for Aarch64 {
+    fn cpu_online(cpu: usize) -> bool {
+        smp::is_online(cpu)
+    }
+
+    fn send_ipi(cpu: usize, ipi: Ipi) -> bool {
+        smp::send(
+            cpu,
+            match ipi {
+                Ipi::Call => smp::IPI_CALL,
+                Ipi::Reschedule => smp::IPI_RESCHEDULE,
+                Ipi::TlbFlush => smp::IPI_TLB,
+            },
+        )
+    }
+
+    fn call_on(cpu: usize, f: fn(u64) -> u64, arg: u64) -> Option<u64> {
+        smp::call(cpu, f, arg)
+    }
+
+    fn set_tlb_flush_handler(handler: Option<fn()>) {
+        smp::set_tlb_handler(handler);
+    }
+
+    fn set_tlb_shootdown(hook: Option<fn(Option<usize>)>) {
+        smp::set_shootdown(hook);
+    }
+
+    unsafe fn flush_tlb_local(addr: Option<usize>) {
+        // SAFETY: forwarded; the caller's contract.
+        unsafe { paging::flush_local(addr) };
+    }
+
+    unsafe fn release_secondaries(entry: fn(usize) -> !) {
+        // SAFETY: the caller's contract is `release`'s.
+        unsafe { smp::release(entry) };
     }
 }
 

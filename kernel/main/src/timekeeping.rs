@@ -21,6 +21,8 @@
 //! The decision "is a slice needed" belongs to the scheduler, which knows who is
 //! waiting. It passes the answer to [`program`].
 
+use core::sync::atomic::Ordering;
+
 use arch::Cpu;
 use hal::ClockSource;
 use sched::ThreadId;
@@ -28,7 +30,7 @@ use sync::lockdep::LockClass;
 use sync::{CasOnce, LockFamily};
 use time::{Clock, Duration, Instant, TimerQueue};
 
-use crate::Locks;
+use crate::{AtomicU64, Locks};
 
 /// Timers the kernel can have armed at once. Every sleeping thread holds one.
 pub const TIMERS: usize = 16;
@@ -109,11 +111,28 @@ pub fn with_timers<R>(f: impl FnOnce(&mut Timers) -> R) -> Option<R> {
     QUEUE.get().map(|lock| Locks::with(lock, f))
 }
 
-/// Arm the timer interrupt for the earliest timer, or for `slice` from now if that is
-/// sooner. `slice` is `Some` when another thread is waiting for the CPU.
+/// Arm this CPU's timer interrupt for the earliest timer, or for `slice` from now if that
+/// is sooner. `slice` is `Some` when another thread is waiting for the CPU.
 ///
 /// Returns the delay armed, in nanoseconds. Never longer than one arming can reach or
 /// than the clock may go unread.
+///
+/// # Which CPU keeps time
+///
+/// The boot CPU does. Only it arms its timer for the timer queue's earliest deadline, and
+/// it records that arming in [`ARMED_UNTIL`] under the timer queue's lock. Every other CPU
+/// arms for its slice, or for as far as one arming reaches, and leaves expiries alone.
+/// An idle secondary therefore sleeps until something interrupts it, rather than waking
+/// for every sleeper in the kernel. Two things then have to interrupt it or the boot CPU:
+///
+/// * a thread armed on another CPU with a deadline earlier than the boot CPU's arming
+///   ([`sleep_needs_kick`]), which the caller answers with a reschedule IPI to the boot CPU, so it
+///   re-arms;
+/// * a thread the boot CPU woke and placed on a secondary, which the scheduler answers with a
+///   reschedule IPI to that CPU.
+///
+/// A missing IPI of either kind shows as a wake-up up to one full arming late, seconds
+/// rather than the milliseconds a CPU woken for every expiry would hide it in.
 ///
 /// # Safety
 /// Interrupts must be masked, so the handler cannot run between reading the queue and
@@ -128,16 +147,40 @@ pub unsafe fn program(slice: Option<Duration>) -> u64 {
         let limit = t.clock.max_idle().as_nanos().min(t.max_oneshot);
         (now, limit)
     });
-    let mut delay = with_timers(|q| q.idle_budget(now, Duration::from_nanos(limit)))
-        .map(|d| d.as_nanos())
-        .unwrap_or(limit);
-    if let Some(slice) = slice {
-        delay = delay.min(slice.as_nanos());
-    }
+    let slice = slice.map_or(u64::MAX, Duration::as_nanos);
+    let delay = if <Cpu as hal::Arch>::cpu_index() == 0 {
+        with_timers(|q| {
+            let delay = q
+                .idle_budget(now, Duration::from_nanos(limit))
+                .as_nanos()
+                .min(slice);
+            // Inside the queue's lock, so a sleeper arming under it either lands before
+            // this read of the queue or sees this value; see `sleep_needs_kick`.
+            ARMED_UNTIL.store(now.as_nanos().saturating_add(delay), Ordering::Release);
+            delay
+        })
+        .unwrap_or(limit.min(slice))
+    } else {
+        limit.min(slice)
+    };
     // SAFETY: forwarded; the caller's contract, and `init` has put the timer in
     // one-shot mode, which `CLOCK` being set proves.
     unsafe { arch::tick::arm_ns(delay) };
     delay
+}
+
+/// When the boot CPU's timer will next interrupt, in nanoseconds of the kernel clock, as
+/// of its last [`program`].
+static ARMED_UNTIL: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Whether a timer at `deadline`, just armed on a CPU other than the boot CPU, is earlier
+/// than the boot CPU's timer will fire, so the boot CPU must be interrupted to re-arm.
+///
+/// Call inside [`with_timers`], in the same critical section as the arming: the boot CPU
+/// records its arming under that lock, so either it saw this timer or this sees its record.
+pub fn sleep_needs_kick(deadline: Instant) -> bool {
+    <Cpu as hal::Arch>::cpu_index() != 0
+        && deadline.as_nanos() < ARMED_UNTIL.load(Ordering::Acquire)
 }
 
 /// The longest one arming reaches, in nanoseconds. Zero before [`init`].

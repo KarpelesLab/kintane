@@ -411,7 +411,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for name in x86_64-qemu i686-qemu aarch64-virt; do
+          for name in x86_64-qemu i686-qemu aarch64-virt aarch64-virt-smp; do
             echo "::group::stress $name"
             if ./kbuild/target/release/kbuild stress --preset "$name" --duration 20s; then
               echo "stress ok: $name"

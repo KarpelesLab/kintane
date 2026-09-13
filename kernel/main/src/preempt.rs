@@ -15,7 +15,7 @@
 //!
 //! There is no periodic tick. The timer interrupt is a one-shot, which [`on_tick`] arms
 //! again each time it runs (see `timekeeping`). It wakes every sleeper whose timer
-//! expired, arms the next interrupt, and then calls `Threads::yield_now` on behalf of
+//! expired, arms the next interrupt, and then calls `Threads::yield_on` on behalf of
 //! whatever thread it interrupted. That is the whole mechanism. A woken thread of higher
 //! priority takes the CPU at once, and a peer at the same level takes its turn. The
 //! switch happens inside the interrupt handler, so each suspended thread's interrupt
@@ -24,15 +24,40 @@
 //! switch, is written down in each port's `tick` module, where it has to stay true.
 //!
 //! The next interrupt is the earliest timer, or the end of a [`SLICE`] if a thread is
-//! waiting for the CPU (`Threads::contended`). A thread about to block cannot know who
+//! waiting for the CPU (`Threads::contended_on`). A thread about to block cannot know who
 //! runs next, so it arms a slice. The idle thread arms only for the earliest timer
 //! before it halts. That is where tickless pays: an idle CPU is not woken to find it has
 //! nothing to do.
 //!
-//! Every access to the table is made with interrupts masked. The tick hook runs masked
-//! because it is an interrupt handler, and thread code masks explicitly. On one CPU that
-//! is mutual exclusion, and no reference into the table is held across a switch (see
-//! the `thread` crate).
+//! # One CPU, then every CPU
+//!
+//! The check here runs on the boot CPU alone, before any other CPU is started. After
+//! bring-up, [`resume`] gives the scheduler every CPU (see `persist`), and from then on
+//! the thread table has a run queue per CPU (`mp::CPUS` of them; one on a kernel built
+//! without `SMP`, where `mp` is a stub and none of the following costs anything):
+//!
+//! * **Joining.** Each secondary leaves its bring-up loop in [`join`], where whatever runs on it
+//!   becomes that CPU's idle thread.
+//! * **The lock.** Every access to the table is made with interrupts masked and the scheduler lock
+//!   held (`mp::lock`). The lock is held *across* a context switch: taken by the thread that
+//!   switches away, released by the thread the switch resumes, or by [`thread_start`] for a thread
+//!   running for the first time. Released earlier, another CPU could resume the leaving thread
+//!   while its registers were still being saved.
+//! * **Waking.** The CPU whose timer found a sleeper due wakes it where `sched::balance` places it,
+//!   and interrupts that CPU with a reschedule IPI when the thread would run or share a slice
+//!   there. Without the IPI a tickless CPU would notice at its next timer interrupt, which can be
+//!   seconds away.
+//! * **Sleeping.** A thread arms its timer with the lock already held and blocks before releasing
+//!   it. So another CPU's timer interrupt cannot find the timer due and try to wake a thread that
+//!   is still running.
+//! * **Balancing.** Every timer interrupt, and every pass of an idle loop, lets the CPU pull a
+//!   ready thread from the busiest other CPU when balancing is due. New threads start on the CPU
+//!   that spawned them, so it is balancing that spreads work.
+//! * **Timers.** Every CPU arms its timer for the earliest timer in the kernel's one queue, and
+//!   whichever CPU takes that interrupt first wakes the sleeper. The honest cost: every idle CPU
+//!   wakes for every expiry, until timers are kept per CPU.
+//!
+//! No reference into the table is held across a switch (see the `thread` crate).
 //!
 //! # What the check proves, and how it fails instead of hanging
 //!
@@ -69,15 +94,17 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use arch::Cpu;
 use hal::{Arch, EarlyConsole, KernAddr};
+use sched::balance::CpuSet;
 use sched::{Priority, ThreadId};
 use thread::Threads;
 use time::{Duration, Instant};
 
-use crate::{AtomicU64, Check, kheap, shared, timekeeping, write_usize};
+use crate::{AtomicU64, Check, kheap, mp, shared, timekeeping, write_usize};
 
 /// Room in the thread table: boot and idle, plus every slot of the port's guarded
-/// stack array, so a thread table slot is never what refuses a spawn.
-pub const SLOTS: usize = 2 + MAX_STACKS;
+/// stack array, plus one idle thread per other CPU, so a thread table slot is never what
+/// refuses a spawn.
+pub const SLOTS: usize = 2 + MAX_STACKS + mp::CPUS;
 
 /// The threads this module's own check runs: boot, idle, high and two workers.
 const DEMO_THREADS: usize = 5;
@@ -128,6 +155,11 @@ const WORKER_PRIORITY: u8 = 4;
 static STACKS: [(AtomicUsize, AtomicUsize); MAX_STACKS] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; MAX_STACKS];
 
+/// What the thread on each stack slot runs, `(entry, argument)`, read by [`thread_start`].
+/// Written by [`spawn`] under the scheduler lock, before the thread can run.
+static STARTS: [(AtomicUsize, AtomicUsize); MAX_STACKS] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; MAX_STACKS];
+
 /// Slots of `STACKS` claimed so far.
 static CLAIMED: AtomicUsize = AtomicUsize::new(0);
 
@@ -138,15 +170,15 @@ const THREAD_STACKS: usize = 4;
 /// Every slot the ports' linker scripts reserve.
 pub const MAX_STACKS: usize = 8;
 
-/// The scheduler state: the thread table.
+/// The scheduler state: the thread table, with a run queue per CPU.
 struct Sched {
-    threads: Threads<Cpu, SLOTS>,
+    threads: Threads<Cpu, SLOTS, { mp::CPUS }>,
 }
 
 /// SAFETY INVARIANT: written once by `demonstrate` before the timer starts, and from then
-/// on accessed only with interrupts masked, on one CPU, through short-lived references
-/// that never span a switch. `Threads` holds a thread's `Context`, which cannot be
-/// constructed in a `const`, hence `MaybeUninit`.
+/// on accessed only with interrupts masked and the scheduler lock held, through
+/// short-lived references that never span a switch. `Threads` holds a thread's `Context`,
+/// which cannot be constructed in a `const`, hence `MaybeUninit`.
 static SCHED: SyncUnsafeCell<MaybeUninit<Sched>> = SyncUnsafeCell::new(MaybeUninit::uninit());
 
 /// Set by the first run. A second would re-`init` stacks a suspended thread still owns.
@@ -155,6 +187,21 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 /// Set once `demonstrate` has built the table and spawned idle, so [`resume`] has a
 /// scheduler to resume.
 static SCHEDULER_BUILT: AtomicBool = AtomicBool::new(false);
+
+/// Which CPUs have a thread in the table running on them: CPU 0 once the table is built,
+/// a secondary once [`join`] has adopted it. A timer interrupt or reschedule IPI on a CPU
+/// that has not joined does nothing.
+static JOINED: [AtomicBool; mp::CPUS] = [const { AtomicBool::new(false) }; mp::CPUS];
+
+/// Reschedule IPIs sent for wake-ups placed on another CPU.
+static RESCHEDULES: AtomicU64 = AtomicU64::new(0);
+/// Threads pulled by balancing.
+static PULLS: AtomicU64 = AtomicU64::new(0);
+/// Reschedule IPIs sent to the boot CPU because a timer armed elsewhere was due before it
+/// would next wake.
+static KICKS: AtomicU64 = AtomicU64::new(0);
+/// Reschedule IPIs sent to an idle CPU because this one had a thread waiting.
+static IDLE_KICKS: AtomicU64 = AtomicU64::new(0);
 
 /// The instant the check started, in nanoseconds.
 static START: AtomicU64 = AtomicU64::new(0);
@@ -176,7 +223,7 @@ static HIGH_FIRST_SAW: AtomicU64 = AtomicU64::new(u64::MAX);
 static HIGH_WOKE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Whether both workers were still busy when `high` resumed.
 static HIGH_PREEMPTED_WORKERS: AtomicBool = AtomicBool::new(false);
-/// Times idle halted to wait for an interrupt.
+/// Times the boot CPU's idle thread halted to wait for an interrupt.
 static IDLE_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Times a thread was suspended by the timer interrupt and later resumed.
 static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
@@ -188,6 +235,7 @@ const BROKE_WAKE: u32 = 1 << 1;
 const BROKE_YIELD: u32 = 1 << 2;
 const BROKE_SLEEP: u32 = 1 << 3;
 const BROKE_EXIT: u32 = 1 << 4;
+const BROKE_JOIN: u32 = 1 << 5;
 
 fn broke(what: u32) {
     BROKEN.fetch_or(what, Ordering::Relaxed);
@@ -197,52 +245,118 @@ fn sched() -> *mut Sched {
     SCHED.get().cast::<Sched>()
 }
 
-fn threads() -> *mut Threads<Cpu, SLOTS> {
+fn threads() -> *mut Threads<Cpu, SLOTS, { mp::CPUS }> {
     // SAFETY: a field projection through the raw pointer, forming no reference. `SCHED`
     // is initialised before any caller runs (see its invariant).
     unsafe { &raw mut (*sched()).threads }
 }
 
-/// The timer interrupt's hook: wake whoever is due, arm the next interrupt, then
-/// preempt.
+/// Run `f` on the table, masked, with the scheduler lock held, and nothing switching.
+fn with_table<R>(f: impl FnOnce(&mut Threads<Cpu, SLOTS, { mp::CPUS }>) -> R) -> R {
+    let irq = Cpu::irq_save();
+    mp::lock();
+    // SAFETY: masked and locked, so by `SCHED`'s invariant this is the only reference; it
+    // ends with the call, and `f` cannot switch through a `&mut`.
+    let r = f(unsafe { &mut *threads() });
+    // SAFETY: taken above, on this CPU, by this thread.
+    unsafe { mp::unlock() };
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { Cpu::irq_restore(irq) };
+    r
+}
+
+fn joined(cpu: usize) -> bool {
+    JOINED.get(cpu).is_some_and(|j| j.load(Ordering::Acquire))
+}
+
+/// Send a reschedule IPI to every CPU in `mask`.
+fn send_reschedules(mask: u64) {
+    for cpu in CpuSet::from_raw(mask).iter() {
+        if mp::reschedule(cpu) {
+            RESCHEDULES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Give CPU `cpu`, the caller's, to a ready thread there that should run, if one should.
+///
+/// # Safety
+/// Masked, on `cpu`, with no reference into the table live and the scheduler lock not held.
+unsafe fn reschedule_here(cpu: usize) {
+    mp::lock();
+    // SAFETY: masked and locked; every thread runs on a stack in `STACKS`, a CPU's boot
+    // stack or the boot stack, so `yield_on`'s contract holds. The lock is released below
+    // by this thread when it next runs, or by `thread_start`.
+    if unsafe { Threads::yield_on(threads(), cpu) }.is_err() {
+        broke(BROKE_YIELD);
+    }
+    // SAFETY: held on this CPU: taken above, or by the thread whose switch resumed this one.
+    unsafe { mp::unlock() };
+}
+
+/// The timer interrupt's and reschedule IPI's hook, on whichever CPU took it: wake whoever
+/// is due, balance, arm the next interrupt, then preempt.
 fn on_tick() {
+    let cpu = Cpu::cpu_index();
+    if !joined(cpu) {
+        return;
+    }
     let interrupts = arch::tick::ticks();
     // Interrupt context until the switch: the thread a switch resumes is not in it.
     kheap::irq_enter();
     let now = timekeeping::now();
+    let mut wakes_elsewhere = 0u64;
+    mp::lock();
     let contended = {
-        // SAFETY: interrupt context, so interrupts are masked, and by `SCHED`'s invariant
-        // no other reference to it is live. This one ends with the block, before the
-        // switch below. The timer lock is taken and released inside it; the table is not
-        // a lock, so there is no order between them to get wrong.
+        // SAFETY: interrupt context, so masked, and locked, so by `SCHED`'s invariant no
+        // other reference to it is live. This one ends with the block, before the lock
+        // is released. The timer lock nests inside the scheduler lock here, and never the
+        // other way round.
         let s = unsafe { &mut *sched() };
         let woke = timekeeping::with_timers(|q| {
             let mut all = true;
             while let Some(expired) = q.pop_expired(now) {
-                all &= s.threads.wake(expired.payload).is_ok();
+                match s.threads.wake_on(expired.payload) {
+                    Ok(w) if w.cpu != cpu && w.reschedule => wakes_elsewhere |= 1 << w.cpu,
+                    Ok(_) => {}
+                    Err(_) => all = false,
+                }
             }
             all
         });
         if woke != Some(true) {
             broke(BROKE_WAKE);
         }
+        if s.threads.balance(cpu).is_some() {
+            PULLS.fetch_add(1, Ordering::Relaxed);
+        }
         if s.threads.check().is_err() {
             broke(BROKE_INVARIANT);
         }
-        s.threads.contended()
+        // Idle balancing needs the idle CPU awake to pull. A secondary with nothing to do
+        // sleeps until interrupted, so a CPU with threads waiting wakes one.
+        let loads = s.threads.loads();
+        if loads[cpu].queued > 0
+            && let Some(idle) =
+                (0..mp::CPUS).find(|&o| o != cpu && loads[o].online && loads[o].idle())
+        {
+            wakes_elsewhere |= 1 << idle;
+            IDLE_KICKS.fetch_add(1, Ordering::Relaxed);
+        }
+        s.threads.contended_on(cpu)
     };
+    // SAFETY: taken above, on this CPU.
+    unsafe { mp::unlock() };
+    send_reschedules(wakes_elsewhere);
     shared::from_interrupt();
     // SAFETY: interrupt context, so masked.
     unsafe { timekeeping::program(contended.then_some(SLICE)) };
     kheap::irq_exit();
 
-    // SAFETY: masked, no reference into the table is live, and every thread's stack is a
-    // static in `STACKS` (or the boot stack), so `yield_now`'s contract holds.
-    if unsafe { Threads::yield_now(threads()) }.is_err() {
-        broke(BROKE_YIELD);
-    }
+    // SAFETY: interrupt context, so masked, on `cpu`, with nothing held.
+    unsafe { reschedule_here(cpu) };
     // Only a thread that was switched away and later switched back sees the counter move
-    // inside one call.
+    // inside one call. The counter is the boot CPU's.
     if arch::tick::ticks() != interrupts {
         PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
     }
@@ -257,23 +371,40 @@ pub fn sleep_until(deadline: Instant) {
         unsafe { Cpu::irq_restore(irq) };
         return;
     }
-    // SAFETY: masked; the reference ends with the statement, before `block` switches.
-    let me = unsafe { (*threads()).current() };
-    // Armed with interrupts masked, and they stay masked until the thread has blocked, so
-    // its timer cannot expire and try to wake a thread that is still running.
-    match timekeeping::with_timers(|q| q.arm_oneshot(deadline, me)) {
-        Some(Ok(_)) => {
+    let cpu = Cpu::cpu_index();
+    // The lock before the timer: another CPU's timer interrupt wakes sleepers under this
+    // lock, so it cannot find this timer due while this thread is still running.
+    mp::lock();
+    // SAFETY: masked and locked; the reference ends with the statement, before `block_on`
+    // switches.
+    let me = unsafe { (*threads()).current_on(cpu) };
+    let armed = me.and_then(|me| {
+        timekeeping::with_timers(|q| {
+            q.arm_oneshot(deadline, me)
+                .map(|_| timekeeping::sleep_needs_kick(deadline))
+        })
+    });
+    match armed {
+        Some(Ok(kick)) => {
+            // The boot CPU keeps time; if it will not wake by this deadline, tell it to
+            // re-arm (see `timekeeping::program`).
+            if kick && mp::reschedule(0) {
+                KICKS.fetch_add(1, Ordering::Relaxed);
+            }
             // Whoever runs next may have a peer waiting, and this thread cannot see who
             // that is, so a slice is armed; idle re-arms for the deadline alone.
             // SAFETY: masked.
             unsafe { timekeeping::program(Some(SLICE)) };
-            // SAFETY: as in `on_tick`.
-            if unsafe { Threads::block(threads()) }.is_err() {
+            // SAFETY: masked and locked, no reference live; see `reschedule_here`.
+            if unsafe { Threads::block_on(threads(), cpu) }.is_err() {
                 broke(BROKE_SLEEP);
             }
         }
         _ => broke(BROKE_SLEEP),
     }
+    // SAFETY: held on the CPU this thread now runs on, by the thread whose switch resumed
+    // it (or by this thread, if nothing switched). See the module docs.
+    unsafe { mp::unlock() };
     // SAFETY: pairs with the `irq_save` above, on this thread.
     unsafe { Cpu::irq_restore(irq) };
 }
@@ -281,11 +412,16 @@ pub fn sleep_until(deadline: Instant) {
 /// End the calling thread.
 pub fn exit_thread() -> ! {
     let _ = Cpu::irq_save();
-    // SAFETY: as in `on_tick`.
-    let _ = unsafe { Threads::exit(threads()) };
+    let cpu = Cpu::cpu_index();
+    mp::lock();
+    // SAFETY: as in `reschedule_here`; on success the lock is released by the thread
+    // this switches to, and this thread never runs again.
+    let _ = unsafe { Threads::exit_on(threads(), cpu) };
     // Only reached if the exit was refused, which with an idle thread cannot happen.
     // Recorded and left for the timer to preempt, rather than halted, so the check still
     // finishes and reports it.
+    // SAFETY: taken above; nothing switched.
+    unsafe { mp::unlock() };
     broke(BROKE_EXIT);
     loop {
         // SAFETY: interrupts are masked here, which is what this wants; the timer has a
@@ -307,34 +443,75 @@ pub fn begin() {
     unsafe { arch::tick::enable_interrupts() };
 }
 
-/// Spawn a thread on guarded stack slot `stack`. Called by boot, with interrupts masked,
-/// only for a slot whose previous thread has been reaped.
+/// Where every spawned thread starts: end the critical section the switch that started it
+/// began, then run what [`spawn`] recorded for its stack slot.
+extern "C" fn thread_start(stack: usize) -> ! {
+    // SAFETY: a new thread is entered only by a switch made with the scheduler lock held,
+    // on the CPU it now runs on, and it is this thread's to release.
+    unsafe { mp::unlock() };
+    let (entry, arg) = &STARTS[stack.min(MAX_STACKS - 1)];
+    let (entry, arg) = (entry.load(Ordering::Acquire), arg.load(Ordering::Acquire));
+    // SAFETY: written by `spawn`, before the thread was queued, with an
+    // `extern "C" fn(usize) -> !` cast to an address; function and data addresses are the
+    // same size on every port.
+    let entry = unsafe { core::mem::transmute::<usize, extern "C" fn(usize) -> !>(entry) };
+    entry(arg)
+}
+
+/// Spawn a thread on guarded stack slot `stack`, queued on the calling CPU and allowed on
+/// every CPU. Called only for a slot whose previous thread has been reaped.
 pub fn spawn(
     stack: usize,
     entry: extern "C" fn(usize) -> !,
     arg: usize,
     level: u8,
 ) -> Option<ThreadId> {
+    spawn_with(stack, entry, arg, level, None)
+}
+
+/// As [`spawn`], or pinned to CPU `idle_on` as that CPU's idle thread.
+fn spawn_with(
+    stack: usize,
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    level: u8,
+    idle_on: Option<usize>,
+) -> Option<ThreadId> {
     let (top, size) = STACKS.get(stack)?;
     let (top, size) = (top.load(Ordering::Relaxed), size.load(Ordering::Relaxed));
     if top == 0 {
         return None;
     }
-    // SAFETY: masked and on boot's thread, so this reference to the table is the only one.
-    // `top` and `size` describe a guarded slot claimed by `demonstrate` for the scheduler
-    // alone, mapped read-write. The caller guarantees no live thread uses it: either it was
-    // never handed out, or its thread exited and was reaped.
-    unsafe { (*threads()).spawn(entry, arg, priority(level), KernAddr::new(top), size) }.ok()
+    with_table(|t| {
+        STARTS[stack].0.store(entry as usize, Ordering::Release);
+        STARTS[stack].1.store(arg, Ordering::Release);
+        let here = Cpu::cpu_index();
+        let (affinity, cpu, idle) = match idle_on {
+            Some(cpu) => (CpuSet::single(cpu), cpu, true),
+            None => (CpuSet::all(mp::CPUS), here, false),
+        };
+        // SAFETY: `top` and `size` describe a guarded slot claimed for the scheduler alone,
+        // mapped read-write. The caller guarantees no live thread uses it: either it was
+        // never handed out, or its thread exited and was reaped.
+        unsafe {
+            t.spawn_on(
+                thread_start,
+                stack,
+                priority(level),
+                KernAddr::new(top),
+                size,
+                affinity,
+                cpu,
+                idle,
+            )
+        }
+        .ok()
+    })
 }
 
 /// Free an exited thread's slot. `false` if it has not exited.
 pub fn reap(id: ThreadId) -> bool {
-    let irq = Cpu::irq_save();
-    // SAFETY: masked, and the reference ends with the statement.
-    let ok = unsafe { (*threads()).reap(id) }.is_ok();
-    // SAFETY: pairs with the `irq_save` above.
-    unsafe { Cpu::irq_restore(irq) };
-    ok
+    with_table(|t| t.reap(id).is_ok())
 }
 
 /// Claim guarded stack slots for threads named `names`, after those already claimed.
@@ -372,16 +549,41 @@ pub fn claim_stacks(names: &[&'static str]) -> Option<usize> {
 )]
 pub fn yield_now() {
     let irq = Cpu::irq_save();
-    // SAFETY: masked, no reference into the table is live, and every thread runs on a
-    // stack in `STACKS` or the boot stack.
-    if unsafe { Threads::yield_now(threads()) }.is_err() {
-        broke(BROKE_YIELD);
-    }
+    // SAFETY: masked, on the CPU just read, nothing held.
+    unsafe { reschedule_here(Cpu::cpu_index()) };
     // SAFETY: pairs with the `irq_save` above, on this thread.
     unsafe { Cpu::irq_restore(irq) };
 }
 
 /// Whether the thread table's invariants hold right now.
+pub fn table_ok() -> bool {
+    with_table(|t| t.check().is_ok())
+}
+
+/// What the scheduler has done across CPUs since the table was built.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(
+    not(CONFIG_MM_PAGED),
+    expect(
+        dead_code,
+        reason = "read only by the stress run, which needs MM_PAGED"
+    )
+)]
+pub struct Stats {
+    /// Threads moved between CPUs, by wake placement, balancing or affinity.
+    pub migrations: u64,
+    /// Of those, threads pulled by balancing.
+    pub pulls: u64,
+    /// Reschedule IPIs sent: for wake-ups placed on another CPU, and to wake idle CPUs.
+    pub reschedules: u64,
+    /// Of those, to wake an idle CPU while a thread waited elsewhere.
+    pub idle_kicks: u64,
+    /// Reschedule IPIs sent to the boot CPU to re-arm for an earlier timer.
+    pub timer_kicks: u64,
+    /// CPUs that have joined the scheduler.
+    pub cpus: usize,
+}
+
 #[cfg_attr(
     not(CONFIG_MM_PAGED),
     expect(
@@ -389,13 +591,15 @@ pub fn yield_now() {
         reason = "used only by the stress run, which needs MM_PAGED"
     )
 )]
-pub fn table_ok() -> bool {
-    let irq = Cpu::irq_save();
-    // SAFETY: masked, and the reference ends with the statement.
-    let ok = unsafe { (*threads()).check() }.is_ok();
-    // SAFETY: pairs with the `irq_save` above.
-    unsafe { Cpu::irq_restore(irq) };
-    ok
+pub fn stats() -> Stats {
+    Stats {
+        migrations: with_table(|t| t.migrations()),
+        pulls: PULLS.load(Ordering::Relaxed),
+        reschedules: RESCHEDULES.load(Ordering::Relaxed),
+        idle_kicks: IDLE_KICKS.load(Ordering::Relaxed),
+        timer_kicks: KICKS.load(Ordering::Relaxed),
+        cpus: (0..mp::CPUS).filter(|&cpu| joined(cpu)).count(),
+    }
 }
 
 /// Put the scheduler's hook back on the timer interrupt, after a check that removed it.
@@ -415,14 +619,16 @@ pub fn broken() -> u32 {
     BROKEN.load(Ordering::Relaxed)
 }
 
-/// Hand the CPU to the scheduler for good, from the boot thread.
+/// Hand the CPU to the scheduler for good, from the boot thread, and every other CPU with
+/// it.
 ///
 /// `demonstrate` runs the scheduler for the boot checks and then stops the timer,
 /// because what follows it in `kmain` — the in-kernel suite, the test modes that end the
 /// run from a fault handler, a deliberate crash — assumes one thread with interrupts
 /// masked. Once those are done, this starts the one-shot timer again with the scheduler's
-/// hook and unmasks. The thread table is still the one the checks used, with idle in it,
-/// so from here boot is one thread among others and returns to its caller as one.
+/// hook, releases the secondaries into [`join`], and unmasks. The thread table is still
+/// the one the checks used, with idle in it, so from here boot is one thread among others
+/// and returns to its caller as one.
 ///
 /// `false`, having changed nothing, if the scheduler was never built, which only
 /// happens when the boot checks failed.
@@ -439,8 +645,65 @@ pub fn resume() -> bool {
     arch::tick::set_hook(Some(on_tick));
     // SAFETY: masked, as `program` requires.
     unsafe { timekeeping::program(Some(SLICE)) };
+    // SAFETY: once, from the boot CPU, with the table built; `join` is the scheduler's.
+    unsafe { mp::release(join) };
     begin();
     true
+}
+
+/// Where a released secondary enters the scheduler: what runs on it becomes its idle
+/// thread. Masked on entry, and idle stays masked except while it waits.
+fn join(cpu: usize) -> ! {
+    let adopted = cpu < mp::CPUS
+        && with_table(|t| {
+            t.adopt(cpu, Priority::IDLE, CpuSet::single(cpu), true)
+                .is_ok()
+        });
+    if !adopted {
+        // A CPU past the table's run queues, or one the table refused: it stays out, and
+        // says so where the stress audit will see it.
+        broke(BROKE_JOIN);
+        Cpu::halt()
+    }
+    // `Release`: a timer interrupt or IPI on this CPU loads it with `Acquire`.
+    JOINED[cpu].store(true, Ordering::Release);
+    idle_loop(cpu)
+}
+
+/// Offer CPU `cpu` to any thread, pulling one from elsewhere first if balancing is due,
+/// and otherwise halt until an interrupt.
+///
+/// Masked except while it waits, so checking for work, arming the timer and halting
+/// cannot be split by the interrupt that brings the work.
+fn idle_loop(cpu: usize) -> ! {
+    loop {
+        mp::lock();
+        // SAFETY: masked and locked; the reference ends with the statement.
+        if unsafe { (*threads()).balance(cpu) }.is_some() {
+            PULLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: masked (a new thread starts masked, and the loop re-masks), locked, and
+        // nothing referenced; see `reschedule_here`.
+        if unsafe { Threads::yield_on(threads(), cpu) }.is_err() {
+            broke(BROKE_YIELD);
+        }
+        // SAFETY: held on this CPU, by this thread or the thread whose switch resumed it.
+        unsafe { mp::unlock() };
+        // Nothing else is ready, or the yield would have run it: wake only for a timer,
+        // or for an IPI that brings a thread.
+        // SAFETY: masked.
+        unsafe { timekeeping::program(None) };
+        // Counted before the wait, not after: the interrupt that ends it usually switches
+        // to the thread it woke from inside the handler, so the wait returns only when
+        // idle next runs. The boot check reads the boot CPU's.
+        if cpu == 0 {
+            IDLE_WAITS.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: masked on entry, as `wait_for_interrupt` requires; the timer and the IPIs
+        // have handlers.
+        unsafe { arch::tick::wait_for_interrupt() };
+        let _ = Cpu::irq_save();
+    }
 }
 
 /// What one busy loop observed.
@@ -540,29 +803,9 @@ extern "C" fn high(_: usize) -> ! {
     exit_thread()
 }
 
-/// Runs whenever nothing else can: offer the CPU, and otherwise halt until an interrupt.
-///
-/// Idle stays masked except while it waits, so checking for work, arming the timer and
-/// halting cannot be split by the interrupt that brings the work.
+/// The boot CPU's idle thread. See [`idle_loop`].
 extern "C" fn idle(_: usize) -> ! {
-    loop {
-        // SAFETY: masked (a new thread starts masked, and the loop re-masks), as in
-        // `on_tick` otherwise.
-        if unsafe { Threads::yield_now(threads()) }.is_err() {
-            broke(BROKE_YIELD);
-        }
-        // Nothing else is ready, or the yield would have run it: wake only for a timer.
-        // SAFETY: masked.
-        unsafe { timekeeping::program(None) };
-        // Counted before the wait, not after: the interrupt that ends it usually switches
-        // to the thread it woke from inside the handler, so the wait returns only when
-        // idle next runs.
-        IDLE_WAITS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: masked on entry, as `wait_for_interrupt` requires; the timer has a
-        // handler.
-        unsafe { arch::tick::wait_for_interrupt() };
-        let _ = Cpu::irq_save();
-    }
+    idle_loop(0)
 }
 
 fn priority(level: u8) -> Priority {
@@ -602,6 +845,7 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
             threads: Threads::new(priority(BOOT_PRIORITY)),
         }));
     }
+    JOINED[0].store(true, Ordering::Release);
 
     // Workers before `high`, so that `high` running first is the priority's doing and not
     // the queue order's.
@@ -624,7 +868,9 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     }
     let mut ids = [ThreadId::new(0); 4];
     for (i, (entry, arg, level, _)) in plan.into_iter().enumerate() {
-        match spawn(i, entry, arg, level) {
+        // Idle belongs to the boot CPU; the others start there and may move.
+        let idle_on = (i == 0).then_some(0);
+        match spawn_with(i, entry, arg, level, idle_on) {
             Some(id) => ids[i] = id,
             None => {
                 c.write_str("spawn refused");
@@ -662,16 +908,9 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     // Every thread but idle has exited by now; give their slots back and let the table
     // check itself in its final state.
     let reaped = ids[1..].iter().all(|&id| reap(id));
-    let table_ok = {
-        let irq = Cpu::irq_save();
-        // SAFETY: masked, and this is the only reference.
-        let ok = unsafe { (*threads()).check() }.is_ok();
-        // SAFETY: pairs with the `irq_save` above.
-        unsafe { Cpu::irq_restore(irq) };
-        reaped && ok
-    };
+    let consistent = reaped && table_ok();
 
-    let preempted = report(c, interrupts, elapsed, table_ok);
+    let preempted = report(c, interrupts, elapsed, consistent);
 
     // The shared-state checks run on the same scheduler, with idle still in place and
     // the stacks the threads above gave back.
@@ -801,7 +1040,7 @@ pub fn report_broken(c: &dyn EarlyConsole) -> bool {
     let broken = BROKEN.load(Ordering::Relaxed);
     if broken != 0 {
         c.write_str("\n             BROKEN:");
-        for (bit, name) in ["invariant", "wake", "yield", "sleep", "exit"]
+        for (bit, name) in ["invariant", "wake", "yield", "sleep", "exit", "join"]
             .iter()
             .enumerate()
         {

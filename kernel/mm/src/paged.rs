@@ -21,8 +21,8 @@
 //! have to descend through one returns [`MapError::WouldSplit`] instead of doing
 //! something surprising. Splitting is an explicit operation (`split_leaf`), used by
 //! [`crate::vm`] where a copy-on-write share or a partial protect needs it. It
-//! invalidates one address, which is correct on one CPU; on SMP it needs a shootdown,
-//! which is Phase 3.
+//! invalidates one address. On a multiprocessor the port's `flush_tlb` extends every
+//! invalidation to the other CPUs through the kernel's shootdown (see [`crate::tlb`]).
 
 // This module is the one place in `mm` that needs `unsafe`, and the crate's
 // `deny(unsafe_code)` is overridden here rather than removed, as

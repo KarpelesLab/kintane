@@ -195,6 +195,41 @@ impl<T, A: Arch + HasCas> SpinLock<T, A> {
     }
 }
 
+impl<A: Arch + HasCas> SpinLock<(), A> {
+    /// Take the lock with no guard, for a critical section one thread enters and another
+    /// leaves.
+    ///
+    /// That is a scheduler's lock: taken by the thread that switches away, held across the
+    /// context switch it protects, and released by whichever thread the switch resumes. A
+    /// guard cannot express that, because the guard belongs to the first thread's stack
+    /// and the release happens on the second's. So this lock holds no data, and the
+    /// critical section is bracketed by this and [`SpinLock::unlock_handoff`].
+    ///
+    /// Spins with interrupts as they are, like [`SpinLock::lock`]. A lock an interrupt
+    /// handler also takes must be taken with interrupts already masked.
+    pub fn lock_handoff(&self) {
+        core::mem::forget(self.lock());
+    }
+
+    /// Release a lock taken with [`SpinLock::lock_handoff`].
+    ///
+    /// # Safety
+    /// The lock must be held through a `lock_handoff` whose critical section this ends,
+    /// and the release must happen on the CPU that took it: lock-order checking keeps its
+    /// held locks per CPU, and a thread switched to on the same CPU is the only other
+    /// thread that may end the section.
+    pub unsafe fn unlock_handoff(&self) {
+        lockdep::release::<A>(&self.class, self.instance());
+        // The holder is the only writer of `now_serving`, and it observed its own ticket
+        // there through the `Acquire` load that admitted it, so this read-modify-write
+        // reads the value it is about to replace. `Release` for the same reason as
+        // `SpinGuard::drop`.
+        let serving = self.now_serving.load(Ordering::Relaxed);
+        self.now_serving
+            .store(serving.wrapping_add(1), Ordering::Release);
+    }
+}
+
 /// Exclusive access to a [`SpinLock`]'s contents. Releases the lock when dropped.
 ///
 /// `!Send`: a lock released from a different CPU than took it is a lock whose
@@ -314,6 +349,21 @@ mod tests {
             *g = i;
         }
         assert_eq!(*lock.lock(), 7);
+    }
+
+    #[test]
+    fn a_handoff_lock_is_released_by_unlock_handoff_full() {
+        let lock: SpinLock<(), MockFull> = SpinLock::new(());
+        for _ in 0..8 {
+            // A release that did not advance `now_serving` would hang the next take.
+            lock.lock_handoff();
+            assert!(lock.is_locked());
+            assert!(lock.try_lock().is_none(), "held, with no guard anywhere");
+            // SAFETY: taken just above, on this thread.
+            unsafe { lock.unlock_handoff() };
+            assert!(!lock.is_locked());
+        }
+        assert!(lock.try_lock().is_some(), "and an ordinary guard works afterwards");
     }
 
     #[test]
