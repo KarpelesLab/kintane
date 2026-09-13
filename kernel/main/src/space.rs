@@ -328,6 +328,13 @@ fn check<A: HasPageTables>(
     ok &= probe(s.rodata.0, PageFlags::READ, PageFlags::WRITE.union(exec_deny), "rodata");
     ok &= probe(s.data.0, PageFlags::WRITE, exec_deny, "data");
 
+    // Errors above end mid-line; the summary gets its own line after any of them, so a
+    // failure reads as a list of problems followed by what was checked rather than
+    // running the last permission string into the summary.
+    if !ok {
+        c.write_str("\n             ");
+    }
+
     // The guard page must not resolve at all. This is the whole point of it: an
     // overflow has to fault rather than quietly write to whatever is below.
     if s.has_stack_guard() {

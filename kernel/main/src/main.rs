@@ -33,7 +33,7 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // SAFETY: first and only initialisation of COM1, before any other writer exists.
     unsafe { arch::EARLY.init() };
 
-    banner(boot_arg);
+    let boot = banner(boot_arg);
     let c = &arch::EARLY;
 
     // In a production image this is the no-op provider and folds away entirely; the
@@ -49,7 +49,41 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
         c.write_str("\n");
     }
 
-    finish(ok)
+    // Both halves gate the exit status. Until this line existed, only the in-kernel
+    // suite did: the banner computed verdicts for paging, interrupts, memory and the
+    // kernel address space, printed them, and discarded all four — so a W^X regression
+    // printed FAILED and still exited as a pass. A check that cannot change the outcome
+    // is a log line.
+    finish(ok && boot != Check::Failed)
+}
+
+/// The outcome of a bring-up check.
+///
+/// Three states rather than a bool, for the same reason the in-kernel suite reports
+/// "skip" separately: a check that could not run is a different claim from one that
+/// ran and passed. Folding "skipped" into "passed" hides coverage that is missing;
+/// folding it into "failed" turns a known, reported gap — aarch64 has no memory map yet
+/// — into a red build nobody can fix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    Passed,
+    Skipped,
+    Failed,
+}
+
+impl Check {
+    fn from_ok(ok: bool) -> Check {
+        if ok { Check::Passed } else { Check::Failed }
+    }
+
+    /// Combine two outcomes: any failure wins, then any skip.
+    fn and(self, other: Check) -> Check {
+        match (self, other) {
+            (Check::Failed, _) | (_, Check::Failed) => Check::Failed,
+            (Check::Skipped, _) | (_, Check::Skipped) => Check::Skipped,
+            _ => Check::Passed,
+        }
+    }
 }
 
 // How the kernel stops depends on the configuration, so the choice is made once, at
@@ -69,7 +103,7 @@ fn finish(_ok: bool) -> ! {
     Cpu::halt()
 }
 
-fn banner(boot_arg: u64) {
+fn banner(boot_arg: u64) -> Check {
     let c = &arch::EARLY;
     c.write_str("\nKinTane\n");
     c.write_str("  arch       ");
@@ -94,7 +128,7 @@ fn banner(boot_arg: u64) {
     let paging_ok = arch::paging_selftest(c);
     c.write_str(if paging_ok { " ok" } else { "" });
 
-    memory(c, boot_arg);
+    let mem = memory(c, boot_arg);
 
     c.write_str("\n  interrupts ");
     // The architecture brings up its own interrupt path; the image only reports the
@@ -103,6 +137,9 @@ fn banner(boot_arg: u64) {
     c.write_str(if irq_ok { " ok" } else { "" });
 
     c.write_str("\n\nreached kmain\n");
+    Check::from_ok(paging_ok)
+        .and(mem)
+        .and(Check::from_ok(irq_ok))
 }
 
 /// Room for the loader's memory map. QEMU reports a handful of regions; real
@@ -128,7 +165,7 @@ static STORE: SyncUnsafeCell<[u8; STORE_BYTES]> = SyncUnsafeCell::new([0; STORE_
 
 /// Report what the loader said about memory, then prove the frame allocator works on
 /// it by handing out a frame and giving it back.
-fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
+fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> Check {
     c.write_str("\n  memory map ");
     c.write_str(bootinfo::SOURCE);
 
@@ -152,7 +189,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
                 bootinfo::Error::TooManyRegions { .. } => "too many regions",
             });
             c.write_str(")");
-            return;
+            return Check::Skipped;
         }
     };
 
@@ -171,7 +208,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
         Ok(b) => b,
         Err(_) => {
             c.write_str("\n  frames     unusable map");
-            return;
+            return Check::Failed;
         }
     };
     if needed > STORE_BYTES {
@@ -179,7 +216,8 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
         write_usize(c, needed);
         c.write_str(" bytes of bitmap, have ");
         write_usize(c, STORE_BYTES);
-        return;
+        c.write_str(" (raise FRAME_BITMAP_KIB)");
+        return Check::Failed;
     }
 
     // SAFETY: the only write to STORE, from the single-threaded boot path before any
@@ -193,7 +231,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
         Ok(f) => f,
         Err(_) => {
             c.write_str("\n  frames     allocator rejected the map");
-            return;
+            return Check::Failed;
         }
     };
 
@@ -222,14 +260,14 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
     write_usize(c, stats.free);
     c.write_str(" free");
 
-    kernel_space(c, &mut frames, &regions[..n]);
+    let space = kernel_space(c, &mut frames, &regions[..n]);
     // Re-read: building the kernel space consumed frames for its tables, so the
     // accounting check below has to compare against the books as they are now.
     let stats = frames.stats();
 
     // Hand out a frame and give it back. Cheap, and it distinguishes "the allocator
     // was constructed" from "the allocator works".
-    match frames.alloc_frame() {
+    let alloc = match frames.alloc_frame() {
         Ok(f) => {
             c.write_str("\n  alloc      ");
             write_hex(c, f.start().raw());
@@ -237,12 +275,21 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) {
             match frames.free_frame(f) {
                 Ok(()) if frames.stats().free == stats.free && after == stats.free - 1 => {
                     c.write_str(" ok");
+                    Check::Passed
                 }
-                _ => c.write_str(" BOOKKEEPING WRONG"),
+                _ => {
+                    c.write_str(" BOOKKEEPING WRONG");
+                    Check::Failed
+                }
             }
         }
-        Err(_) => c.write_str("\n  alloc      exhausted"),
-    }
+        Err(_) => {
+            c.write_str("\n  alloc      exhausted");
+            Check::Failed
+        }
+    };
+
+    space.and(alloc)
 }
 
 /// The largest region of physical memory the kernel will address directly.
@@ -259,7 +306,7 @@ fn kernel_space(
     c: &dyn EarlyConsole,
     frames: &mut mm::phys::FrameAllocator<'_, Cpu>,
     map: &[MemoryRegion],
-) {
+) -> Check {
     c.write_str("\n  kspace     ");
 
     let top = map
@@ -271,19 +318,20 @@ fn kernel_space(
     let len = top.min(DIRECT_MAP_MAX);
     if len == 0 {
         c.write_str("no usable memory");
-        return;
+        return Check::Failed;
     }
 
     let direct = match mm::DirectMap::identity(len) {
         Ok(d) => d,
         Err(_) => {
             c.write_str("direct map rejected");
-            return;
+            return Check::Failed;
         }
     };
 
     let ok = space::build_and_verify::<Cpu>(c, frames, direct, arch::image_sections());
     c.write_str(if ok { " ok" } else { " FAILED" });
+    Check::from_ok(ok)
 }
 
 fn write_usize(c: &dyn EarlyConsole, mut v: usize) {
