@@ -1,12 +1,12 @@
 # kbuild size report for preset aarch64-virt. Rewrite with `kbuild size --preset aarch64-virt --update-baseline`.
 section .bss 192512
-section .data 89112
+section .data 89152
 section .rodata 258048
 section .stack 16384
 section .stack_guard 4096
 section .text 282624
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 77134 data 0 bss 0
+crate (anonymous) text 0 rodata 77489 data 0 bss 0
 crate (unmangled) text 5844 rodata 0 data 0 bss 0
 crate __rustc text 172 rodata 0 data 0 bss 0
 crate abi text 2760 rodata 0 data 0 bss 0
@@ -17,7 +17,7 @@ crate bootinfo text 1544 rodata 0 data 0 bss 0
 crate buildid text 252 rodata 32 data 0 bss 0
 crate cmdline text 1448 rodata 0 data 0 bss 0
 crate core text 8680 rodata 0 data 0 bss 0
-crate device text 16408 rodata 0 data 0 bss 0
+crate device text 17480 rodata 0 data 0 bss 0
 crate elf text 3444 rodata 0 data 0 bss 0
 crate fat text 6096 rodata 0 data 0 bss 0
 crate fdt text 7076 rodata 0 data 0 bss 0
@@ -26,9 +26,9 @@ crate hal text 632 rodata 0 data 0 bss 0
 crate hwproxy text 68 rodata 0 data 0 bss 0
 crate ipc text 1688 rodata 16 data 0 bss 0
 crate kalloc text 12516 rodata 0 data 0 bss 0
-crate kintane text 100708 rodata 80 data 16380 bss 102804
+crate kintane text 100692 rodata 80 data 16380 bss 102804
 crate kobject text 5412 rodata 16 data 0 bss 0
-crate mm text 28208 rodata 0 data 0 bss 0
+crate mm text 28200 rodata 0 data 0 bss 0
 crate pl011 text 1660 rodata 0 data 80 bss 108
 crate platform text 7312 rodata 16 data 70392 bss 1699
 crate sched text 2956 rodata 0 data 0 bss 0
@@ -38,6 +38,6 @@ crate thread text 7176 rodata 0 data 0 bss 0
 crate time text 2860 rodata 0 data 0 bss 0
 crate unwind text 2500 rodata 0 data 0 bss 0
 crate vfs text 2088 rodata 0 data 0 bss 0
-crate virtio_blk text 14912 rodata 16 data 136 bss 8
+crate virtio_blk text 15540 rodata 16 data 176 bss 8
 crate virtio_probe text 464 rodata 0 data 0 bss 0
-total 1104920
+total 1104960
