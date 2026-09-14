@@ -59,6 +59,14 @@ and one read another's memory. The kernel now refuses to build a process while a
 is mapped in the user range. The real fix — mapping device memory outside the user range —
 changes an assumption every driver makes, and is named here as open work.
 
+*Fixed in the seventh round (3d0428f).* Device memory on x86_64 and aarch64 now lives in a
+kernel-half window at 1 TiB above its physical address, and `hal::paging::device_virt` is
+the only way to turn a device's physical address into a pointer. The machine that exposed
+the bug runs unchanged, with its BAR still at 768 GiB, and passes the process, spawn and
+isolation checks. Every boot now checks that the user half holds no kernel mapping, and the
+refusal in `userproc.rs` stays as a backstop that can no longer trigger. i686 keeps identity
+mapping: it has no user half, and no room in 32 bits for the window.
+
 **What integration found that no branch could:**
 
 - **The scheduler's table lived on the boot stack.** `Threads::new` returned the table by
