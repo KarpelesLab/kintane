@@ -85,6 +85,13 @@ const WORKLOADS: usize = 7;
 
 const NAMES: [&str; WORKLOADS] = ["heap A", "heap B", "ping", "pong", "sleep", "vm", "pages"];
 
+/// Guarded stacks the run claims beyond the ones the scheduler's own check left behind.
+/// `preempt` asserts at compile time that `KERNEL_THREAD_SLOTS` covers both.
+pub const EXTRA_STACKS: usize = EXTRA_NAMES.len();
+
+/// The workloads that need a stack of their own, in the order they claim them.
+const EXTRA_NAMES: [&str; 4] = ["heap B", "sleep", "vm", "pages"];
+
 /// Where a parked workload stopped.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -339,8 +346,7 @@ fn start() -> Result<(), &'static str> {
 
     // Idle keeps the first of the scheduler's stacks. The other three the boot checks
     // used are free again; four more come from the port's array.
-    let extra = preempt::claim_stacks(&["heap B", "sleep", "vm", "pages"])
-        .ok_or("not enough guarded thread stacks")?;
+    let extra = preempt::claim_stacks(&EXTRA_NAMES).ok_or("not enough guarded thread stacks")?;
     let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS] = [
         (heap::worker, 0, 4, 1),
         (heap::worker, 1, 4, extra),

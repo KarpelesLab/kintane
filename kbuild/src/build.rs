@@ -299,6 +299,10 @@ impl Build {
                 .ok_or("this configuration selects no linker script (LINKER_SCRIPT is empty)")?;
             args.push("-C".into());
             args.push(format!("link-arg=-T{}", script.display()));
+            // Where the script finds `stacks.ld`, the thread-stack geometry this
+            // configuration asks for; see `codegen::stacks`.
+            args.push("-C".into());
+            args.push(format!("link-arg=-L{}", self.gen_dir.display()));
             // Without this the linker emits a warning and picks its own entry point,
             // which for a multiboot image is silently the wrong address.
             args.push("-C".into());
@@ -331,6 +335,16 @@ impl Build {
         if unit.kind == Kind::Bin {
             if let Some(script) = &self.link_script {
                 kb.file(script)?;
+                // A kernel script includes this, so a changed stack geometry must relink.
+                // Keyed only where it exists: a loader such as kinboot-bios is linked
+                // through a `Build` of its own, whose generated directory has no thread
+                // stacks and no fragment. That is not a way to link a kernel against a
+                // stale or missing geometry, because a script that includes an absent
+                // `stacks.ld` fails to link.
+                let stacks = self.gen_dir.join("stacks.ld");
+                if stacks.exists() {
+                    kb.file(&stacks)?;
+                }
             }
         }
         kb.source_tree(&unit.src_dir())?;

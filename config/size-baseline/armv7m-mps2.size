@@ -1,5 +1,5 @@
 # kbuild size report for preset armv7m-mps2. Rewrite with `kbuild size --preset armv7m-mps2 --update-baseline`.
-section .bss 41940
+section .bss 41972
 section .data 4064
 section .handler_stack 8192
 section .rodata 12288
@@ -7,23 +7,23 @@ section .stack 16384
 section .stack_guard 4096
 section .text 102400
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 8227 data 0 bss 0
+crate (anonymous) text 0 rodata 8284 data 0 bss 0
 crate (unmangled) text 6096 rodata 0 data 0 bss 1
 crate __rustc text 124 rodata 0 data 0 bss 0
-crate arch text 10004 rodata 0 data 64 bss 4213
+crate arch text 10044 rodata 0 data 64 bss 4213
 crate bootinfo text 316 rodata 0 data 0 bss 0
 crate buildid text 528 rodata 32 data 0 bss 0
 crate cmdline text 1490 rodata 0 data 0 bss 0
 crate core text 5984 rodata 256 data 0 bss 0
 crate hal text 724 rodata 0 data 0 bss 0
-crate kalloc text 9744 rodata 0 data 0 bss 0
-crate kintane text 37508 rodata 24 data 3188 bss 37527
-crate mm text 6714 rodata 0 data 0 bss 0
+crate kalloc text 9036 rodata 0 data 0 bss 0
+crate kintane text 38226 rodata 24 data 3188 bss 37552
+crate mm text 6774 rodata 0 data 0 bss 0
 crate platform text 44 rodata 0 data 0 bss 0
 crate sched text 1736 rodata 0 data 0 bss 0
-crate sync text 8846 rodata 16 data 808 bss 136
+crate sync text 8884 rodata 16 data 808 bss 136
 crate thread text 4194 rodata 0 data 0 bss 0
-crate time text 2606 rodata 0 data 0 bss 0
+crate time text 3576 rodata 0 data 0 bss 0
 crate trim_matches text 582 rodata 0 data 0 bss 0
 crate unwind text 2418 rodata 0 data 0 bss 0
-total 451508
+total 451540

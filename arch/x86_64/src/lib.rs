@@ -236,9 +236,10 @@ pub fn paging_selftest(c: &dyn hal::EarlyConsole) -> bool {
 /// identical permissions; the linker keeps them adjacent so this stays true.
 /// Bytes per kernel thread stack slot: one guard page, then the stack.
 ///
-/// A power of two, which [`hal::StackArray`] requires. `link.ld` reserves whole slots
-/// and asserts it agrees with this value.
-pub const THREAD_STACK_SLOT: u64 = 32 * 1024;
+/// A power of two, which [`hal::StackArray`] requires and `link.ld` asserts. Both this and
+/// the count of slots come from the configuration, through `stacks.ld`, so the array the
+/// linker reserves and the geometry the kernel reads cannot drift apart.
+pub const THREAD_STACK_SLOT: u64 = kconfig::THREAD_STACK_KIB as u64 * 1024;
 
 pub fn image_sections() -> hal::ImageSections {
     unsafe extern "C" {

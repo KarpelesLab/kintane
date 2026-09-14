@@ -8,6 +8,10 @@ use hal::EarlyConsole;
 
 use crate::{Check, finish};
 
+/// No workload, so no stack beyond the scheduler's own; `preempt`'s compile-time check on
+/// `KERNEL_THREAD_SLOTS` reads this from whichever half of the seam is built.
+pub const EXTRA_STACKS: usize = 0;
+
 /// No pools to take. `Passed`: there is nothing to have failed.
 pub fn reserve<F, M, L>(_c: &dyn EarlyConsole, _frames: F, _map: M, _live: L) -> Check {
     Check::Passed

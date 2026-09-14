@@ -20,6 +20,19 @@ pub struct Machine {
 }
 
 pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine, String> {
+    // A kernel built for fewer CPUs than the guest has starts only the first `NR_CPUS`, so
+    // its SMP checks would pass or fail on a machine other than the one asked for. Only
+    // with SMP: a uniprocessor PC build is given two CPUs on purpose, so its firmware
+    // describes more than one and a MADT walk that stops early cannot pass.
+    if res.is_on("SMP") && res.int("QEMU_CPUS") > res.int("NR_CPUS") {
+        return Err(format!(
+            "QEMU_CPUS={} is more than NR_CPUS={}: the kernel would start only {} of them\n  \
+             raise NR_CPUS, which also sizes the thread-stack array, or lower QEMU_CPUS",
+            res.int("QEMU_CPUS"),
+            res.int("NR_CPUS"),
+            res.int("NR_CPUS")
+        ));
+    }
     let s = |x: &str| x.to_string();
     let mem = format!("{}M", {
         let m = res.int("QEMU_MEMORY_MB");

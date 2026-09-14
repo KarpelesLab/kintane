@@ -357,6 +357,28 @@ commitment to make before the SMP scheduler exists.
     names it.
   - A retirement that finds its bag full, even after advancing and reclaiming, is
     refused. The caller keeps the node.
+- **A full bag means wait; only a stuck reader is a fault.** The boot check's writer
+  (`kernel/main/src/epoch.rs`) gives a refused node back and tries again. It unpins
+  between attempts, because its own pin holds the epoch back as much as any reader's.
+  - `stall` counts advances, not time. A writer retrying that fast names a reader the host
+    has merely descheduled within milliseconds.
+  - So a named CPU is judged by its own progress. A reader finishes one read per
+    pin-and-unpin, and each finished read is counted. A CPU that finishes none for two
+    seconds has stopped unpinning, and fails the check by name.
+  - An attempt cap bounds the wait even when the clock never started.
+
+**Eight CPUs needed both halves of the fix.** Eight emulated CPUs contended for the host
+when both SMP ports ran at once. The writer's bag then filled before seven readers had all
+observed the epoch, and a check that failed on the first refusal failed about half the
+time.
+
+- **Sizing was the smaller half.** The bag grew from a fixed eight to two per participant,
+  floored at eight. It is capped by the boot stack: the collector is built there before it
+  moves into its static, and at four per participant aarch64's 16 KiB boot stack
+  overflowed into its guard page.
+- **The check's premise was the larger half.** A writer that outruns reclamation must
+  wait, and the first version of the wait tripped the stall report itself. That is why a
+  stall is now judged by progress.
 
 Checked on the host with real threads playing CPUs: a reader held across a concurrent
 unlink, a stalled participant, and three readers racing a writer through 20 000
@@ -684,6 +706,29 @@ fail within seconds instead of hanging.
 
 Thread stacks come from the guarded thread-stack array described under memory, so a thread
 that overflows faults on its own guard page, and the report names the slot's owner.
+
+**The array is sized by configuration, not by each linker script.** Two symbols decide it:
+
+- `THREAD_STACK_KIB` is one slot, guard included, and must be a power of two.
+- `KERNEL_THREAD_SLOTS` is how many kernel threads may hold a stack at once.
+
+The port reserves `KERNEL_THREAD_SLOTS` plus one slot per secondary CPU, because each
+secondary comes up on a stack of its own and keeps it as its idle thread. kbuild computes
+that count once (`codegen::stacks`) and writes it into `stacks.ld` beside `config.rs`.
+Every port's `link.ld` includes the fragment, and each arch crate reads the slot size from
+`kconfig`, so the linker and the kernel cannot disagree.
+
+A count written by hand into each script is what stopped an eight-CPU stress run from
+starting its workloads. Twelve slots covered four CPUs, but the secondaries' seven took
+most of them at eight. Two checks now happen at build time rather than at run time:
+
+- `kernel/main/src/preempt.rs` asserts that `KERNEL_THREAD_SLOTS` covers the threads its
+  checks and the stress run need.
+- Every `link.ld` asserts that the slot size is a power of two with room above its guard.
+  ARMv7-M also asserts an even count, since one MPU region covers two slots.
+
+A uniprocessor build now reserves eight slots instead of the twelve the SMP-capable ports
+had hard-coded, which is 128 KiB less RAM.
 
 Threads sleep with `preempt::sleep_until(Instant)`, which arms a one-shot timer on the
 kernel's timer queue and blocks. The expiring timer's interrupt wakes the thread. After

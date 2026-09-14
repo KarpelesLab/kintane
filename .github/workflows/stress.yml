@@ -41,6 +41,14 @@ jobs:
       fail-fast: false
       matrix:
         preset: [x86_64-qemu, i686-qemu, aarch64-virt, aarch64-virt-smp, x86_64-qemu-smp]
+        cpus: [""]
+        # The SMP presets boot four CPUs so every other job stays quick. Phase 3's exit
+        # criterion is eight, so the soak runs both SMP ports at eight as well.
+        include:
+          - preset: aarch64-virt-smp
+            cpus: "8"
+          - preset: x86_64-qemu-smp
+            cpus: "8"
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     # The job's own budget: the longest duration a hosted runner allows. A self-hosted
     # runner is not held to it by GitHub, and kbuild's timeout bounds the run anyway.
@@ -66,11 +74,14 @@ jobs:
         env:
           DURATION: ${{ github.event.inputs.duration || '30m' }}
           SEED: ${{ github.event.inputs.seed || '1' }}
+          # Empty for the presets' own CPU count; the eight-CPU jobs set it.
+          CPUS: ${{ matrix.cpus }}
         run: |
           # Not -e: the log is printed whether or not the run passed.
           set +e
           ./kbuild/target/release/kbuild stress --preset "${{ matrix.preset }}" \
-            --duration "$DURATION" --set "STRESS_SEED=$SEED" > stress.log 2>&1
+            --duration "$DURATION" --set "STRESS_SEED=$SEED" \
+            ${CPUS:+--set "QEMU_CPUS=$CPUS"} > stress.log 2>&1
           status=$?
           # The console of a day's run is tens of megabytes; the job log gets the start and
           # the end, and the whole of it is an artifact.

@@ -62,6 +62,32 @@ config NR_CPUS
     range 2 4096
     default 8
 
+config KERNEL_THREAD_SLOTS
+    int "Guarded stack slots for kernel threads"
+    range 4 256
+    default 8
+    help
+        How many kernel threads may hold a guarded stack at once, not
+        counting the one each secondary CPU takes to come up on. The
+        scheduler's own check holds four and the stress run four more, so
+        eight is the floor for a test build; a build that asks for fewer
+        than its threads need fails to compile, in kernel/main/src/preempt.rs.
+
+        The port's linker script reserves this many slots plus one per
+        secondary CPU, so the array grows with NR_CPUS without anyone
+        editing a linker script. See docs/architecture.md, "Thread stacks".
+
+config THREAD_STACK_KIB
+    int "Bytes in a kernel thread's stack slot (KiB)"
+    range 4 1024
+    default 32
+    help
+        One slot: the guard at its bottom and the stack above it. A power
+        of two, which hal::StackArray requires so a faulting address maps
+        to its slot with a shift. Every slot costs this much RAM whether a
+        thread uses it or not, which is what makes it worth turning down on
+        a machine with kilobytes rather than gigabytes.
+
 config USERSPACE
     bool "Native userspace"
     depends on (ARCH_X86_64 || ARCH_AARCH64) && MM_PAGED

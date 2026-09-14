@@ -355,6 +355,68 @@ which a day of timer interrupts would grow past any disk.
 | Pong keeps one extra handle | "pong's table does not hold exactly its endpoint" |
 | One vm pool frame leaked once | "frames are missing from the pool with nothing mapped" at the first empty checkpoint |
 
+**Eight CPUs.** Phase 3's exit criterion is eight CPUs. The SMP presets boot four, so
+every other step stays quick. CI adds a 20-second eight-CPU run of both SMP presets,
+the nightly soak adds eight-CPU jobs, and a run by hand passes `--set QEMU_CPUS=8`. A
+guest given more CPUs than `NR_CPUS` is refused by kbuild before it boots, rather than
+started with fewer.
+
+Sixty seconds at eight CPUs passed all 60 audits on both ports, with every CPU doing work:
+
+| Port | Iterations per CPU | Least over most | Migrations | Shootdowns |
+|---|---|---|---|---|
+| x86_64 | 171,674 – 285,244 | 0.60 | 27,976 | 161,519 |
+| aarch64 | 591,456 – 2,024,585 | 0.29 | 32,507 | 324,042 |
+
+On aarch64, CPU 1 carried the least. That is observed, not explained.
+
+Five minutes at eight CPUs, one port after the other, passed all 300 audits on both:
+
+| Port | Heap iterations | Channel round trips | Shootdowns | Migrations | Least over most |
+|---|---|---|---|---|---|
+| x86_64 | 4,401,203 (276,033 refused) | 2,061,894 | 782,777 | 130,551 | 0.47 |
+| aarch64 | 20,163,952 (1,261,496 refused) | 19,955,584 | 1,620,530 | 174,886 | 0.33 |
+
+aarch64's CPU 1 again carried the least. The latest wake-up in either run was about
+300 ms late, where four CPUs stay within tens of milliseconds. That fits the boot CPU
+alone keeping time for eight emulated CPUs competing for fewer real ones, but it is an
+observation rather than a measured cause.
+
+Two things had stopped eight CPUs, and neither showed at four:
+
+- **Thread stacks ran out.** Each linker script hard-coded its slot count, and at eight
+  CPUs the secondaries' own stacks left the stress run too few for its workloads. The
+  array is now sized from configuration ([architecture](architecture.md)). Two checks make
+  asking for too little fail at build time:
+  - `KERNEL_THREAD_SLOTS=4` fails to compile: "KERNEL_THREAD_SLOTS is below what this
+    build's kernel threads need".
+  - `THREAD_STACK_KIB=12` fails to link: "THREAD_STACK_KIB is not a power of two".
+- **The epoch check failed under a loaded host.** It passed 16 of 16 runs alone. With both
+  SMP ports booting eight CPUs at once, aarch64 failed "RETIREMENT REFUSED" in two of two
+  rounds, because its writer outran reclamation. Now the writer waits for room, and judges
+  a CPU the collector names by that CPU's own finished reads rather than by the
+  collector's count of advances. The contended case then passed eight of eight.
+
+The epoch fix was falsified in three directions, each mutation asserted and restored byte
+for byte:
+
+| Mutation | Result |
+|---|---|
+| A reader stuck while pinned on CPU 1 | "A PARTICIPANT STALLED THE EPOCH on CPU 1" |
+| A reader that never releases its pin but keeps counting reads | "RECLAMATION NEVER CAUGHT UP" after 24 s, not a harness timeout |
+| The writer fails on the first full bag again, bag still scaled | aarch64 "RETIREMENT REFUSED" in two of three contended rounds |
+
+The last row is why the waiting, and not the larger bag, is the fix.
+
+**Not only at eight CPUs.** Before the fix, other verification runs saw the same "RETIREMENT
+REFUSED" at four CPUs, on `aarch64-virt-smp` and in both SMP stress images. They reported
+it at roughly one boot in five while the host ran suites in parallel, and passing when
+rerun alone. That rate is their report, not measured here.
+
+After the fix, both SMP presets booted twenty times in a row at their default four CPUs.
+Every boot shared the host with `i686-qemu` and `riscv32-virt`, so four QEMUs ran at once.
+All 40 boots passed the epoch check and exited cleanly.
+
 **What it found on its first long run.** x86_64 and i686 passed 600 audits. aarch64 went
 silent after 109 audits, with no report, and the watchdog killed it. Three runs
 reproduced it, at 156, 191 and 406 seconds. `info registers` on QEMU's monitor at the
