@@ -1006,6 +1006,54 @@ On the same presets with userspace, two checks write the volume and gate the boo
   files write init: wrote the disk through the file service; created, wrote, read back, truncated, renamed and removed through a writable connection; refused through a read-only one; /KINTANE/NATIVE.OUT read back, the volume consistent: 7 files, 2 directories, no lost cluster, the tables the same; the same server thread; 0 objects left, 0 frames left ok
 ```
 
+#### Long names
+
+The `fat` host tests cover the pieces against the format's own arithmetic — the checksum over the
+short name, the one-based ordinals and the bit marking the entry that holds the end of the name,
+the two bits recording whether each half of a short name was written in lower case — and the
+driver against what a caller sees: a long name is written and read back, its alias is a name of
+its own that never takes one something else answers to, a name the driver will not write is
+refused rather than shortened, and a long name survives a rename and a move between directories.
+
+One of them counts the directory's entries in the image rather than asking the driver, because
+**every other check passes with a leaked set still on the disk**: a long set whose short entry
+is gone lists as nothing, answers to no name, and holds no cluster, so the listing, the lookups
+and the consistency walk are all satisfied by it. Deleting only the short entry was not caught
+until the test counted entries before the name was made and after it was removed.
+
+In a boot, `linux-hello`'s files mode makes `/KINTANE/NOT.AN.83` — a name no short entry can hold
+— opens it again by the name it was made with, and removes it, before the step whose `fsync`
+makes all of that durable. What must still be refused is a component longer than the namespace
+holds, which creates nothing.
+
+| Mutation | What catches it |
+|---|---|
+| Deleting only the short entry, leaving the long ones | `removing_a_long_name_frees_every_entry_of_its_set`, by the entry count; nothing else |
+| An alias that ignores what the directory already holds | `an_alias_never_takes_a_name_something_else_answers_to` |
+| A name with a reserved character, or a trailing dot, written rather than refused | `a_name_this_driver_will_not_write_is_refused`, and the boot's step 96 |
+
+#### What the volumes say they are
+
+- **`files size`**, right after `files write`. `init` asks the file server what the filesystem
+  covering `/` is, and what covers `/FAT32`, through `statfs` — a read-side request, so a
+  read-only connection may ask it too, and the answer follows the path rather than the mount at
+  the root. The program requires each answer to stand on its own — an allocation unit of some
+  size, units to hold, no more free than there are, and room for a name longer than
+  eight-and-three — and requires the two to differ, since one volume answered twice would look
+  the same. It leaves both answers in `/KINTANE/STATFS.BIN`, synced.
+
+  Then the kernel reads them back and holds them against its own walk of the same volumes. The
+  allocation unit, the unit count and the longest name must match exactly. The free count may be
+  ahead by at most eight clusters: the program was told before it wrote the file carrying the
+  answer, so it is ahead by what that file took, and no more. And the count the driver keeps must
+  be what the walk counts, which is what makes the answer worth anything — a program cannot count
+  free clusters itself, so its half is that it asked and was answered coherently, and the kernel's
+  half is that the answer was true.
+
+```
+  files size init: asked the file service what the volumes are; both volumes answered for themselves; the same server thread; 0 objects left, 0 frames left ok
+```
+
 #### The disk image after a run
 
 The test disk is no longer attached with `snapshot=on`. Before each run kbuild copies the image it

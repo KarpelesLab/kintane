@@ -1484,8 +1484,12 @@ compiled by `kbuild portability` for the machines with no atomics:
   which this driver counts at mount and rewrites at every sync rather than trusting what a crash
   left. `statfs` reports that count, and the consistency walk counts it again independently. Every
   boot-sector field, every cluster number and every chain step is checked before it is used, and a
-  chain walk is bounded, so a corrupt volume is an error rather than a hang. Names are 8.3, stored
-  in upper case, and one that is not is refused rather than shortened.
+  chain walk is bounded, so a corrupt volume is an error rather than a hang. A name that is
+  eight-and-three is stored as one, with two bits recording whether each half was written in lower
+  case; anything longer is kept in long entries with an alias of its own — the name's characters
+  upper-cased, cut to six, and `~1`, the number rising until the directory holds no such short
+  name. Only printable ASCII is written, and a name the driver will not write — one holding a
+  character the format reserves, or ending in a dot or a space — is refused rather than shortened.
 
 **The order FAT writes in.** Every operation is a sequence of steps with a barrier after each,
 chosen so that the volume is consistent after any prefix of them and after any subset of the

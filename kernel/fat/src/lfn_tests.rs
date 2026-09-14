@@ -90,6 +90,23 @@ fn with_volume<R>(disk: &Disk, f: impl FnOnce(&mut Fat<'_, '_>) -> R) -> R {
     f(&mut fat)
 }
 
+/// Live entries in the root, counted from the image itself: an entry is live unless it was
+/// never used or is marked deleted.
+///
+/// What a caller cannot see. A long set left behind when its name was removed lists as nothing,
+/// answers to no name, and holds no cluster, so every other check passes with it still there —
+/// this is the one that does not.
+fn live_root_entries(disk: &Disk) -> usize {
+    let at = (RESERVED + FATS * fat_sectors()) * SECTOR;
+    let image = disk.0.borrow();
+    (0..ROOT_ENTRIES)
+        .filter(|i| {
+            let first = image[at + i * 32];
+            first != 0x00 && first != 0xE5
+        })
+        .count()
+}
+
 fn consistency(fat: &mut Fat<'_, '_>) -> Result<Consistency, Error> {
     let mut seen = vec![0u8; (fat.clusters() as usize + 2).div_ceil(8)];
     fat.check_consistency(&mut seen)
@@ -322,11 +339,26 @@ fn removing_a_long_name_frees_every_entry_of_its_set() {
         ns.mount("/", fat).unwrap();
         // Long enough to need three entries of its own.
         let long = "/a name long enough to need three entries.txt";
+        ns.sync().unwrap();
+        let empty = live_root_entries(&disk);
         create(&mut ns, long, b"x");
         assert_eq!(listing(&mut ns).len(), 1);
         // Its alias names it while it is there.
         assert!(ns.stat("/ANAMEL~1.TXT").is_ok());
+        ns.sync().unwrap();
+        let name = long.strip_prefix('/').unwrap().as_bytes();
+        assert_eq!(
+            live_root_entries(&disk),
+            empty + 1 + lfn::entries_for(name),
+            "the short entry and every long one are on the disk"
+        );
         ns.unlink(long).unwrap();
+        ns.sync().unwrap();
+        assert_eq!(
+            live_root_entries(&disk),
+            empty,
+            "every entry of the set came back, not only the short one"
+        );
         assert_eq!(listing(&mut ns), Vec::<String>::new(), "nothing is left");
         assert_eq!(ns.stat(long), Err(Error::NotFound));
         // The short entry went with the long ones: neither name finds anything.
