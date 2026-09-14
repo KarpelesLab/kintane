@@ -463,12 +463,21 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no block device");
         return Check::Skipped;
     };
-    // QEMU's virtio-blk-pci has an MSI-X table. On a platform that delivers messages, a test
-    // disk that came up on anything else fell back somewhere, and this check and the next
-    // would skip where they should have measured.
+    // QEMU's virtio-blk-pci has an MSI-X table unless it was started with `vectors=0`. On a
+    // platform that delivers messages, a test disk whose function has one and came up on
+    // anything else fell back somewhere; one whose function has none must be on its pin,
+    // routed through `_PRT`. Falling back to polling would turn this check and the next into
+    // skips where they should have measured.
+    let pin = platform::block_line().and_then(platform::pin_route);
     if kconfig::QEMU_BLOCK_TEST && platform::delivers_msi() && !blk.uses_msix() {
-        c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
-        return Check::Failed;
+        if platform::block_has_msix() {
+            c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
+            return Check::Failed;
+        }
+        if pin.is_none() {
+            c.write_str("THE DISK HAS NO MSI-X AND IS NOT ON ITS PIN THROUGH _PRT");
+            return Check::Failed;
+        }
     }
     let Some(line) = platform::block_line() else {
         c.write_str("skipped: the disk is polled, no interrupt route on this port");
@@ -478,6 +487,32 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
     write_usize(c, line as usize);
     if blk.uses_msix() {
         c.write_str(", MSI-X");
+    }
+    if let Some(route) = pin {
+        c.write_str(", INTx on GSI ");
+        write_usize(c, route.gsi as usize);
+        c.write_str(if route.level { " level" } else { " edge" });
+        c.write_str(if route.active_low {
+            " active low"
+        } else {
+            " active high"
+        });
+        // The entry as the I/O APIC holds it, read back: the line's vector, the boot CPU,
+        // unmasked, and the trigger and polarity the route gave.
+        if let Err(why) = platform::check_pin_entry(line) {
+            c.write_str(": ");
+            c.write_str(why);
+            return Check::Failed;
+        }
+        // What QEMU's q35 wires a PCI pin to: GSI 16 to 23, level-triggered, active high. A
+        // wrong polarity still delivers under QEMU, whose I/O APIC ignores it, so this is
+        // where an interpreter or route that got it wrong is caught. A wrong GSI in that range
+        // is caught by the reads below, which time out.
+        let qemu = (16..=23).contains(&route.gsi) && route.level && !route.active_low;
+        if kconfig::QEMU_BLOCK_TEST && !qemu {
+            c.write_str(": NOT THE ROUTE QEMU'S Q35 GIVES A PCI PIN");
+            return Check::Failed;
+        }
     }
 
     // SAFETY: the interrupt path is up (the interrupt selftest ran), the disk's handler is

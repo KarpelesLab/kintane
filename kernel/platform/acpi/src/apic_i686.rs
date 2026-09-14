@@ -5,10 +5,34 @@
 //! is the reason x86_64 needed an APIC at all. The windows are still claimed, so the kernel
 //! address space is built the same way on both PC ports.
 
+use acpi::Tables;
 use device::Driver;
+use device::pci::{Address, ConfigSpace, Function};
 use hal::EarlyConsole;
 
-use crate::{ECAM, MadtFacts, Reserve};
+use crate::{BootMemory, ECAM, MadtFacts, PinRoute, Reserve};
+
+/// No routes through the ACPI namespace: this port trusts the line firmware routed (see
+/// [`PCI_LINE_TRUSTED`]) and has no I/O APIC to program.
+pub(crate) fn pin_routes(
+    _c: &dyn EarlyConsole,
+    _tables: &Tables<'_, BootMemory>,
+    _cfg: Option<&dyn ConfigSpace>,
+    _functions: &[Function],
+    _out: &mut [(Address, PinRoute)],
+) -> usize {
+    0
+}
+
+/// No I/O APIC entry to program.
+pub(crate) fn route_pin(_line: u32, _route: &PinRoute, _masked: bool) -> bool {
+    false
+}
+
+/// No I/O APIC entry to read back.
+pub(crate) fn check_pin(_line: u32, _route: &PinRoute) -> Result<(), &'static str> {
+    Err("NO I/O APIC ON THIS PORT")
+}
 
 static LOCAL_APIC: Reserve = Reserve {
     name: "local-apic",

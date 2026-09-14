@@ -162,6 +162,30 @@ fn redirection_entries_put_every_field_where_the_datasheet_does() {
 }
 
 #[test]
+fn a_pci_gsi_is_routed_with_the_polarity_and_trigger_it_was_given() {
+    let c = controller(one_io_apic());
+    // q35's disk: GSI 23, level-triggered, active high, on the first message line's vector.
+    assert!(c.route_gsi(23, 48, false, true, false));
+    let expected = Redirection {
+        vector: 48,
+        destination: 3,
+        masked: false,
+        level: true,
+        active_low: false,
+    };
+    assert_eq!(c.redirection_entry(23), Some(expected));
+    assert!(c.route_gsi(22, 49, true, true, true));
+    let e = c.redirection_entry(22).unwrap();
+    assert!(e.active_low && e.masked && e.level);
+    assert_eq!(e.vector, 49);
+    // No I/O APIC serves GSI 24, and ISA IRQs own GSIs 2 and 9.
+    assert!(!c.route_gsi(24, 48, false, true, false));
+    assert!(!c.route_gsi(2, 48, false, true, false));
+    assert!(!c.route_gsi(9, 48, false, true, false));
+    assert_eq!(c.redirection_entry(24), None);
+}
+
+#[test]
 fn construction_masks_every_entry_and_prepares_the_boot_cpu() {
     let c = controller(one_io_apic());
     let apic = c.io[0].as_ref().unwrap();

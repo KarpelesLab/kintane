@@ -70,6 +70,17 @@ pub struct Vectors {
     pub spurious: u8,
 }
 
+/// An I/O APIC redirection entry, as [`Controller::redirection_entry`] reads it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redirection {
+    pub vector: u8,
+    /// The physical destination: one local APIC's ID.
+    pub destination: u8,
+    pub masked: bool,
+    pub level: bool,
+    pub active_low: bool,
+}
+
 /// The local APIC, reached one of two ways; see [`local`].
 pub enum Local {
     Mmio(MmioLocal),
@@ -228,6 +239,45 @@ impl<L: LocalRegisters, R: io::IoRegisters> Controller<L, R> {
         };
         let vector = self.vectors.irq_base.wrapping_add(isa);
         apic.set(index, io::redirection(vector, self.boot_id, active_low, level, masked));
+    }
+
+    /// Route global system interrupt `gsi` to `vector` on the boot CPU, with the polarity
+    /// and trigger its source has, masked or not.
+    ///
+    /// For a PCI interrupt, whose GSI, polarity and trigger firmware gives in `_PRT` and a
+    /// link device's `_CRS`, not as an ISA override. The caller chose the vector, and owns
+    /// unmasking and masking the entry. `false` when no I/O APIC serves `gsi`, or when an
+    /// ISA IRQ is routed there, whose entry [`IrqChip::enable`] writes.
+    pub fn route_gsi(
+        &self,
+        gsi: u32,
+        vector: u8,
+        active_low: bool,
+        level: bool,
+        masked: bool,
+    ) -> bool {
+        let overrides = &self.overrides[..self.n_overrides];
+        if (0..ISA_IRQS as u8).any(|isa| io::route(isa, overrides).0 == gsi) {
+            return false;
+        }
+        let Some((apic, index)) = self.entry_for(gsi) else {
+            return false;
+        };
+        apic.set(index, io::redirection(vector, self.boot_id, active_low, level, masked));
+        true
+    }
+
+    /// The redirection entry for `gsi`, read back from the I/O APIC serving it.
+    pub fn redirection_entry(&self, gsi: u32) -> Option<Redirection> {
+        let (apic, index) = self.entry_for(gsi)?;
+        let e = apic.get(index);
+        Some(Redirection {
+            vector: e as u8,
+            destination: (e >> 56) as u8,
+            masked: e & io::MASKED != 0,
+            level: e & io::LEVEL != 0,
+            active_low: e & io::ACTIVE_LOW != 0,
+        })
     }
 
     /// INIT and startup IPIs for the CPU whose APIC ID is `apic_id`, with the startup

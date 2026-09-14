@@ -379,7 +379,15 @@ fn x86_platform(
     if res.is_on("IOMMU") {
         args.extend(["-device".to_string(), "intel-iommu,intremap=on".to_string()]);
     }
-    args.extend(block_disk(res, image, "virtio-blk-pci,disable-legacy=on"));
+    // On x86_64-bios the disk has no MSI-X table (`vectors=0`), so its interrupt is its pin,
+    // which only `_PRT` routes: that preset proves INTx through the ACPI namespace while the
+    // other x86_64 presets keep proving MSI-X. i686 keeps the table its 8259A never uses.
+    let disk = if res.is_on("ARCH_X86_64") && res.is_on("KINBOOT_BIOS") {
+        "virtio-blk-pci,disable-legacy=on,vectors=0"
+    } else {
+        "virtio-blk-pci,disable-legacy=on"
+    };
+    args.extend(block_disk(res, image, disk));
     // On `pc`, slot 0x1e: the chipset routes its INTA to a different line from the disk's
     // function, and a line has one handler (`device::Handlers`), so the two cannot share.
     // On q35 no PCI line is trusted (`PCI_LINE_TRUSTED`) and the card is polled wherever
