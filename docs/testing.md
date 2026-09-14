@@ -395,6 +395,94 @@ offsets, an empty slot, non-virtio memory, a window too small to read, and the r
 wire format round trip. The falsifications above were run by hand; nothing in CI mutates
 the code.
 
+### 2d. Fuzzing
+
+Every parser that reads bytes the kernel did not write is fuzzed on the host, and so is
+system call dispatch. The harness is `lib/fuzz`, one table of targets that `kbuild fuzz`
+lists, the nightly job iterates, and the smoke run replays:
+
+| Target | What it reads | How inputs are made |
+|---|---|---|
+| `fdt` | device tree blobs | seeded: QEMU `virt` and the device model's tree, mutated |
+| `acpi` | ACPI tables | seeded: QEMU `q35` and `pc` captures, mutated, checksums repaired half the time |
+| `elf` | static executables | built valid, then one deliberate mistake a third of the time |
+| `module` | relocatable modules and their bundle | seeded: a module kbuild built, sometimes bundled |
+| `bootproto` | the boot protocol's tag stream | built with the crate's own `Builder`, then corrupted |
+| `menu` | the boot menu's entry list, and the menu it drives | built valid, then one mistake a person makes |
+| `pci` | configuration space, as devices answer enumeration | a machine with bridges and buses laid out on purpose |
+| `virtio-ring` | a used ring, as a hostile device writes it | a device script: heads, lengths, index jumps |
+| `syscall` | numbers and argument registers | drawn from `abi::TABLE`, so a new call is fuzzed without a new target |
+
+A target's `run` must answer every input: a value or an error, never a panic, never a
+hang. The driver runs each input on a worker thread under `catch_unwind` and waits for it
+with a deadline, so a panic and a loop are both failures, reported with the seed and
+iteration that produced them. Out-of-bounds reads are panics in Rust, which makes them the
+first rule rather than a third.
+
+```
+$ kbuild fuzz --preset x86_64-qemu --iterations 5000 --seed 3
+fdt          5000 iterations, seed 3, 1.0s, 971 accepted (19.4%), no failures
+acpi         5000 iterations, seed 3, 2.3s, 4018 accepted (80.4%), no failures
+elf          5000 iterations, seed 3, 0.1s, 2153 accepted (43.1%), no failures
+...
+```
+
+**Reproducing a failure.** The failing input is shrunk and written to
+`lib/fuzz/corpus/<target>/crash-<hash>.bin`, with a note beside it naming the seed, the
+iteration and the message. `kbuild fuzz --target <t> --file <path>` runs that one input.
+Committing the file makes it a permanent regression test: `kbuild fuzz --smoke` replays
+the whole corpus, and CI runs it on every change. A panic is shrunk; a hang is saved as
+found, because every shrink attempt at a hang would wait out the whole budget.
+
+**Why structure-aware, and not coverage-guided.** Coverage guidance needs the compiler to
+instrument every branch and a runtime to read the counters; kbuild drives `rustc`
+directly, the kernel crates are `no_std`, and neither is available. Random bytes without
+it spend their budget failing the first length check. So each generator knows the shape of
+what it makes, and the driver reports how many inputs got past the parser's top-level
+check. That number is the honest measure of whether a campaign tested a parser or only its
+rejection of garbage, and a host test requires the built generators to beat random bytes by
+a wide margin.
+
+**What the acceptance rate found.** The first campaign ran 45,000 inputs with no failures,
+and that result was worth almost nothing:
+
+| Target | First version | Now | Why |
+|---|---|---|---|
+| `elf` | 0% | 43% | the generator wrote `e_phentsize` and `e_phnum` two bytes late, so every file failed the first header check |
+| `acpi` | 0% | 80% | the seeds are address/length records, not flat memory; no RSDP was ever found |
+| `menu` | 5% | 40% | every line was drawn from lists half made of mistakes, so nearly every file had several |
+
+**What falsification found.** Each check was broken on purpose, confirmed to fail, and
+restored byte for byte:
+
+| Mutation | Result |
+|---|---|
+| a panic planted in `boot_protocol::tags::parse` | caught at iteration 9; `--smoke` then failed on the saved input, and passed once the parser was restored |
+| an infinite loop planted in `Config::parse` | caught by the watchdog at iteration 0, input saved unshrunk |
+| `abi::dispatch` sends an unknown number to a handler | caught at iteration 1, shrunk from 450 to 112 bytes |
+| `pci::enumerate` records an impossible parent | **not caught in 20,000 inputs** by the first generator, which never built a bridge with a device behind it; caught at iteration 0 by the rewritten one, shrunk from 1336 to 320 bytes |
+
+Two defects were the harness's own. The virtio target built the device's view of the used
+ring at an address it recomputed, ignoring the alignment padding `Dma::take` adds; its
+writes landed misaligned and were refused, which the first run reported as a driver
+failure. And the driver waited for each worker by polling every millisecond, which put a
+floor under every input: all nine targets ran at the same ~800 inputs a second, whatever
+their parser cost. A channel receive with a timeout made the cheap targets about sixty
+times faster.
+
+**No parser in the kernel has panicked or hung** on any input so far. That is a statement
+about the inputs these generators make, not a proof.
+
+**CI.** Every change replays the corpus and runs 200 inputs per target from a fixed seed.
+Nightly, every target runs a million inputs from a seed that changes each night, and any
+failing input is uploaded so it can be committed.
+
+**Not covered.** In-guest system call fuzzing: the host target proves dispatch refuses
+unknown numbers and decodes arguments before a handler runs, but "never faults the kernel"
+and "never leaks kernel memory" depend on the real copy-in and copy-out paths, which only a
+fuzzing user program against a booted kernel can exercise. Filesystem metadata and network
+packets join the table when those parsers exist.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once
@@ -1019,9 +1107,9 @@ is hard-capped by the 440 bytes the MBR allows.
 - **Miri** on host tests for the `unsafe` portions that can run under it.
 - **Model checking** for lock-free data structures on the host, since this is the one
   mitigation that genuinely substitutes for the weak-memory testing QEMU cannot do.
-- **Fuzzing** from Phase 6 on every parser touching untrusted input: device tree, ELF,
-  module loading, filesystem metadata, network packets, and the boot protocol's tags.
-  Syscall argument fuzzing from the point an ABI exists.
+- **Fuzzing** of every parser that reads untrusted input, and of system call dispatch:
+  see [2c. Fuzzing](#2c-fuzzing). Filesystem metadata and network packets join the table
+  the day those parsers exist.
 
 ## Debugging
 

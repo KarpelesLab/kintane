@@ -11,6 +11,7 @@ mod cache;
 mod codegen;
 mod dwarf;
 mod esp;
+mod fuzz;
 mod graph;
 mod hosttest;
 mod kcfg;
@@ -57,6 +58,8 @@ COMMANDS:
     lint                 check the in-tree rules rustc cannot express
     portability          compile the hardware-independent units for machines
                          without a port yet (no atomics, no 64-bit atomics, no MMU)
+    fuzz [--target T]    fuzz the parsers that read untrusted input; every target
+                         when none is named. --smoke replays the committed corpus
     run                  build, then boot under QEMU
     modules              build the kernel and its loadable modules, and the bundle
                          that carries them to it
@@ -77,6 +80,10 @@ OPTIONS:
                          seed and preset give the same configuration everywhere
     --allyes, --allno    extend it to everything on, or everything off, that can be
     --count K            `randconfig-build`: how many configurations (default 20)
+    --iterations K       `fuzz`: inputs per target (default 1000)
+    --corpus DIR         `fuzz`: where seeds and failures live
+    --file PATH          `fuzz`: run one input and stop, to reproduce a failure
+    --smoke              `fuzz`: replay the committed corpus and stop
     --compare REF|FILE   `size`: baseline to compare with (default: the committed one)
     --save FILE          `size`: also write the report to FILE
     --update-baseline    `size`: rewrite config/size-baseline/<preset>.size
@@ -125,6 +132,13 @@ struct Opts {
     duration: Option<u64>,
     /// `sdk`: write the module SDK after building.
     sdk: bool,
+    /// `fuzz`: which target, how many inputs, where the corpus is, and whether to replay
+    /// it rather than generate anything.
+    target: Option<String>,
+    iterations: u64,
+    corpus: Option<String>,
+    file: Option<String>,
+    smoke: bool,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -144,6 +158,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         update_baseline: false,
         duration: None,
         sdk: false,
+        target: None,
+        iterations: 1000,
+        corpus: None,
+        file: None,
+        smoke: false,
     };
     let mut random = false;
     let mut seed: Option<u64> = None;
@@ -178,7 +197,16 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 o.only = Some(args.get(i).ok_or("--only needs a name")?.clone());
             }
             "--host" => o.in_kernel = false,
-            "--target" => o.in_kernel = true,
+            // `test --target` takes no value; `fuzz --target NAME` does. One flag, told
+            // apart by whether a name follows it, so neither command grows a second
+            // spelling of "which".
+            "--target" => match args.get(i + 1) {
+                Some(name) if !name.starts_with('-') => {
+                    o.target = Some(name.clone());
+                    i += 1;
+                }
+                _ => o.in_kernel = true,
+            },
             "-v" | "--verbose" => o.verbose = true,
             "--random" => random = true,
             "--seed" => {
@@ -207,6 +235,22 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 o.save = Some(args.get(i).ok_or("--save needs a file")?.clone());
             }
             "--update-baseline" => o.update_baseline = true,
+            "--iterations" => {
+                i += 1;
+                let v = args.get(i).ok_or("--iterations needs a number")?;
+                o.iterations = v
+                    .parse()
+                    .map_err(|_| format!("--iterations expects a number, got `{v}`"))?;
+            }
+            "--corpus" => {
+                i += 1;
+                o.corpus = Some(args.get(i).ok_or("--corpus needs a directory")?.clone());
+            }
+            "--file" => {
+                i += 1;
+                o.file = Some(args.get(i).ok_or("--file needs a path")?.clone());
+            }
+            "--smoke" => o.smoke = true,
             other if !other.starts_with('-') => o.positional.push(other.to_string()),
             other => return Err(format!("unknown option `{other}`")),
         }
@@ -230,7 +274,8 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             return Err(format!("unexpected argument `{p}`"));
         }
     }
-    if opts.seed.is_some() && opts.generate.is_none() && cmd != "randconfig-build" {
+    if opts.seed.is_some() && opts.generate.is_none() && cmd != "randconfig-build" && cmd != "fuzz"
+    {
         return Err("--seed goes with --random (or with `randconfig-build`)".into());
     }
     let root = find_root()?;
@@ -318,6 +363,31 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                 return Err(format!("{} unit(s) had failing tests", s.failed));
             }
             Ok(())
+        }
+        "fuzz" => {
+            let tc = toolchain::verify(&root)?;
+            // The mocks, as `test` does: the harness links the same units its tests do.
+            let mut fopts = opts.clone();
+            fopts.sets.push(("MOCK_ARCH".into(), "y".into()));
+            let (table, res) = configure(&root, &fopts)?;
+            let identity = codegen::identity_text(&table, &res, &tc.identity(), "host");
+            let generated = codegen::emit(&table, &res, &root.join("build/host/gen"), &identity)?;
+            let ordered = graph::plan(graph::discover(&root)?, &res)?;
+            fuzz::run(
+                &root,
+                &tc,
+                &generated,
+                &ordered,
+                &fuzz::Run {
+                    target: opts.target.clone(),
+                    seed: opts.seed,
+                    iterations: opts.iterations,
+                    smoke: opts.smoke,
+                    file: opts.file.clone(),
+                    corpus: opts.corpus.clone(),
+                },
+                opts.verbose,
+            )
         }
         "run" => {
             let (image, res) = do_build(&root, &opts)?;
@@ -884,4 +954,47 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     println!("  build   {build_id}");
     println!("  image   {} ({} bytes)", image.display(), size);
     Ok((image, res))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_opts;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    // `--target` is two options told apart by what follows: alone it asks `test` for the
+    // in-kernel suite, as it always has; with a name it names a `fuzz` target. These pin
+    // that the older meaning did not change when the newer one arrived.
+    #[test]
+    fn a_bare_target_flag_still_means_the_in_kernel_suite() {
+        let o = parse_opts(&args(&["--target", "--preset", "x86_64-qemu"])).unwrap();
+        assert!(o.in_kernel);
+        assert!(o.target.is_none());
+        assert_eq!(o.preset.as_deref(), Some("x86_64-qemu"));
+
+        let o = parse_opts(&args(&["--target"])).unwrap();
+        assert!(o.in_kernel);
+        assert!(o.target.is_none());
+    }
+
+    #[test]
+    fn a_target_followed_by_a_name_names_a_fuzz_target() {
+        let o = parse_opts(&args(&["--target", "fdt", "--iterations", "50"])).unwrap();
+        assert!(!o.in_kernel, "naming a target is not asking for in-kernel tests");
+        assert_eq!(o.target.as_deref(), Some("fdt"));
+        assert_eq!(o.iterations, 50);
+    }
+
+    #[test]
+    fn fuzz_options_parse_and_have_defaults() {
+        let o = parse_opts(&args(&["--smoke", "--corpus", "c", "--file", "f"])).unwrap();
+        assert!(o.smoke);
+        assert_eq!(o.corpus.as_deref(), Some("c"));
+        assert_eq!(o.file.as_deref(), Some("f"));
+        assert_eq!(parse_opts(&[]).unwrap().iterations, 1000);
+        assert!(parse_opts(&args(&["--iterations", "lots"])).is_err());
+        assert!(parse_opts(&args(&["--corpus"])).is_err());
+    }
 }

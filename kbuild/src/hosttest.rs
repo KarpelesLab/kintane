@@ -29,7 +29,13 @@ pub struct Summary {
     pub failed: usize,
 }
 
-struct HostBuild<'a> {
+/// The host build: rustc invocations that target the machine kbuild runs on.
+///
+/// Reachable from `crate::fuzz`, which builds the same units the same way and then links
+/// one binary of its own against them. Two host builds that disagreed about the flags
+/// would be two host environments, and a unit that passed its tests in one could fail in
+/// the other for reasons nobody could see.
+pub struct HostBuild<'a> {
     root: &'a Path,
     tc: &'a Toolchain,
     out: PathBuf,
@@ -37,13 +43,80 @@ struct HostBuild<'a> {
     verbose: bool,
 }
 
-impl HostBuild<'_> {
+impl<'a> HostBuild<'a> {
+    pub fn new(
+        root: &'a Path,
+        tc: &'a Toolchain,
+        out: PathBuf,
+        generated: &'a Generated,
+        verbose: bool,
+    ) -> HostBuild<'a> {
+        HostBuild {
+            root,
+            tc,
+            out,
+            generated,
+            verbose,
+        }
+    }
+
+    /// The generated configuration as a crate every unit can read.
+    pub fn kconfig(&self) -> Result<PathBuf, String> {
+        let dest = self.out.join("libkconfig.rlib");
+        let mut args = self.common();
+        args.extend([
+            "--crate-type".into(),
+            "rlib".into(),
+            "--crate-name".into(),
+            "kconfig".into(),
+            self.generated.config_rs.display().to_string(),
+            "-o".into(),
+            dest.display().to_string(),
+        ]);
+        self.run(&args, "kconfig")?;
+        Ok(dest)
+    }
+
+    /// Compile `file` from `unit`'s directory as a host binary named `bin_name`, linked
+    /// against `unit` and its dependencies.
+    ///
+    /// For a driver that lives beside a library rather than inside it: `kbuild fuzz`
+    /// needs a `main` that takes arguments, and the unit itself has to stay a `no_std`
+    /// library the kernel crates can be linked against.
+    pub fn bin(
+        &self,
+        unit: &Unit,
+        file: &str,
+        bin_name: &str,
+        deps: &BTreeMap<String, PathBuf>,
+    ) -> Result<PathBuf, String> {
+        let dest = self.out.join(bin_name);
+        let mut args = self.common();
+        args.extend([
+            "--crate-type".into(),
+            "bin".into(),
+            "--crate-name".into(),
+            bin_name.replace('-', "_"),
+        ]);
+        self.externs(&mut args, unit, deps);
+        // The unit itself, which `externs` does not add: it adds what a unit depends on.
+        if let Some(p) = deps.get(&unit.name) {
+            args.push("--extern".into());
+            args.push(format!("{}={}", unit.name.replace('-', "_"), p.display()));
+        }
+        args.push(unit.dir.join(file).display().to_string());
+        args.push("-o".into());
+        args.push(dest.display().to_string());
+        self.run(&args, bin_name)?;
+        Ok(dest)
+    }
+
     /// Arguments shared by host rlibs and host test binaries.
     ///
     /// Note what is absent: no `--target`, so this builds for the host and links
     /// against its `std`; and no `-C panic=abort`, because the test harness reports
     /// a failing test by unwinding.
-    fn common(&self) -> Vec<String> {
+    pub fn common(&self) -> Vec<String> {
         let mut a = vec![
             "--edition".into(),
             "2024".into(),
@@ -60,7 +133,7 @@ impl HostBuild<'_> {
         a
     }
 
-    fn run(&self, args: &[String], what: &str) -> Result<(), String> {
+    pub fn run(&self, args: &[String], what: &str) -> Result<(), String> {
         if self.verbose {
             eprintln!("    rustc {}", args.join(" "));
         }
@@ -78,7 +151,7 @@ impl HostBuild<'_> {
         Ok(())
     }
 
-    fn rlib(&self, unit: &Unit, deps: &BTreeMap<String, PathBuf>) -> Result<PathBuf, String> {
+    pub fn rlib(&self, unit: &Unit, deps: &BTreeMap<String, PathBuf>) -> Result<PathBuf, String> {
         let name = unit.name.replace('-', "_");
         let dest = self.out.join(format!("lib{name}.rlib"));
         let mut args = self.common();
@@ -113,7 +186,7 @@ impl HostBuild<'_> {
         Ok(dest)
     }
 
-    fn externs(&self, args: &mut Vec<String>, unit: &Unit, deps: &BTreeMap<String, PathBuf>) {
+    pub fn externs(&self, args: &mut Vec<String>, unit: &Unit, deps: &BTreeMap<String, PathBuf>) {
         for d in &unit.deps {
             if let Some(p) = deps.get(d) {
                 args.push("--extern".into());
@@ -141,13 +214,7 @@ pub fn run(
     let out = root.join("build/host/out");
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
 
-    let hb = HostBuild {
-        root,
-        tc,
-        out: out.clone(),
-        generated,
-        verbose,
-    };
+    let hb = HostBuild::new(root, tc, out.clone(), generated, verbose);
 
     // Which units to run tests for, and everything they transitively need.
     let wanted: Vec<&Unit> = ordered
@@ -169,21 +236,7 @@ pub fn run(
 
     // The generated configuration, as a crate the units can read.
     let mut built: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let kconfig = out.join("libkconfig.rlib");
-    {
-        let mut args = hb.common();
-        args.extend([
-            "--crate-type".into(),
-            "rlib".into(),
-            "--crate-name".into(),
-            "kconfig".into(),
-            generated.config_rs.display().to_string(),
-            "-o".into(),
-            kconfig.display().to_string(),
-        ]);
-        hb.run(&args, "kconfig")?;
-    }
-    built.insert("kconfig".into(), kconfig);
+    built.insert("kconfig".into(), hb.kconfig()?);
 
     // Dependencies first, as plain rlibs. A unit under test is compiled twice: once
     // as a library for its dependents, once with --test for itself.
