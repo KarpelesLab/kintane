@@ -10,12 +10,95 @@ demonstrable — something boots, something passes, something fits in a budget �
 |---|---|
 | 0 — Build system and first boot | **done**, including `kinboot-efi` |
 | 1 — The portability spine | **done**, including `kinboot-bios` |
-| 2 — Core kernel | **every item landed**; the stress audit is judged in slices rather than wall-clock windows, and `kbuild soak` runs it unattended; 30-minute soaks pass on both SMP presets, the 2-hour and 24-hour runs are not yet done |
+| 2 — Core kernel | **every item landed**; the stress audit is judged in slices rather than wall-clock windows, and `kbuild soak` runs it unattended; **a two-hour soak at 8 CPUs passed 7,200 audits of 7,200** while five branches shared the host, and the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
 | 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
 | 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Stopping signals, queued real-time signals, floating-point state in a signal frame, `MSG_PEEK` and scatter/gather are not built |
 | 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, FAT16 written as well as read and a FAT32 second volume, both checked after every run; virtio-net with IPv4 reassembly, TCP with congestion control and out-of-order delivery, datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The eleventh round of landings
+
+Eighteen presets build and boot. Five branches ran in parallel, and the round is as much about what
+was refused as about what was built.
+
+- **A race the checks can reach.** The tenth round closed the window between a wait's first
+  readiness look and its registering, then found its own checks could not hit it: deleting that look
+  left them passing, because a millisecond-paced test cannot aim at a sub-microsecond window.
+  `WAIT_RACE_TEST` now compiles a stall point into the wait, parks a thread there, and has another
+  make the condition true and wake the queue — on a plain queue and on the set path a program's
+  `poll` is woken by. Deleting the second look now **fails the boot**. The check reads the block
+  count rather than whether the condition held, because both a fixed and a broken kernel end with
+  the condition true; a check asking the obvious question would have passed either. Its own first
+  run caught itself racing nothing — the boot thread released before the waiter parked — which is
+  the same failure the work exists to prevent. Without the symbol the stall is an empty inline
+  function, so a default build carries neither a branch nor a symbol, and `spawn::wait_exit`, the
+  last wall-clock bound in that area, now shares the slice-based rule.
+- **Long names, and `statfs` reaching a program.** A name that fits eight-and-three keeps the case
+  it was written in; anything longer, mixed in case, or holding a space or second dot is kept in
+  long entries with a short alias that is never given out twice, and the file answers to either
+  name. Only printable ASCII is written: a name the driver will not write is refused rather than
+  shortened, including one ending in a dot or space, which every reader strips. Removing or moving a
+  name takes away every entry of its set. `statfs` rides a new file-server operation rather than a
+  system call, answers for the filesystem covering a path, and a program's answers for both volumes
+  are held against the kernel's own walk. **Two of its falsifications failed to catch their
+  mutations**, and both tests were strengthened until they did: a leaked long-name set lists as
+  nothing, answers to no name and holds no cluster, so listings, lookups and the consistency walk
+  are all satisfied by it; and three files sharing one alias are each reachable by their long names.
+  A check that surveys state can be satisfied by the very thing it should catch.
+- **A receive that looks without taking.** `MSG_PEEK` leaves the datagram in its slot and the
+  stream's ring head where it was, and deliberately does not flush — nothing was taken, so nothing
+  is acknowledged and no window reopens. `MSG_WAITALL` waits for the whole count on a stream and is
+  honestly a no-op on a datagram. Messages carry up to four buffers, gathering one datagram from
+  several and scattering one receive across them in order, refusing more rather than carrying half
+  a message.
+- **The sender's fast retransmit, proven in a guest.** A segment is now a quarter of the send ring
+  rather than a whole MSS, so four are outstanding and the three behind a dropped one draw three
+  duplicate acknowledgements; kbuild's relay already drops each connection's first data segment, so
+  a new bulk round turns that into a gated, falsified check. The smaller segment was chosen over
+  several pool buffers per ring because the latter costs about 18 KB on every port, and i686 sits at
+  the edge of its budget.
+- **Queued real-time signals.** A signal of 32 or above queues eight deep per process: three sent
+  are three delivered, oldest first and lowest number first, each carrying its sender's value, and a
+  ninth send is refused rather than dropped. Below 32 a signal still coalesces, keeping the first
+  sender's value.
+
+**Three things were refused, and each refusal is the finding.**
+
+- **Floating-point state in a signal frame.** Saving it there would be false the moment another
+  thread ran: neither port's context switch saves those registers by explicit design, aarch64
+  asserts at compile time that nothing in the image can name one, and x86_64 never sets the bit that
+  would let a program use SSE at all — a user SSE instruction is `SIGILL` today. So the frame now
+  **refuses** one that claims such state rather than reading past it, and the honest home for the
+  feature is the `HasFpu` trait that already names the work.
+- **Selective acknowledgement and ICMP errors, in a guest.** Before writing either, that branch
+  captured a whole boot's frames and parsed them: QEMU's user-mode network offers only MSS — never
+  SACK-permitted — and sends no destination-unreachable message at all. kbuild's relay could have
+  forged both, but that tests the guest against a peer that does not exist. Both are implemented and
+  host-tested and **documented as unreachable in a boot**, with the capture as the evidence. The
+  same measurement overruled an instruction of mine: I asked for the quiet-port check to require
+  `ECONNREFUSED`, which would have failed every network boot.
+- **A second drive.** Every layer that names "the disk" is a singleton — the driver's claims and
+  handler, the platform's block line and MSI-X in both ACPI and FDT, the block layer's statics, the
+  IOMMU's single domain source, the driver domain's one grant, and the filesystem mounting both
+  volumes from one device. That is a six-crate rework before the brief's actual content begins, so
+  it was left unstarted and nothing was moved half-way.
+
+**What assigning numbers in advance taught this round.** Round ten collided because native call
+numbers were left to chance, so this round every number was handed out first — and **every branch
+merged without a single conflict**. But two of the assignments were themselves defective, and only
+running the falsifications exposed them: one step band was unrepresentable in an eight-bit exit
+status, and another truncated onto its own mode's success code, so a failure there would have been
+graded a pass. Assigning was right; the assignments now need checking for truncation and
+self-collision before they go out. A third lesson came free: a hard kill during a build can leave a
+zero-length object hard-linked inside the build cache, so deleting the build directory does not
+clear it and the failure reads like a compiler bug.
+
+**Still open.** Selective acknowledgement's sending half, and a peer that can exercise it or the
+ICMP path in a guest; a real second drive; floating-point state, which waits on `HasFpu`;
+`rt_sigsuspend` and `rt_sigtimedwait`; FAT32 in the fuzz target, the crash test and the stress
+workload; the Linux `statfs` calls; and, as before, real hardware, Secure Boot with a TPM, and the
+24-hour soak.
 
 ### The tenth round of landings
 
