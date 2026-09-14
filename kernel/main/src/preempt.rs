@@ -303,7 +303,17 @@ unsafe fn reschedule_here(cpu: usize) {
     // SAFETY: masked and locked; every thread runs on a stack in `STACKS`, a CPU's boot
     // stack or the boot stack, so `yield_on`'s contract holds. The lock is released below
     // by this thread when it next runs, or by `thread_start`.
-    if unsafe { Threads::yield_on(threads(), cpu) }.is_err() {
+    // A thread whose affinity no longer allows this CPU is re-queued on another, which
+    // must be told: an idle CPU is asleep, and nothing else announces this placement.
+    // The IPI goes out under the scheduler lock, so the target spins in its handler until
+    // this CPU's switch releases it, which is the next thing that happens.
+    if unsafe {
+        Threads::yield_on_with(threads(), cpu, |to| {
+            let _ = mp::reschedule(to);
+        })
+    }
+    .is_err()
+    {
         broke(BROKE_YIELD);
     }
     // SAFETY: held on this CPU: taken above, or by the thread whose switch resumed this one.
@@ -626,6 +636,19 @@ pub fn alive(id: ThreadId) -> bool {
     with_table(|t| !matches!(t.state(id), None | Some(thread::State::Exited)))
 }
 
+/// Where `id` is and what it is doing, for a check that waited for it in vain: its state
+/// and the CPU it is queued on or running on. `None` when the table has never heard of it.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only by the process checks, which need USERSPACE"
+    )
+)]
+pub fn where_is(id: ThreadId) -> Option<(thread::State, Option<usize>)> {
+    with_table(|t| t.state(id).map(|s| (s, t.cpu_of(id))))
+}
+
 /// Whether the scheduler is running, so a thread that ends must go through
 /// [`exit_thread`] rather than any table of its own.
 #[cfg_attr(
@@ -809,7 +832,15 @@ fn idle_loop(cpu: usize) -> ! {
         }
         // SAFETY: masked (a new thread starts masked, and the loop re-masks), locked, and
         // nothing referenced; see `reschedule_here`.
-        if unsafe { Threads::yield_on(threads(), cpu) }.is_err() {
+        // As in `reschedule_here`: an affinity change can send the yielding thread to
+        // another CPU, which has to be told.
+        if unsafe {
+            Threads::yield_on_with(threads(), cpu, |to| {
+                let _ = mp::reschedule(to);
+            })
+        }
+        .is_err()
+        {
             broke(BROKE_YIELD);
         }
         // SAFETY: held on this CPU, by this thread or the thread whose switch resumed it.

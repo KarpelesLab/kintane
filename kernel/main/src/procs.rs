@@ -457,6 +457,22 @@ static CYCLES: AtomicU64 = AtomicU64::new(0);
 /// one-second interval.
 const STRESS_WINDOW: Duration = Duration::from_nanos(80_000_000);
 
+/// The longest a cycle waits to see its pinned thread served on the CPU it was moved to
+/// and making progress there. A bound on a scheduling delay, so it is generous; the delay
+/// itself is measured and reported rather than assumed.
+const SERVE_WAIT: Duration = Duration::from_nanos(1_000_000_000);
+
+/// How often that wait looks.
+const POLL: Duration = Duration::from_nanos(5_000_000);
+
+/// The longest any cycle waited for its thread on the CPU it pinned it to.
+static SERVE_WORST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// That wait in microseconds, for the stress heartbeat.
+pub fn stress_serve_worst_us() -> u64 {
+    SERVE_WORST_NS.load(Ordering::Relaxed) / 1_000
+}
+
 /// Claim the stack the stress run's process thread runs on. Called once by the stress
 /// run's setup, with interrupts masked.
 pub fn stress_setup() -> Result<(), &'static str> {
@@ -498,11 +514,40 @@ pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
     };
     let exercised = exercise(id, round);
 
+    // Unpinned before it is told to stop, on every path. `exercise` pins the thread to one
+    // CPU at a time and only unpins when it succeeds, so a failure part of the way through
+    // used to leave the thread pinned: ready on a CPU busy with equal-priority workloads,
+    // where the balancer may not move it, and never reading the stop word. The wait below
+    // then failed, and its message hid the failure that really happened.
+    let _ = preempt::set_affinity(id, u64::MAX);
     set_stop(0);
+    let before = passes(0);
     if !wait_exit(id) {
         // Its tables cannot be freed while it may still run on them. The run is failing
         // anyway; leaving the process is the only safe thing to do.
-        return Err("a process did not stop when told to");
+        //
+        // What `exercise` found comes first: a thread that failed there is usually why it
+        // is still here, and its message says what actually went wrong.
+        exercised?;
+        // Otherwise, which way it failed is the whole diagnosis, and a `&'static str`
+        // cannot carry numbers, so the cases are separate messages: a thread still making
+        // passes never saw the stop word, one that is ready and made none was never
+        // scheduled, and a refused exit shows up in the scheduler's own record.
+        let moving = passes(0) > before;
+        return Err(match preempt::where_is(id) {
+            _ if preempt::broken() != 0 => "a process did not stop: the scheduler refused it",
+            Some((thread::State::Running, _)) if moving => {
+                "a process did not stop: still running, and never read the stop word"
+            }
+            Some((thread::State::Running, _)) => "a process did not stop: running but stuck",
+            Some((thread::State::Ready, _)) if moving => {
+                "a process did not stop: ready, and ran without reading the stop word"
+            }
+            Some((thread::State::Ready, _)) => "a process did not stop: ready, never scheduled",
+            Some((thread::State::Blocked, _)) => "a process did not stop: blocked",
+            Some((thread::State::Exited, _)) => "a process did not stop: exited after the wait",
+            None => "a process did not stop: the table lost its thread",
+        });
     }
     let code = userproc::slot(WORKERS[0]).and_then(|p| p.exit);
     let _ = preempt::reap(id);
@@ -534,17 +579,55 @@ fn exercise(id: ThreadId, round: u64) -> Result<(), &'static str> {
             if !preempt::set_affinity(id, 1 << cpu) {
                 return Err("a process thread could not be moved");
             }
-            // Once to get there: a running thread moves at its next yield.
-            nap(STRESS_WINDOW);
             userproc::clear_cpus(WORKERS[0]);
             let before = passes(0);
-            nap(STRESS_WINDOW);
-            if userproc::cpus(WORKERS[0]) & (1 << cpu) == 0 {
-                return Err("a process was never served on the CPU it was moved to");
+            // Waited for, not sampled once. How long a pinned thread takes to be served on
+            // its new CPU is a scheduling delay, not a constant: it shares that CPU with
+            // workloads of its own priority and only traps every so many passes. Two fixed
+            // 80 ms windows used to stand in for that, which was enough to hide what went
+            // wrong at eight CPUs behind "never served" — the real fault was a yield that
+            // moved the thread without interrupting the CPU it moved to (`plan_yield`), so
+            // an idle CPU slept through its arrival. With that fixed the worst wait any
+            // cycle has taken is about 13 ms, reported in the heartbeat, so this bound is
+            // measured rather than guessed.
+            let start = timekeeping::now();
+            let give_up = start.saturating_add(SERVE_WAIT);
+            loop {
+                let served = userproc::cpus(WORKERS[0]) & (1 << cpu) != 0;
+                if served && passes(0) > before {
+                    break;
+                }
+                if timekeeping::now() >= give_up {
+                    if served {
+                        return Err("a process stopped making progress after it moved");
+                    }
+                    // Where it is says which half failed: a thread the table never moved to
+                    // the CPU it was pinned to is a placement bug, while one sitting there
+                    // unserved is a scheduling or trap-rate problem. A `&'static str`
+                    // carries no numbers, so the cases are separate messages.
+                    let here = preempt::where_is(id).map(|(s, on)| (s, on == Some(cpu)));
+                    return Err(match here {
+                        Some((thread::State::Running, true)) => {
+                            "never served: running on the CPU it was pinned to, but never trapped"
+                        }
+                        Some((thread::State::Running, false)) => {
+                            "never served: still running on a CPU its affinity excludes"
+                        }
+                        Some((thread::State::Ready, true)) => {
+                            "never served: ready on the right CPU, never scheduled"
+                        }
+                        Some((thread::State::Ready, false)) => {
+                            "never served: ready on a CPU its affinity excludes"
+                        }
+                        Some((thread::State::Blocked, _)) => "never served: blocked",
+                        Some((thread::State::Exited, _)) => "never served: it had exited",
+                        None => "never served: the table lost its thread",
+                    });
+                }
+                nap(POLL);
             }
-            if passes(0) <= before {
-                return Err("a process stopped making progress after it moved");
-            }
+            let waited = timekeeping::now().saturating_duration_since(start);
+            SERVE_WORST_NS.fetch_max(waited.as_nanos(), Ordering::Relaxed);
         }
         let _ = preempt::set_affinity(id, u64::MAX);
     }

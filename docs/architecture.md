@@ -1104,6 +1104,15 @@ tickless secondary waited for that CPU's next timer interrupt, up to one full ar
 (2.15 s on aarch64). The stress run's process cycle found this as a process that did not
 stop within its one-second drain.
 
+That covers a thread the table moves while it is queued. A thread that is *running* when
+its affinity changes keeps its CPU until it next yields, and `plan_yield` then re-queues it
+where `sched::balance` places it — the one placement path that used to name its destination
+to nobody. `Threads::yield_on_with` now hands that CPU back to the caller, which interrupts
+it, because an idle CPU is asleep and nothing else was going to tell it. Until this, an
+eight-CPU stress run left its user process ready on exactly the CPU it had been pinned to,
+unscheduled for the whole second the check allows, while four CPUs sat idle. Four CPUs hid
+it: with the workloads filling every run queue, the destination was never an idle CPU.
+
 #### The SMP scheduler
 
 After bring-up, `preempt::resume` releases every secondary into `preempt::join`, where

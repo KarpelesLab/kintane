@@ -109,12 +109,7 @@ const MAX_SEGMENTS: usize = 8 + MAX_THREAD_STACKS;
 /// It was a literal 16, which the thread-stack array outgrew as soon as its size came from
 /// the configuration: a stress build's ten slots plus seven secondaries is seventeen, and
 /// every SMP stress run refused its own kernel address space.
-const MAX_THREAD_STACKS: usize = kconfig::KERNEL_THREAD_SLOTS
-    + if kconfig::SMP && kconfig::NR_CPUS > 1 {
-        kconfig::NR_CPUS - 1
-    } else {
-        0
-    };
+const MAX_THREAD_STACKS: usize = kconfig::THREAD_STACK_SLOTS;
 
 /// A kernel address space that passed verification and has not been installed yet.
 pub struct Verified<A: HasPageTables> {

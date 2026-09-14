@@ -118,6 +118,17 @@ pub fn process_stress_cycles() -> u64 {
     crate::procs::stress_cycles()
 }
 
+/// The longest a cycle waited for its thread on the CPU it pinned it to, in microseconds.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_stress_serve_worst_us() -> u64 {
+    crate::procs::stress_serve_worst_us()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_stress_serve_worst_us() -> u64 {
+    0
+}
+
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn process_stress_cycles() -> u64 {
     0

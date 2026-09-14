@@ -179,6 +179,15 @@ pub fn emit(
     );
 
     out.push_str(&format!(
+        "\n/// Slots in the kernel thread-stack array every port's `link.ld` reserves, derived\n\
+         /// by `codegen::stacks` from THREAD_STACK_KIB's companions KERNEL_THREAD_SLOTS and\n\
+         /// NR_CPUS. The same number `stacks.ld` gives the linker, so code sizing a table by\n\
+         /// it cannot disagree with the array.\n\
+         pub const THREAD_STACK_SLOTS: usize = {};\n",
+        stacks(res).slots
+    ));
+
+    out.push_str(&format!(
         "\n/// This build's identity; see `kbuild/src/codegen.rs`, `identity_text`.\n\
          pub const MODULE_IDENTITY: &str = {identity:?};\n\
          /// SHA-256 of [`MODULE_IDENTITY`].\n\

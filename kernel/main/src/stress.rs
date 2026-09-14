@@ -543,6 +543,13 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
     if processes != 0 {
         c.write_str(", processes ");
         write_usize(c, processes as usize);
+        // How long the slowest cycle waited to see its thread served on the CPU it pinned
+        // it to. A scheduling delay, reported because the wait that bounds it would
+        // otherwise be a number nobody checks: at eight CPUs it outgrew the fixed window
+        // this replaced.
+        c.write_str(" (served after max ");
+        write_usize(c, crate::model::process_stress_serve_worst_us() as usize);
+        c.write_str(" us)");
     }
     c.write_str(", audits ");
     write_usize(c, audits as usize);

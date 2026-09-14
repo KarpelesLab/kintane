@@ -438,9 +438,32 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
     /// See [`Threads::perform`]'s contract, which every switching operation shares.
     #[allow(unsafe_code)]
     pub unsafe fn yield_on(table: *mut Self, cpu: usize) -> Result<(), Error> {
+        // SAFETY: forwarded.
+        unsafe { Self::yield_on_with(table, cpu, |_| {}) }
+    }
+
+    /// [`Threads::yield_on`], telling `kick` where the yielding thread went when its
+    /// affinity sent it to another CPU.
+    ///
+    /// `kick` runs before the switch, while the caller still holds whatever lock it took:
+    /// after the switch this thread is not running, and the CPU it was queued on would
+    /// have to be told by someone else. A caller with interrupts to send uses it to make
+    /// that CPU reschedule; one with nothing to send passes an empty closure.
+    ///
+    /// # Safety
+    /// See [`Threads::perform`]'s contract.
+    #[allow(unsafe_code)]
+    pub unsafe fn yield_on_with(
+        table: *mut Self,
+        cpu: usize,
+        kick: impl FnOnce(usize),
+    ) -> Result<(), Error> {
         // SAFETY: the caller guarantees `table` is valid and unaliased by any live
         // reference; this `&mut` ends at the end of the statement.
-        if let Some(sw) = unsafe { (*table).plan_yield(cpu) }? {
+        if let Some((sw, moved_to)) = unsafe { (*table).plan_yield(cpu) }? {
+            if let Some(to) = moved_to {
+                kick(to);
+            }
             // SAFETY: `sw` was just planned on this table, and the caller's contract is
             // `perform`'s.
             unsafe { Self::perform(table, sw) };
@@ -448,7 +471,17 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
         Ok(())
     }
 
-    fn plan_yield(&mut self, cpu: usize) -> Result<Option<Switch>, Error> {
+    /// Plan a yield on `cpu`: the switch to make, and the CPU the yielding thread was
+    /// re-queued on when that is not `cpu`.
+    ///
+    /// That second half matters because this is the one placement path whose destination
+    /// nobody else hears about. `wake_on` returns where it placed a thread and
+    /// `set_affinity`'s caller reads `cpu_of`, and both send that CPU a reschedule IPI; a
+    /// thread that leaves a CPU its affinity no longer allows used to be enqueued in
+    /// silence. An idle CPU sleeps until something interrupts it, so on a machine with
+    /// CPUs to spare the thread sat ready on the right CPU, unscheduled, until an
+    /// unrelated interrupt happened along.
+    fn plan_yield(&mut self, cpu: usize) -> Result<Option<(Switch, Option<usize>)>, Error> {
         let cur_slot = (*self.current.get(cpu).ok_or(Error::BadCpu)?).ok_or(Error::BadCpu)?;
         let cur = self.meta[cur_slot].ok_or(Error::NoSuchThread)?;
         let allowed_here = cur.affinity.contains(cpu);
@@ -482,7 +515,9 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
             m.state = State::Ready;
             m.cpu = to;
         }
-        self.plan_next(cpu).map(Some)
+        // `to` when the yield sent the thread to another CPU: that CPU has to be told.
+        let moved_to = (to != cpu).then_some(to);
+        self.plan_next(cpu).map(|sw| Some((sw, moved_to)))
     }
 
     /// Take the current thread off CPU 0 until something wakes it.
@@ -1208,6 +1243,35 @@ mod tests {
         assert_ne!(t.current_on(3), Some(running));
         assert_eq!(t.cpu_of(running), Some(1));
         assert_eq!(t.set_affinity(running, CpuSet::EMPTY), Err(Error::BadAffinity));
+        t.check().unwrap();
+    }
+
+    /// The CPU a yielding thread is sent to has to be told, or an idle one sleeps through
+    /// the arrival. Nothing else announces this placement: `wake_on` returns its
+    /// destination and `set_affinity`'s caller reads `cpu_of`, but a thread leaving a CPU
+    /// its affinity no longer allows used to be enqueued in silence. On an eight-CPU
+    /// stress run that left a user process ready on the right CPU, unscheduled, until an
+    /// unrelated interrupt happened along.
+    #[test]
+    fn a_yield_that_moves_a_thread_names_the_cpu_to_interrupt() {
+        let _serial = serial();
+        let mut t = smp_table(5);
+        smp_spawn(&mut t, 11, 4, CpuSet::all(4), 3);
+        yield_on(&mut t, 3).unwrap();
+        let running = t.current_on(3).unwrap();
+        t.set_affinity(running, CpuSet::single(1)).unwrap();
+
+        let mut kicked = None;
+        // SAFETY: as for `yield_now`; the mock switch only records.
+        unsafe { Threads::yield_on_with(&mut t, 3, |to| kicked = Some(to)) }.unwrap();
+        assert_eq!(kicked, Some(1), "the CPU it was re-queued on must be interrupted");
+        assert_eq!(t.cpu_of(running), Some(1));
+
+        // A yield that keeps the thread where it is has nobody to tell.
+        let mut kicked = None;
+        // SAFETY: as above.
+        unsafe { Threads::yield_on_with(&mut t, 1, |to| kicked = Some(to)) }.unwrap();
+        assert_eq!(kicked, None, "a thread that stays put interrupts nothing");
         t.check().unwrap();
     }
 

@@ -25,7 +25,10 @@ pub fn device_windows() -> &'static [DeviceWindow] {
 static CLAIMED: AtomicUsize = AtomicUsize::new(0);
 
 /// The most slots `link.ld` reserves.
-const NAMED_SLOTS: usize = 8;
+/// Every slot `link.ld` reserves, by the same derivation as its `stacks.ld`. It was a
+/// literal, which a configuration-sized array outgrew: at eight CPUs a stress build lays
+/// out seventeen slots, and the seventeenth claim was refused though the array had room.
+const NAMED_SLOTS: usize = kconfig::THREAD_STACK_SLOTS;
 
 /// Who each slot was claimed for, for the report.
 struct Owners(UnsafeCell<[&'static str; NAMED_SLOTS]>);
