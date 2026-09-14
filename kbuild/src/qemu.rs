@@ -1681,7 +1681,7 @@ mod tests {
         assert_eq!(super::disturb(&plain, &mut state), vec![plain.clone()]);
         // A runt, read and passed on rather than read past its end.
         assert_eq!(super::disturb(&[0u8; 20], &mut state), vec![vec![0u8; 20]]);
-        assert!(!state.reordered, "nothing was held back");
+        assert!(state.split.is_empty(), "no connection was disturbed");
     }
 }
 
