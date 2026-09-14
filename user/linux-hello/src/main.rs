@@ -22,8 +22,8 @@
 //! * `serve`: [`serve`], a TCP server kbuild connects to through a port QEMU forwards.
 //! * `files`: [`files`], writing the test disk: create, write, append, truncate, directories,
 //!   rename and remove, and a file left for kbuild to read after the guest exits.
-//! * `faults`: [`faults`], a handler run for a thread that only spins, and handlers for the
-//!   faults a program raises itself.
+//! * `faults`: [`faults`], a handler run for a thread that only spins, and handlers for the faults
+//!   a program raises itself.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 

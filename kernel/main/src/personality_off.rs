@@ -52,7 +52,10 @@ pub(crate) fn killed_by<P>(_slot: usize, _personality: P) -> u64 {
     not(CONFIG_USERSPACE),
     expect(dead_code, reason = "only userspace returns to user code")
 )]
-pub(crate) fn deliver_on_interrupt(_slot: usize, _regs: &mut [u64; hal::user::REGISTER_WORDS]) -> bool {
+pub(crate) fn deliver_on_interrupt(
+    _slot: usize,
+    _regs: &mut [u64; hal::user::REGISTER_WORDS],
+) -> bool {
     false
 }
 

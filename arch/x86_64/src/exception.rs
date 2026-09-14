@@ -106,7 +106,8 @@ extern "C" fn on_trap(frame: *mut crate::idt::TrapFrame) {
     let from_user = crate::smp::gs_enter(f.cs);
     // #PF alone has resolutions that are the kernel's own: a page the fault hook maps, or a
     // fault something asked to be told about. Neither is a program's business.
-    if f.vector == 14 && (crate::paging::on_page_fault(cr2(), f.error) || crate::fault::route(cr2(), f.error))
+    if f.vector == 14
+        && (crate::paging::on_page_fault(cr2(), f.error) || crate::fault::route(cr2(), f.error))
     {
         crate::smp::gs_leave(from_user);
         return;

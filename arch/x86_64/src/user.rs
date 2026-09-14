@@ -274,8 +274,8 @@ pub(crate) fn kill(trap: UserTrap) -> ! {
 fn words_of(f: &crate::idt::TrapFrame) -> [u64; hal::user::REGISTER_WORDS] {
     let mut w = [0u64; hal::user::REGISTER_WORDS];
     w[..18].copy_from_slice(&[
-        f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp, f.r8, f.r9, f.r10, f.r11, f.r12,
-        f.r13, f.r14, f.r15, f.rip, f.rflags, f.rsp,
+        f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp, f.r8, f.r9, f.r10, f.r11, f.r12, f.r13,
+        f.r14, f.r15, f.rip, f.rflags, f.rsp,
     ]);
     w
 }

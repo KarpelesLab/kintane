@@ -148,7 +148,6 @@ impl TrapFrame {
             ss: self.ss,
         }
     }
-
 }
 
 /// Define an assembly entry point for `vector` that saves every register into a [`TrapFrame`]

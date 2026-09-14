@@ -1182,6 +1182,24 @@ exited before it looks for a free one; before that, the first run stopped at ste
 `fork` refused. Native thread starts do not reap: a native thread that has exited stays in the
 table until its check reaps it.
 
+**Signals a system call never reaches.** A third run, `linux flt`, follows `linux sig` on the same
+slot and stacks, as `hello faults`. Its exit code is 54 when every step behaved:
+
+| Step | What it checks |
+|---|---|
+| 210–212 | a thread started with `clone` spins in user mode reading one word, making no system call at all; the first thread sends it `SIGUSR1` with `tgkill`, and its handler runs. Nothing but the interrupt that finds it spinning can deliver that, so this is the whole of delivery from an interrupt |
+| 213–216 | a one-page mapping is unmapped and stored to. The store raises `SIGSEGV`, whose `siginfo` names *exactly* the address stored to in `si_addr`, and the handler steps over the store by writing the saved program counter in the `ucontext` — which also proves the frame's program counter is where the kernel says it is |
+| 217–218 | the architecture's arithmetic trap — a division by zero on x86_64, an undefined instruction on aarch64, since `sdiv` by zero raises nothing there — reaches its handler as `SIGFPE` or `SIGILL`, and is stepped over the same way |
+| 219 | both dispositions go back to the default, with the process still its own after three handlers |
+
+The check requires that exit code and, from the kernel's own counters, at least one handler entered
+from an interrupt, at least two entered from a fault, and as many frames returned through
+`rt_sigreturn` as handlers entered. On `x86_64-qemu` and `aarch64-virt`:
+
+```
+  linux flt  a spinning thread took its handler, SIGSEGV was fixed from si_addr, the arithmetic trap stepped over; 1 from an interrupt, 2 from a fault, 3 of 3 returned; 0 frames left ok
+```
+
 **In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
 the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.
 It starts each process as it builds it and pins both to one CPU, a
@@ -1306,6 +1324,10 @@ was restored and compared byte for byte.
 | Delivery ignoring the mask (aarch64) | boot: `linux sig  the program exited 0x73, WRONG`, step 115: the blocked `SIGUSR2`'s handler ran |
 | Sending a signal waking no blocked thread (x86_64) | boot: `linux sig  the program NEVER EXITED; 2 handlers run, 2 returned, 0 blocked calls interrupted; A THREAD NEVER ENDED`. The thread in its read was never woken to see the signal, and the check's patience, not a hang, ended the run |
 | `rt_sigaction` taking a disposition for `SIGKILL` (aarch64) | boot: `linux sig  the program exited 0x6e, WRONG`, step 110 |
+| Nothing delivered on the way out of an interrupt (x86_64) | boot: `linux flt  the program NEVER EXITED; 0 from an interrupt, 0 from a fault, 0 of 0 returned; A THREAD NEVER ENDED, its processes left in place; 15 FRAMES LEAKED`. The spinning thread never sees its signal, and the check's patience, not a hang, ends the run |
+| `si_addr` a page away from the address that faulted (x86_64) | boot: `linux flt  the program exited 0x00000000000000d8, WRONG; 1 from an interrupt, 1 from a fault`, step 216: the handler was told about an address the store never touched |
+| A fault handler that returns without fixing anything (x86_64) | boot: `linux flt  the program exited 0x5349474e0000000b, WRONG; 1 from an interrupt, 16 from a fault, 17 of 17 returned`. The store faults again the moment the handler returns; after 16 of them at that one instruction the kernel stops running the handler and the default action ends the process, reported as `SIGSEGV` — promptly, not as a hang |
+| The same, with the re-fault bound removed (`REFAULTS` raised) | boot: `linux flt  the program NEVER EXITED; 1 from an interrupt, 317451 from a fault, 317451 of 317452 returned; A THREAD NEVER ENDED, its processes left in place; 15 FRAMES LEAKED`. This is what the bound exists to stop, and what Linux itself leaves to the program |
 
 `LINUX_ENOSYS_FATAL=y` was booted as well. The boot passes, with `exit 0xffffffffffffffff ok` and
 the log line `linux: getrandom (318) is not implemented, and LINUX_ENOSYS_FATAL ends the process`.

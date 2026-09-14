@@ -361,7 +361,10 @@ pub(crate) fn killed_by(slot: usize, personality: Personality) -> u64 {
 ///
 /// On the way back to user code, so the interrupted context was the program's: it cannot have
 /// held any lock this takes.
-pub(crate) fn deliver_on_interrupt(slot: usize, regs: &mut [u64; hal::user::REGISTER_WORDS]) -> bool {
+pub(crate) fn deliver_on_interrupt(
+    slot: usize,
+    regs: &mut [u64; hal::user::REGISTER_WORDS],
+) -> bool {
     signals::deliver_interrupted(slot, regs)
 }
 
