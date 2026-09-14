@@ -759,7 +759,8 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
       (`platform::set_line_message`). From then on:
       - The table entry, not the MSI-X entry, says where the interrupt goes.
         `route_interrupt` therefore refuses a remapped line rather than rewrite a message the
-        IOMMU ignores. Moving one would mean rewriting its table entry.
+        IOMMU ignores. `iommu::route_disk_interrupt` moves it instead, rewriting the table entry
+        and flushing its cache; `block cpu` and `blk smp` move the disk's interrupt that way.
       - A destination is a 32-bit x2APIC ID, the only way to name a CPU whose ID is above 255.
         `apic::msi::message` still refuses such an ID rather than truncate it.
       - An interrupt whose entry is absent is blocked and recorded in the fault log with the
@@ -767,14 +768,19 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
       - Other functions' MSI-X and the I/O APIC's entries stay in compatibility format. QEMU
         still delivers those with remapping on (the network card does on `x86_64-iommu`).
 
-      The interrupt entry cache is not flushed when an entry changes. That needs queued
-      invalidation, which the driver does not implement. QEMU keeps no such cache for an
-      emulated device, so the `remap` check's changes apply at once there. Hardware needs the
-      flush first.
+      Once remapping is on, an entry is changed in two steps through the unit's invalidation
+      queue: the table, then an index-selective interrupt entry cache flush, waited for
+      (`drivers/iommu/vtd`, `qi.rs`). A unit without the queue on refuses the change. The same
+      queue flushes a translation taken away while a device may use it, page by page. QEMU keeps
+      no interrupt entry cache for an emulated device, so a guest cannot see a skipped entry
+      flush; the host tests' model of the cache can, and QEMU's IOTLB shows a skipped
+      translation flush in the `iommu` check. See isolation.md, "Flushing what the unit cached".
 
       **The Phase 5 domain's forwarded interrupt.** A driver in a domain does not own its
       vector. The kernel keeps the line, the handler and, with remapping, the table entry, and
-      forwards each interrupt to the domain as a message. Remapping does not change that path:
+      forwards each interrupt to the domain as a message. The handler does not send it: it counts
+      the interrupt and wakes a kernel thread that does, so it takes no channel lock on any CPU
+      (isolation.md, "Four CPUs"). Remapping does not change that path:
       the kernel's handler runs on the line's vector either way. The interface a domain's
       device relies on is:
       - `platform::message_target(line, cpu)`: the vector and APIC ID an entry must name;

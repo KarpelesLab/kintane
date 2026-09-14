@@ -230,6 +230,21 @@ fn a_superpage_can_be_unmapped_and_split_regions_still_translate() {
     assert!(domain.translate(2 * two_mib, mem).is_some(), "the third is not");
 }
 
+#[test]
+fn a_table_frame_is_zeroed_and_nothing_past_it() {
+    let mem = MockMem::default();
+    let mut pool = MockFrames::new(64);
+    let root = 0x1_0000_0000;
+    // Stale bytes inside the frame the root table will get, and the frame after it, which is not
+    // the table's to touch.
+    mem.write64(root + 16, 0xdead);
+    mem.write64(root + PAGE_SIZE, 0x5a5a_5a5a);
+    let unit = Unit::new(MockRegs::new(), mem.clone(), &mut pool).expect("bring-up");
+    assert_eq!(unit.root_for_test(), root);
+    assert_eq!(mem.read64(root + 16), 0, "the table's own frame is zeroed");
+    assert_eq!(mem.read64(root + PAGE_SIZE), 0x5a5a_5a5a, "the next frame is untouched");
+}
+
 /// A helper for the tests to reach the internals the hardware would.
 impl<R: Regs, M: PhysMem> Unit<R, M> {
     pub(crate) fn regs_for_test(&self) -> &R {

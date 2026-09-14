@@ -23,6 +23,9 @@
 //!
 //! # What is here, and where the `unsafe` is
 //!
+//! Changing an entry the hardware may have cached is followed by an invalidation, through the
+//! registers until the invalidation queue ([`qi`]) is on and through the queue after.
+//!
 //! All of it is plain logic over three traits — [`Regs`] for the unit's registers, [`Frames`]
 //! for the page-table frames, and [`PhysMem`] for the entries the hardware reads — so the whole
 //! driver is host-tested against models of each. The `unsafe` that turns a physical address into
@@ -36,6 +39,7 @@
 
 mod fault;
 mod pagetable;
+mod qi;
 mod regs;
 mod remap;
 
@@ -47,6 +51,7 @@ mod tests;
 
 pub use fault::Fault;
 pub use pagetable::{Domain, Perm};
+pub use qi::{Invalidation, QUEUE_ENTRIES, QueueStats};
 pub use regs::reg;
 pub use remap::{IRT_ENTRIES, InterruptTable, Irte, message_handle, remappable_message};
 
@@ -87,11 +92,6 @@ pub trait PhysMem {
 pub const PAGE_SIZE: u64 = 4096;
 const PAGE_SHIFT: u64 = 12;
 
-/// Entries in every table here: a root table, a context table and a page table are all one
-/// frame of 512 eight-byte entries — except the root and context tables, which are 256
-/// sixteen-byte entries. Both fill a frame.
-const ENTRIES: u64 = 512;
-
 /// Why the IOMMU could not be brought up or programmed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
@@ -113,6 +113,14 @@ pub enum Error {
     /// A destination the table's interrupt mode cannot hold: an APIC ID above 255 without
     /// extended interrupt mode.
     Destination,
+    /// A change the hardware may have cached needs flushing, and the unit has no invalidation
+    /// queue turned on to flush it with (`ECAP.QI` clear, or never enabled).
+    NoQueuedInvalidation,
+    /// The hardware rejected a descriptor in the invalidation queue (`FSTS.IQE`).
+    InvalidationRejected,
+    /// A register-interface invalidation after the queue was turned on, which the
+    /// specification forbids (§6.5.2).
+    QueueIsOn,
 }
 
 /// Reads before a register bit is called stuck. Under QEMU each of these completes at once;
@@ -136,6 +144,10 @@ pub struct Unit<R: Regs, M: PhysMem> {
     /// The guest address width chosen for the page tables: 48 bits, four levels, which QEMU
     /// supports and every domain here uses.
     levels: u8,
+    /// The invalidation queue, once [`Unit::enable_queued_invalidation`] has turned it on.
+    queue: Option<qi::Queue>,
+    /// What the queue has completed.
+    queue_stats: QueueStats,
 }
 
 /// The address width and level count this driver programs: 48-bit, four-level tables. The
@@ -163,6 +175,8 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
             root,
             max_address_width,
             levels: LEVELS_48,
+            queue: None,
+            queue_stats: QueueStats::default(),
         })
     }
 
@@ -210,6 +224,24 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
         self.mem.write64(entry, (domain.root() & ADDR_MASK) | 1);
         self.mem
             .write64(entry + 8, u64::from(AGAW_48) | (u64::from(domain.id()) << 8));
+        // Attached while translation is on, the device may have a cached context entry, and its
+        // new domain may have cached translations from before: flush both.
+        if self.enabled() {
+            if self.queue.is_some() {
+                self.invalidate(&[
+                    Invalidation::ContextDevice {
+                        domain: domain.id(),
+                        source,
+                    },
+                    Invalidation::IotlbDomain {
+                        domain: domain.id(),
+                    },
+                ])?;
+            } else {
+                self.invalidate_context()?;
+                self.invalidate_iotlb()?;
+            }
+        }
         Ok(())
     }
 
@@ -249,6 +281,10 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
     /// device's old context entry, and a newly attached or detached device would otherwise be
     /// translated by a stale one.
     pub fn invalidate_context(&mut self) -> Result<(), Error> {
+        // Once the queue is on, the register interface is closed and the queue does it.
+        if self.queue.is_some() {
+            return self.invalidate(&[Invalidation::ContextGlobal]);
+        }
         // CCMD: bit 63 ICC (invalidate context cache), bits [62:61] = 01 global.
         let ccmd = (1u64 << 63) | (0b01 << 61);
         self.regs.write64(reg::CCMD, ccmd);
@@ -258,7 +294,12 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
     /// Invalidate the IOTLB globally (VT-d §10.4.8.1): the hardware caches address
     /// translations, so a mapping just changed must be flushed before it is trusted to fault
     /// or to reach its new page.
+    ///
+    /// Refused once the queue is on: flush by domain or by page through the queue instead.
     pub fn invalidate_iotlb(&mut self) -> Result<(), Error> {
+        if self.queue.is_some() {
+            return Err(Error::QueueIsOn);
+        }
         let iotlb = self.iotlb_reg();
         // IOTLB register: bit 63 IVT (invalidate), bits [61:60] = 01 global.
         let cmd = (1u64 << 63) | (0b01 << 60);
@@ -337,9 +378,12 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 /// "…enable status" bit. Re-writing GCMD without them would turn those features back off.
 const GSTS_STICKY: u32 = reg::gsts::TES | reg::gsts::RTPS | reg::gsts::IRES | reg::gsts::QIES;
 
-/// Zero a freshly allocated table frame through the physical-memory accessor.
+/// Zero a freshly allocated table frame through the physical-memory accessor. Every table here
+/// fills one frame — 512 eight-byte entries, or 256 sixteen-byte ones for the root and context
+/// tables — so that is 512 words, and not a byte past them, which belong to whoever the allocator
+/// gave the next frame.
 fn zero_frame(mem: &impl PhysMem, phys: u64) {
-    for i in 0..ENTRIES * 2 {
+    for i in 0..PAGE_SIZE / 8 {
         mem.write64(phys + i * 8, 0);
     }
 }

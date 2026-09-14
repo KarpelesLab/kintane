@@ -229,6 +229,44 @@ with its DMA translated — the in-grant DMA working end to end. The `iommu` lin
 
 Each was falsified; see [testing.md](testing.md#2c-bis-dma-confinement-with-the-iommu).
 
+### Flushing what the unit cached
+
+A VT-d unit caches what it reads from its tables: context entries, translations (its IOTLB) and
+interrupt remapping entries. A change to one of those tables takes effect only once the cache is
+invalidated, so a mapping taken away without the flush is still reachable, and a remapping entry
+changed without it still delivers where it used to. The register interface invalidates contexts
+and translations only globally, and cannot invalidate an interrupt entry at all.
+
+The kernel turns the unit's *invalidation queue* on right after translation (`drivers/iommu/vtd`,
+`qi.rs`): a frame of 128-bit descriptors the unit reads from its head to its tail, each batch ended
+by a wait descriptor whose status write says the unit is done. Every change the unit may have
+cached is followed by its flush, waited for under a bound:
+
+- unmapping a page in use flushes its translation, page by page (`Unit::unmap_in_use`);
+- attaching a device while translating flushes its context entry and its domain;
+- changing a remapping entry flushes that entry's cache (`Unit::set_irte`), and a unit without the
+  queue on refuses the change rather than make half of it;
+- latching a new remapping table flushes the whole entry cache.
+
+QEMU's unit keeps a real IOTLB for its emulated devices, so a missing translation flush is visible
+in a guest, and the `iommu` check shows it. The disk reads a sector into a canary page mapped into
+its domain, the page is unmapped with its flush, and the rogue DMA aimed at it must then fault.
+With the flush skipped, the device reaches the canary through the translation it cached, and the
+boot fails. QEMU keeps no interrupt entry cache for an emulated device, so a skipped entry flush
+changes nothing a guest can observe. The `remap` check requires a completed flush for each of its
+six changes to the disk's entry in use, and the host tests' model of the cache shows the stale
+entry itself.
+
+| Operation | Value, under QEMU TCG |
+|---|---|
+| A remapping entry changed and its cache flushed, the wait included | 4.5 µs mean over 64 (`blk smp`); below the boot clock's resolution over 256 at boot (`remap`) |
+| Status reads before a wait saw its completion | 1 |
+
+QEMU processes the queue inside the exit the tail write causes, so a wait is complete by its first
+read. The 4.5 µs is two traps into the emulator and its descriptor processing, not a real unit's
+asynchronous queue, which drains in its own time; there the bound the driver waits under is what
+matters, and only the host tests exercise it.
+
 ## Running the driver in a domain (x86_64)
 
 With `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the two halves above are joined: the disk's
@@ -302,16 +340,43 @@ in the kernel, because the domain executes the same loads and stores over the sa
 what isolation adds is the completion's trip through a channel, which is why an interrupt-driven
 driver that waits on many completions is the case this measures.
 
+### Four CPUs (`x86_64-isolated-smp`)
+
+The handler does not send the message itself. A channel send takes the channel's lock and the
+object store's, and a handler that took them could wait for another CPU holding one. So the handler
+only counts the interrupt, stamps it, and wakes the *forwarder*, a kernel thread waiting on a wait
+queue, which sends the cumulative count (`blockdomain::forward_interrupt`). The only locks left on
+the handler's path are the wait queue's and the scheduler's, which every holder takes with
+interrupts masked for a few instructions. The count the forwarder records as sent is the one its
+message carried, not the counter read again after the send, so an interrupt taken while a message
+is leaving is still owed one. Every run checks that each interrupt the platform dispatched on the
+disk's line reached the forwarder and was sent.
+
+`x86_64-isolated-smp` runs the boot checks as `x86_64-isolated` does, and `block cpu` moves the
+disk's remapped interrupt to CPU 1 through its table entry. Once `persist` has given the scheduler
+every CPU, `blk smp` runs the domain checks again with the sides apart: the kernel's block layer
+pinned to CPU 0, the disk's interrupt on CPU 1, the domain pinned to CPU 2, and the domain started
+after the deliberate fault pinned to CPU 3. It gates the verdict on everything `blk domain` does,
+and on each domain entering user mode on its CPU and every interrupt of the run being taken on
+CPU 1 and none elsewhere.
+
+| Forward latency, kernel handler to the domain receiving | Mean | Worst |
+|---|---|---|
+| `x86_64-isolated`, one CPU | 127 µs | 1.1 ms |
+| `x86_64-isolated-smp`, `blk domain` (the scheduler still on one CPU) | 146 µs | 1.3 ms |
+| `x86_64-isolated-smp`, `blk smp` (handler, forwarder and domain apart) | 293–419 µs | 1.3–4.1 ms |
+
+Single boots, on a host running other QEMU guests; the spread is host load, and `blk domain` on
+the same image is the fair baseline. Apart, a message crosses CPUs twice: the handler's wake reaches
+the forwarder by IPI, and the forwarder's send reaches the domain by another, and under TCG each IPI
+is a round trip through the emulator's CPU threads. What the numbers support is the ratio, two to
+three times the one-CPU path. On hardware an IPI costs microseconds.
+
 ### What it does not prove
 
-- **The interrupt reaches the domain in software, not through VT-d interrupt remapping.** The kernel's
-  handler takes the MSI and forwards it as a message. VT-d interrupt remapping (`intremap=on` is
-  already enabled on the machine) would steer the device's MSI at the domain directly, and the kernel
-  handler would only acknowledge; that remapping table is another fork's work
-  (`drivers/iommu/vtd`), and where it slots in is marked in `blockdomain::forward_interrupt`.
-- **Uniprocessor only.** The `x86_64-isolated` preset runs one CPU. Forwarding the interrupt from the
-  handler relies on the uniprocessor lock discipline (every lock the forward takes is held with
-  interrupts masked); an SMP variant would forward through a dedicated queue instead.
+- **The interrupt reaches the domain through the kernel.** The disk's message is steered by a
+  remapping table entry the kernel owns, but remapping cannot make ring 3 an interrupt's target, so
+  the kernel's handler still takes it and the forwarder sends it on.
 - **The forward latency is QEMU's.** It is dominated by TCG scheduling and emulation, as the register
   prototype's fixed cost is.
 
@@ -321,6 +386,12 @@ driver that waits on many completions is the case this measures.
   QEMU's IOMMU invalidation is far cheaper than silicon's. What survives the emulator is the
   *shape*: the grant is mapped once at setup, and per DMA the MMU-equivalent does the work, so the
   cost is at the edges, as with the register prototype.
+- **No CPU above x2APIC ID 255.** Delivery through a remapping entry to such a CPU is shown only by
+  the host tests and by the boot CPU not taking a message aimed at ID 256. QEMU can place a CPU at
+  ID 256 only in a topology of at least 257 possible CPUs, and its MADT lists every one; the
+  kernel's ACPI discovery describes at most 72 devices (`MAX_DESCRIBED`), so it stops before it
+  installs the local APIC. Tried with `-smp 3,sockets=4,cores=128,threads=1,maxcpus=512` and a
+  fourth CPU cold-plugged at socket 2: `512 in the MADT`, no local APIC, no disk.
 - **One unit, the first DRHD.** The kernel programs the first remapping unit the DMAR lists, which
   is all QEMU presents. A machine with several units, each covering part of the PCI topology, would
   need each programmed and the device matched to the unit whose scope covers it.

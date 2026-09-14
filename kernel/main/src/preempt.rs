@@ -288,7 +288,8 @@ fn with_table<R>(f: impl FnOnce(&mut Threads<Cpu, SLOTS, { mp::CPUS }>) -> R) ->
     r
 }
 
-fn joined(cpu: usize) -> bool {
+/// Whether CPU `cpu` has joined the scheduler, so a thread pinned to it will run.
+pub fn joined(cpu: usize) -> bool {
     JOINED.get(cpu).is_some_and(|j| j.load(Ordering::Acquire))
 }
 
@@ -698,6 +699,53 @@ pub fn spawn_prepared(
     level: u8,
     prepare: impl FnOnce(&mut <Cpu as hal::HasContextSwitch>::Context, KernAddr),
 ) -> Option<ThreadId> {
+    spawn_prepared_at(stack, entry, arg, level, None, prepare)
+}
+
+/// As [`spawn_prepared`], queued on CPU `cpu` and allowed only there, so the thread's first
+/// instruction already runs on that CPU. The CPU is interrupted, so a tickless one takes the
+/// thread now rather than at its next timer interrupt.
+#[cfg_attr(
+    not(CONFIG_BLOCK_DOMAIN),
+    expect(
+        dead_code,
+        reason = "used only by the block driver domain's check with every CPU scheduling"
+    )
+)]
+pub fn spawn_prepared_on(
+    stack: usize,
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    level: u8,
+    cpu: usize,
+    prepare: impl FnOnce(&mut <Cpu as hal::HasContextSwitch>::Context, KernAddr),
+) -> Option<ThreadId> {
+    if cpu >= mp::CPUS {
+        return None;
+    }
+    let id = spawn_prepared_at(stack, entry, arg, level, Some(cpu), prepare)?;
+    if cpu != Cpu::cpu_index() {
+        mp::reschedule(cpu);
+    }
+    Some(id)
+}
+
+/// [`spawn_prepared`], allowed on every CPU and queued on this one, or pinned to `pinned`.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only to start user threads, which need USERSPACE"
+    )
+)]
+fn spawn_prepared_at(
+    stack: usize,
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    level: u8,
+    pinned: Option<usize>,
+    prepare: impl FnOnce(&mut <Cpu as hal::HasContextSwitch>::Context, KernAddr),
+) -> Option<ThreadId> {
     let (top, size) = STACKS.get(stack)?;
     let (top, size) = (top.load(Ordering::Relaxed), size.load(Ordering::Relaxed));
     if top == 0 {
@@ -706,7 +754,10 @@ pub fn spawn_prepared(
     with_table(|t| {
         STARTS[stack].0.store(entry as usize, Ordering::Release);
         STARTS[stack].1.store(arg, Ordering::Release);
-        let here = Cpu::cpu_index();
+        let (affinity, cpu) = match pinned {
+            Some(cpu) => (CpuSet::single(cpu), cpu),
+            None => (CpuSet::all(mp::CPUS), Cpu::cpu_index()),
+        };
         // SAFETY: as in `spawn_with`: a guarded slot claimed for the scheduler alone,
         // whose previous thread the caller guarantees has been reaped.
         let id = unsafe {
@@ -716,8 +767,8 @@ pub fn spawn_prepared(
                 priority(level),
                 KernAddr::new(top),
                 size,
-                CpuSet::all(mp::CPUS),
-                here,
+                affinity,
+                cpu,
                 false,
             )
         }

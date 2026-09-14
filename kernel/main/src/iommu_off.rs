@@ -64,3 +64,28 @@ pub fn check_disk_interrupt(_line: u32) -> Result<bool, &'static str> {
 pub fn tamper_disk_interrupt(_how: Tamper) -> bool {
     false
 }
+
+/// No domain to map a page into.
+pub fn grant_page(_frames: &mut mm::phys::FrameAllocator<'_, arch::Cpu>, _phys: u64) -> bool {
+    false
+}
+
+/// Nothing mapped to take away.
+pub fn revoke_page(_phys: u64) -> bool {
+    false
+}
+
+/// Nothing is remapped.
+pub fn disk_interrupt_remapped() -> bool {
+    false
+}
+
+/// No table entry to route an interrupt through.
+pub fn route_disk_interrupt(_line: u32, _cpu: usize) -> Result<(), &'static str> {
+    Err("NO IOMMU IN THIS BUILD")
+}
+
+/// No invalidation queue.
+pub fn invalidation_stats() -> Option<vtd::QueueStats> {
+    None
+}

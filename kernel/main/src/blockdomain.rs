@@ -30,13 +30,16 @@
 //! killed alone and the disk marked failed; a fresh domain serves again. Afterwards the disk is
 //! handed back to the kernel, so the stress run and the filesystem find it working.
 //!
-//! It does **not** yet use VT-d **interrupt remapping**: the interrupt is delivered to the
-//! kernel and forwarded in software. Where remapping would slot in is at [`forward_interrupt`]'s
-//! comment — the remapping table would target the message at the domain directly, and the
-//! kernel handler would only acknowledge. That table is another fork's work (`drivers/iommu/vtd`,
-//! `intremap=on` is already enabled on the machine so it can build on it).
+//! # The interrupt, on any CPU
+//!
+//! The disk's message is steered by its VT-d remapping table entry, which the kernel owns, but
+//! remapping cannot make ring 3 an interrupt's target, so the kernel still takes it and forwards
+//! it. The handler takes no channel lock: it counts the interrupt, stamps it and wakes a kernel
+//! thread, the *forwarder*, which sends the message ([`forward_interrupt`]). The handler, the
+//! forwarder and the domain may each be on a different CPU, and on `x86_64-isolated-smp` the
+//! check with every CPU scheduling ([`smp_check`]) puts them there.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ::block::testdisk;
 use arch::Cpu;
@@ -52,11 +55,12 @@ use virtio_blk_core::domain::{Facts, Interrupt, Op, Reply, Request, Setup, statu
 
 use crate::preempt::{self, sleep_until};
 use crate::userproc::{self, KernelEnd};
-use crate::{Check, block, iommu, timekeeping, write_usize};
+use crate::wait::WaitQueue;
+use crate::{Check, block, iommu, mp, timekeeping, write_usize};
 
-/// Guarded stack slots this check claims: one, for the domain's thread, reused across the
-/// domains it starts.
-pub const STACKS: usize = 1;
+/// Guarded stack slots this check claims: one for the domain's thread, reused across the domains
+/// it starts, and one for the thread that forwards the disk's interrupt to them.
+pub const STACKS: usize = 2;
 
 /// The process slot the domain runs in. `userproc::MAX_PROCS` is four; the scheduled process
 /// checks use 0–2 and tear them down before this runs, and the aarch64 register prototype
@@ -98,45 +102,170 @@ static STACK_TOP: AtomicUsize = AtomicUsize::new(0);
 
 // ---- interrupt forwarding -------------------------------------------------------------
 
-/// The kernel end of the domain's interrupt channel, and the running interrupt count. The
-/// handler owns this while a domain is being served; it is `None` otherwise.
+/// The kernel end of the domain's interrupt channel, which the forwarder sends on. `None` while
+/// no domain is being served.
 struct Forward {
     end: KernelEnd,
-    count: u64,
 }
 
 static FORWARD_CLASS: LockClass = LockClass::new("blockdomain.forward");
 static FORWARD: SpinLock<Option<Forward>, Cpu> = SpinLock::with_class(None, &FORWARD_CLASS);
 
-/// Interrupt messages the handler managed to forward, and ones it could not because the
+/// Whether a domain owns the disk's interrupt: set while [`FORWARD`] holds an end.
+static OWNED: AtomicBool = AtomicBool::new(false);
+
+/// The queue between the handler and the forwarder, as atomics: the interrupts taken for the
+/// domain, when the latest was taken, and the count the forwarder last sent. The handler only
+/// adds and stores, so it never waits on a lock another CPU holds, whichever CPU the disk's
+/// interrupt is delivered to. The count is cumulative, so one message carries every interrupt
+/// taken since the last.
+static RAISED: AtomicU64 = AtomicU64::new(0);
+static RAISED_AT: AtomicU64 = AtomicU64::new(0);
+static SENT: AtomicU64 = AtomicU64::new(0);
+/// Set while the forwarder sends, so an interrupt taken meanwhile is counted: the contention the
+/// lock-free handoff exists for.
+static SENDING: AtomicBool = AtomicBool::new(false);
+static TAKEN_WHILE_SENDING: AtomicU64 = AtomicU64::new(0);
+/// Tells the forwarder to end; and whether one is still alive on its stack slot.
+static STOP: AtomicBool = AtomicBool::new(false);
+static FORWARDER_LIVE: AtomicBool = AtomicBool::new(false);
+/// What the forwarder waits on and the handler wakes.
+static WAKE: WaitQueue = WaitQueue::new();
+
+/// Interrupt messages the forwarder managed to send, and ones it could not because the
 /// domain's inbox was full — harmless, because the count each message carries is cumulative,
 /// so the next delivered message brings the domain up to date.
 static FORWARDED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Forward the disk's interrupt to the domain as a message. Called from the interrupt
-/// handler while [`block::forward_interrupts`] is on. `true` if a domain owns the interrupt.
+/// The forwarder's priority: above the domain's, so an interrupt is passed on before the domain
+/// is given the CPU again.
+const FORWARDER_LEVEL: u8 = 6;
+
+/// How long the last interrupt's message may take to leave the forwarder before the accounting
+/// that every interrupt was forwarded is read.
+const SETTLE: Duration = Duration::from_nanos(100_000_000);
+
+/// Take the disk's interrupt for the domain. Called from the interrupt handler while
+/// [`block::forward_interrupts`] is on. `true` if a domain owns the interrupt.
 ///
-/// Where VT-d interrupt remapping would slot in: with a remapping table, the device's MSI
-/// would be steered to the domain without this software hop, and the kernel handler would only
-/// acknowledge. Until that table exists (another fork), the interrupt lands in the kernel and
-/// is forwarded here.
+/// Nothing here takes a channel's lock or waits for one: the interrupt is counted and stamped,
+/// and the forwarder is woken to send the message. The only locks on the path are the wait
+/// queue's and the scheduler's, which every holder takes with interrupts masked and holds for a
+/// few instructions, so the handler may run on one CPU while the forwarder sends on another and
+/// the domain receives on a third.
 pub fn forward_interrupt() -> bool {
-    let mut held = FORWARD.lock_irqsave();
-    let Some(fwd) = held.as_mut() else {
+    if !OWNED.load(Ordering::Acquire) {
         return false;
-    };
-    fwd.count += 1;
-    let msg = Interrupt {
-        count: fwd.count,
-        stamp: timekeeping::now().as_nanos(),
-    };
-    // A full inbox means a message is already queued that will wake the domain; it drains
-    // every completion when it does, and the cumulative count keeps it correct.
-    if fwd.end.send(&msg.encode()).is_ok() {
-        FORWARDED.fetch_add(1, Ordering::Relaxed);
-    } else {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    RAISED_AT.store(timekeeping::now().as_nanos(), Ordering::Relaxed);
+    RAISED.fetch_add(1, Ordering::AcqRel);
+    if SENDING.load(Ordering::Acquire) {
+        TAKEN_WHILE_SENDING.fetch_add(1, Ordering::Relaxed);
+    }
+    WAKE.wake_all();
+    true
+}
+
+/// The forwarder: wait until an interrupt has been taken that no message has carried, and send
+/// one that carries it.
+extern "C" fn forwarder(_: usize) -> ! {
+    preempt::begin();
+    loop {
+        let next = WAKE.wait_until(None, || {
+            if STOP.load(Ordering::Acquire) {
+                return Some(None);
+            }
+            let raised = RAISED.load(Ordering::Acquire);
+            (raised != SENT.load(Ordering::Acquire)).then_some(Some(raised))
+        });
+        let Ok(Some(raised)) = next else {
+            break;
+        };
+        SENDING.store(true, Ordering::Release);
+        let msg = Interrupt {
+            count: raised,
+            stamp: RAISED_AT.load(Ordering::Relaxed),
+        };
+        let sent = FORWARD
+            .lock_irqsave()
+            .as_mut()
+            .map(|fwd| fwd.end.send(&msg.encode()).is_ok());
+        match sent {
+            Some(true) => FORWARDED.fetch_add(1, Ordering::Relaxed),
+            // A full inbox means a message is already queued that will wake the domain; it
+            // drains every completion when it does, and the cumulative count keeps it correct.
+            Some(false) => DROPPED.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+        // The count this message carried, not `RAISED` read again: an interrupt taken while the
+        // message was being sent is still owed one, and reading `RAISED` here would mark it sent.
+        SENT.store(raised, Ordering::Release);
+        SENDING.store(false, Ordering::Release);
+    }
+    preempt::exit_thread()
+}
+
+/// Start the forwarder on the slot after the domain's, with nothing owed. `None` if one is still
+/// alive from a run that could not end it, or it cannot be spawned.
+fn start_forwarder(stack: usize) -> Option<ThreadId> {
+    if FORWARDER_LIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    STOP.store(false, Ordering::Release);
+    SENT.store(RAISED.load(Ordering::Acquire), Ordering::Release);
+    let id = preempt::spawn(stack + 1, forwarder, 0, FORWARDER_LEVEL)?;
+    FORWARDER_LIVE.store(true, Ordering::Release);
+    Some(id)
+}
+
+/// End the forwarder and reap it. `false`, leaving its slot claimed, if it did not end.
+fn stop_forwarder(id: ThreadId) -> bool {
+    STOP.store(true, Ordering::Release);
+    WAKE.wake_all();
+    if !wait_dead(id) || !preempt::reap(id) {
+        return false;
+    }
+    FORWARDER_LIVE.store(false, Ordering::Release);
+    true
+}
+
+/// Interrupts the platform dispatched on the disk's line, on every CPU.
+fn line_taken() -> u64 {
+    platform::block_line().map_or(0, |line| {
+        (0..mp::CPUS)
+            .map(|cpu| platform::interrupts_on_cpu(line, cpu))
+            .sum()
+    })
+}
+
+/// Every interrupt the platform dispatched on the disk's line since `taken_before` was taken for
+/// the domain and sent to it: none lost between the handler and the channel. Read once the last
+/// message has left the forwarder.
+fn forwarded_all(c: &dyn EarlyConsole, taken_before: u64, raised_before: u64) -> bool {
+    let give_up = timekeeping::now().saturating_add(SETTLE);
+    while SENT.load(Ordering::Acquire) != RAISED.load(Ordering::Acquire)
+        && timekeeping::now() < give_up
+    {
+        sleep_until(timekeeping::now().saturating_add(Duration::from_nanos(1_000_000)));
+    }
+    let taken = line_taken() - taken_before;
+    let raised = RAISED.load(Ordering::Acquire) - raised_before;
+    let sent = SENT.load(Ordering::Acquire) - raised_before;
+    c.write_str("; ");
+    write_usize(c, taken as usize);
+    c.write_str(" interrupts taken, ");
+    write_usize(c, sent as usize);
+    c.write_str(" forwarded");
+    let contended = TAKEN_WHILE_SENDING.load(Ordering::Relaxed);
+    if contended != 0 {
+        c.write_str(" (");
+        write_usize(c, contended as usize);
+        c.write_str(" taken while a message was being sent)");
+    }
+    if taken == 0 || raised != taken || sent != taken {
+        c.write_str("; AN INTERRUPT WAS TAKEN BUT NEVER FORWARDED");
+        return false;
     }
     true
 }
@@ -146,24 +275,32 @@ pub fn forward_interrupt() -> bool {
 /// Run the disk from a domain and report. On the boot thread, with the scheduler running,
 /// after the disk is up in the kernel and confined by the IOMMU.
 pub fn check(c: &dyn EarlyConsole) -> Check {
+    match grant(c) {
+        Ok(setup) => serve(c, &setup, Placement::Anywhere, || {}),
+        Err(check) => check,
+    }
+}
+
+/// What a domain serving the disk is given, or the outcome that says why the disk cannot be.
+fn grant(c: &dyn EarlyConsole) -> Result<Setup, Check> {
     if !kconfig::IOMMU {
         c.write_str("skipped: the disk is not behind an IOMMU to confine a domain");
-        return Check::Skipped;
+        return Err(Check::Skipped);
     }
     let Some((_, dma_phys, dma_len)) = block::grant() else {
         c.write_str("skipped: no disk to hand to a domain");
-        return Check::Skipped;
+        return Err(Check::Skipped);
     };
     let (_window_phys, window_len) = match virtio_blk::window() {
         Some(w) => w,
         None => {
             c.write_str("NO DISK WINDOW TO GRANT");
-            return Check::Failed;
+            return Err(Check::Failed);
         }
     };
     let Some((layout, bar, device_id)) = virtio_blk::pci_layout() else {
         c.write_str("THE DISK IS NOT ON PCI");
-        return Check::Failed;
+        return Err(Check::Failed);
     };
     let vector = match virtio_blk::msix_entry()
         .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi))
@@ -173,11 +310,11 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
             // A polled domain is exactly what this host refuses; the in-kernel path handles a
             // polled disk, but a domain would have to poll the ring, which defeats the point.
             c.write_str("skipped: the disk's interrupt is not one that can reach a domain");
-            return Check::Skipped;
+            return Err(Check::Skipped);
         }
     };
 
-    let setup = Setup {
+    Ok(Setup {
         window: window_va() as u64,
         window_len,
         dma_virt: dma_va() as u64,
@@ -189,8 +326,17 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         bar,
         device_id,
         layout,
-    };
+    })
+}
 
+/// Hand the disk to domains placed as `placement` says, run the checks against them, and hand the
+/// disk back to the kernel, calling `before_restart` just before.
+fn serve(
+    c: &dyn EarlyConsole,
+    setup: &Setup,
+    placement: Placement,
+    before_restart: impl FnOnce(),
+) -> Check {
     // The setup page and the data pages, allocated once and reused by every domain this check
     // starts, so a teardown between domains does not churn frames. Freed at the end.
     if !alloc_shared() {
@@ -198,16 +344,26 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         free_shared();
         return Check::Failed;
     }
+    let Some(forwarder) = stack().and_then(start_forwarder) else {
+        c.write_str("NO FORWARDER FOR THE DISK'S INTERRUPT");
+        free_shared();
+        return Check::Failed;
+    };
 
     // The disk is the domain's now: its interrupt is forwarded, not collected in the kernel.
     block::forward_interrupts(true);
-    let verdict = run(c, &setup, dma_phys, dma_len);
+    let mut verdict = run(c, setup, placement);
     block::forward_interrupts(false);
     forward_end(None);
+    if !stop_forwarder(forwarder) {
+        c.write_str("; THE FORWARDER DID NOT END");
+        verdict = Check::Failed;
+    }
     free_shared();
 
     // Hand the disk back to the kernel, whatever happened, so the stress run and the
     // filesystem find it working.
+    before_restart();
     if !block::restart_in_kernel(c) {
         c.write_str("; THE DISK DID NOT COME BACK TO THE KERNEL");
         return Check::Failed;
@@ -216,10 +372,11 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     verdict
 }
 
-fn run(c: &dyn EarlyConsole, setup: &Setup, dma_phys: u64, dma_len: usize) -> Check {
+fn run(c: &dyn EarlyConsole, setup: &Setup, placement: Placement) -> Check {
+    let (dma_phys, dma_len) = (setup.dma_phys, setup.dma_len as usize);
     // First domain: bring the disk up, serve every block check, and prove the IOMMU stops a
     // DMA it aims outside its grant.
-    let mut client = match start_domain(c, setup) {
+    let mut client = match start_domain(c, setup, placement.domain()) {
         Ok(client) => client,
         Err(why) => {
             c.write_str("; ");
@@ -243,6 +400,7 @@ fn run(c: &dyn EarlyConsole, setup: &Setup, dma_phys: u64, dma_len: usize) -> Ch
     if !ok {
         c.write_str("; NOT THE TEST DISK BEHIND VT-d ON MSI-X");
     }
+    let (taken_before, raised_before) = (line_taken(), RAISED.load(Ordering::Acquire));
     ok = ok && functional(c, &mut client, &facts);
     // The interrupt accounting, read after the functional run and before the rogue DMA — a
     // blocked rogue deliberately leaves a descriptor outstanding, so cleanliness is asked of
@@ -258,13 +416,17 @@ fn run(c: &dyn EarlyConsole, setup: &Setup, dma_phys: u64, dma_len: usize) -> Ch
         c.write_str("; A DESCRIPTOR LEAKED");
         ok = false;
     }
+    ok = forwarded_all(c, taken_before, raised_before) && ok;
+    if let Some(cpu) = placement.domain() {
+        ok = entered_on(c, "the domain", cpu) && ok;
+    }
     ok = contain_rogue(c, &mut client, dma_phys, dma_len) && ok;
     stop(&mut client);
     teardown();
 
     // Containment of a faulting *domain*: kill one, mark the disk failed, start another that
     // serves again.
-    ok = ok && restart_after_fault(c, setup);
+    ok = ok && restart_after_fault(c, setup, placement);
     Check::from_ok(ok)
 }
 
@@ -435,8 +597,8 @@ fn contain_rogue(c: &dyn EarlyConsole, client: &mut Client, dma_phys: u64, dma_l
 
 /// A domain whose driver faults is killed alone; the disk is marked failed; a fresh domain
 /// serves a read again.
-fn restart_after_fault(c: &dyn EarlyConsole, setup: &Setup) -> bool {
-    let mut client = match start_domain(c, setup) {
+fn restart_after_fault(c: &dyn EarlyConsole, setup: &Setup, placement: Placement) -> bool {
+    let mut client = match start_domain(c, setup, placement.domain()) {
         Ok(client) => client,
         Err(why) => {
             c.write_str("; the replacement domain FAILED: ");
@@ -469,7 +631,7 @@ fn restart_after_fault(c: &dyn EarlyConsole, setup: &Setup) -> bool {
     c.write_str("; a faulting domain was killed, disk marked failed");
 
     // A fresh domain over the same grant serves a read again — the host survived the fault.
-    let mut fresh = match start_domain(c, setup) {
+    let mut fresh = match start_domain(c, setup, placement.fresh()) {
         Ok(client) => client,
         Err(why) => {
             c.write_str("; a fresh domain did not start: ");
@@ -489,7 +651,169 @@ fn restart_after_fault(c: &dyn EarlyConsole, setup: &Setup) -> bool {
     } else {
         c.write_str("; THE NEW DOMAIN DID NOT SERVE A READ");
     }
-    served
+    match placement.fresh() {
+        Some(cpu) => entered_on(c, "the new domain", cpu) && served,
+        None => served,
+    }
+}
+
+// ---- with every CPU scheduling --------------------------------------------------------
+
+/// Whether this build serves the disk from domains again once the scheduler has every CPU.
+pub const SCHEDULED_CHECK: bool = kconfig::SMP;
+
+/// Where [`smp_check`] puts each side: the disk's interrupt on CPU 1, the domains on CPU 2 and,
+/// after the deliberate fault, CPU 3. The kernel's block layer, their client, stays on CPU 0.
+const IRQ_CPU: usize = 1;
+const DOMAIN_CPU: usize = 2;
+const FRESH_CPU: usize = 3;
+
+/// Entry changes [`smp_check`] times, to report what a flush through the queue costs.
+const FLUSH_SAMPLES: u64 = 64;
+
+/// Where a run's domains are placed.
+#[derive(Clone, Copy)]
+enum Placement {
+    /// Wherever the scheduler puts them: the boot-time check, whose scheduler has one CPU.
+    Anywhere,
+    /// Pinned away from the client and from the CPU taking the disk's interrupt.
+    Split,
+}
+
+impl Placement {
+    /// The CPU the served domain, and the one made to fault, are pinned to.
+    fn domain(self) -> Option<usize> {
+        match self {
+            Placement::Anywhere => None,
+            Placement::Split => Some(DOMAIN_CPU),
+        }
+    }
+
+    /// The CPU the domain started after the fault is pinned to.
+    fn fresh(self) -> Option<usize> {
+        match self {
+            Placement::Anywhere => None,
+            Placement::Split => Some(FRESH_CPU),
+        }
+    }
+}
+
+/// The CPU the latest domain thread entered user mode on.
+static ENTERED_ON: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Serve the disk from domains with the client, the interrupt and the domain each on a CPU of its
+/// own, and report as the boot-time check does. On the boot thread, once `persist` has given the
+/// scheduler every CPU.
+pub fn smp_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  blk smp    ");
+    if !(IRQ_CPU..=FRESH_CPU).all(platform::secondary_online) {
+        if kconfig::QEMU_CPUS > FRESH_CPU {
+            c.write_str("CPUS 1 TO 3 ARE NOT ALL ONLINE, THOUGH QEMU HAS THEM");
+            return Check::Failed;
+        }
+        c.write_str("skipped: fewer than four CPUs online");
+        return Check::Skipped;
+    }
+    let give_up = timekeeping::now().saturating_add(DRAIN);
+    while !(0..=FRESH_CPU).all(preempt::joined) {
+        if timekeeping::now() >= give_up {
+            c.write_str("A CPU NEVER JOINED THE SCHEDULER");
+            return Check::Failed;
+        }
+        sleep_until(timekeeping::now().saturating_add(Duration::from_nanos(2_000_000)));
+    }
+    let setup = match grant(c) {
+        Ok(setup) => setup,
+        Err(check) => return check,
+    };
+    let (Some(line), Some(me)) = (platform::block_line(), preempt::current_thread()) else {
+        c.write_str("NO DISK LINE, OR NOT ON A SCHEDULED THREAD");
+        return Check::Failed;
+    };
+    let every_cpu = if mp::CPUS >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << mp::CPUS) - 1
+    };
+    // The client stays on the boot CPU for the whole check.
+    if !preempt::set_affinity(me, 1) {
+        c.write_str("THE CLIENT COULD NOT BE PINNED TO CPU 0");
+        return Check::Failed;
+    }
+    let route = |cpu| {
+        if iommu::disk_interrupt_remapped() {
+            iommu::route_disk_interrupt(line, cpu)
+        } else {
+            platform::route_interrupt(line, cpu)
+        }
+    };
+    if let Err(why) = route(IRQ_CPU) {
+        c.write_str("THE DISK'S INTERRUPT WAS NOT ROUTED TO CPU 1: ");
+        c.write_str(why);
+        let _ = preempt::set_affinity(me, every_cpu);
+        return Check::Failed;
+    }
+    c.write_str("client on CPU 0, interrupt on CPU 1");
+    // What changing the entry costs once the scheduler owns the clock: the entry rewritten to the
+    // same CPU and its cache flushed through the queue, the wait included, averaged.
+    let flushes_from = timekeeping::now();
+    for _ in 0..FLUSH_SAMPLES {
+        if route(IRQ_CPU).is_err() {
+            c.write_str("; THE ENTRY COULD NOT BE CHANGED AGAIN");
+            let _ = preempt::set_affinity(me, every_cpu);
+            return Check::Failed;
+        }
+    }
+    let flushes_ns = timekeeping::now()
+        .saturating_duration_since(flushes_from)
+        .as_nanos();
+    if iommu::disk_interrupt_remapped() {
+        c.write_str("; an entry change flushed in ");
+        write_usize(c, (flushes_ns / FLUSH_SAMPLES) as usize);
+        c.write_str(" ns");
+    }
+    c.write_str("; ");
+
+    let taken = |cpu| platform::interrupts_on_cpu(line, cpu);
+    let before: [u64; mp::CPUS] = core::array::from_fn(taken);
+    let mut after = before;
+    let mut routed_back = true;
+    let verdict = serve(c, &setup, Placement::Split, || {
+        after = core::array::from_fn(taken);
+        routed_back = route(0).is_ok();
+    });
+    let _ = preempt::set_affinity(me, every_cpu);
+
+    // Read through `get`: on a one-CPU build the arrays have a single element, and this is never
+    // reached there, but a constant index past it would not compile.
+    let taken_during = |cpu: usize| {
+        after
+            .get(cpu)
+            .zip(before.get(cpu))
+            .map_or(0, |(after, before)| after - before)
+    };
+    let on_irq_cpu = taken_during(IRQ_CPU);
+    let elsewhere: u64 = (0..mp::CPUS)
+        .filter(|&cpu| cpu != IRQ_CPU)
+        .map(taken_during)
+        .sum();
+    c.write_str("; interrupts taken on CPU 1: ");
+    write_usize(c, on_irq_cpu as usize);
+    c.write_str(", elsewhere: ");
+    write_usize(c, elsewhere as usize);
+    let mut ok = verdict != Check::Failed;
+    if on_irq_cpu == 0 || elsewhere != 0 {
+        c.write_str("; NOT EVERY INTERRUPT WAS TAKEN ON CPU 1");
+        ok = false;
+    }
+    if !routed_back {
+        c.write_str("; THE INTERRUPT WAS NOT ROUTED BACK TO CPU 0");
+        ok = false;
+    }
+    if ok {
+        c.write_str(" ok");
+    }
+    Check::from_ok(ok)
 }
 
 // ---- the client (the kernel's block layer, over the channel) --------------------------
@@ -599,8 +923,13 @@ fn stop(client: &mut Client) {
 
 // ---- building and starting a domain ---------------------------------------------------
 
-/// Build a domain over the grant, spawn it, and wait for its ready (or failure) reply.
-fn start_domain(c: &dyn EarlyConsole, setup: &Setup) -> Result<Client, &'static str> {
+/// Build a domain over the grant, spawn it (pinned to `cpu`, if given), and wait for its ready
+/// (or failure) reply.
+fn start_domain(
+    c: &dyn EarlyConsole,
+    setup: &Setup,
+    cpu: Option<usize>,
+) -> Result<Client, &'static str> {
     let _ = c;
     let program = program().ok_or("the embedded domain program does not load")?;
     let root = build_domain(setup)?;
@@ -622,7 +951,8 @@ fn start_domain(c: &dyn EarlyConsole, setup: &Setup) -> Result<Client, &'static 
     ENTRY.store(program.entry as usize, Ordering::Relaxed);
 
     let stack = stack().ok_or("no guarded stack for the domain's thread")?;
-    let thread = spawn(stack, root).ok_or("the domain's thread could not be spawned")?;
+    ENTERED_ON.store(usize::MAX, Ordering::Release);
+    let thread = spawn(stack, root, cpu).ok_or("the domain's thread could not be spawned")?;
 
     let mut client = Client {
         requests: req_end,
@@ -737,7 +1067,8 @@ fn window_phys() -> u64 {
 /// Set or clear the interrupt channel's kernel end the handler forwards on.
 fn forward_end(end: Option<KernelEnd>) {
     let mut held = FORWARD.lock_irqsave();
-    *held = end.map(|end| Forward { end, count: 0 });
+    OWNED.store(end.is_some(), Ordering::Release);
+    *held = end.map(|end| Forward { end });
 }
 
 /// The setup page and the data pages, shared by every domain this check starts: allocated
@@ -809,16 +1140,20 @@ fn stack() -> Option<usize> {
     if have != usize::MAX {
         return Some(have);
     }
-    let claimed = preempt::claim_stacks(&["block driver domain"])?;
+    let claimed = preempt::claim_stacks(&["block driver domain", "block interrupt forwarder"])?;
     STACK.store(claimed, Ordering::Relaxed);
     Some(claimed)
 }
 
-fn spawn(stack: usize, root: PhysAddr) -> Option<ThreadId> {
-    preempt::spawn_prepared(stack, domain_entry, 0, 4, |ctx, top| {
+fn spawn(stack: usize, root: PhysAddr, cpu: Option<usize>) -> Option<ThreadId> {
+    let prepare = |ctx: &mut <Cpu as hal::HasContextSwitch>::Context, top: KernAddr| {
         STACK_TOP.store(top.raw(), Ordering::Relaxed);
         <Cpu as HasUserMode>::bind(ctx, top, root);
-    })
+    };
+    match cpu {
+        None => preempt::spawn_prepared(stack, domain_entry, 0, 4, prepare),
+        Some(cpu) => preempt::spawn_prepared_on(stack, domain_entry, 0, 4, cpu, prepare),
+    }
 }
 
 /// The domain thread's kernel entry: fill the program in, then drop to user mode.
@@ -833,6 +1168,7 @@ extern "C" fn domain_entry(_: usize) -> ! {
     }
     let args = ARGS.each_ref().map(|a| a.load(Ordering::Relaxed));
     let top = STACK_TOP.load(Ordering::Relaxed);
+    ENTERED_ON.store(Cpu::cpu_index(), Ordering::Release);
     let _ = Cpu::irq_save();
     // SAFETY: `spawn` bound this thread to `top` and its process's root before any CPU could
     // switch to it, the program is filled in, and its stack is mapped; masked.
@@ -856,6 +1192,21 @@ fn wait_dead(id: ThreadId) -> bool {
         sleep_until(timekeeping::now().saturating_add(Duration::from_nanos(2_000_000)));
     }
     true
+}
+
+/// Whether the latest domain entered user mode on `cpu`, reported as `what`. Pinned, it can run
+/// nowhere else after.
+fn entered_on(c: &dyn EarlyConsole, what: &str, cpu: usize) -> bool {
+    c.write_str("; ");
+    c.write_str(what);
+    if ENTERED_ON.load(Ordering::Acquire) == cpu {
+        c.write_str(" ran on CPU ");
+        write_usize(c, cpu);
+        true
+    } else {
+        c.write_str(" DID NOT RUN ON THE CPU IT WAS PINNED TO");
+        false
+    }
 }
 
 fn report_interrupts(c: &dyn EarlyConsole, last: &Reply) {

@@ -248,7 +248,8 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // A test image reports and stops. A stress image, and any image with no channel to
     // report through, goes on: everything above assumed one masked boot thread and has
     // finished, so from here the scheduler owns the CPU.
-    if kconfig::QEMU_EXIT && !kconfig::STRESS_TEST {
+    // Unless checks remain that need every CPU scheduling, which only `persist` can run.
+    if kconfig::QEMU_EXIT && !kconfig::STRESS_TEST && !persist::SCHEDULED_CHECKS {
         finish(verdict);
     }
     if !verdict {

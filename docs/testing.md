@@ -663,13 +663,17 @@ On x86_64 with `IOMMU` (the `x86_64-iommu` preset), the disk runs behind an Inte
 a translation domain that maps *exactly* its DMA grant. The `iommu` line gates the boot:
 
 ```
-  iommu      in-grant DMA served behind VT-d; out-of-grant DMA stopped at 0x000000000023d000 from 0x0000000000000018; restarted and served a read ok
+  iommu      in-grant DMA served behind VT-d; a page the device used was unmapped and flushed; out-of-grant DMA stopped at 0x00000000002a9000 from 0x0000000000000010; restarted and served a read ok
 ```
 
 The `block` line first shows the device brought up behind the IOMMU (`VT-d on, 48-bit; disk
 00:03.0 mapped to its grant only`) and passes every functional check with its DMA translated —
 that is the in-grant DMA working. Then the `iommu` line requires all of:
 
+- a translation the device used is taken away: the canary is mapped into the domain, the device
+  reads a sector into it and the sector arrives, and the canary is unmapped with a page-selective
+  flush through the invalidation queue. QEMU's unit caches the translation, so without the flush the
+  rogue DMA below would reach the canary;
 - the domain maps the grant and does **not** map the canary frame beside it (map exactly the grant);
 - a deliberate out-of-grant DMA (a read into the canary) is stopped, and the unit's fault log names
   the canary's address and the disk's own source id `00:03.0`;
@@ -681,6 +685,7 @@ that is the in-grant DMA working. Then the `iommu` line requires all of:
 | Grant one extra page, so the canary is inside the grant | `THE DOMAIN DOES NOT MAP EXACTLY THE GRANT` |
 | Skip mapping the grant into the domain | the device faults reading its own ring; the block check fails |
 | Drop the restart | the device is not re-stored; `restarted and served a read` never prints and the boot fails |
+| `unmap_in_use` skips its flush | `THE ROGUE DMA WAS NOT STOPPED; THE CANARY WAS OVERWRITTEN`: the device used its cached translation |
 
 `drivers/iommu/vtd` and `boot/acpi::dmar` are host-tested under every preset: the DMAR fixture
 (`q35-iommu.bin`) and the register programming, page tables, attach and fault decode against
@@ -693,7 +698,7 @@ turns extended interrupt mode on only with an in-kernel irqchip. The `block` lin
 entry 0. The `remap` line gates the boot, and every other preset reports it skipped:
 
 ```
-  remap      remappable MSI-X through entry 0; 32 requests, 32 completions in 32 interrupts, 0 polled; entry absent: blocked, fault 0x22 from 0x10; entry for another function: blocked, fault 0x26 from 0x10; entry to x2APIC ID 256: not taken by the boot CPU; restored; 32 requests, 32 completions in 32 interrupts, 0 polled ok
+  remap      remappable MSI-X through entry 0; 32 requests, 32 completions in 32 interrupts, 0 polled; entry absent: blocked, fault 0x22 from 0x10; entry for another function: blocked, fault 0x26 from 0x10; entry to x2APIC ID 256: not taken by the boot CPU; 6 entry-cache flushes completed in 6 waits; 256 entry changes flushed below the boot clock's resolution (longest wait 1 status reads); restored; 32 requests, 32 completions in 32 interrupts, 0 polled ok
 ```
 
 (The two fault fields are printed at 64-bit width.) The check requires the disk's MSI-X entry to
@@ -708,6 +713,8 @@ disk's, for its line's vector on the boot CPU. Then, with interrupts enabled:
   QEMU records 0x26, invalid source id;
 - with the entry delivering to x2APIC ID 256, the boot CPU takes nothing. Cut to the eight bits
   a compatibility-format message holds, that ID is the boot CPU's 0;
+- every one of those six changes to the entry in use was followed by an interrupt entry cache flush
+  the unit completed, counted by the queue's wait descriptors;
 - restored, every read by interrupt completes again.
 
 | Mutation | Result |
@@ -716,12 +723,20 @@ disk's, for its line's vector on the boot CPU. Then, with interrupts enabled:
 | "Absent" leaves the entry present | `entry absent: THE INTERRUPT WAS DELIVERED` |
 | "Another function" writes the disk's own source id | `entry for another function: THE INTERRUPT WAS DELIVERED` |
 | Extended destinations are cut to eight bits when encoded | `entry to x2APIC ID 256: DELIVERED TO THE BOOT CPU: THE DESTINATION WAS CUT TO EIGHT BITS`, and the `vtd` host tests fail |
+| `set_irte` skips the entry cache flush | `AN ENTRY CHANGED IN USE WAS NOT FLUSHED`, and `qi::tests::changing_an_interrupt_entry_in_use_flushes_the_entry_cache` fails on the stale entry its model delivers |
 
-**Not shown in a guest:** delivery to a CPU whose x2APIC ID is above 255. No preset has such a
-CPU. It would need an x2APIC topology with an IOMMU on an SMP build, and `x86_64-iommu` is
-uniprocessor. The check shows the 32-bit destination is carried whole, not truncated onto CPU 0,
-and the `vtd` host tests show it encoded. Changing an entry in use without flushing the
-interrupt entry cache works only because QEMU keeps none; see architecture.md, "PCI interrupts".
+**Not shown in a guest:** delivery to a CPU whose x2APIC ID is above 255, or a stale interrupt
+entry. The first needs a topology of at least 257 possible CPUs, which the kernel's ACPI discovery
+does not describe (isolation.md, "What it does not prove"); the check shows the 32-bit destination
+is carried whole, not truncated onto CPU 0, and the `vtd` host tests show it encoded. The second
+needs an entry cache, which QEMU does not keep for an emulated device; the host tests' model does.
+
+On `x86_64-isolated-smp`, `block cpu` moves the disk's remapped interrupt to CPU 1 by rewriting its
+table entry, with the entry's cache flushed, and requires all 32 completions taken there:
+
+```
+  block cpu  line 16 to CPU 1 through its remapping entry; 32 requests, 32 completions in 32 interrupts, 0 polled; taken on CPU 1: 32, on CPU 0: 0 ok
+```
 
 ### 2c-ter. The disk's driver in a domain
 
@@ -749,9 +764,29 @@ a faulting domain is not killed; or a fresh domain does not serve a read after i
 | Skip the restart's read after the faulting domain is killed | `THE NEW DOMAIN DID NOT SERVE A READ` |
 | Aim the rogue DMA inside the grant (an over-broad grant) | `THE IOMMU DOMAIN DOES NOT MAP EXACTLY THE GRANT` |
 
+Each run also requires every interrupt the platform dispatched on the disk's line while a domain
+owned it to have been forwarded (`73 interrupts taken, 73 forwarded`).
+
 The wire types between the kernel and the domain (`virtio_blk_core::domain`: `Setup`, `Request`,
 `Reply`, `Facts`, `Interrupt`) are host-tested for their encode/decode round trips. The live
 falsifications above were run by hand.
+
+**On four CPUs.** `x86_64-isolated-smp` runs the same boot checks, then, once `persist` has given
+the scheduler every CPU, `blk smp` runs the domain checks with the client pinned to CPU 0, the disk's
+interrupt on CPU 1, the domain pinned to CPU 2 and its replacement after the fault to CPU 3. A test
+image on this preset reports its verdict only after `blk smp`; a stress image runs it before the
+stress run and stops if it fails.
+
+```
+  blk smp    client on CPU 0, interrupt on CPU 1; an entry change flushed in 4452 ns; 12544 sectors of 512 bytes, 15 per request, in a domain; 32 sectors read back the pattern; a write read back after a flush; the device's own refusal was an error; 73 requests, 73 completions in 73 interrupt messages (419359 ns mean, 4071097 ns worst forward); 73 interrupts taken, 73 forwarded; the domain ran on CPU 2; the domain's out-of-grant DMA stopped at 0x00000000005d9000 from 0x0000000000000010; a faulting domain was killed, disk marked failed; a new domain served a read; the new domain ran on CPU 3; restarted and served a read; disk back in the kernel; interrupts taken on CPU 1: 75, elsewhere: 0 ok
+```
+
+It fails if anything `blk domain` requires fails, if a domain did not enter user mode on the CPU it
+was pinned to, or if an interrupt of the run was taken anywhere but CPU 1.
+
+| Mutation | Result |
+|---|---|
+| The handler drops an interrupt taken while the forwarder sends, with the forwarder holding its send 3 ms to force the overlap | `blk domain` passes, its one scheduling CPU never overlapping them; `blk smp` fails: `reading ... FAILED`, `2 interrupts taken, 1 forwarded; AN INTERRUPT WAS TAKEN BUT NEVER FORWARDED` |
 
 ### 2d. Fuzzing
 

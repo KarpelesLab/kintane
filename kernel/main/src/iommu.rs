@@ -19,7 +19,7 @@ use arch::Cpu;
 use hal::{EarlyConsole, PhysAddr};
 use mm::DirectMap;
 use mm::phys::FrameAllocator;
-use vtd::{Domain, Fault, Frames, InterruptTable, Irte, Perm, PhysMem, Regs, Unit};
+use vtd::{Domain, Fault, Frames, InterruptTable, Irte, Perm, PhysMem, QueueStats, Regs, Unit};
 
 use crate::write_usize;
 
@@ -176,11 +176,17 @@ pub fn confine_disk(
         c.write_str("the IOMMU did not enable translation");
         return false;
     }
+    // The queue next, before anything changes an entry the unit may have cached: every flush from
+    // here goes through it and waits for the unit to say it is done.
+    if unit.enable_queued_invalidation(&mut pool).is_err() {
+        c.write_str("the IOMMU did not turn its invalidation queue on");
+        return false;
+    }
     c.write_str("VT-d on, ");
     write_usize(c, facts.host_address_width as usize);
     c.write_str("-bit; disk ");
     write_source(c, facts.block_source_id);
-    c.write_str(" mapped to its grant only");
+    c.write_str(" mapped to its grant only, invalidation queued");
     // SAFETY: the one write, on the single-threaded boot path, before anything reads it.
     unsafe {
         *CONFINEMENT.get() = Some(Confinement {
@@ -348,6 +354,69 @@ pub fn tamper_disk_interrupt(how: Tamper) -> bool {
         Tamper::Restore => Some(*set),
     };
     unit.set_irte(table, DISK_HANDLE, entry).is_ok()
+}
+
+/// Map the page at `phys` into the disk's domain, at the same device address, while the disk
+/// runs: for the check that has the device use a page and then takes it away. `false` without
+/// an IOMMU, or when the map fails.
+pub fn grant_page(frames: &mut FrameAllocator<'_, Cpu>, phys: u64) -> bool {
+    // SAFETY: as `domain_maps`; the boot thread is the only reader and writer.
+    let Some(Confinement { unit, domain, .. }) = (unsafe { (*CONFINEMENT.get()).as_mut() }) else {
+        return false;
+    };
+    let mut pool = Pool { frames };
+    unit.map_in_use(domain, phys, phys, vtd::PAGE_SIZE, Perm::ReadWrite, &mut pool)
+        .is_ok()
+}
+
+/// Unmap the page [`grant_page`] mapped, and flush the translation the device may have cached of
+/// it, returning once the unit says it is gone.
+pub fn revoke_page(phys: u64) -> bool {
+    // SAFETY: as `domain_maps`; the boot thread is the only reader and writer.
+    let Some(Confinement { unit, domain, .. }) = (unsafe { (*CONFINEMENT.get()).as_mut() }) else {
+        return false;
+    };
+    unit.unmap_in_use(domain, phys, vtd::PAGE_SIZE).is_ok()
+}
+
+/// Whether the disk's interrupt goes through a remapping table entry, so that the entry, not
+/// the MSI-X message, names its CPU.
+pub fn disk_interrupt_remapped() -> bool {
+    // SAFETY: as `domain_maps`; the boot thread is the only reader and writer.
+    unsafe { (*CONFINEMENT.get()).as_ref() }.is_some_and(|conf| conf.interrupts.is_some())
+}
+
+/// Deliver the disk's remapped interrupt on `line` to CPU `cpu` from its next message on: the
+/// table entry's destination becomes that CPU's APIC ID, and the entry cache is flushed before
+/// this returns, so no message after it is delivered by the old entry.
+pub fn route_disk_interrupt(line: u32, cpu: usize) -> Result<(), &'static str> {
+    // SAFETY: as `domain_maps`; the boot thread is the only reader and writer.
+    let conf = unsafe { (*CONFINEMENT.get()).as_mut() }.ok_or("NO IOMMU CONFINES THE DISK")?;
+    let Confinement {
+        unit,
+        interrupts: Some((table, set)),
+        ..
+    } = conf
+    else {
+        return Err("THE DISK'S INTERRUPT IS NOT REMAPPED");
+    };
+    let (vector, destination) =
+        platform::message_target(line, cpu).ok_or("THAT CPU HAS NO APIC ID TO NAME")?;
+    let entry = Irte {
+        vector,
+        destination,
+        ..*set
+    };
+    unit.set_irte(table, DISK_HANDLE, Some(entry))
+        .map_err(|_| "THE TABLE ENTRY DID NOT TAKE THE CPU, OR ITS CACHE WAS NOT FLUSHED")?;
+    *set = entry;
+    Ok(())
+}
+
+/// What the unit's invalidation queue has completed since it was turned on.
+pub fn invalidation_stats() -> Option<QueueStats> {
+    // SAFETY: as `domain_maps`; the boot thread is the only reader.
+    unsafe { (*CONFINEMENT.get()).as_ref() }.map(|conf| conf.unit.queue_stats())
 }
 
 fn write_source(c: &dyn EarlyConsole, source: u16) {

@@ -31,3 +31,11 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     c.write_str("skipped: no block driver domain on this configuration");
     Check::Skipped
 }
+
+/// No domain to serve the disk from once every CPU schedules, so nothing waits for that.
+pub const SCHEDULED_CHECK: bool = false;
+
+/// Never called: [`SCHEDULED_CHECK`] is false.
+pub fn smp_check(_c: &dyn EarlyConsole) -> Check {
+    Check::Skipped
+}

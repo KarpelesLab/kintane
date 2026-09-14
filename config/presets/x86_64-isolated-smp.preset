@@ -1,0 +1,18 @@
+# x86_64 under QEMU q35 with four CPUs and the disk's driver in an isolated domain behind VT-d.
+#
+# `x86_64-isolated` with SMP on. The boot checks run as they do there; `block cpu` moves the
+# disk's remapped interrupt to CPU 1 through its remapping table entry. Once the scheduler has
+# every CPU, `blk smp` serves the disk from a domain again with the three sides on different
+# CPUs: the kernel's block layer on the boot CPU, the disk's interrupt on CPU 1, and the domain
+# pinned to CPU 2, its replacement after a deliberate fault to CPU 3. The interrupt reaches the
+# domain through a queue the handler fills without a lock. See docs/isolation.md.
+ARCH_X86_64=y
+SMP=y
+NR_CPUS=8
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+QEMU_CPUS=4
+IOMMU=y
+BLOCK_DOMAIN=y
+SIZE_BUDGET_KIB=2304

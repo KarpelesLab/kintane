@@ -21,15 +21,20 @@
 //! - [`remappable_message`] and [`message_handle`]: the MSI address a device is programmed with
 //!   (§5.1.2.2), and back.
 //!
+//! # Changing an entry in use
+//!
+//! The unit caches the entries it has read (the interrupt entry cache), so once remapping is on
+//! an entry is changed in two steps: the table, then an index-selective interrupt entry cache
+//! invalidation through the queue (§6.5.2.7), waited for. [`Unit::set_irte`] refuses to change
+//! an entry in use on a unit without the queue on, rather than change it half way. QEMU keeps no
+//! such cache for an emulated device's messages, so there the flush changes nothing a guest can
+//! see; the host tests' model does keep one, and shows a change without the flush being ignored.
+//!
 //! # Not here
 //!
-//! The interrupt entry cache is not flushed when an entry changes. That flush is a
-//! queued-invalidation descriptor (§6.5.2.7), and this driver invalidates through registers.
-//! QEMU keeps no such cache for an emulated device's messages, so there a changed entry
-//! applies from the next message. Real hardware needs queued invalidation before an entry in
-//! use may change. Compatibility-format interrupts are left as the unit's reset leaves them.
+//! Compatibility-format interrupts are left as the unit's reset leaves them.
 
-use crate::{Error, Frames, PAGE_SIZE, PhysMem, Regs, Unit, reg, zero_frame};
+use crate::{Error, Frames, Invalidation, PAGE_SIZE, PhysMem, Regs, Unit, reg, zero_frame};
 
 /// Entries in a table here: one frame of 16-byte entries.
 pub const IRT_ENTRIES: u16 = 256;
@@ -165,7 +170,9 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
     /// Set entry `handle` to `entry`, or make it not present with `None`.
     ///
     /// The high qword is written before the low one, whose present bit makes the entry usable,
-    /// so an entry is never present with another entry's source id.
+    /// so an entry is never present with another entry's source id. With remapping on, the
+    /// hardware may have cached the old entry, so the change is followed by that entry's cache
+    /// invalidation, and refused on a unit without the queue on to send it.
     pub fn set_irte(
         &mut self,
         table: &InterruptTable,
@@ -174,6 +181,10 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
     ) -> Result<(), Error> {
         if handle >= IRT_ENTRIES {
             return Err(Error::BadHandle);
+        }
+        let in_use = self.interrupt_remapping_enabled();
+        if in_use && self.queue.is_none() {
+            return Err(Error::NoQueuedInvalidation);
         }
         let at = table.phys + u64::from(handle) * 16;
         match entry {
@@ -187,6 +198,9 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
                 self.mem.write64(at + 8, high);
                 self.mem.write64(at, low);
             }
+        }
+        if in_use {
+            self.invalidate(&[Invalidation::InterruptEntry { handle }])?;
         }
         Ok(())
     }
@@ -210,6 +224,10 @@ impl<R: Regs, M: PhysMem> Unit<R, M> {
         }
         self.regs.write64(reg::IRTA, irta);
         self.command(reg::gcmd::SIRTP, reg::gsts::IRTPS, "set interrupt remapping table pointer")?;
+        // A newly latched table makes every cached entry stale (§6.5.2.7).
+        if self.queue.is_some() {
+            self.invalidate(&[Invalidation::InterruptGlobal])?;
+        }
         self.command(reg::gcmd::IRE, reg::gsts::IRES, "enable interrupt remapping")
     }
 
