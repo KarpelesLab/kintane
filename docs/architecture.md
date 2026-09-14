@@ -1308,31 +1308,67 @@ Three units above the block layer, each at the `subsystem` layer, each host-test
 compiled by `kbuild portability` for the machines with no atomics:
 
 - **`vfs`** is the namespace: a mount table, path walking, and a table of open files, over a trait
-  of five operations a filesystem implements — `lookup`, `stat`, `read_at`, `write_at` and
-  `readdir`, all by an opaque `NodeId`. Both tables are fixed arrays and a filesystem is borrowed
-  rather than owned, so nothing allocates and the kernel mounts a volume during bring-up. A handle
-  carries a generation, as an object handle does, so a closed one cannot name the file that takes
-  its slot. `.` and empty components resolve; `..` does not yet. `vfs::memfs` is the in-memory
-  reference filesystem the namespace's own tests run against.
+  a filesystem implements by an opaque `NodeId` — `lookup`, `stat`, `read_at` and `readdir` to
+  read; `write_at`, `create`, `truncate`, `unlink`, `rename` and `sync` to write, each read-only by
+  default, so a filesystem that only reads implements none of them. Both tables are fixed arrays
+  and a filesystem is borrowed rather than owned, so nothing allocates and the kernel mounts a
+  volume during bring-up. A handle carries a generation, as an object handle does, so a closed one
+  cannot name the file that takes its slot, and what it was opened for: `open_with` takes
+  `OpenFlags` (write, create, exclusive, truncate, append), and a handle opened to read refuses
+  writes. `mkdir`, `unlink` and `rename` work by path; a rename between two directories is refused,
+  because no filesystem here can do one atomically. `.` and empty components resolve; `..` does not
+  yet. `vfs::memfs` is the in-memory reference filesystem the namespace's own tests run against.
 - **`bcache`** caches whole blocks between a filesystem and a device: fixed slots from the caller,
-  least-recently-used replacement, and **write-through**. A write goes to the device first and
-  updates the cached copy only if the device took it, so the cache is never the only place a byte
-  lives, nothing is lost that a flush would have saved, and `flush` is the device's own. A
-  write-back cache would be faster and would need an ordering policy and a story about what a
-  crash loses; neither is worth inventing before something writes enough to measure. The cache's
-  books — every miss read the device exactly once, no block held by two slots — are checked by
-  `Cache::check`.
-- **`fat`** is FAT16, read-only. FAT rather than a format of our own because the tree already
+  least-recently-used replacement, and two ways to write. `write_block` writes **through**: the
+  device takes the block first and the cached copy changes only if it did. `write_at` writes
+  **back**: the bytes change in a slot marked dirty, which reaches the device at `sync`, when its
+  slot is needed for another block, or before a later step changes it. Order is what makes
+  write-back safe for a filesystem that must survive a crash, so every dirty slot carries the
+  *generation* it was dirtied in, `barrier` starts a new one, and blocks reach the device in
+  ascending generation: a filesystem that puts a barrier between two steps knows every block of the
+  first is on the device before any block of the second. A slot dirty from an earlier generation is
+  written out, with everything before it, before a later write changes it; evicting a dirty slot is
+  writing out the oldest generation. A write-through never overtakes a dirty block. The cache's
+  books — every miss read the device exactly once, no block held by two slots, no slot dirty without
+  a block or from a generation not yet begun — are checked by `Cache::check`.
+- **`fat`** is FAT16, read and written. FAT rather than a format of our own because the tree already
   writes it twice — the ESP and the test disk, both through `kbuild/src/fat16.rs` — and
   `kinboot-efi` already reads it. The type is decided by the cluster count, as the specification
-  says, and a volume outside FAT16's range is refused by name. Every boot-sector field, every
-  cluster number and every chain step is checked before it is used, and a chain walk is bounded,
-  so a corrupt volume is an error rather than a hang.
+  says, and a volume outside FAT16's range is refused by name; FAT32 is not implemented. Every
+  boot-sector field, every cluster number and every chain step is checked before it is used, and a
+  chain walk is bounded, so a corrupt volume is an error rather than a hang. Names are 8.3, stored
+  in upper case, and one that is not is refused rather than shortened.
 
-**The VFS as a service over channels**, which Phase 6a describes, is a wrapper that has not been
-written: a server would decode a message into one of the namespace's calls and encode what came
-back. Nothing in `vfs` knows about channels, processes or rights, so nothing there has to change
-when it arrives — and the kernel can read a volume long before a channel exists.
+**The order FAT16 writes in.** Every operation is a sequence of steps with a barrier after each,
+chosen so that the volume is consistent after any prefix of them and after any subset of the
+blocks of the step in progress:
+
+1. data, into clusters the table still calls free — a crash leaves free clusters with bytes in them;
+2. the new clusters' own table entries, each naming the next and the last ending the chain — a crash
+   leaves allocated clusters nothing names, lost clusters;
+3. the link from the file's old last cluster to the first new one — the chain is now longer than the
+   size its entry records, which is allowed;
+4. the directory entry, its first cluster and its size, which one sector holds whole.
+
+Steps 2 and 3 are written to the first table copy and then, as a step of their own, to the second,
+so a crash leaves the copies at most one step apart with the first ahead. Freeing runs the other way:
+the entry first (a smaller size, or deleted), then the chain's new end, then the freed clusters. A
+rename that replaces a file deletes the target's entry, renames, then frees; a directory grows by a
+zeroed cluster marked and linked before a name is written into it. So whatever a crash leaves, no
+chain runs through a free cluster, no cluster is claimed twice and no entry names more bytes than its
+chain holds. The damage a crash may do is lost clusters and table copies apart, and it does not make
+an overwrite inside a file atomic or keep an extension that was never synced. `Fat16::check_consistency`
+walks a volume for exactly those properties, into a bitmap its caller lends, so it runs in the kernel —
+the boot checks and the stress audit — as well as on a host; kbuild's own reader walks the disk image
+the same way after every run (see [testing](testing.md#2e-files)).
+
+**The VFS as a service.** `kernel/main/src/fileserver.rs` answers `lib/vfsproto` over channels for
+every process the kernel has connected, holding the volume one request at a time through
+`fs::lease`. Whether a connection may write is decided when the kernel makes it: a request that would
+change the volume on a read-only connection is refused before the volume is touched, and a file opened
+without the write flag is read-only on any connection. The server syncs when a file opened for writing
+is closed and when a client asks. Nothing in `vfs` knows about channels, processes or rights. The
+Linux personality reaches the same namespace through its descriptors.
 
 **Where a volume lives.** The test disk (`kernel/block/src/testdisk.rs`, version 2) has three
 regions: the pattern sectors the block check verifies, the scratch area tests may overwrite, and a

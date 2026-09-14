@@ -299,9 +299,13 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             return Err(format!("unexpected argument `{p}`"));
         }
     }
-    if opts.seed.is_some() && opts.generate.is_none() && cmd != "randconfig-build" && cmd != "fuzz"
+    if opts.seed.is_some()
+        && opts.generate.is_none()
+        && !matches!(cmd, "randconfig-build" | "fuzz" | "crashtest")
     {
-        return Err("--seed goes with --random (or with `randconfig-build`)".into());
+        return Err(
+            "--seed goes with --random (or with `randconfig-build`, `fuzz` or `crashtest`)".into(),
+        );
     }
     let root = find_root()?;
 
