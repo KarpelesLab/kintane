@@ -27,6 +27,8 @@ pub const FTRUNCATE: u64 = 77;
 pub const MKDIRAT: u64 = 258;
 pub const UNLINKAT: u64 = 263;
 pub const RENAMEAT: u64 = 264;
+pub const STATFS: u64 = 137;
+pub const FSTATFS: u64 = 138;
 /// `open`, which x86_64 keeps beside `openat`.
 pub const OPEN: Option<u64> = Some(2);
 pub const PIPE2: u64 = 293;

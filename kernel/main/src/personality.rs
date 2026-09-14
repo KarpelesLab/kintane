@@ -329,6 +329,8 @@ fn dispatch(
         Call::Mkdirat => mkdirat(slot, a0, a1),
         Call::Rename => renameat(slot, linux::AT_FDCWD as u64, a0, linux::AT_FDCWD as u64, a1),
         Call::Renameat => renameat(slot, a0, a1, a2, a3),
+        Call::Statfs => statfs(slot, a0, a1),
+        Call::Fstatfs => fstatfs(slot, a0, a1),
         Call::Poll => poll::poll_call(slot, a0, a1, a2, false, 0),
         Call::Ppoll => poll::poll_call(slot, a0, a1, a2, true, a3),
         Call::Select => poll::select_call(slot, a0, a1, a2, a3, a4, false, 0),
@@ -572,6 +574,35 @@ fn fstat(slot: usize, fd: u64, out: u64) -> Result<u64, Failure> {
     };
     let bytes = linux::stat_bytes(ABI, kind, len, ino);
     to_user(out, &bytes[..ABI.stat_len()])?;
+    Ok(0)
+}
+
+/// `statfs`: what the filesystem covering a path is.
+///
+/// The path is made absolute the way every other path call makes one, so a program that asks
+/// about a name on the second volume is answered for that volume rather than for the root.
+fn statfs(slot: usize, path: u64, out: u64) -> Result<u64, Failure> {
+    let mut name = [0u8; PATH_MAX + 1];
+    let n = absolute_path(slot, linux::AT_FDCWD as u64, path, &mut name)?;
+    let path = path_str(&name, n)?;
+    let s = with_ns(|ns| ns.statfs(path).map_err(failure))?;
+    write_statfs(out, s)
+}
+
+/// `fstatfs`: the same, for the filesystem an open descriptor's file is on.
+///
+/// A descriptor names its mount, so this asks that filesystem rather than a path: the file may
+/// have been renamed or removed since it was opened, and a program holding it may never have
+/// had a path for it.
+fn fstatfs(slot: usize, fd: u64, out: u64) -> Result<u64, Failure> {
+    let (fd, _) = file_of(slot, fd, Failure::BadDescriptor)?;
+    let s = with_ns(|ns| ns.statfs_fd(fd).map_err(failure))?;
+    write_statfs(out, s)
+}
+
+fn write_statfs(out: u64, s: vfs::StatFs) -> Result<u64, Failure> {
+    let bytes = linux::statfs_bytes(ABI, s.block_size, s.blocks, s.free, s.name_max);
+    to_user(out, &bytes[..ABI.statfs_len()])?;
     Ok(0)
 }
 

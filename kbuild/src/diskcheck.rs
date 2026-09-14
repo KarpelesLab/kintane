@@ -11,7 +11,9 @@
 //! check says it read back must hold what it wrote — kbuild does not take the kernel's word.
 //! After a power cut ([`after_crash`]) lost clusters and tables that differ are allowed, since
 //! the kernel's write ordering promises no more, but everything else in the walk must hold, and
-//! every byte below a crash-test file's size must be one the workload wrote.
+//! every byte below a crash-test file's size must be one the workload wrote. Both volumes are
+//! checked: the workload writes the FAT32 one as well, so a cut lands in a root that is a
+//! cluster chain and a table of 28-bit entries as often as in the first volume's.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +27,9 @@ pub const RUN_FILE: &str = "testdisk.run.img";
 /// mirrors `CRASH_DIR` and `CRASH_SEED` in `kernel/main/src/fs.rs`.
 const CRASH_DIR: &str = "CRASH";
 const CRASH_SEED: u8 = 0x41;
+/// The same directory on the second volume; mirrors `CRASH_DIR32` in `kernel/main/src/fs.rs`.
+/// The workload reaches it through its own mount point, so on the volume it is a root entry.
+const CRASH_DIR32: &str = "CRASH";
 
 /// Where the run's copy of the image goes, given the kernel image QEMU boots.
 pub fn run_copy(image: &Path) -> PathBuf {
@@ -180,12 +185,55 @@ pub struct Crashed {
     /// Files of the crash workload found, and bytes of them checked.
     pub crash_files: usize,
     pub crash_bytes: usize,
+    /// The same, counted on the second volume.
+    pub lost32: u32,
+    pub fats_differ32: u32,
+    pub crash_files32: usize,
+    pub crash_bytes32: usize,
 }
 
 /// The volume on the run's copy after QEMU was killed, checked by the crash rule.
 pub fn after_crash(run: &Path) -> Result<Crashed, String> {
     let image = std::fs::read(run).map_err(|e| format!("{}: {e}", run.display()))?;
-    verify_crashed(volume_bytes(&image)?)
+    let mut crashed = verify_crashed(volume_bytes(&image)?)?;
+    let second = verify_crashed32(volume32_bytes(&image)?)?;
+    crashed.lost32 = second.0;
+    crashed.fats_differ32 = second.1;
+    crashed.crash_files32 = second.2;
+    crashed.crash_bytes32 = second.3;
+    Ok(crashed)
+}
+
+/// The second volume after a cut, by the same rule as the first: lost clusters and tables one
+/// step apart are what the ordering allows, and everything else must hold. Returns what it
+/// counted, as `(lost, tables differing, workload files, bytes checked)`.
+///
+/// FSInfo's free count is *not* required to match here. It is written at a sync, so a cut
+/// between a table change and the next sync leaves it stale by design — which is exactly the
+/// case a clean run refuses and a crashed one must tolerate.
+fn verify_crashed32(bytes: &[u8]) -> Result<(u32, u32, usize, usize), String> {
+    let v = crate::fat32::Volume::open(bytes)
+        .map_err(|e| format!("the FAT32 volume after a cut: {e}"))?;
+    let r = v
+        .check()
+        .map_err(|e| format!("the FAT32 volume after a cut is inconsistent: {e}"))?;
+    let (mut files, mut bytes_checked) = (0, 0);
+    for (name, data) in v.files_in(CRASH_DIR32)?.unwrap_or_default() {
+        if let Some(at) = data
+            .iter()
+            .enumerate()
+            .position(|(i, &b)| b != testdisk::out_byte(CRASH_SEED, i))
+        {
+            return Err(format!(
+                "/{CRASH_DIR32}/{name} on the FAT32 volume holds a byte at {at}, below its size \
+                 of {}, that the workload never wrote",
+                data.len()
+            ));
+        }
+        files += 1;
+        bytes_checked += data.len();
+    }
+    Ok((r.lost, r.fats_differ, files, bytes_checked))
 }
 
 fn verify_crashed(bytes: &[u8]) -> Result<Crashed, String> {
@@ -197,6 +245,11 @@ fn verify_crashed(bytes: &[u8]) -> Result<Crashed, String> {
         fats_differ: r.fats_differ,
         crash_files: 0,
         crash_bytes: 0,
+        // Filled in by `after_crash`, which reads the second volume from the same image.
+        lost32: 0,
+        fats_differ32: 0,
+        crash_files32: 0,
+        crash_bytes32: 0,
     };
     // The workload may not have made its directory reach the disk before the cut.
     for (name, data) in v.files_in(CRASH_DIR)?.unwrap_or_default() {
@@ -263,6 +316,77 @@ mod tests {
             verify_clean(&v, "")
                 .unwrap_err()
                 .contains("still on the disk image")
+        );
+    }
+
+    /// The shape of the FAT32 volume the test disk carries: the smallest that is FAT32 by
+    /// its cluster count.
+    fn params32() -> crate::fat32::Params {
+        crate::fat32::Params {
+            sectors: 66_600,
+            sectors_per_cluster: 1,
+            reserved_sectors: 32,
+            fats: 2,
+            hidden_sectors: 0,
+            label: *b"KTFAT32    ",
+            volume_id: 0x4654_3332,
+            what: "a test volume",
+        }
+    }
+
+    #[test]
+    fn the_second_volume_is_checked_after_a_cut() {
+        let good = seeded(CRASH_SEED, 2500);
+        let v = crate::fat32::volume(
+            &[fat16::File {
+                path: "CRASH/G0.BIN",
+                data: &good,
+            }],
+            &params32(),
+        )
+        .unwrap();
+        let (lost, differ, files, bytes) = verify_crashed32(&v).unwrap();
+        assert_eq!((lost, differ, files, bytes), (0, 0, 1, 2500));
+
+        // A byte below the file's size that the workload never wrote: what a cut must never
+        // leave, whichever volume it lands on.
+        let mut hole = good.clone();
+        hole[1200..1300].fill(0);
+        let v = crate::fat32::volume(
+            &[fat16::File {
+                path: "CRASH/G0.BIN",
+                data: &hole,
+            }],
+            &params32(),
+        )
+        .unwrap();
+        assert!(
+            verify_crashed32(&v).unwrap_err().contains("never wrote"),
+            "a hole below a workload file's size must be refused on the second volume too"
+        );
+    }
+
+    #[test]
+    fn a_volume_the_walk_refuses_is_not_reported_clean() {
+        // Two live chains claiming one cluster: a cross-link, which the ordering promises a
+        // cut can never leave, so the check must refuse it rather than count it as damage.
+        let mut v = crate::fat32::volume(
+            &[fat16::File {
+                path: "CRASH/G0.BIN",
+                data: &seeded(CRASH_SEED, 4096),
+            }],
+            &params32(),
+        )
+        .unwrap();
+        let reserved = u16::from_le_bytes([v[14], v[15]]) as usize;
+        let fat_at = reserved * crate::fat32::SECTOR;
+        // Entries 3 and 4 both lead to cluster 5.
+        v[fat_at + 12..fat_at + 16].copy_from_slice(&5u32.to_le_bytes());
+        v[fat_at + 16..fat_at + 20].copy_from_slice(&5u32.to_le_bytes());
+        v[fat_at + 20..fat_at + 24].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        assert!(
+            verify_crashed32(&v).is_err(),
+            "a FAT32 volume the walk refuses must not pass the crash check"
         );
     }
 

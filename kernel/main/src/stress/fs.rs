@@ -50,6 +50,12 @@ const DROP_EVERY: u64 = 64;
 const SCRATCH: &str = "/SUB/STRESS.TMP";
 const SCRATCH_SEED: u8 = 0x53;
 const SCRATCH_MAX: u64 = 24_000;
+/// The second volume's mount point in this workload's namespace, and its scratch file. The
+/// FAT32 volume is written the same way the first is, so the audit's books cover a root that
+/// is a cluster chain and a table of 28-bit entries as well.
+const FAT32_AT: &str = "/FAT32";
+const SCRATCH32: &str = "/FAT32/SUB32/STRESS.TMP";
+const SCRATCH32_SEED: u8 = 0x33;
 
 /// Whether the machine has the volume this workload reads.
 pub fn present() -> bool {
@@ -112,6 +118,20 @@ pub fn audit() -> Result<(), &'static str> {
         }
         Err(_) => return Err("the volume failed the consistency walk"),
     }
+    // The second volume, written by the same workload: its free count lives in a sector of
+    // its own, so a synced FAT32 volume must also agree with what its table says.
+    if let (_, Some(second)) = fat.both() {
+        match crate::fs::consistency(second) {
+            Ok(c) if c.lost == 0 && c.fats_differ == 0 && c.fsinfo_free == Some(c.free) => {}
+            Ok(c) if c.fsinfo_free != Some(c.free) => {
+                return Err("the second volume's FSInfo count is not what its table says");
+            }
+            Ok(_) => {
+                return Err("the second volume lost a cluster, or its tables differ");
+            }
+            Err(_) => return Err("the second volume failed the consistency walk"),
+        }
+    }
     let s = fat.cache_stats();
     HITS.store(s.hits, Ordering::Relaxed);
     MISSES.store(s.misses, Ordering::Relaxed);
@@ -146,15 +166,25 @@ pub extern "C" fn worker(_: usize) -> ! {
                 continue;
             };
             {
-                let mut ns = Vfs::<1, 2>::new();
-                if ns.mount("/", &mut *fat).is_err() {
+                let mut ns = Vfs::<2, 2>::new();
+                let (first, second) = fat.both();
+                if ns.mount("/", first).is_err() {
                     fail(w, "the volume could not be mounted in a namespace");
                 } else {
-                    match rng.below(6) {
+                    // Both volumes under one lease, so an iteration that writes the second
+                    // holds the first too and the audit sees a consistent pair.
+                    let both = match second {
+                        Some(second) => ns.mount(FAT32_AT, second).is_ok(),
+                        None => false,
+                    };
+                    match rng.below(8) {
                         0 | 1 => read_big(w, &mut ns, &mut rng, &mut buf),
                         2 => read_small(w, &mut ns, &mut rng, &mut small),
                         3 => list_root(w, &mut ns),
                         4 => write_scratch(w, &mut ns, &mut rng, &mut buf),
+                        5 => check_scratch(w, &mut ns, &mut buf),
+                        6 if both => write_scratch32(w, &mut ns, &mut rng, &mut buf),
+                        _ if both => check_scratch32(w, &mut ns, &mut buf),
                         _ => check_scratch(w, &mut ns, &mut buf),
                     }
                     if ns.open_count() != 0 {
@@ -177,7 +207,7 @@ pub extern "C" fn worker(_: usize) -> ! {
 }
 
 /// A random range of `/BIG.BIN`, checked byte for byte.
-fn read_big(w: Workload, ns: &mut Vfs<'_, 1, 2>, rng: &mut Rng, buf: &mut [u8; 512]) {
+fn read_big(w: Workload, ns: &mut Vfs<'_, 2, 2>, rng: &mut Rng, buf: &mut [u8; 512]) {
     let fd = match ns.open_with("/BIG.BIN", OpenFlags::READ) {
         Ok(fd) => fd,
         Err(_) => return fail(w, "opening /BIG.BIN failed"),
@@ -211,7 +241,7 @@ fn read_big(w: Workload, ns: &mut Vfs<'_, 1, 2>, rng: &mut Rng, buf: &mut [u8; 5
 }
 
 /// One of the small files, whole.
-fn read_small(w: Workload, ns: &mut Vfs<'_, 1, 2>, rng: &mut Rng, small: &mut [u8; 64]) {
+fn read_small(w: Workload, ns: &mut Vfs<'_, 2, 2>, rng: &mut Rng, small: &mut [u8; 64]) {
     let (path, want): (&str, &[u8]) = if rng.below(2) == 0 {
         ("/HELLO.TXT", testdisk::HELLO)
     } else {
@@ -233,7 +263,7 @@ fn read_small(w: Workload, ns: &mut Vfs<'_, 1, 2>, rng: &mut Rng, small: &mut [u
 
 /// The root lists a stable number of names: the scratch file lives in `/SUB`, so writing never
 /// changes it.
-fn list_root(w: Workload, ns: &mut Vfs<'_, 1, 2>) {
+fn list_root(w: Workload, ns: &mut Vfs<'_, 2, 2>) {
     let want = if kconfig::USERSPACE { 4 } else { 3 };
     let mut count = 0usize;
     loop {
@@ -250,7 +280,7 @@ fn list_root(w: Workload, ns: &mut Vfs<'_, 1, 2>) {
 
 /// Grow the scratch file by an append of its own bytes; or, once it is large, cut it short;
 /// and now and then remove it, so the next append makes it again.
-fn write_scratch(w: Workload, ns: &mut Vfs<'_, 1, 2>, rng: &mut Rng, buf: &mut [u8; 512]) {
+fn write_scratch(w: Workload, ns: &mut Vfs<'_, 2, 2>, rng: &mut Rng, buf: &mut [u8; 512]) {
     if rng.below(16) == 0 {
         match ns.unlink(SCRATCH) {
             Ok(()) | Err(Error::NotFound) => {}
@@ -289,9 +319,86 @@ fn write_scratch(w: Workload, ns: &mut Vfs<'_, 1, 2>, rng: &mut Rng, buf: &mut [
     }
 }
 
+/// The second volume's scratch file, grown and cut short the way the first's is.
+fn write_scratch32(w: Workload, ns: &mut Vfs<'_, 2, 2>, rng: &mut Rng, buf: &mut [u8; 512]) {
+    if rng.below(16) == 0 {
+        match ns.unlink(SCRATCH32) {
+            Ok(()) | Err(Error::NotFound) => {}
+            Err(_) => fail(w, "removing the second volume's scratch file failed"),
+        }
+        return;
+    }
+    let flags = OpenFlags {
+        write: true,
+        create: true,
+        append: true,
+        ..OpenFlags::READ
+    };
+    let fd = match ns.open_with(SCRATCH32, flags) {
+        Ok(fd) => fd,
+        Err(_) => return fail(w, "opening the second volume's scratch file to write failed"),
+    };
+    OPENED.fetch_add(1, Ordering::Relaxed);
+    let wrote = ns.fstat(fd).and_then(|stat| {
+        if stat.len >= SCRATCH_MAX {
+            return ns.truncate(fd, rng.below(stat.len));
+        }
+        let len = 1 + rng.below(buf.len() as u64) as usize;
+        for (i, b) in buf[..len].iter_mut().enumerate() {
+            *b = testdisk::out_byte(SCRATCH32_SEED, stat.len as usize + i);
+        }
+        ns.write(fd, &buf[..len]).map(|_| ())
+    });
+    if wrote.is_err() {
+        fail(w, "writing the second volume's scratch file failed");
+    }
+    if ns.close(fd).is_ok() {
+        CLOSED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        fail(w, "closing the second volume's scratch file failed");
+    }
+}
+
+/// The second volume's scratch file holds what it was written with.
+fn check_scratch32(w: Workload, ns: &mut Vfs<'_, 2, 2>, buf: &mut [u8; 512]) {
+    let fd = match ns.open_with(SCRATCH32, OpenFlags::READ) {
+        Ok(fd) => fd,
+        Err(Error::NotFound) => return,
+        Err(_) => return fail(w, "opening the second volume's scratch file to read failed"),
+    };
+    OPENED.fetch_add(1, Ordering::Relaxed);
+    let mut offset = 0usize;
+    loop {
+        match ns.read(fd, buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let wrong = buf[..n]
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &b)| b != testdisk::out_byte(SCRATCH32_SEED, offset + i));
+                if wrong {
+                    fail(w, "the second volume's scratch file read back something else");
+                    break;
+                }
+                offset += n;
+                CHECKED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                fail(w, "reading the second volume's scratch file failed");
+                break;
+            }
+        }
+    }
+    if ns.close(fd).is_ok() {
+        CLOSED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        fail(w, "closing the second volume's scratch file failed");
+    }
+}
+
 /// The scratch file holds exactly the bytes it was written with, however it was grown, cut
 /// short and made again.
-fn check_scratch(w: Workload, ns: &mut Vfs<'_, 1, 2>, buf: &mut [u8; 512]) {
+fn check_scratch(w: Workload, ns: &mut Vfs<'_, 2, 2>, buf: &mut [u8; 512]) {
     let fd = match ns.open_with(SCRATCH, OpenFlags::READ) {
         Ok(fd) => fd,
         Err(Error::NotFound) => return,

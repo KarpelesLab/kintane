@@ -147,6 +147,8 @@ pub enum Call {
     Mkdirat,
     Rename,
     Renameat,
+    Statfs,
+    Fstatfs,
     Poll,
     Ppoll,
     Select,
@@ -162,7 +164,7 @@ pub enum Call {
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 64] = [
+    pub const ALL: [Call; 66] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -227,6 +229,8 @@ impl Call {
         Call::Sendmsg,
         Call::Recvmsg,
         Call::RtSigqueueinfo,
+        Call::Statfs,
+        Call::Fstatfs,
     ];
 
     /// The name the tables give it.
@@ -296,6 +300,8 @@ impl Call {
             Call::Sendmsg => "sendmsg",
             Call::Recvmsg => "recvmsg",
             Call::RtSigqueueinfo => "rt_sigqueueinfo",
+            Call::Statfs => "statfs",
+            Call::Fstatfs => "fstatfs",
         }
     }
 
@@ -367,6 +373,8 @@ impl Call {
             Call::Sendmsg => (46, 211),
             Call::Recvmsg => (47, 212),
             Call::RtSigqueueinfo => (129, 138),
+            Call::Statfs => (137, 43),
+            Call::Fstatfs => (138, 44),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,
@@ -926,6 +934,64 @@ impl Abi {
             Abi::Aarch64 => 128,
         }
     }
+}
+
+/// The largest `struct statfs`: x86_64's, 120 bytes. aarch64's, the generic layout, is 88.
+pub const STATFS_BYTES: usize = 120;
+
+impl Abi {
+    /// Bytes of this ABI's `struct statfs`.
+    pub const fn statfs_len(self) -> usize {
+        match self {
+            Abi::X86_64 => 120,
+            Abi::Aarch64 => 88,
+        }
+    }
+}
+
+/// A `struct statfs` in `abi`'s layout for a filesystem whose allocation unit is `block_size`
+/// bytes, holding `blocks` of them with `free` free, and whose longest name is `name_max`: the
+/// first [`Abi::statfs_len`] bytes of the result.
+///
+/// The two layouts differ in the width of their fields, not their order. x86_64's are all
+/// 64-bit; the generic one aarch64 uses keeps `f_bsize`, `f_frsize` and `f_namelen` at 32 bits
+/// with the counts still 64. `f_bavail` is `free`: this personality has no reservation a
+/// privileged writer could dip into, so what is free is what is available.
+pub fn statfs_bytes(
+    abi: Abi,
+    block_size: u64,
+    blocks: u64,
+    free: u64,
+    name_max: u32,
+) -> [u8; STATFS_BYTES] {
+    let mut s = [0u8; STATFS_BYTES];
+    // The FAT magic Linux reports for both formats, so a program that recognises filesystems
+    // by their type sees the one it is actually on.
+    const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
+    match abi {
+        Abi::X86_64 => {
+            s[0..8].copy_from_slice(&MSDOS_SUPER_MAGIC.to_le_bytes()); // f_type
+            s[8..16].copy_from_slice(&block_size.to_le_bytes()); // f_bsize
+            s[16..24].copy_from_slice(&blocks.to_le_bytes()); // f_blocks
+            s[24..32].copy_from_slice(&free.to_le_bytes()); // f_bfree
+            s[32..40].copy_from_slice(&free.to_le_bytes()); // f_bavail
+            // f_files, f_ffree, f_fsid: zero — this driver has no inode table to count.
+            s[56..64].copy_from_slice(&u64::from(name_max).to_le_bytes()); // f_namelen
+            s[64..72].copy_from_slice(&block_size.to_le_bytes()); // f_frsize
+        }
+        Abi::Aarch64 => {
+            s[0..8].copy_from_slice(&MSDOS_SUPER_MAGIC.to_le_bytes()); // f_type
+            s[8..12].copy_from_slice(&(block_size as u32).to_le_bytes()); // f_bsize
+            // Four bytes of padding follow, as the generic layout has.
+            s[16..24].copy_from_slice(&blocks.to_le_bytes()); // f_blocks
+            s[24..32].copy_from_slice(&free.to_le_bytes()); // f_bfree
+            s[32..40].copy_from_slice(&free.to_le_bytes()); // f_bavail
+            // f_files, f_ffree, f_fsid: zero.
+            s[56..60].copy_from_slice(&name_max.to_le_bytes()); // f_namelen
+            s[60..64].copy_from_slice(&(block_size as u32).to_le_bytes()); // f_frsize
+        }
+    }
+    s
 }
 
 /// A `struct stat` in `abi`'s layout for a file of `kind` and `size` bytes, inode `ino`: the

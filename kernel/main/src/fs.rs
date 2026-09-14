@@ -126,13 +126,6 @@ pub unsafe fn volume() -> Option<&'static mut Fat<'static, 'static>> {
 /// # Safety
 /// As [`volume`]: the caller is on the boot path, before the file server or the stress run
 /// has started.
-#[cfg_attr(
-    not(CONFIG_ABI_LINUX),
-    expect(
-        dead_code,
-        reason = "the Linux personality's check is the one boot-path user left"
-    )
-)]
 pub unsafe fn volume32() -> Option<&'static mut Fat<'static, 'static>> {
     if !MOUNTED32.load(Ordering::Acquire) {
         return None;
@@ -179,13 +172,6 @@ pub fn consistency(volume: &mut Fat<'_, '_>) -> Result<fat::Consistency, Error> 
 /// waits for anything else.
 pub struct Lease {
     volume: &'static mut Fat<'static, 'static>,
-    #[cfg_attr(
-        not(CONFIG_USERSPACE),
-        expect(
-            dead_code,
-            reason = "only the file server and the personality mount the second volume, and they need USERSPACE"
-        )
-    )]
     volume32: Option<&'static mut Fat<'static, 'static>>,
 }
 
@@ -196,13 +182,6 @@ impl Lease {
     /// needs both borrows live at the same time, which two methods could not give it. A
     /// caller that mounts the second puts it below the first, so a rename across the two —
     /// and its refusal — is something a program can meet.
-    #[cfg_attr(
-        not(CONFIG_USERSPACE),
-        expect(
-            dead_code,
-            reason = "only the file server and the personality mount the second volume, and they need USERSPACE"
-        )
-    )]
     pub fn both(&mut self) -> (&mut Fat<'static, 'static>, Option<&mut Fat<'static, 'static>>) {
         let second = match &mut self.volume32 {
             Some(v) => Some(&mut **v),
@@ -338,11 +317,15 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
     ok &= cache_books(c, &fat);
     ok &= write_through(c, disk);
     ok &= volume_size(c, &mut fat);
-    if kconfig::FS_CRASH_TEST {
-        crash_writes(c, fat);
-    }
 
+    // Before the crash workload, which never returns: the workload writes both volumes, so
+    // both must be mounted, and `second_volume` is what mounts and publishes the second.
     ok &= second_volume(c, disk);
+    if kconfig::FS_CRASH_TEST {
+        // SAFETY: boot, before the file server or the stress run exists, so no other thread
+        // can be using the second volume; see `Volume`'s invariant.
+        crash_writes(c, fat, unsafe { volume32() });
+    }
 
     // SAFETY: the one write to `VOLUME`, before `MOUNTED` makes it reachable.
     unsafe { *VOLUME.0.get() = Some(fat) };
@@ -810,18 +793,45 @@ const CRASH_FILES: [&str; 6] = [
     "/CRASH/F5.BIN",
 ];
 const CRASH_SEED: u8 = 0x41;
+/// The same, on the second volume. The mount point is this workload's own: the file server
+/// names the same one, but it is built only with userspace and the crash test is not.
+const FAT32_AT: &str = "/FAT32";
+const CRASH_DIR32: &str = "/FAT32/CRASH";
+const CRASH_FILES32: [&str; 3] = [
+    "/FAT32/CRASH/G0.BIN",
+    "/FAT32/CRASH/G1.BIN",
+    "/FAT32/CRASH/G2.BIN",
+];
 
 /// `FS_CRASH_TEST`: write the volume for ever, for `kbuild crashtest` to cut off at a random
 /// point. Every byte of every file below [`CRASH_DIR`] is `out_byte(CRASH_SEED, offset)`,
 /// whichever file it was written through and however it was renamed since, so after any cut a
 /// byte below a file's size that is anything else was never written there. Never returns.
-fn crash_writes(c: &dyn EarlyConsole, mut fat: Fat<'static, 'static>) -> ! {
-    let mut ns = Vfs::<1, 1>::new();
+fn crash_writes(
+    c: &dyn EarlyConsole,
+    mut fat: Fat<'static, 'static>,
+    second: Option<&'static mut Fat<'static, 'static>>,
+) -> ! {
+    let mut ns = Vfs::<2, 1>::new();
     if ns.mount("/", &mut fat).is_err() {
         c.write_str("\nfscrash: THE VOLUME DID NOT MOUNT\n");
         halt();
     }
+    // The second volume is written through the same namespace, so one workload cuts across
+    // both formats: FAT16's fixed root and 16-bit entries, and FAT32's root chain, 28-bit
+    // entries and FSInfo count.
+    let both = match second {
+        Some(v) => ns.mount(FAT32_AT, v).is_ok(),
+        None => false,
+    };
+    if kconfig::QEMU_BLOCK_TEST && !both {
+        c.write_str("\nfscrash: THE SECOND VOLUME DID NOT MOUNT\n");
+        halt();
+    }
     let _ = ns.mkdir(CRASH_DIR);
+    if both {
+        let _ = ns.mkdir(CRASH_DIR32);
+    }
     let _ = ns.sync();
     c.write_str("\nfscrash: writing\n");
     // Where the cut lands decides what it catches; the operations it catches vary too.
@@ -832,7 +842,10 @@ fn crash_writes(c: &dyn EarlyConsole, mut fat: Fat<'static, 'static>) -> ! {
     let mut ops = 0usize;
     loop {
         let r = xorshift(&mut rng);
-        let pick = |bits: u64| CRASH_FILES[(bits % CRASH_FILES.len() as u64) as usize];
+        let pick = |bits: u64| match both && bits % 3 == 0 {
+            true => CRASH_FILES32[(bits / 3 % CRASH_FILES32.len() as u64) as usize],
+            false => CRASH_FILES[(bits % CRASH_FILES.len() as u64) as usize],
+        };
         let file = pick(r);
         let result = match (r >> 8) % 10 {
             0..=3 => crash_append(&mut ns, file, 1 + (r >> 16) % 3000),
@@ -841,9 +854,21 @@ fn crash_writes(c: &dyn EarlyConsole, mut fat: Fat<'static, 'static>) -> ! {
             7 => ns.unlink(file),
             8 => match pick(r >> 32) {
                 to if to == file => Ok(()),
-                to => ns.rename(file, to),
+                // Across the two volumes this is `CrossDevice`, which is an answer, not a
+                // fault: the workload asked for something no rename can do.
+                to => match ns.rename(file, to) {
+                    Err(Error::CrossDevice) => Ok(()),
+                    other => other,
+                },
             },
-            _ => ns.mkdir("/CRASH/D").or_else(|_| ns.unlink("/CRASH/D")),
+            _ => {
+                let d = if both && r >> 48 & 1 == 0 {
+                    "/FAT32/CRASH/D"
+                } else {
+                    "/CRASH/D"
+                };
+                ns.mkdir(d).or_else(|_| ns.unlink(d))
+            }
         };
         // A missing file, a full volume: the workload's own business. A corrupt volume is not.
         if let Err(Error::Corrupt(what)) = result {
@@ -879,7 +904,7 @@ fn xorshift(state: &mut u64) -> u64 {
 
 /// Write `len` of the crash workload's bytes at `start` of the open file `fd`, whose position is
 /// already there.
-fn crash_fill(ns: &mut Vfs<'_, 1, 1>, fd: vfs::Fd, start: u64, len: u64) -> Result<(), Error> {
+fn crash_fill(ns: &mut Vfs<'_, 2, 1>, fd: vfs::Fd, start: u64, len: u64) -> Result<(), Error> {
     let mut chunk = [0u8; 512];
     let mut done = 0u64;
     while done < len {
@@ -895,10 +920,10 @@ fn crash_fill(ns: &mut Vfs<'_, 1, 1>, fd: vfs::Fd, start: u64, len: u64) -> Resu
 
 /// Run `f` on `path` opened as `flags` say, closing it whatever `f` did.
 fn crash_with(
-    ns: &mut Vfs<'_, 1, 1>,
+    ns: &mut Vfs<'_, 2, 1>,
     path: &str,
     flags: OpenFlags,
-    f: impl FnOnce(&mut Vfs<'_, 1, 1>, vfs::Fd, u64) -> Result<(), Error>,
+    f: impl FnOnce(&mut Vfs<'_, 2, 1>, vfs::Fd, u64) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let fd = ns.open_with(path, flags)?;
     let result = match ns.fstat(fd) {
@@ -909,7 +934,7 @@ fn crash_with(
     result
 }
 
-fn crash_append(ns: &mut Vfs<'_, 1, 1>, path: &str, len: u64) -> Result<(), Error> {
+fn crash_append(ns: &mut Vfs<'_, 2, 1>, path: &str, len: u64) -> Result<(), Error> {
     let flags = OpenFlags {
         write: true,
         create: true,
@@ -919,7 +944,7 @@ fn crash_append(ns: &mut Vfs<'_, 1, 1>, path: &str, len: u64) -> Result<(), Erro
     crash_with(ns, path, flags, |ns, fd, size| crash_fill(ns, fd, size, len))
 }
 
-fn crash_overwrite(ns: &mut Vfs<'_, 1, 1>, path: &str, r: u64) -> Result<(), Error> {
+fn crash_overwrite(ns: &mut Vfs<'_, 2, 1>, path: &str, r: u64) -> Result<(), Error> {
     crash_with(ns, path, OpenFlags::READ_WRITE, |ns, fd, size| {
         if size == 0 {
             return Ok(());
@@ -931,6 +956,6 @@ fn crash_overwrite(ns: &mut Vfs<'_, 1, 1>, path: &str, r: u64) -> Result<(), Err
     })
 }
 
-fn crash_truncate(ns: &mut Vfs<'_, 1, 1>, path: &str, r: u64) -> Result<(), Error> {
+fn crash_truncate(ns: &mut Vfs<'_, 2, 1>, path: &str, r: u64) -> Result<(), Error> {
     crash_with(ns, path, OpenFlags::READ_WRITE, |ns, fd, size| ns.truncate(fd, r % (size + 1)))
 }
