@@ -8,8 +8,8 @@
 //! process whose address space holds its program, its stack, two channels, a setup page, and
 //! three mappings of the grant:
 //!
-//! * the device's **register window**, as device memory — a register access there is the same
-//!   load the kernel would make, in ring 3;
+//! * the device's **register window**, as device memory — a register access there is the same load
+//!   the kernel would make, in ring 3;
 //! * the device's **DMA buffer**, the very grant the IOMMU already confines the device to, so the
 //!   rings and bounce buffers the domain builds are exactly what VT-d lets the device reach;
 //! * **data pages** shared with the kernel, that a request's bytes move through — the CPU copies
@@ -38,6 +38,7 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use ::block::testdisk;
 use arch::Cpu;
 use hal::{Arch, EarlyConsole, HasUserMode, KernAddr, PhysAddr};
 use mm::frame::{Frame, FrameRange};
@@ -52,7 +53,6 @@ use virtio_blk_core::domain::{Facts, Interrupt, Op, Reply, Request, Setup, statu
 use crate::preempt::{self, sleep_until};
 use crate::userproc::{self, KernelEnd};
 use crate::{Check, block, iommu, timekeeping, write_usize};
-use ::block::testdisk;
 
 /// Guarded stack slots this check claims: one, for the domain's thread, reused across the
 /// domains it starts.
@@ -664,15 +664,14 @@ fn build_domain(setup: &Setup) -> Result<PhysAddr, &'static str> {
         userproc::build(SLOT, &program).ok_or("the domain's address space could not be built")?;
     let setup_frame = PhysAddr::new(SETUP_FRAME.load(Ordering::Relaxed));
     let p = userproc::slot(SLOT).ok_or("the domain's slot is empty after building it")?;
-    p.vm
-        .reserve(Region {
-            start: setup_va(),
-            len: Cpu::PAGE_SIZE,
-            flags: userproc::user_rw(),
-            backing: Backing::Physical { base: setup_frame },
-            huge: false,
-        })
-        .map_err(|_| "the setup page could not be mapped into the domain")?;
+    p.vm.reserve(Region {
+        start: setup_va(),
+        len: Cpu::PAGE_SIZE,
+        flags: userproc::user_rw(),
+        backing: Backing::Physical { base: setup_frame },
+        huge: false,
+    })
+    .map_err(|_| "the setup page could not be mapped into the domain")?;
     // Write the setup for the domain to read.
     let ptr = userproc::direct_ptr(setup_frame).ok_or("the setup page is unreachable")?;
     for (i, b) in setup.encode().iter().enumerate() {
@@ -688,7 +687,8 @@ fn map_grant(setup: &Setup) -> Result<usize, &'static str> {
     // The data pages: a contiguous run the kernel reaches through its direct map and the
     // domain through a mapping of its own. Not device-visible, so no IOMMU mapping.
     let data_phys = PhysAddr::new(DATA_PHYS.load(Ordering::Relaxed));
-    let data_kvirt = userproc::direct_ptr(data_phys).ok_or("the data pages are unreachable")? as usize;
+    let data_kvirt =
+        userproc::direct_ptr(data_phys).ok_or("the data pages are unreachable")? as usize;
 
     let p = userproc::slot(SLOT).ok_or("the domain's slot is empty before its grant")?;
     // The register window, as device memory.
@@ -697,37 +697,34 @@ fn map_grant(setup: &Setup) -> Result<usize, &'static str> {
     // The window VA the domain was told already points inside its page; map from the page.
     let win_base = PhysAddr::new(window_phys() - win_off);
     let win_pages = ((win_off + setup.window_len).next_multiple_of(page)) as usize;
-    p.vm
-        .reserve(Region {
-            start: window_va() - win_off as usize,
-            len: win_pages,
-            flags: userproc::user_device(),
-            backing: Backing::Physical { base: win_base },
-            huge: false,
-        })
-        .map_err(|_| "the register window could not be mapped into the domain")?;
+    p.vm.reserve(Region {
+        start: window_va() - win_off as usize,
+        len: win_pages,
+        flags: userproc::user_device(),
+        backing: Backing::Physical { base: win_base },
+        huge: false,
+    })
+    .map_err(|_| "the register window could not be mapped into the domain")?;
     // The DMA buffer: exactly the grant the IOMMU confines the device to.
-    p.vm
-        .reserve(Region {
-            start: dma_va(),
-            len: setup.dma_len as usize,
-            flags: userproc::user_rw(),
-            backing: Backing::Physical {
-                base: PhysAddr::new(setup.dma_phys),
-            },
-            huge: false,
-        })
-        .map_err(|_| "the DMA grant could not be mapped into the domain")?;
+    p.vm.reserve(Region {
+        start: dma_va(),
+        len: setup.dma_len as usize,
+        flags: userproc::user_rw(),
+        backing: Backing::Physical {
+            base: PhysAddr::new(setup.dma_phys),
+        },
+        huge: false,
+    })
+    .map_err(|_| "the DMA grant could not be mapped into the domain")?;
     // The data pages.
-    p.vm
-        .reserve(Region {
-            start: data_va(),
-            len: DATA_PAGES * Cpu::PAGE_SIZE,
-            flags: userproc::user_rw(),
-            backing: Backing::Physical { base: data_phys },
-            huge: false,
-        })
-        .map_err(|_| "the data pages could not be mapped into the domain")?;
+    p.vm.reserve(Region {
+        start: data_va(),
+        len: DATA_PAGES * Cpu::PAGE_SIZE,
+        flags: userproc::user_rw(),
+        backing: Backing::Physical { base: data_phys },
+        huge: false,
+    })
+    .map_err(|_| "the data pages could not be mapped into the domain")?;
     Ok(data_kvirt)
 }
 

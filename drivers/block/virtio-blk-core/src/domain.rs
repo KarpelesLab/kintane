@@ -5,10 +5,10 @@
 //! field out differently from the other:
 //!
 //! * [`Setup`] — where the kernel put the grant, written on a page the domain reads once at start:
-//!   the register window, the DMA buffer, the page requests' data moves through, and the PCI
-//!   layout the kernel read from configuration space (which the domain cannot reach).
-//! * [`Request`] and [`Reply`] — one block request and its answer, as channel messages. A message is
-//!   at most 64 bytes, so data does not travel in it: it moves through the shared data pages.
+//!   the register window, the DMA buffer, the page requests' data moves through, and the PCI layout
+//!   the kernel read from configuration space (which the domain cannot reach).
+//! * [`Request`] and [`Reply`] — one block request and its answer, as channel messages. A message
+//!   is at most 64 bytes, so data does not travel in it: it moves through the shared data pages.
 //! * [`Interrupt`] — the device's interrupt, as a message the kernel forwards: how many have been
 //!   taken since the domain started, and when the latest was.
 //!

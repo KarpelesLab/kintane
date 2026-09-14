@@ -8,15 +8,20 @@ mitigation is to measure early with a prototype.
 This page is that prototype: what it builds, what it proves, what it costs, and — as
 plainly as the rest — what it does not prove.
 
-Two things run under this heading, and they are at different stages:
+Three things run under this heading:
 
 - **The aarch64 register-driver prototype** (`DRIVER_ISOLATION`): the same driver body in the
   kernel and in an unprivileged domain, over one register window. This is the "same source, either
   way" claim, executed on every aarch64 boot. It does no DMA.
 - **DMA confinement with a VT-d IOMMU** (`IOMMU`, x86_64): the disk's DMA put behind an IOMMU that
   maps exactly its grant, demonstrated **in the kernel**. This is the DMA-confinement piece the
-  prototype named as missing. It is not yet a separate driver *domain* on x86_64 — the stateful
-  driver runs in-kernel behind the IOMMU — and that remaining gap is stated plainly below.
+  prototype named as missing.
+- **The disk's driver in a domain** (`BLOCK_DOMAIN`, x86_64, the `x86_64-isolated` preset): the two
+  halves above joined. `virtio-blk-core` — a stateful, DMA-capable driver — runs in an unprivileged
+  ring-3 domain, confined by the IOMMU to exactly its grant, served the kernel's block requests over
+  a channel, and given the disk's MSI-X interrupt as a message. This is Phase 5's exit criterion on
+  x86_64, and the section [Running the driver in a domain (x86_64)](#running-the-driver-in-a-domain-x86_64)
+  covers it, its measurements, and what it still leaves for a later fork.
 
 ## What runs
 
@@ -169,24 +174,16 @@ exists to catch.
 ### What is not measured
 
 The directive for this work named several operations to measure. The register-identification
-cost is measured above. The DMA-related ones are only partly measurable with what runs today,
-and nothing is estimated:
+cost is measured above, and the block-read and interrupt-delivery ones are now measured on
+x86_64 by the driver domain (see [Running the driver in a domain](#running-the-driver-in-a-domain-x86_64)).
+One remains unmeasurable, and nothing is estimated:
 
-- **A block read end to end, in-kernel versus in a domain.** Not measured as a comparison: the
-  converted block driver runs in-kernel behind the IOMMU, but there is no x86_64 *domain* running
-  it, so there is no second number to compare against. The in-kernel read behind VT-d passes the
-  block check (see the IOMMU section), which shows it works, not what it costs relative to a domain.
 - **IOMMU map and unmap.** Attempted and deliberately **not published as a per-operation number**:
   over 65 536 map+unmap+invalidate iterations the total came in below the boot clock's resolution
   under QEMU TCG, so any per-op figure would round to zero and mean nothing. QEMU's `intel-iommu`
   global invalidation is a cheap flag toggle rather than the pipeline drain hardware pays, so the
   operation is exactly the kind QEMU makes meaningless — reported here as unmeasurable rather than
   reported as a false small number.
-- **Interrupt delivery**, in-kernel versus as a message to a domain. Not measured, and not
-  implemented: x86_64 has no PCI interrupt route to the disk yet (`controller::PCI_LINE_TRUSTED` is
-  false; the disk is polled), and MSI-X is a separate fork's work. `hwproxy::Irq` remains defined
-  and unused on this path. Interrupt remapping (`intremap=on`) is enabled on the machine so that MSI
-  fork can build on it, but nothing here delivers an interrupt as a message.
 
 ## Confining DMA with an IOMMU (x86_64)
 
@@ -232,18 +229,94 @@ with its DMA translated — the in-grant DMA working end to end. The `iommu` lin
 
 Each was falsified; see [testing.md](testing.md#2c-bis-dma-confinement-with-the-iommu).
 
+## Running the driver in a domain (x86_64)
+
+With `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the two halves above are joined: the disk's
+stateful, DMA-capable driver runs in an unprivileged ring-3 **domain**, confined by the IOMMU.
+This is Phase 5's exit criterion on x86_64.
+
+The disk still comes up in the kernel during boot, behind the IOMMU, and the boot-time `block`
+check reads it there — before the scheduler exists there are no domains to run one. Once the
+scheduler is up, the `blk domain` check hands the disk to a domain and reads it *from there*
+instead, then hands it back so the stress run and the filesystem find it working.
+
+### What runs
+
+`user/blkdomain` is an unprivileged program that links the same crates the kernel's in-kernel
+host of the driver links — `virtio-blk-core`, `virtio`, `hwproxy`, `abi`, all `user`-layer — and
+runs `virtio_blk_core::Engine`. It carries the KinTane ABI note in its link script, so the loader
+runs it native rather than tagging it Linux. The kernel builds it a domain whose address space
+holds only its program, its stack, two channels, a setup page, and three mappings:
+
+- the device's **register window**, as device memory — a register access there is the same load the
+  kernel would make, executed in ring 3;
+- the device's **DMA buffer**, which is *exactly* the grant the IOMMU already confines the device to
+  (`kernel/main/src/block.rs` reuses it), so the rings and bounce buffers the domain builds are
+  precisely what VT-d lets the device reach;
+- **data pages** shared with the kernel, that a request's bytes move through. The CPU copies them to
+  and from the engine's bounce buffers, so they are never device-visible and need no IOMMU mapping.
+
+The kernel's block layer is the domain's **client**, over a channel: `kernel/main/src/blockdomain.rs`
+sends a request and reads a reply. The disk's **MSI-X interrupt** is taken by the kernel's handler,
+which acknowledges it and forwards it to the domain as a message on a second channel. The domain
+drains the used ring only after a message has arrived — never on its own — so every completion it
+collects was announced by an interrupt the kernel delivered; a request whose interrupt never comes
+times out rather than being polled into looking fine. The proxy layer's `hwproxy::Irq` is the
+domain's view of this: it counts the messages.
+
+### What the check requires
+
+The `blk domain` line runs the same `block` checks against the test disk, served by the domain, and
+gates on all of:
+
+- the geometry is the test disk's, behind VT-d, on MSI-X;
+- 32 sectors read back the pattern (a read split across several requests), a write reads back after a
+  flush, and a read past the end is the *device's* own refusal returned as an error;
+- every completion arrived by an interrupt message and no descriptor leaked;
+- **containment of a rogue DMA:** a DMA the domain aims outside its grant is stopped by VT-d, whose
+  fault log names the target address and the disk's source id, and the target is untouched;
+- **containment of a faulting domain:** a domain whose driver reaches past its grant is killed by the
+  MMU — not a bounds check in the driver — alone, the disk is marked failed, and a fresh domain over
+  the same grant serves a read again;
+- the disk is handed back to the kernel afterwards.
+
+Each was falsified; see [testing.md](testing.md#2c-ter-the-disk-driver-in-a-domain).
+
+### What it costs
+
+Measured on every `x86_64-isolated` boot and reported in the `blk domain` line. One boot's numbers,
+under QEMU TCG:
+
+| Operation | Value |
+|---|---|
+| Block reads/writes served end to end from the domain | 73 requests, all completed |
+| Completions collected, each after an interrupt message | 73 in 73 messages |
+| Interrupt forward latency — kernel handler to domain receiving the message | ~42 µs mean, ~0.6 ms worst |
+
+The forward latency is the cost this design adds over an in-kernel handler: the interrupt lands in
+the kernel, is turned into a channel message, and the domain is scheduled to receive it. Under TCG
+that is tens of microseconds dominated by scheduling and emulation, not the message itself; on
+hardware it is far less, and it is paid once per interrupt, not per register access — the same shape
+the register prototype measured. The block transfers themselves run at the same per-access cost as
+in the kernel, because the domain executes the same loads and stores over the same mapped DMA buffer;
+what isolation adds is the completion's trip through a channel, which is why an interrupt-driven
+driver that waits on many completions is the case this measures.
+
+### What it does not prove
+
+- **The interrupt reaches the domain in software, not through VT-d interrupt remapping.** The kernel's
+  handler takes the MSI and forwards it as a message. VT-d interrupt remapping (`intremap=on` is
+  already enabled on the machine) would steer the device's MSI at the domain directly, and the kernel
+  handler would only acknowledge; that remapping table is another fork's work
+  (`drivers/iommu/vtd`), and where it slots in is marked in `blockdomain::forward_interrupt`.
+- **Uniprocessor only.** The `x86_64-isolated` preset runs one CPU. Forwarding the interrupt from the
+  handler relies on the uniprocessor lock discipline (every lock the forward takes is held with
+  interrupts masked); an SMP variant would forward through a dedicated queue instead.
+- **The forward latency is QEMU's.** It is dominated by TCG scheduling and emulation, as the register
+  prototype's fixed cost is.
+
 ## What it does not prove
 
-- **The stateful driver is confined in the kernel, not in a domain, on x86_64.** The block driver
-  runs in-kernel behind the IOMMU; it is not the separate unprivileged *domain* the aarch64
-  register prototype is. The two halves — a driver body in a domain (aarch64, no DMA) and a
-  DMA-capable driver confined by an IOMMU (x86_64, in-kernel) — are not yet joined into one
-  isolated DMA-capable driver domain on x86_64. Joining them needs the domain to run
-  `virtio_blk_core` in ring 3 and to receive completions, which is the interrupt-as-a-message path
-  that does not exist yet (see below).
-- **Interrupts do not reach a domain as messages.** x86_64 has no PCI interrupt route to the disk
-  (it is polled), and MSI-X is a separate fork's work. Until then a driver domain would poll, which
-  is why the domain half is not wired on x86_64 yet.
 - **The numbers are QEMU's.** The map/unmap cost is below the boot clock under TCG (above), and
   QEMU's IOMMU invalidation is far cheaper than silicon's. What survives the emulator is the
   *shape*: the grant is mapped once at setup, and per DMA the MMU-equivalent does the work, so the

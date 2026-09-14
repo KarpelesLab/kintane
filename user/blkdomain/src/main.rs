@@ -99,9 +99,8 @@ fn serve(requests: Handle, interrupts: Handle, setup_page: usize) -> u64 {
     };
     // SAFETY: the kernel mapped the DMA buffer at `dma_virt`, writable, backed by the
     // memory the device reaches at `dma_phys`, and this is the only region made over it.
-    let grant = unsafe {
-        Buffer::new(setup.dma_phys, setup.dma_virt as usize, setup.dma_len as usize)
-    };
+    let grant =
+        unsafe { Buffer::new(setup.dma_phys, setup.dma_virt as usize, setup.dma_len as usize) };
     // SAFETY: as above: the grant's addresses, with no other owner in this program.
     let dma = unsafe { Dma::from_proxy(&grant) };
     let engine = match Engine::bring_up(&transport, dma, Some(setup.vector)) {
@@ -247,13 +246,14 @@ impl Host {
     /// Exactly what a driver that has turned hostile would do, and what the IOMMU must stop:
     /// this program's page tables do not map `addr` either, but the device does not use them.
     fn rogue_dma(&mut self, addr: u64) -> (u32, u32) {
-        let slot = match self
-            .engine
-            .submit_raw_read(&self.transport, 0, addr, PROTOCOL_SECTOR as u32)
-        {
-            Ok(slot) => slot,
-            Err(e) => return submit_error(e),
-        };
+        let slot =
+            match self
+                .engine
+                .submit_raw_read(&self.transport, 0, addr, PROTOCOL_SECTOR as u32)
+            {
+                Ok(slot) => slot,
+                Err(e) => return submit_error(e),
+            };
         self.submitted += 1;
         match self.wait(slot, ROGUE_WAIT_NS) {
             Some(byte) => {
@@ -347,8 +347,11 @@ impl Messages {
         self.received.set(self.received.get() + 1);
         self.latency_total
             .set(self.latency_total.get().saturating_add(latency));
-        self.latency_max
-            .set(self.latency_max.get().max(u32::try_from(latency).unwrap_or(u32::MAX)));
+        self.latency_max.set(
+            self.latency_max
+                .get()
+                .max(u32::try_from(latency).unwrap_or(u32::MAX)),
+        );
         self.count.set(self.count.get().max(m.count));
         true
     }
