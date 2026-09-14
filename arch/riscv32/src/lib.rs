@@ -168,8 +168,11 @@ pub fn interrupt_selftest(c: &dyn hal::EarlyConsole) -> bool {
         c.write_str(", timer interrupt never fired");
         return false;
     }
-    c.write_str(", timer interrupt taken");
-    true
+    c.write_str(", timer interrupt taken; ");
+    // The stack guards are armed here, beside the trap path that reports a fault on one:
+    // a guard is only as useful as the handler that names it, which this selftest has just
+    // shown takes traps. ARMv7-M probes its MPU guards from its interrupt selftest too.
+    kspace::arm_guards(c)
 }
 
 /// The physical range the kernel image occupies, as `[start, end)`.

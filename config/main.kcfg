@@ -12,6 +12,7 @@ config TARGET
     default "x86_64-kintane" if ARCH_X86_64
     default "aarch64-kintane" if ARCH_AARCH64
     default "i686-kintane" if ARCH_I686
+    default "riscv32i-kintane" if RISCV32_NO_ATOMICS
     default "riscv32-kintane" if ARCH_RISCV32
     default "armv7m-kintane" if ARCH_ARMV7M
     default ""
@@ -410,8 +411,9 @@ config INKERNEL_TESTS
 
 config STACK_GUARD_TEST
     bool "Overflow the boot stack on purpose"
-    # A guard page is an unmapped page; without translation there is none.
-    depends on QEMU_EXIT && MM_PAGED
+    # A guard that faults: an unmapped page on a paged kernel, or a locked
+    # Physical Memory Protection region on a core with PMP and no MMU.
+    depends on QEMU_EXIT && (MM_PAGED || ARCH_HAS_PMP)
     default n
     help
         After bring-up, recurse until the boot stack reaches its guard page,
@@ -420,6 +422,10 @@ config STACK_GUARD_TEST
         faulting address and exits through the emulator's result channel.
         Any other fault, or none, is a failure.
 
+        On a core with PMP and no MMU the guard is touched from a healthy
+        stack rather than overflowed into, because a machine-mode trap runs
+        on the stack it interrupts; see arch/riscv32/src/kspace.rs.
+
         A test mode, never a production setting. It exists because "the guard
         page is unmapped" is a property of a table, and "an overflow is caught
         and reported" is a property of the running machine. Only the second
@@ -427,7 +433,7 @@ config STACK_GUARD_TEST
 
 config THREAD_STACK_GUARD_TEST
     bool "Overflow a kernel thread's stack on purpose"
-    depends on QEMU_EXIT && MM_PAGED
+    depends on QEMU_EXIT && (MM_PAGED || ARCH_HAS_PMP)
     default n
     help
         After bring-up, start a kernel thread on a stack from the guarded

@@ -47,7 +47,7 @@ use core::cell::SyncUnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use arch::Cpu;
 use boot_protocol::{MemoryKind, MemoryRegion};
@@ -58,7 +58,7 @@ use mm::phys::{FrameAllocator, bitmap_bytes};
 use sync::LockFamily;
 use sync::lockdep::LockClass;
 
-use crate::{AtomicU64, Check, DIRECT_MAP_MAX, Locks, write_usize};
+use crate::{AtomicBool, AtomicU32, AtomicU64, Check, DIRECT_MAP_MAX, Locks, write_usize};
 
 /// Frames the heap owns for the life of the kernel.
 const PAGES: usize = 512;
@@ -105,7 +105,7 @@ type Lock<T> = <Locks as LockFamily>::Lock<T>;
 /// reported it. Now nothing larger than a pointer moves: `install` writes the heap into
 /// this static under its lock. If `Locks` ever names another family, this line stops
 /// compiling, rather than quietly building a second kind of lock.
-static HEAP: Lock<Option<KernelHeap>> = sync::SpinLock::with_class(None, &HEAP_CLASS);
+static HEAP: Lock<Option<KernelHeap>> = Lock::<Option<KernelHeap>>::with_class(None, &HEAP_CLASS);
 
 /// Set once [`install`] has put a heap in `HEAP`. Checked before taking the lock, so a
 /// request before then does not take it for nothing.

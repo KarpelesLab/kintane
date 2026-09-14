@@ -469,6 +469,57 @@ returns to a trampoline, the trampoline runs the hook as a thread would, and a s
 PendSV returns through the original frame. `arch/armv7m/src/preempt.rs` has the
 details, including why a tick that lands during that return must not be dropped.
 
+### Without compare-and-swap: rv32i
+
+This chapter has claimed since Phase 1 that code needing a capability the target lacks is
+absent from its image rather than stubbed. rv32i is the case the claim was written for:
+the base RISC-V ISA, with no A extension and so no atomic instruction at all. The
+`riscv32i-virt` preset builds the riscv32 port for it. It boots on QEMU's `rv32` hart with
+the A extension switched off, and M and C with it, so an atomic, multiply, divide or
+compressed instruction is illegal. That the hart refuses exactly what the image avoids was
+checked, not assumed: the rv32imac image, which does use atomics, boots on the same hart
+until `kheap::install` swaps an `AtomicBool`, and dies there on an illegal `amoor.w`. QEMU's
+own `rv32i` model could not be used. It has no Zicsr either, and a machine-mode kernel
+cannot run without CSRs: both images trap on their first instruction, `csrw mie, zero`.
+The port implements `Arch`,
+`UniProcessor` and a context switch, and not `HasCas`, and the kernel's lock family is
+interrupt masking throughout. It passes the banner, the flat allocator and the heap,
+preemption, sleep and the tickless idle, lock-order checking in its uniprocessor form,
+both PMP stack-guard modes, crash decoding by panic, and the in-kernel suite with its four
+atomic read-modify-write checks reported as skipped: 31 passed, 4 skipped.
+
+**The hardware-independent units needed nothing.** `sync`, `kobject`, `ipc` and the rest
+were gated on `target_has_atomic` in Phase 2, and `kbuild portability` has compiled them
+for `riscv32i` ever since. Every miss was in code that check could not see:
+
+- **`kernel/main`, again.** It named the spinlock family, a compare-and-swap `Once` and
+  atomic counters directly. The capability seam riscv32 started now also chooses the lock
+  family (`sync::Irq` where there is no compare-and-swap), the `Once`, and 32-bit,
+  pointer-width and boolean counters, through new masked stand-ins `sync::IrqU32`,
+  `IrqUsize` and `IrqBool` beside `IrqU64`. The choice is made once, at item level on
+  `target_has_atomic`. The image crate is not host-tested, so `kbuild portability` now also
+  builds the whole rv32i kernel image.
+- **`kernel/selftest`.** Its atomics check is compiled only into test images, and the unit
+  is not host-tested, so nothing had built it for such a core. It is now absent there, and
+  its checks report as skipped under the names they have elsewhere.
+- **The runtime library, in `lib/builtins`.** rv32i has no M extension either, so every
+  `*`, `/` and `%` becomes a call: `__mulsi3`, `__muldi3`, `__udivsi3` and the rest, and
+  the 64-bit shifts. The first link failed on `__muldi3`, from a multiply in the heap's
+  statistics. It is the same class of debt ARMv7-M paid for the Arm run-time ABI.
+- **A latent bug in `sync::IrqLock`.** No image had used interrupt masking as its kernel
+  lock family before, so this code had never run under a timer. `IrqLock::lock` told
+  lock-order checking it held the lock *before* it masked interrupts. A timer interrupt in
+  that window ran a handler whose own acquisition of the heap lock looked like recursion,
+  and the checker stops the CPU on recursion, silently. It hung the heap check in 4 boots
+  of 5; with the stop turned into a panic, 4 boots of 5 panicked with that recursion.
+  Masking first, as `SpinLock::lock_irqsave` already did, passed 8 boots of 8, and
+  restoring only the old order hung again, in 1 boot of 5. The bug was not rv32i's: any
+  uniprocessor that chose `Irq` would have hit it.
+
+So the claim held where it had always been checked, in the hardware-independent units. It
+failed only in code outside the check's reach, in one runtime library, and in one lock the
+compare-and-swap ports never exercised.
+
 ### Keeping it true
 
 The claim is only credible if it is checked continuously. The rule:

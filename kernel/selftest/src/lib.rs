@@ -131,6 +131,7 @@ fn interrupt_masking<A: Arch>(r: &mut Report) {
 /// memory ordering, so this proves the instructions exist and work single-threaded,
 /// not that the ordering is right. The ordering claim needs real hardware and is
 /// recorded as such in docs/testing.md.
+#[cfg(target_has_atomic = "ptr")]
 fn atomics(r: &mut Report) {
     use core::sync::atomic::{AtomicUsize, Ordering};
     let v = AtomicUsize::new(1);
@@ -148,6 +149,23 @@ fn atomics(r: &mut Report) {
         v.compare_exchange(42, 9, Ordering::SeqCst, Ordering::SeqCst) == Err(7),
     );
     r.check("atomic swap", v.swap(0, Ordering::SeqCst) == 7);
+}
+
+/// The same four checks, on a core with no atomic instructions at all (rv32i).
+///
+/// A naturally aligned word still loads and stores in one instruction there, so
+/// `AtomicUsize` exists, but none of the read-modify-writes these exercise does. They are
+/// absent from this image rather than stubbed, and each is reported as skipped under the
+/// name it has elsewhere, so the report says exactly which checks this ISA cannot run.
+/// This function was the in-kernel suite's miss: it is compiled only into test images and
+/// is not host-tested, so nothing had built it for such a core until the rv32i port did.
+#[cfg(not(target_has_atomic = "ptr"))]
+fn atomics(r: &mut Report) {
+    const WHY: &str = "no atomic read-modify-write on this ISA";
+    r.skip("atomic fetch_add", WHY);
+    r.skip("atomic compare_exchange succeeds on match", WHY);
+    r.skip("atomic compare_exchange fails on mismatch", WHY);
+    r.skip("atomic swap", WHY);
 }
 
 /// 64-bit division, which on a 32-bit target is a runtime-library call rather than an

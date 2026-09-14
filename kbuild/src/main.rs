@@ -415,8 +415,37 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                 println!("  {} of {} units build", r.checked - r.broken.len(), r.checked);
                 failed += r.broken.len();
             }
+            // The units above are the host-testable ones, which is where this check began and
+            // what it could reach with built-in targets. The image that links them into a
+            // kernel for a core with no atomics is not among them, and `kernel/main` is where
+            // unguarded read-modify-writes most recently hid: it had never been compiled for
+            // such a core until the rv32i port tried. So the whole rv32i image is built too.
+            // `do_build` records its configuration in `.config`, which this check must not
+            // leave pointing at a machine nobody selected, so the file is put back after.
+            println!(
+                "\n\x1b[36mriscv32i-virt\x1b[0m  the whole kernel image, for a core with no atomics"
+            );
+            let dotconfig = root.join(".config");
+            let saved = std::fs::read(&dotconfig).ok();
+            let mut iopts = opts.clone();
+            iopts.preset = Some("riscv32i-virt".into());
+            let built = do_build(&root, &iopts);
+            match &saved {
+                Some(bytes) => std::fs::write(&dotconfig, bytes)
+                    .map_err(|e| format!("{}: {e}", dotconfig.display()))?,
+                None => {
+                    let _ = std::fs::remove_file(&dotconfig);
+                }
+            }
+            match built {
+                Ok(_) => println!("  kernel image builds"),
+                Err(e) => {
+                    eprintln!("  \x1b[31mkernel image does not build\x1b[0m: {e}\n");
+                    failed += 1;
+                }
+            }
             if failed > 0 {
-                return Err(format!("{failed} unit build(s) failed the portability check"));
+                return Err(format!("{failed} build(s) failed the portability check"));
             }
             println!("\nportability ok");
             Ok(())

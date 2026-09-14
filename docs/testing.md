@@ -141,11 +141,28 @@ Each verdict was falsified, in every case by a mutation confirmed to have applie
 | aarch64 vector ignores the thread-stack array | the thread overflow is reported from a frame beneath its guard and fails; the boot-stack test still passes |
 | Page 0 mapped | the kernel space is refused. With the check also removed, the null read succeeds and x86_64 and i686 fail |
 
-CI runs all three on every preset with an MMU, beside the ordinary boot. A guard page
-is an unmapped page, and `riscv32-virt` has nothing to unmap: the three symbols depend on
-`MM_PAGED`, the configuration refuses them there, and CI skips that preset and says so.
-An overflow on `riscv32` is not caught today. PMP regions could catch it and are not
-programmed yet.
+CI runs all three on every preset with an MMU, beside the ordinary boot. `riscv32-virt`
+and `riscv32i-virt` have no page to unmap, but their harts have Physical Memory
+Protection. The port locks a no-access PMP region over the page below the boot stack and
+over the bottom page of each thread-stack slot, and the boot banner's `interrupts` line
+reads `pmp 9 of 9 stack guards locked`. So the two stack-guard modes depend on
+`MM_PAGED || ARCH_HAS_PMP`, and CI runs both on the two riscv32 presets. The
+null-dereference mode needs page 0 unmapped, which only a paged kernel has, so it stays
+`MM_PAGED`-only.
+
+On riscv32 each mode *touches* a guard from a healthy stack rather than overflowing into
+it. A machine-mode trap runs on the stack it interrupts, so a real overflow would take its
+trap on the overflowed stack, with no separate stack to escape to. The modes therefore
+prove that each region faults and is reported as the stack it guards — `stack guard: the
+address is in the PMP region below the boot stack`, then `expected guard fault: observed`
+— on rv32i and rv32imac alike. They do not prove a real overflow is reported, which needs
+an emergency stack switched in through `mscratch`.
+
+The falsification is the lock bit. An entry without it does not bind machine mode, the
+mode the kernel runs in. With the bit dropped, the run prints `touching the boot stack's
+guard region`, the read succeeds, and the guest exits with code 1. The banner still reads
+`9 of 9 locked`, because its read-back checks what was written, not that machine mode is
+bound by it — which is why the test mode, not the banner, is the proof.
 
 `armv7m-mps2` has no page to unmap either, but it has an MPU, and its guards are MPU
 regions: no access to the page below the boot stack, or to the bottom 8 KiB of each
@@ -543,6 +560,7 @@ hand:
 | armv7m (`armv7m-mps2`) | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none: `-kernel`, executing in place | semihosting |
 | x86_64 (`x86_64-qemu-smp`) | `qemu-system-x86_64` | `q35`, `-smp 4` | `-kernel`, secondaries through INIT and startup IPIs | `isa-debug-exit` |
 | riscv32 (`riscv32-virt`) | `qemu-system-riscv32` | `virt` | `-bios none`, `-kernel` | `sifive_test` |
+| riscv32 (`riscv32i-virt`) | `qemu-system-riscv32` | `virt`, `-cpu rv32` with A, M and C off | `-bios none`, `-kernel` | `sifive_test` |
 
 The `-kernel` rows also pass `-append` with the command line the configuration's default
 entry would hand over.

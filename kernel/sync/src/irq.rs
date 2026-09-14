@@ -146,11 +146,20 @@ impl<T, A: UniProcessor> IrqLock<T, A> {
     ///
     /// Stops the CPU if the lock is already held; see the type's documentation.
     pub fn lock(&self) -> IrqLockGuard<'_, T, A> {
+        // Mask *before* telling lock-order checking, for the reason `SpinLock::lock_irqsave`
+        // gives. The validator records this lock as held on this context, so a timer
+        // interrupt arriving between that record and the mask would run a handler whose
+        // own acquisition of this lock looks like recursion. It is not — this context has
+        // not taken the lock yet — but the validator stops the CPU on recursion, so the
+        // false report was a silent halt. The first image to take `Irq` as its kernel lock
+        // family (rv32i, which has no compare-and-swap) hit it in four boots of five, in
+        // the heap check that allocates from threads and from the timer interrupt at once.
+        let irq = IrqGuard::mask();
         // Checked as a blocking acquisition, which in effect it is: re-entering it is the
         // same bug as re-entering a spinlock, and the order it is taken in matters the
         // same way once there are two CPUs.
         lockdep::acquire::<A>(&self.class, self.instance());
-        match self.take() {
+        match self.take(irq) {
             Some(g) => g,
             // Reached only by re-entering the critical section from inside itself:
             // with interrupts masked, nothing else on this machine runs.
@@ -161,7 +170,7 @@ impl<T, A: UniProcessor> IrqLock<T, A> {
     /// Mask interrupts and take the lock, or give the interrupts back and return
     /// `None` if it is already held.
     pub fn try_lock(&self) -> Option<IrqLockGuard<'_, T, A>> {
-        let guard = self.take();
+        let guard = self.take(IrqGuard::mask());
         if guard.is_some() {
             lockdep::acquire_try::<A>(&self.class, self.instance());
         }
@@ -170,12 +179,14 @@ impl<T, A: UniProcessor> IrqLock<T, A> {
 
     /// The acquisition itself, shared by `lock` and `try_lock`, each of which tells
     /// lock-order checking what kind of acquisition it was.
-    fn take(&self) -> Option<IrqLockGuard<'_, T, A>> {
-        // Mask first. Testing the flag with interrupts enabled would leave a window
-        // between the test and the set in which an interrupt handler could take the
-        // lock, which is the race this whole type is meant not to have.
-        let irq = IrqGuard::mask();
-
+    ///
+    /// `irq` is the mask the caller already took. Testing the flag with interrupts enabled
+    /// would leave a window between the test and the set in which an interrupt handler
+    /// could take the lock, which is the race this whole type is meant not to have; and
+    /// masking here rather than in the caller would leave `lock` a window before it, in
+    /// which it has already recorded the lock as held. When the lock is already held,
+    /// `irq` is dropped with the `None`, which gives the interrupts back.
+    fn take(&self, irq: IrqGuard<A>) -> Option<IrqLockGuard<'_, T, A>> {
         // `Acquire`/`Release` on `held` rather than `Relaxed`. On one CPU the hardware
         // needs no barrier — but the *compiler* does: `Relaxed` orders nothing, so the
         // optimiser would be free to sink a store from inside the critical section

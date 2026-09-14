@@ -25,7 +25,7 @@
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use hal::{Arch, EarlyConsole};
 use kalloc::AllocContext;
@@ -34,7 +34,7 @@ use time::{Duration, Instant};
 
 use crate::kheap::{self, KBox};
 use crate::preempt::{self, SLICE, begin, exit_thread, sleep_until};
-use crate::{AtomicU64, Check, lockcheck, timekeeping, write_usize};
+use crate::{AtomicBool, AtomicU32, AtomicU64, Check, lockcheck, timekeeping, write_usize};
 
 /// Latest a sleeper may wake after its deadline. Its own timer interrupt wakes it, so
 /// microseconds are expected; three slices tolerate an emulator delivering it late.

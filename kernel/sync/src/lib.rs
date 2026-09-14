@@ -127,4 +127,4 @@ pub use once::{Claim, IrqGate, IrqOnce, Once, OnceGate};
 pub use percpu::{PerCpu, Pinned};
 #[cfg(target_has_atomic = "32")]
 pub use spin::{SpinGuard, SpinIrqGuard, SpinLock};
-pub use wide::IrqU64;
+pub use wide::{IrqBool, IrqU32, IrqU64, IrqUsize};

@@ -26,11 +26,11 @@ use core::sync::atomic::Ordering;
 use arch::Cpu;
 use hal::ClockSource;
 use sched::ThreadId;
+use sync::LockFamily;
 use sync::lockdep::LockClass;
-use sync::{CasOnce, LockFamily};
 use time::{Clock, Duration, Instant, TimerQueue};
 
-use crate::{AtomicU64, Locks};
+use crate::{AtomicU64, BootOnce, Locks};
 
 /// Timers the kernel can have armed at once. Every sleeping thread holds one.
 pub const TIMERS: usize = 16;
@@ -50,8 +50,8 @@ struct Timekeeping {
 
 type Lock<T> = <Locks as LockFamily>::Lock<T>;
 
-static CLOCK: CasOnce<Lock<Timekeeping>, Cpu> = CasOnce::new();
-static QUEUE: CasOnce<Lock<Timers>, Cpu> = CasOnce::new();
+static CLOCK: BootOnce<Lock<Timekeeping>> = BootOnce::new();
+static QUEUE: BootOnce<Lock<Timers>> = BootOnce::new();
 
 /// Why [`init`] could not set the clock up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -24,13 +24,13 @@
 
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 use arch::Cpu;
 use hal::EarlyConsole;
 use sync::epoch::{Collector, EpochPtr, RetireError};
 
-use crate::{AtomicU64, Check, Locks, write_usize};
+use crate::{AtomicBool, AtomicU64, AtomicUsize, Check, Locks, write_usize};
 
 /// Retirements a CPU's bag holds before it must reclaim.
 ///

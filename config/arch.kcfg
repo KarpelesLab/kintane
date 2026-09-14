@@ -52,6 +52,17 @@ config ARCH_HAS_FPU
     help
         Floating-point state exists and must be saved across context switches.
 
+config ARCH_HAS_PMP
+    bool
+    readonly
+    help
+        The target has Physical Memory Protection that binds the mode the
+        kernel runs in, so a stack guard can fault without an MMU. The
+        riscv32 port locks a no-access region over each stack guard, which is
+        what lets the stack-guard test modes run on a core with no page
+        tables. ARMv7-M's MPU guards its stacks too, but proves it with boot
+        probes rather than these test modes, so it does not select this.
+
 choice ARCH
     prompt "Target architecture"
     default ARCH_X86_64
@@ -88,9 +99,31 @@ choice ARCH
 
     config ARCH_RISCV32
         bool "RISC-V 32-bit (no MMU)"
-        # Assumes the A extension (LR/SC). An rv32i core without it has no
-        # CAS; the portability check compiles for one to keep that possible.
-        select ARCH_HAS_CAS
+        # The A extension's LR/SC, unless the base-ISA variant below says
+        # this core has none.
+        select ARCH_HAS_CAS if !RISCV32_NO_ATOMICS
+        # Machine-mode PMP, which `virt`'s harts have with and without the A
+        # extension; the port locks a no-access region over each stack guard.
+        select ARCH_HAS_PMP
 endchoice
+
+config RISCV32_NO_ATOMICS
+    bool "rv32i: the base ISA, without the A extension"
+    depends on ARCH_RISCV32
+    default n
+    help
+        Build for a core with no atomic instructions at all: rv32i rather
+        than rv32imac. The kernel then has no compare-and-swap, so it takes
+        the uniprocessor lock family throughout, and every atomic item the
+        portable crates gate on `target_has_atomic` is absent rather than
+        stubbed.
+
+        This is the configuration docs/portability.md has claimed since
+        Phase 1 and the roadmap's Phase 4 exit requires: an image that boots
+        on a machine whose hardware would refuse an atomic instruction.
+        The preset runs on QEMU's `rv32` hart with the A extension switched
+        off, and M and C with it, so an atomic, multiply, divide or compressed
+        instruction is illegal. QEMU's `rv32i` model cannot be used: it has
+        no Zicsr, and a machine-mode kernel cannot run without CSRs.
 
 source "board.kcfg"

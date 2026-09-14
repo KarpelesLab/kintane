@@ -202,12 +202,20 @@ model.
   - The context switch saves `ra`, `sp` and `s0`–`s11`.
 - **Capabilities.** It implements `Arch`, `HasCas`, `UniProcessor` and
   `HasContextSwitch`, and nothing else.
+- **Stack guards.** Physical Memory Protection, not unmapped pages. The port locks a
+  no-access PMP region over the page below the boot stack and over the bottom page of each
+  thread-stack slot (`ARCH_HAS_PMP`), and the banner reads `pmp 9 of 9 stack guards
+  locked`. The two stack-guard test modes run here; the null-dereference mode, which needs
+  page 0 unmapped, does not.
 - **What passes.**
   - The whole boot banner, the flat region allocator and the heap.
   - Preemption, sleep and the tickless idle.
   - All 35 in-kernel checks.
   - Crash decoding by panic and by fault.
-- **What reports Skipped.** The MMU checks. The guard-page test modes do not exist here.
+  - Both stack-guard modes. Each touches a guard from a healthy stack, because a
+    machine-mode trap runs on the stack it interrupts; a real overflow is not yet
+    reported, which needs an emergency stack switched in through `mscratch`.
+- **What reports Skipped.** The MMU checks.
 
 What the port found outside `arch/`:
 
@@ -222,6 +230,19 @@ What the port found outside `arch/`:
 The addresses of the UART, the CLINT and `sifive_test`, and the timebase frequency, are
 `virt`'s constants. The device tree carries the same facts, and reading them is the device
 model's work, which only aarch64 has so far.
+
+**The rv32i variant** (the `riscv32i-virt` preset, `targets/riscv32i-kintane.json`,
+`RISCV32_NO_ATOMICS`) is the same port built for the base ISA: no A extension, so no
+compare-and-swap, and no M extension, so no multiply or divide instruction. It runs on
+QEMU's `rv32` hart with A, M and C switched off, where an atomic, multiply, divide or
+compressed instruction is illegal. (QEMU's own `rv32i` model has no Zicsr, so no
+machine-mode kernel can run on it.) It implements `Arch`,
+`UniProcessor` and `HasContextSwitch`, and not `HasCas`, so the kernel's lock family is
+interrupt masking throughout. It passes the banner, the heap, preemption, sleep and the
+tickless idle, lock-order checking in its uniprocessor form, both PMP stack-guard modes,
+and crash decoding by panic. The in-kernel suite reports its four atomic
+read-modify-write checks as skipped: 31 passed, 4 skipped. What it took is in
+[portability.md](portability.md#without-compare-and-swap-rv32i).
 
 ## Tier 2
 
@@ -267,8 +288,11 @@ point and is written from scratch.
 
 The spec records, among other things:
 - pointer width, data layout, endianness
-- `max-atomic-width` — `0` for targets without atomics, which is how the `HasCas`
-  capability is kept honest
+- `max-atomic-width` and `atomic-cas` — together, which atomics exist. A core with no atomic
+  instructions still loads and stores a naturally aligned word in one instruction, so
+  `riscv32i-kintane` keeps `max-atomic-width: 32` with `atomic-cas: false`, as the built-in
+  `riscv32i-unknown-none-elf` does: `AtomicU32` exists, and every read-modify-write on it
+  does not. That, not a width of `0`, is how the `HasCas` capability is kept honest.
 - `features` — the exact ISA subset, never "whatever the host supports"
 - `panic-strategy = "abort"`, `relocation-model`, `code-model`
 - floating point ABI and whether the kernel may use FP registers at all

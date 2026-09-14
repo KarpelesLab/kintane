@@ -29,6 +29,9 @@
 mod aeabi;
 #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
 mod probestack;
+/// Multiply and divide for rv32i, which has neither instruction. Discarded on rv32imac.
+#[cfg(target_arch = "riscv32")]
+mod softmuldiv;
 #[cfg(target_os = "uefi")]
 mod uefi_link;
 

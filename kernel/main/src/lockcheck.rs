@@ -10,22 +10,26 @@
 //! orders ([`abba`]), and the verdict passes only if exactly that inversion was
 //! reported.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 
 use arch::Cpu;
 use hal::{Arch, EarlyConsole};
-use sync::SpinLock;
+use sync::LockFamily;
 use sync::lockdep::{self, LockClass, Violation};
 use time::Duration;
 
 use crate::preempt::{self, begin, exit_thread, sleep_until};
-use crate::{Check, timekeeping, write_usize};
+use crate::{AtomicBool, Check, Locks, timekeeping, write_usize};
 
 static TEST_A: LockClass = LockClass::new("test.abba.a");
 static TEST_B: LockClass = LockClass::new("test.abba.b");
 
-static LOCK_A: SpinLock<(), Cpu> = SpinLock::with_class((), &TEST_A);
-static LOCK_B: SpinLock<(), Cpu> = SpinLock::with_class((), &TEST_B);
+/// The two locks the inversion is taken on, in the image's own lock family: a spinlock
+/// where the target has compare-and-swap, interrupt masking where it has none. Both
+/// record to the validator, so the test proves the same thing either way.
+type Lock = <Locks as LockFamily>::Lock<()>;
+static LOCK_A: Lock = Lock::with_class((), &TEST_A);
+static LOCK_B: Lock = Lock::with_class((), &TEST_B);
 
 static FIRST_DONE: AtomicBool = AtomicBool::new(false);
 static SECOND_DONE: AtomicBool = AtomicBool::new(false);
@@ -34,8 +38,7 @@ static SECOND_DONE: AtomicBool = AtomicBool::new(false);
 extern "C" fn first(_: usize) -> ! {
     begin();
     {
-        let _a = LOCK_A.lock_irqsave();
-        let _b = LOCK_B.lock_irqsave();
+        Locks::with(&LOCK_A, |_| Locks::with(&LOCK_B, |_| ()));
     }
     FIRST_DONE.store(true, Ordering::Relaxed);
     exit_thread()
@@ -46,8 +49,7 @@ extern "C" fn first(_: usize) -> ! {
 extern "C" fn second(_: usize) -> ! {
     begin();
     {
-        let _b = LOCK_B.lock_irqsave();
-        let _a = LOCK_A.lock_irqsave();
+        Locks::with(&LOCK_B, |_| Locks::with(&LOCK_A, |_| ()));
     }
     SECOND_DONE.store(true, Ordering::Relaxed);
     exit_thread()

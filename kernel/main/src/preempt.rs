@@ -90,7 +90,7 @@
 
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 use arch::Cpu;
 use hal::{Arch, EarlyConsole, KernAddr};
@@ -99,7 +99,10 @@ use sched::{Priority, ThreadId};
 use thread::Threads;
 use time::{Duration, Instant};
 
-use crate::{AtomicU64, Check, kheap, mp, shared, timekeeping, write_usize};
+use crate::{
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Check, kheap, mp, shared, timekeeping,
+    write_usize,
+};
 
 /// Room in the thread table: boot and idle, plus every slot of the port's guarded
 /// stack array, plus one idle thread per other CPU, so a thread table slot is never what

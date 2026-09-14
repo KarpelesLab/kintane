@@ -1,0 +1,15 @@
+# riscv32 without atomics: rv32i on QEMU's `virt` machine, on an `rv32` hart with the A
+# extension switched off (and M and C with it), so the hardware refuses an atomic,
+# multiply, divide or compressed instruction. QEMU's own `rv32i` model has no Zicsr, which
+# a machine-mode kernel needs, so it cannot be used. The roadmap's Phase 4 exit and
+# docs/portability.md's oldest claim — that code needing a capability the target lacks
+# is absent rather than stubbed — are what this preset tests.
+#
+# Everything `riscv32-virt` runs, minus what compare-and-swap buys: the kernel takes the
+# uniprocessor lock family throughout.
+ARCH_RISCV32=y
+RISCV32_NO_ATOMICS=y
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+SIZE_BUDGET_KIB=560
