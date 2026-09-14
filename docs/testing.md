@@ -611,6 +611,83 @@ writer and the new one as standalone programs over the same files. The two image
 byte-identical, and a copy of the new writer with one boot-sector field changed is not, so the
 comparison can see a difference.
 
+### 2f. The Linux personality
+
+On the x86_64 presets with userspace and the test disk, where `ABI_LINUX` defaults on, every boot
+runs a `linux` check right after `fs`
+([userspace-abi.md](userspace-abi.md#as-built--one-static-program-x86_64)). It reads
+`/KINTANE/LINUX.ELF` from the volume. That file is `user/linux-hello`, a static program that makes
+Linux's system calls by Linux's numbers and knows nothing of KinTane. The check runs it unmodified
+and requires:
+
+- the file loads and is tagged `linux`: it has no KinTane ABI note and a System V `EI_OSABI`;
+- it exits with 42. It returns 42 only if every step behaved; otherwise its exit code is the
+  number of the first step that went wrong:
+
+  | Step | What it checks |
+  |---|---|
+  | 10 | `argc` and `argv[0]` |
+  | 11 | `AT_PAGESZ` |
+  | 12 | `AT_ENTRY` |
+  | 13 | `AT_RANDOM` |
+  | 14 | `write(1)` |
+  | 15 | `getpid` |
+  | 16 | `uname` |
+  | 17–18 | `brk`, and the memory behind it |
+  | 19–20 | anonymous `mmap` and `munmap` |
+  | 21–22 | `arch_prctl(ARCH_SET_FS)`, read back through `fs:0` |
+  | 23–26 | `openat`, `fstat`, `read` and `close` on `/HELLO.TXT` |
+  | 27 | `ENOENT` for a missing file |
+  | 28 | `EBADF` for a descriptor that names nothing |
+  | 29 | `ENOSYS` for `getrandom` |
+
+- what it wrote to standard output, as the kernel captured it, is exactly `hello from linux\n`;
+- the kernel logged the unimplemented call, and the number it recorded is the one the table names
+  `getrandom`;
+- `init` then runs natively on the same kernel, to its success code;
+- no file is left open in the namespace, and no frame is leaked.
+
+With `LINUX_ENOSYS_FATAL=y` the check expects the process to be killed at `getrandom` instead, and
+the log line says so.
+
+On `x86_64-qemu` the line reads:
+
+```
+  linux      /KINTANE/LINUX.ELF (13424 bytes, tagged linux):
+             hello from linux
+linux: getrandom (318) is not implemented
+             exit 0x000000000000002a ok, output ok, getrandom logged as unimplemented; init after it:
+             hello from userspace
+             native init unaffected
+```
+
+`kernel/linux` is host-tested (7 tests), covering:
+
+- every dispatched number against its name in the table;
+- the errno encoding and its range;
+- the start-up stack, read back the way start-up code reads it, at 40 string lengths for its
+  alignment;
+- the `struct stat` and `struct utsname` offsets.
+
+`kernel/elf` has 4 more tests for the note walk: the KinTane note found, a prefix of its owner not
+matching, notes truncated at every length and with an oversized name never panicking, and
+`AT_PHDR`'s address.
+
+Each property was falsified: the mutation was applied and checked, the check failed, and the file
+was restored and compared byte for byte.
+
+| Mutation | What caught it |
+|---|---|
+| `Failure::NotFound` mapped to `EIO` | the `linux` host test `errors_travel_as_negated_linux_numbers`; boot: `exit 0x1b WRONG`, step 27 |
+| `AT_ENTRY` left out of the auxiliary vector | boot: `exit 0xc WRONG, OUTPUT WRONG`, step 12, before the program writes anything |
+| A Linux process given the native table | boot: `exit 0x1 WRONG, OUTPUT WRONG`. The program's first system call reached the native table |
+| A native process given the Linux table | boot: the `userspace` check logs `linux: stat (4) is not implemented` for `init`'s native calls, and the boot fails |
+| The unimplemented call logged but not recorded | boot: `THE UNIMPLEMENTED CALL WAS NOT LOGGED` |
+| Every program tagged native, the note test reading `true` | boot: `/KINTANE/LINUX.ELF IS NOT TAGGED linux` |
+
+`LINUX_ENOSYS_FATAL=y` was booted as well. The boot passes, with `exit 0xffffffffffffffff ok` and
+the log line `linux: getrandom (318) is not implemented, and LINUX_ENOSYS_FATAL ends the process`.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

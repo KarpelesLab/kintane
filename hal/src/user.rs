@@ -34,6 +34,10 @@ pub trait SyscallFrame {
     fn args(&self) -> [u64; 6];
     /// Set the two return registers: status, then value.
     fn set_result(&mut self, status: u64, value: u64);
+    /// Set the one register a Linux system call returns in (`rax`, `x0`), leaving the second
+    /// return register as the caller had it: Linux returns a value or a negated errno in one
+    /// register and preserves the rest.
+    fn set_return(&mut self, value: u64);
 }
 
 /// Why a user thread must stop: a trap its process did not ask for and the kernel could
@@ -127,6 +131,17 @@ pub trait HasUserMode: HasPageTables + HasContextSwitch {
     /// # Safety
     /// As [`HasUserMode::copy_from_user`].
     unsafe fn copy_to_user(dst: UserAddr, src: &[u8]) -> Result<(), CopyFault>;
+
+    /// Set the running CPU's user thread pointer: `FS` base on x86_64, `TPIDR_EL0` on aarch64.
+    /// What a Linux process's `arch_prctl(ARCH_SET_FS)` asks for.
+    ///
+    /// Not yet part of a thread's saved context: a switch to another thread does not change
+    /// it. So a caller must reset it when the process that set it is done, and a process that
+    /// sets it must not share a CPU with another that relies on it.
+    ///
+    /// # Safety
+    /// On the CPU the process runs on, with interrupts masked or from its own system call.
+    unsafe fn set_tls(value: usize);
 }
 
 /// Whether `[addr, addr + len)` lies in the user half. The first check of every copy, so

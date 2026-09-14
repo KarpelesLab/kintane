@@ -47,6 +47,8 @@ const NESTED: &[u8] = b"a file in a directory\n";
 const BIG_LEN: usize = 100_000;
 /// Where the user program goes.
 const PROGRAM: &str = "KINTANE/INIT.ELF";
+/// Where the static Linux program goes; mirrors `LINUX_PROGRAM_PATH` in the kernel's copy.
+const LINUX_PROGRAM: &str = "KINTANE/LINUX.ELF";
 
 const fn pattern(sector: u64, offset: usize) -> u8 {
     let s = (sector as u32).wrapping_mul(2_654_435_761);
@@ -76,8 +78,9 @@ const VOLUME: Params = Params {
     what: "the test disk's volume",
 };
 
-/// The whole image. `program` is the user program to place on the volume, if there is one.
-pub fn image(program: Option<&[u8]>) -> Result<Vec<u8>, String> {
+/// The whole image. `program` is the user program to place on the volume, if there is one,
+/// and `linux` the static Linux program.
+pub fn image(program: Option<&[u8]>, linux: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let mut disk = vec![0u8; SECTORS as usize * SECTOR];
     let pattern_bytes = FS_START as usize * SECTOR;
     for (sector, bytes) in disk[..pattern_bytes].chunks_exact_mut(SECTOR).enumerate() {
@@ -110,19 +113,26 @@ pub fn image(program: Option<&[u8]>) -> Result<Vec<u8>, String> {
             data: program,
         });
     }
+    if let Some(linux) = linux {
+        files.push(File {
+            path: LINUX_PROGRAM,
+            data: linux,
+        });
+    }
     let volume = fat16::volume(&files, &VOLUME)?;
     disk[pattern_bytes..].copy_from_slice(&volume);
     Ok(disk)
 }
 
 /// Write the image into `out`, unless the file already holds exactly these bytes. With
-/// `program`, that file's bytes go on the volume as `/KINTANE/INIT.ELF`.
-pub fn write(out: &Path, program: Option<&Path>) -> Result<PathBuf, String> {
+/// `program`, that file's bytes go on the volume as `/KINTANE/INIT.ELF`; with `linux`, as
+/// `/KINTANE/LINUX.ELF`.
+pub fn write(out: &Path, program: Option<&Path>, linux: Option<&Path>) -> Result<PathBuf, String> {
     let path = out.join(FILE);
-    let program = program
-        .map(|p| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display())))
-        .transpose()?;
-    let bytes = image(program.as_deref())?;
+    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+    let program = program.map(read).transpose()?;
+    let linux = linux.map(read).transpose()?;
+    let bytes = image(program.as_deref(), linux.as_deref())?;
     if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
         return Ok(path);
     }
@@ -159,7 +169,7 @@ mod tests {
 
     #[test]
     fn the_pinned_bytes_match_the_kernels_side() {
-        let disk = image(None).unwrap();
+        let disk = image(None, None).unwrap();
         for (sector, offset, byte) in PINNED {
             let at = sector as usize * SECTOR + offset;
             assert_eq!(disk[at], byte, "sector {sector} offset {offset}");
@@ -171,7 +181,7 @@ mod tests {
 
     #[test]
     fn the_header_is_where_the_kernel_reads_it() {
-        let disk = image(None).unwrap();
+        let disk = image(None, None).unwrap();
         assert_eq!(&disk[..8], MAGIC);
         assert_eq!(u32::from_le_bytes(disk[8..12].try_into().unwrap()), VERSION);
         assert_eq!(u32::from_le_bytes(disk[12..16].try_into().unwrap()), SECTORS as u32);
@@ -180,7 +190,7 @@ mod tests {
 
     #[test]
     fn the_volume_starts_where_the_kernel_mounts_it() {
-        let disk = image(None).unwrap();
+        let disk = image(None, None).unwrap();
         let boot = &disk[FS_START as usize * SECTOR..][..SECTOR];
         assert_eq!(&boot[510..512], &[0x55, 0xAA], "a boot sector at FS_START");
         assert_eq!(&boot[54..62], b"FAT16   ");
@@ -198,8 +208,8 @@ mod tests {
     #[test]
     fn the_program_is_placed_on_the_volume_when_there_is_one() {
         let program: Vec<u8> = (0..20_000u32).map(|i| (i * 7 + 3) as u8).collect();
-        let with = image(Some(&program)).unwrap();
-        let without = image(None).unwrap();
+        let with = image(Some(&program), None).unwrap();
+        let without = image(None, None).unwrap();
         let volume = &with[FS_START as usize * SECTOR..];
         assert!(
             volume.windows(64).any(|w| w == &program[..64]),
@@ -214,8 +224,8 @@ mod tests {
 
     #[test]
     fn the_image_is_the_same_bytes_every_time() {
-        assert_eq!(image(None).unwrap(), image(None).unwrap());
+        assert_eq!(image(None, None).unwrap(), image(None, None).unwrap());
         let program = [0x7Fu8, b'E', b'L', b'F', 1, 2, 3];
-        assert_eq!(image(Some(&program)).unwrap(), image(Some(&program)).unwrap());
+        assert_eq!(image(Some(&program), None).unwrap(), image(Some(&program), None).unwrap());
     }
 }

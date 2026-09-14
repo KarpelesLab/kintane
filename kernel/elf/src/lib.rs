@@ -37,6 +37,19 @@ pub const EM_AARCH64: u16 = 183;
 
 const ET_EXEC: u16 = 2;
 const PT_LOAD: u32 = 1;
+const PT_NOTE: u32 = 4;
+
+/// `EI_OSABI` for System V, which is what a toolchain that does not set it writes.
+pub const ELFOSABI_SYSV: u8 = 0;
+/// `EI_OSABI` for Linux.
+pub const ELFOSABI_LINUX: u8 = 3;
+
+/// The owner name of the note a native KinTane program carries, without its NUL.
+pub const NOTE_KINTANE: &[u8] = b"KinTane";
+/// The type of that note: the native ABI version the program was built against.
+pub const NT_KINTANE_ABI: u32 = 0x4b54;
+/// The most notes [`Program::has_note`] walks, so a hostile file cannot make it loop.
+const MAX_NOTES: usize = 64;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -205,6 +218,60 @@ impl<'a> Program<'a> {
         Ok(program)
     }
 
+    /// `EI_OSABI` from the file's identification bytes.
+    pub fn os_abi(&self) -> u8 {
+        // `parse` checked the header's 64 bytes are present.
+        self.bytes[7]
+    }
+
+    /// The number of program headers, loadable or not: `AT_PHNUM`.
+    pub fn phnum(&self) -> usize {
+        self.phnum
+    }
+
+    /// Where the program headers are in the program's memory: `AT_PHDR`.
+    ///
+    /// Linux's rule for a static executable: the first loadable segment's address less its
+    /// file offset, plus the headers' file offset. For a file whose first segment does not
+    /// map the headers, that address holds whatever the segment put there, which is also
+    /// what Linux reports. `None` if the arithmetic overflows.
+    pub fn phdr_vaddr(&self) -> Option<u64> {
+        let ph = (0..self.phnum)
+            .map(|i| self.phoff + i * PHDR_SIZE)
+            .find(|&ph| u32_at(self.bytes, ph) == Ok(PT_LOAD))?;
+        let off = u64_at(self.bytes, ph + 8).ok()?;
+        let vaddr = u64_at(self.bytes, ph + 16).ok()?;
+        vaddr.checked_sub(off)?.checked_add(self.phoff as u64)
+    }
+
+    /// Whether a `PT_NOTE` segment holds a note owned by `name` (without its NUL) of type
+    /// `ty`.
+    ///
+    /// Bounded, and never panics: a note whose sizes run past its segment ends the walk, as
+    /// does the [`MAX_NOTES`]th note.
+    pub fn has_note(&self, name: &[u8], ty: u32) -> bool {
+        (0..self.phnum).any(|i| {
+            let ph = self.phoff + i * PHDR_SIZE;
+            if u32_at(self.bytes, ph) != Ok(PT_NOTE) {
+                return false;
+            }
+            let (Ok(off), Ok(size)) = (u64_at(self.bytes, ph + 8), u64_at(self.bytes, ph + 32))
+            else {
+                return false;
+            };
+            let (Ok(off), Ok(size)) = (usize::try_from(off), usize::try_from(size)) else {
+                return false;
+            };
+            let Some(seg) = off
+                .checked_add(size)
+                .and_then(|end| self.bytes.get(off..end))
+            else {
+                return false;
+            };
+            note_in(seg, name, ty)
+        })
+    }
+
     /// The loadable segments, in program header order, each already checked by `parse`
     /// except for being in range, which `parse` checks on the non-empty ones.
     pub fn segments(&self) -> impl Iterator<Item = Result<Segment<'a>, Error>> + '_ {
@@ -244,4 +311,42 @@ impl<'a> Program<'a> {
             access,
         })
     }
+}
+
+/// Whether the notes in `seg` include one owned by `name` of type `ty`. Each note is a
+/// 12-byte header (name size, descriptor size, type), the name padded to four bytes, and the
+/// descriptor padded to four.
+fn note_in(seg: &[u8], name: &[u8], ty: u32) -> bool {
+    let pad4 = |n: usize| n.checked_add(3).map(|n| n & !3);
+    let mut at = 0usize;
+    for _ in 0..MAX_NOTES {
+        let (Ok(namesz), Ok(descsz), Ok(kind)) =
+            (u32_at(seg, at), u32_at(seg, at + 4), u32_at(seg, at + 8))
+        else {
+            return false;
+        };
+        let (namesz, descsz) = (namesz as usize, descsz as usize);
+        let name_at = at + 12;
+        let Some(name_end) = name_at.checked_add(namesz) else {
+            return false;
+        };
+        let Some(owner) = seg.get(name_at..name_end) else {
+            return false;
+        };
+        // A note's name carries its NUL in its size.
+        if kind == ty && owner.split_last() == Some((&0, name)) {
+            return true;
+        }
+        let (Some(np), Some(dp)) = (pad4(namesz), pad4(descsz)) else {
+            return false;
+        };
+        let Some(next) = name_at.checked_add(np).and_then(|n| n.checked_add(dp)) else {
+            return false;
+        };
+        if next <= at || next >= seg.len() {
+            return false;
+        }
+        at = next;
+    }
+    false
 }

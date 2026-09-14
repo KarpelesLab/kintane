@@ -221,12 +221,66 @@ pub(crate) struct Process {
     /// the context switch loads for its thread.
     pub(crate) root: PhysAddr,
     /// Which slot of [`PROCS`] this is, for the per-slot records kept outside it.
-    slot: usize,
+    pub(crate) slot: usize,
     /// Whether a thread has been started in it: the first installs the program, and
     /// every later one is given a stack of its own.
     started: bool,
     /// User stacks given to threads after the first, each reserved once.
     stacks: usize,
+    /// The system call ABI it speaks, decided once from its program at [`build`].
+    pub(crate) personality: Personality,
+    /// Its system call table, chosen with `personality`. [`on_syscall`] calls through it and
+    /// never looks at the personality, so a second ABI costs the native one an indirect call
+    /// and nothing else.
+    syscalls: SyscallTable,
+}
+
+/// Which system call ABI a process speaks.
+///
+/// Decided at load by [`personality_of`], from the program alone: a program cannot choose a
+/// personality once it runs, and a process never changes one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Personality {
+    /// KinTane's own ABI, `lib/abi`: a status and a value in two registers, handles for
+    /// everything.
+    Native,
+    /// Linux's x86_64 ABI, answered by [`crate::personality`].
+    Linux,
+}
+
+/// A process's system call table: one call, given the calling process's slot and the frame
+/// to read the arguments from and to write the result into, in that ABI's own convention.
+///
+/// The slot, not the process: a table takes the process's lock itself, so that the native
+/// one can let go of it around a call that blocks ([`Syscalls::wait_for`]).
+pub(crate) type SyscallTable = fn(usize, &mut <Cpu as HasUserMode>::SyscallFrame);
+
+/// The personality `program` runs under, or `None` for a program the kernel refuses.
+///
+/// A program carrying the KinTane ABI note ([`elf::NOTE_KINTANE`]) is native; every native
+/// program's link script writes one. A program without it is Linux's if its `EI_OSABI` is
+/// System V or Linux, which is what Linux's own toolchains write, and if this kernel has
+/// the Linux personality. Anything else — a note-less program for another system, or a
+/// Linux one on a kernel without the personality — is refused at load rather than run
+/// under an ABI it was not built for.
+pub(crate) fn personality_of(program: &Program) -> Option<Personality> {
+    if program.has_note(elf::NOTE_KINTANE, elf::NT_KINTANE_ABI) {
+        return Some(Personality::Native);
+    }
+    match program.os_abi() {
+        elf::ELFOSABI_SYSV | elf::ELFOSABI_LINUX if crate::personality::ENABLED => {
+            Some(Personality::Linux)
+        }
+        _ => None,
+    }
+}
+
+/// The table a process of `personality` calls through.
+fn table_for(personality: Personality) -> SyscallTable {
+    match personality {
+        Personality::Native => native_syscalls,
+        Personality::Linux => linux_syscalls,
+    }
 }
 
 /// How many processes can exist at once. The sequential slice needs one; the scheduled
@@ -459,6 +513,85 @@ impl Process {
             .insert(self.console, ObjectType::DeviceResource, Rights::WRITE)
             .ok()
     }
+
+    /// Whether `h` is a handle to this process's console carrying `WRITE`: the check a
+    /// descriptor that views the console makes, the same one the native `debug_write` makes.
+    #[cfg_attr(
+        not(CONFIG_ABI_LINUX),
+        expect(
+            dead_code,
+            reason = "only the Linux personality's descriptors view handles"
+        )
+    )]
+    pub(crate) fn may_write_console(&self, h: Handle) -> bool {
+        self.table
+            .get_checked(h, ObjectType::DeviceResource, Rights::WRITE)
+            .is_ok_and(|entry| entry.object == self.console)
+    }
+
+    /// Close handle `h`, retiring what it named. `false` if it named nothing.
+    #[cfg_attr(
+        not(CONFIG_ABI_LINUX),
+        expect(
+            dead_code,
+            reason = "only the Linux personality's descriptors view handles"
+        )
+    )]
+    pub(crate) fn close_handle(&mut self, h: Handle) -> bool {
+        match self.table.close(h) {
+            Ok(entry) => {
+                objects::retire(entry.object);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Reserve `bytes` of anonymous memory with `flags` at the next free user address, a page
+    /// of unmapped gap above it. Its address, or why not.
+    pub(crate) fn reserve_next(
+        &mut self,
+        bytes: usize,
+        flags: hal::PageFlags,
+    ) -> Result<usize, Error> {
+        let start = self.next_map;
+        let end = start.checked_add(bytes).ok_or(Error::InvalidArgument)?;
+        if end > <Cpu as HasUserMode>::USER_END {
+            return Err(Error::NoMemory);
+        }
+        self.vm
+            .reserve(Region {
+                start,
+                len: bytes,
+                flags,
+                backing: Backing::Anonymous,
+                huge: false,
+            })
+            .map_err(|_| Error::NoMemory)?;
+        self.next_map = end + Cpu::PAGE_SIZE;
+        Ok(start)
+    }
+
+    /// Release the region that starts at `start` and is exactly `len` bytes, frames and all.
+    /// `false` if no region is exactly that: part of a region is never released.
+    #[cfg_attr(
+        not(CONFIG_ABI_LINUX),
+        expect(
+            dead_code,
+            reason = "only the Linux personality's munmap releases by range"
+        )
+    )]
+    pub(crate) fn release_exact(&mut self, start: usize, len: usize) -> bool {
+        if !self
+            .vm
+            .regions()
+            .iter()
+            .any(|r| r.start == start && r.len == len)
+        {
+            return false;
+        }
+        with_frames(|f| self.vm.release(start, f).is_ok()).unwrap_or(false)
+    }
 }
 
 /// The process in slot `i`, for boot to build, inspect and tear down.
@@ -538,7 +671,7 @@ fn finish_thread(slot: usize, last: bool, exit: Option<u64>) -> ! {
 
 /// End the running user thread, whichever scheduler it belongs to: the one the boot-time
 /// slice drives by hand, or the kernel's own once it is running. Never returns.
-fn end_thread() -> ! {
+pub(crate) fn end_thread() -> ! {
     if crate::preempt::scheduled() {
         crate::preempt::exit_thread()
     }
@@ -569,34 +702,85 @@ fn record_exit(p: &mut Process, code: u64) {
     wake_all_channel_waiters();
 }
 
+/// End the running process with `code`, from its own system call. Never returns.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "the native ABI's exits go through its handler")
+)]
+pub(crate) fn exit_current(p: &mut Process, code: u64) -> ! {
+    let slot = p.slot;
+    record_exit(p, code);
+    let exit = p.exit;
+    let last = leave(slot);
+    // The call ending here holds the process's lock ([`linux_syscalls`]) and never returns to
+    // drop it, so it is let go of now, as the native exits do.
+    if let Some(owner) = OWNER.get(slot) {
+        let _ =
+            owner.compare_exchange(Cpu::cpu_index() + 1, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+    finish_thread(slot, last, exit)
+}
+
 /// Recorded as the exit code when the kernel kills a process rather than the program
 /// choosing its own code.
-const KILLED: u64 = 0xffff_ffff_ffff_ffff;
+pub(crate) const KILLED: u64 = 0xffff_ffff_ffff_ffff;
 
-/// Run one system call.
-fn on_syscall(frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
+/// Fail the call in `frame` the native way: the only ABI a call with no process can have.
+fn unsupported(frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
     use hal::user::SyscallFrame;
-    let (status, value) = abi::encode(dispatch(frame.number(), frame.args()));
+    let (status, value) = abi::encode(Err(Error::Unsupported));
     frame.set_result(status, value);
 }
 
-/// Decode and perform system call `nr`. A process with no current state fails everything.
-fn dispatch(nr: u64, args: [u64; 6]) -> Result<u64, Error> {
-    let slot = current_slot().ok_or(Error::Unsupported)?;
+/// Run one system call, through the calling process's own table.
+fn on_syscall(frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
+    let Some(slot) = current_slot() else {
+        unsupported(frame);
+        return;
+    };
     // Where the call was served. The only record of a user thread having run on a CPU, and
     // what makes a migration observable.
     CPUS_SEEN[slot].fetch_or(1 << (Cpu::cpu_index() & 63), Ordering::Relaxed);
-    let held = lock(slot).ok_or(Error::Unsupported)?;
+    // The table is read under the lock and called without it: each table takes the lock
+    // itself, for as long as it needs it.
+    let Some(table) = lock(slot).map(|mut held| held.process().syscalls) else {
+        unsupported(frame);
+        return;
+    };
+    table(slot, frame)
+}
+
+/// The native table: decode and perform the call in `frame` by `lib/abi`'s numbers.
+fn native_syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
+    use hal::user::SyscallFrame;
+    let Some(held) = lock(slot) else {
+        unsupported(frame);
+        return;
+    };
     let mut calls = Syscalls {
         slot,
         held: Some(held),
     };
     // A thread whose process another thread has ended ends at its next call...
     calls.end_if_exiting();
-    let result = abi::dispatch(&mut calls, nr, args);
+    let result = abi::dispatch(&mut calls, frame.number(), frame.args());
     // ...or on its way out of the one it was in, which the ending woke.
     calls.end_if_exiting();
-    result
+    drop(calls);
+    let (status, value) = abi::encode(result);
+    frame.set_result(status, value);
+}
+
+/// The Linux table: [`crate::personality::syscalls`], over the process borrowed under its lock
+/// for the whole call. A Linux process has one thread and no call that blocks yet; one that
+/// does will wait through [`crate::wait`] and let go of the lock around it, as the native
+/// calls do.
+fn linux_syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
+    let Some(mut held) = lock(slot) else {
+        unsupported(frame);
+        return;
+    };
+    crate::personality::syscalls(held.process(), frame)
 }
 
 /// The kernel's implementation of the native ABI, over one process.
@@ -670,24 +854,9 @@ impl abi::Handler for Syscalls {
     fn vm_map(&mut self, len: usize) -> Result<u64, Error> {
         let page = Cpu::PAGE_SIZE;
         let pages = len.div_ceil(page).max(1);
-        let bytes = pages * page;
-        let start = self.p().next_map;
-        let end = start.checked_add(bytes).ok_or(Error::InvalidArgument)?;
-        if end > <Cpu as HasUserMode>::USER_END {
-            return Err(Error::NoMemory);
-        }
         self.p()
-            .vm
-            .reserve(Region {
-                start,
-                len: bytes,
-                flags: user_rw(),
-                backing: Backing::Anonymous,
-                huge: false,
-            })
-            .map_err(|_| Error::NoMemory)?;
-        self.p().next_map = end + page; // a page of gap between mappings
-        Ok(start as u64)
+            .reserve_next(pages * page, user_rw())
+            .map(|start| start as u64)
     }
 
     fn channel_create(&mut self, out: UserPtr) -> Result<u64, Error> {
@@ -777,6 +946,10 @@ impl abi::Handler for Syscalls {
         .map_err(store_error)?
         .ok_or(Error::WrongType)?;
         let program = parse(bytes).ok_or(Error::InvalidArgument)?;
+        // The child's thread enters its program the native way, so only a native program.
+        if personality_of(&program) != Some(Personality::Native) {
+            return Err(Error::InvalidArgument);
+        }
         let slot = free_slot().ok_or(Error::Full)?;
         build(slot, &program).ok_or(Error::NoMemory)?;
         // The child's own thread installs the program; remember what from.
@@ -946,11 +1119,12 @@ impl abi::Handler for Syscalls {
         .map_err(store_error)?
         .ok_or(Error::WrongType)?;
         let slot = self.target_slot(process)?;
-        if slot == self.slot {
-            map_anonymous(self.p(), len)
+        let mapped = if slot == self.slot {
+            self.p().reserve_next(len, user_rw())
         } else {
-            self.with_other(slot, |_, target| map_anonymous(target, len))?
-        }
+            self.with_other(slot, |_, target| target.reserve_next(len, user_rw()))?
+        };
+        mapped.map(|start| start as u64)
     }
 
     fn channel_send(
@@ -1183,21 +1357,6 @@ impl abi::Handler for Syscalls {
     fn clock_now(&mut self) -> Result<u64, Error> {
         Ok(timekeeping::now().as_nanos())
     }
-}
-
-/// Reserve `len` bytes of anonymous memory at `target`'s next free address.
-fn map_anonymous(target: &mut Process, len: usize) -> Result<u64, Error> {
-    let start = target.next_map;
-    let end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
-    if end > <Cpu as HasUserMode>::USER_END {
-        return Err(Error::NoMemory);
-    }
-    target
-        .vm
-        .reserve(anon(start, len))
-        .map_err(|_| Error::NoMemory)?;
-    target.next_map = end + Cpu::PAGE_SIZE;
-    Ok(start as u64)
 }
 
 impl Syscalls {
@@ -1444,7 +1603,7 @@ fn run(
     let arg1 = if mode == MODE_FAULT { fault_target } else { 0 };
     let ready = install_program(program).is_some() && install_handles(mode).is_some();
     let exit = if ready {
-        drive(program.entry as usize, mode, arg1)
+        drive(program.entry as usize, mode, arg1, user_stack_pointer())
     } else {
         c.write_str("(setup failed) ");
         None
@@ -1479,19 +1638,30 @@ pub(crate) fn user_half_clear(direct: DirectMap, kernel_root: PhysAddr) -> bool 
 ///
 /// The process is not loaded and nothing runs in it yet; the caller loads the space (or
 /// binds a thread to it) and fills the segments in with [`install_program`].
+///
+/// `program` must be native ([`personality_of`]): everything that builds a process this way
+/// enters it by the native convention. [`run_linux`] builds a Linux one.
 pub(crate) fn build(slot: usize, program: &Program) -> Option<PhysAddr> {
+    build_as(slot, program, Personality::Native)
+}
+
+/// [`build`], for a program that must be tagged `personality`. `None` if it is not.
+fn build_as(slot: usize, program: &Program, personality: Personality) -> Option<PhysAddr> {
+    if personality_of(program) != Some(personality) {
+        return None;
+    }
     if slot >= MAX_PROCS || USED[slot].swap(true, Ordering::AcqRel) {
         return None;
     }
-    let built = build_claimed(slot, program);
+    let built = build_claimed(slot, program, personality);
     if built.is_none() {
         USED[slot].store(false, Ordering::Release);
     }
     built
 }
 
-/// [`build`], in a slot it has claimed.
-fn build_claimed(slot: usize, program: &Program) -> Option<PhysAddr> {
+/// [`build_as`], in a slot it has claimed.
+fn build_claimed(slot: usize, program: &Program, personality: Personality) -> Option<PhysAddr> {
     if self::slot(slot).is_some() {
         return None;
     }
@@ -1518,7 +1688,7 @@ fn build_claimed(slot: usize, program: &Program) -> Option<PhysAddr> {
         let (lo, hi) = seg.pages(Cpu::PAGE_SIZE as u64);
         vm.reserve(anon(lo as usize, (hi - lo) as usize)).ok()?;
     }
-    let stack_top = <Cpu as HasUserMode>::USER_END - Cpu::PAGE_SIZE;
+    let stack_top = user_stack_top();
     let stack_bottom = stack_top - USER_STACK_PAGES * Cpu::PAGE_SIZE;
     vm.reserve(anon(stack_bottom, USER_STACK_PAGES * Cpu::PAGE_SIZE))
         .ok()?;
@@ -1538,6 +1708,8 @@ fn build_claimed(slot: usize, program: &Program) -> Option<PhysAddr> {
             slot,
             started: false,
             stacks: 0,
+            personality,
+            syscalls: table_for(personality),
         });
     }
     LIVE[slot].store(0, Ordering::Release);
@@ -1547,10 +1719,16 @@ fn build_claimed(slot: usize, program: &Program) -> Option<PhysAddr> {
     Some(root)
 }
 
-/// The user stack pointer a process starts on: the top of its stack region, with room for
-/// the ABI's alignment and the initial frame.
+/// The top of a process's stack region: one past the highest byte its stack may use, with an
+/// unmapped page above.
+pub(crate) fn user_stack_top() -> usize {
+    <Cpu as HasUserMode>::USER_END - Cpu::PAGE_SIZE
+}
+
+/// The user stack pointer a native process starts on: the top of its stack region, with
+/// room for the ABI's alignment and the initial frame.
 pub(crate) fn user_stack_pointer() -> usize {
-    <Cpu as HasUserMode>::USER_END - Cpu::PAGE_SIZE - 16
+    user_stack_top() - 16
 }
 
 /// Pages of stack each thread after a process's first is given.
@@ -1820,6 +1998,44 @@ pub(crate) fn run_disk_program(
     exit.map(|code| (code, code == INIT_SUCCESS))
 }
 
+/// Run `program` as a Linux process in slot 0, to exit, and return its exit code.
+///
+/// The way [`run`] runs `init`, but for a program tagged `linux`: build it, install its
+/// segments, and let `start` lay out what a Linux program starts with — its descriptors and
+/// its start-up stack — returning the stack pointer to enter it on. Every argument register
+/// is zero at entry, as Linux leaves them. `None` if the program is not a Linux one, if it
+/// never started or never exited, or if [`check`] never installed the user-mode hooks.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality's check")
+)]
+pub(crate) fn run_linux(
+    frames: &mut FrameAllocator<'static, Cpu>,
+    program: &Program,
+    start: impl FnOnce(&mut Process, &Program) -> Option<usize>,
+) -> Option<u64> {
+    if KERNEL_ROOT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    set_frames(frames);
+    let exit = build_as(0, program, Personality::Linux).and_then(|root| {
+        // SAFETY: as in `run`: `root` mirrors the kernel half, where the running code and
+        // stack live.
+        unsafe { Cpu::set_root(root) };
+        let stack = install_program(program).and_then(|()| start(current()?, program));
+        for arg in &ARG_HANDLES {
+            arg.store(0, Ordering::Relaxed);
+        }
+        let exit = stack.and_then(|sp| drive(program.entry as usize, MODE_MAIN, 0, sp));
+        // SAFETY: as in `run`.
+        unsafe { Cpu::set_root(kernel_root()) };
+        teardown(0);
+        exit
+    });
+    FRAMES.store(core::ptr::null_mut(), Ordering::Relaxed);
+    exit
+}
+
 /// Copy each segment into user memory and set its final permissions.
 ///
 /// The process's address space must be loaded for the whole copy. Either the caller is
@@ -1883,8 +2099,9 @@ fn install_handles(mode: usize) -> Option<()> {
     Some(())
 }
 
-/// Spawn the user thread and switch to it; return the exit code the handlers recorded.
-fn drive(entry: usize, mode: usize, arg1: usize) -> Option<u64> {
+/// Spawn the user thread and switch to it, to enter `entry` on user stack pointer `stack`;
+/// return the exit code the handlers recorded.
+fn drive(entry: usize, mode: usize, arg1: usize, stack: usize) -> Option<u64> {
     let irq = Cpu::irq_save();
     // SAFETY: written once here before the thread is spawned; boot is the only thread.
     unsafe {
@@ -1895,6 +2112,7 @@ fn drive(entry: usize, mode: usize, arg1: usize) -> Option<u64> {
     ENTRY.store(entry, Ordering::Relaxed);
     MODE.store(mode, Ordering::Relaxed);
     FAULT_ARG.store(arg1, Ordering::Relaxed);
+    STACK.store(stack, Ordering::Relaxed);
     let (top, size) = user_thread_stack();
     // SAFETY: masked, boot the only thread; `top`/`size` are the user thread's kernel stack,
     // mapped read-write.
@@ -1933,8 +2151,7 @@ fn drive(entry: usize, mode: usize, arg1: usize) -> Option<u64> {
 extern "C" fn trampoline(_: usize) -> ! {
     let entry = ENTRY.load(Ordering::Relaxed);
     let mode = MODE.load(Ordering::Relaxed);
-    // 16 bytes below the top: room for the ABI's stack alignment and the initial frame.
-    let stack = <Cpu as HasUserMode>::USER_END - Cpu::PAGE_SIZE - 16;
+    let stack = STACK.load(Ordering::Relaxed);
     let (top, _) = user_thread_stack();
     let arg1 = if mode == MODE_FAULT {
         FAULT_ARG.load(Ordering::Relaxed)
@@ -1979,6 +2196,10 @@ pub(crate) fn teardown(slot: usize) {
         crate::objects::retire(entry.object);
     }
     free_channels_of(slot);
+    // What only a Linux process has: its descriptors and its thread pointer.
+    if p.personality == Personality::Linux {
+        crate::personality::release(slot);
+    }
     // SAFETY: see `PROCS`; the threads have exited and been reaped, so nothing else holds
     // this slot.
     unsafe { *PROCS[slot].get() = None };
@@ -1996,6 +2217,8 @@ static THREADS: SyncUnsafeCell<core::mem::MaybeUninit<thread::Threads<Cpu, 2>>> 
 static ENTRY: AtomicUsize = AtomicUsize::new(0);
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static FAULT_ARG: AtomicUsize = AtomicUsize::new(0);
+/// The user stack pointer the thread [`drive`] spawns enters on.
+static STACK: AtomicUsize = AtomicUsize::new(0);
 /// The two argument handle values a MAIN process is given, or zero.
 static ARG_HANDLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 

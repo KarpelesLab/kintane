@@ -954,7 +954,16 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
             .get("userinit")
             .filter(|b| b.embed.is_some())
             .map(|b| b.path.clone());
-        testdisk::write(image.parent().unwrap_or(Path::new(".")), program.as_deref())?;
+        // The static Linux program, when the configuration builds the Linux personality.
+        let linux = built
+            .get("linux-hello")
+            .filter(|b| b.embed.is_some())
+            .map(|b| b.path.clone());
+        testdisk::write(
+            image.parent().unwrap_or(Path::new(".")),
+            program.as_deref(),
+            linux.as_deref(),
+        )?;
     }
     // A module asking for another configuration gets this one with its overrides on top.
     // A `--set` the overridden configuration cannot honour is dropped for that build only:
