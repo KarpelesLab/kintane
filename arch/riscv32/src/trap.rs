@@ -191,6 +191,10 @@ extern "C" fn riscv32_trap(frame: *mut TrapFrame) {
     write_hex(c, u64::from(mtval));
     c.write_str("\n");
     crate::backtrace::print(c, Some(mepc as usize), crate::backtrace::EXCEPTION_FRAMES);
+    // Instruction, load and store access faults are what a locked PMP region raises. An
+    // address inside a stack guard is named as such, and a test mode waiting for exactly
+    // that fault ends the run here.
+    crate::kspace::after_fault_report(c, matches!(mcause, 1 | 5 | 7), u64::from(mtval));
     crate::stop_after_fault()
 }
 

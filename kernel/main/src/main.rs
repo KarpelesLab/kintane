@@ -66,7 +66,14 @@ use model::Live;
 
 /// The lock family for state the whole kernel shares. Named once, here, because the image
 /// is the one place allowed to name the architecture. See `sync::family`.
+///
+/// A ticket spinlock where the target has compare-and-swap, which is every port that can
+/// have a second CPU. A core with no atomic instructions at all — rv32i — cannot have
+/// one, and cannot have a second CPU either, so there interrupt masking *is* the lock.
+#[cfg(target_has_atomic = "32")]
 type Locks = sync::Spin<Cpu>;
+#[cfg(not(target_has_atomic = "32"))]
+type Locks = sync::Irq<Cpu>;
 use boot_protocol::{MemoryKind, MemoryRegion};
 use hal::{Arch, EarlyConsole};
 use mm::phys::{FrameAllocator, bitmap_bytes};
@@ -79,6 +86,33 @@ type AtomicU64 = core::sync::atomic::AtomicU64;
 /// with interrupts masked, which has the same methods.
 #[cfg(not(target_has_atomic = "64"))]
 type AtomicU64 = sync::IrqU64<Cpu>;
+
+/// Counters and flags the image's checks keep in a `static` and update from a handler.
+///
+/// The real atomics where the target has a read-modify-write to do it in one instruction.
+/// On rv32i it has none at any width: a naturally aligned word still loads and stores
+/// atomically, so `core`'s types exist, but `fetch_add`, `fetch_or` and `swap` do not.
+/// The masked stand-ins have the same methods, which is what lets the code above this
+/// line be written once.
+#[cfg(target_has_atomic = "32")]
+type AtomicU32 = core::sync::atomic::AtomicU32;
+#[cfg(not(target_has_atomic = "32"))]
+type AtomicU32 = sync::IrqU32<Cpu>;
+#[cfg(target_has_atomic = "ptr")]
+type AtomicUsize = core::sync::atomic::AtomicUsize;
+#[cfg(not(target_has_atomic = "ptr"))]
+type AtomicUsize = sync::IrqUsize<Cpu>;
+#[cfg(target_has_atomic = "8")]
+type AtomicBool = core::sync::atomic::AtomicBool;
+#[cfg(not(target_has_atomic = "8"))]
+type AtomicBool = sync::IrqBool<Cpu>;
+
+/// A value built once and then shared: through a compare-and-swap claim where there is
+/// one, and through interrupt masking on a uniprocessor that has none.
+#[cfg(target_has_atomic = "8")]
+type BootOnce<T> = sync::CasOnce<T, Cpu>;
+#[cfg(not(target_has_atomic = "8"))]
+type BootOnce<T> = sync::IrqOnce<T, Cpu>;
 
 /// Entry from the architecture's boot code, which has already established a stack,
 /// whatever execution mode the target needs, and an identity mapping.

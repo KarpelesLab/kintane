@@ -226,16 +226,18 @@ jobs:
           fail=0
           for p in config/presets/*.preset; do
             name=$(basename "$p" .preset)
-            # A guard page is an unmapped page, so a preset without an MMU has none, and
-            # the configuration refuses the test mode there (it depends on MM_PAGED).
+            # A guard that faults: an unmapped page on a kernel with an MMU, or a locked
+            # PMP region on a core with Physical Memory Protection and no MMU. A preset with
+            # neither has no guard, and the configuration refuses the test mode there.
             ./kbuild/target/release/kbuild config --preset "$name" > /dev/null
-            if ! grep -q '^MM_PAGED=y' .config; then
-              echo "stack guard skipped: $name has no MMU"
+            if ! grep -qE '^(MM_PAGED|ARCH_HAS_PMP)=y' .config; then
+              echo "stack guard skipped: $name has neither an MMU nor PMP"
               continue
             fi
             echo "::group::stack guard $name"
-            # The image overflows its boot stack and passes only if the fault that ends
-            # the run is on the guard page. See docs/testing.md.
+            # The image overflows its boot stack, or on a PMP core touches the guard from a
+            # healthy stack, and passes only if the fault that ends the run is on the guard.
+            # See docs/testing.md.
             if ./kbuild/target/release/kbuild run --preset "$name" \
                 --set QEMU_EXIT=y --set STACK_GUARD_TEST=y --timeout 60; then
               echo "stack guard ok: $name"
@@ -253,16 +255,23 @@ jobs:
           fail=0
           for p in config/presets/*.preset; do
             name=$(basename "$p" .preset)
-            # Both modes fault on an unmapped page; see the stack guard step.
+            # The thread guard needs an MMU or PMP; see the stack guard step. The null
+            # dereference needs page 0 unmapped, which only a kernel with an MMU has.
             ./kbuild/target/release/kbuild config --preset "$name" > /dev/null
-            if ! grep -q '^MM_PAGED=y' .config; then
-              echo "thread stack guard and null dereference skipped: $name has no MMU"
+            if ! grep -qE '^(MM_PAGED|ARCH_HAS_PMP)=y' .config; then
+              echo "thread stack guard and null dereference skipped: $name has neither an MMU nor PMP"
               continue
+            fi
+            modes="THREAD_STACK_GUARD_TEST"
+            if grep -q '^MM_PAGED=y' .config; then
+              modes="$modes NULL_DEREF_TEST"
+            else
+              echo "null dereference skipped: $name has no MMU, so page 0 is not unmapped"
             fi
             # A kernel thread overflows its own stack and must fault on that stack's guard,
             # not the boot stack's and not in the stack below. Then a read of address zero
             # must fault and be reported as a null dereference.
-            for mode in THREAD_STACK_GUARD_TEST NULL_DEREF_TEST; do
+            for mode in $modes; do
               echo "::group::$mode $name"
               if ./kbuild/target/release/kbuild run --preset "$name" \
                   --set QEMU_EXIT=y --set "$mode=y" --timeout 60; then
@@ -333,12 +342,13 @@ jobs:
           host=$($rustc -vV | sed -n 's/^host: //p')
           nm="$($rustc --print sysroot)/lib/rustlib/$host/bin/llvm-nm"
           fail=0
-          for name in x86_64-qemu i686-qemu aarch64-virt riscv32-virt armv7m-mps2; do
+          for name in x86_64-qemu i686-qemu aarch64-virt riscv32-virt riscv32i-virt armv7m-mps2; do
             case $name in
               x86_64-qemu) image=build/x86_64-kintane/out/kintane.mb32.elf ;;
               i686-qemu) image=build/i686-kintane/out/kintane.img.elf ;;
               aarch64-virt) image=build/aarch64-kintane/out/kintane.img.elf ;;
               riscv32-virt) image=build/riscv32-kintane/out/kintane.img.elf ;;
+              riscv32i-virt) image=build/riscv32i-kintane/out/kintane.img.elf ;;
               armv7m-mps2) image=build/armv7m-kintane/out/kintane.img.elf ;;
             esac
             for crash in PANIC:kintane::crash::nested_panic FAULT:arch::backtrace::undefined_instruction; do

@@ -202,14 +202,36 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
 
     if res.is_on("ARCH_RISCV32") {
+        // The hart. rv32imac runs on `virt`'s default. The no-atomics image must run on a
+        // hart that refuses what it avoids, so it gets `rv32` with the A extension switched
+        // off — and Zawrs, which QEMU refuses to keep without it — and M and C with them:
+        // an atomic, multiply, divide or compressed instruction is then illegal. Not
+        // `-cpu rv32i`: QEMU's `rv32i` model has no Zicsr either, and a machine-mode kernel
+        // cannot run without CSRs; its first instruction, `csrw mie, zero`, traps.
+        let cpu = if res.is_on("RISCV32_NO_ATOMICS") {
+            vec![
+                s("-cpu"),
+                s(concat!(
+                    "rv32,a=false,zawrs=false,",
+                    "m=false,zmmul=false,",
+                    "c=false,zca=false,zcf=false,zcd=false"
+                )),
+            ]
+        } else {
+            Vec::new()
+        };
         return Ok(Machine {
             binary: "qemu-system-riscv32",
-            args: vec![
+            args: [
                 // No firmware: the reset vector jumps straight to the image in M-mode,
                 // with the hart ID in a0 and the device tree in a1. `virt` always has
                 // the sifive_test finisher, which is the result channel.
                 s("-machine"),
                 s("virt"),
+            ]
+            .into_iter()
+            .chain(cpu)
+            .chain([
                 s("-bios"),
                 s("none"),
                 s("-m"),
@@ -228,7 +250,8 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 s("int,guest_errors"),
                 s("-D"),
                 log.display().to_string(),
-            ],
+            ])
+            .collect(),
             // sifive_test's pass value powers off with status 0, like aarch64's
             // semihosting, and the harness treats a timeout as a failure for the same
             // reason.

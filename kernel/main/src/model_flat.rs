@@ -69,8 +69,34 @@ pub fn demand_check(
     Check::Skipped
 }
 
-/// No test mode here needs anything but an MMU, and the configuration refuses them
-/// without `MM_PAGED`.
+/// The stack-guard test modes, on a core whose Physical Memory Protection can make a
+/// guard fault without an MMU.
+///
+/// Each touches a guard rather than overflowing into it: a machine-mode trap runs on the
+/// stack it interrupts, so a real overflow would take its trap on the overflowed stack
+/// with nowhere to escape to (see `arch::kspace`). The null-dereference mode needs page 0
+/// unmapped, which only a paged kernel has, so the configuration refuses it here.
+#[cfg(CONFIG_ARCH_HAS_PMP)]
+pub fn test_modes(c: &dyn EarlyConsole, boot: Check) {
+    if kconfig::STACK_GUARD_TEST {
+        if boot == Check::Failed {
+            crate::finish(false);
+        }
+        c.write_str("\n  touching the boot stack's guard region\n");
+        arch::kspace::provoke_guard_fault();
+    }
+    if kconfig::THREAD_STACK_GUARD_TEST {
+        if boot == Check::Failed {
+            crate::finish(false);
+        }
+        c.write_str("\n  touching a kernel thread stack's guard region\n");
+        arch::kspace::provoke_thread_guard_fault();
+    }
+}
+
+/// No test mode here without an MMU or PMP to make a guard fault: the configuration
+/// refuses them.
+#[cfg(not(CONFIG_ARCH_HAS_PMP))]
 pub fn test_modes(_c: &dyn EarlyConsole, _boot: Check) {}
 
 /// Free-list entries for the check. The map's ranges, the holes the reservations cut, and
