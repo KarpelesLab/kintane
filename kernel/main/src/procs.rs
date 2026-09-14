@@ -466,15 +466,18 @@ static CYCLES: AtomicU64 = AtomicU64::new(0);
 const RAN_SLICES: u64 = 16;
 
 /// Slices it may be passed over for — ready on its CPU while a thread no more urgent runs
-/// there — while making no progress. Round robin passes it over once for each of the four
-/// busy workloads that share its level; sixty-four is a queue that never reaches it.
+/// there — for each slice it ran, while making no progress. Round robin passes it over once
+/// for each of the four busy workloads that share its level; sixty-four to one is a queue
+/// that does not reach it. Per slice run, because a thread taking its turns among peers
+/// reaches sixty-four passes at about the moment it reaches [`RAN_SLICES`]: counted alone,
+/// a process that ran without advancing was reported as passed over.
 const PASSED_SLICES: u64 = 64;
 
 /// The longest a cycle waits when neither count reaches its bound, which only a thread that
 /// neither runs nor is passed over can do: one that is blocked, queued on a CPU taking no
 /// interrupts, or ready behind more urgent threads. Fixed priority allows that last, and
 /// only its length tells a busy moment from starvation, so this one bound is still guest
-/// time. It is sixty-two of the old windows, and a fifth of the thirty seconds kbuild allows
+/// time. It is sixty-two of the old windows, and a sixth of the thirty seconds kbuild allows
 /// between heartbeats.
 const STARVE_WAIT: Duration = Duration::from_nanos(5_000_000_000);
 
@@ -487,7 +490,7 @@ enum Waited {
     Done,
     /// It ran [`RAN_SLICES`] without making progress.
     Ran,
-    /// It was passed over for [`PASSED_SLICES`] without making progress.
+    /// It was passed over for [`PASSED_SLICES`] per slice it ran, without making progress.
     PassedOver,
     /// [`STARVE_WAIT`] passed with neither.
     Starved,
@@ -521,10 +524,12 @@ fn await_slices(
             return Waited::Lost;
         };
         if !moving() {
-            if now.ran.wrapping_sub(start.ran) >= RAN_SLICES {
+            let ran = now.ran.wrapping_sub(start.ran);
+            if ran >= RAN_SLICES {
                 return Waited::Ran;
             }
-            if now.passed.wrapping_sub(start.passed) >= PASSED_SLICES {
+            let passed = now.passed.wrapping_sub(start.passed);
+            if passed >= PASSED_SLICES.saturating_mul(ran + 1) {
                 return Waited::PassedOver;
             }
         }

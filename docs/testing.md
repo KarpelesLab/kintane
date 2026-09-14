@@ -956,6 +956,59 @@ only place the harness looks at console output, and it looks only for the absenc
 line. A pass is still only the exit code. The run also drops QEMU's per-interrupt log,
 which a day of timer interrupts would grow past any disk.
 
+**The user process cycle is judged in slices, not wall-clock time.** Between audits the
+auditor builds a process, waits for it to make progress (on one CPU) or to be served on
+each of two pinned CPUs, stops it and tears it down (`procs::stress_cycle`). On one CPU the
+first wait used to be a fixed 80 ms of guest time. Under TCG the guest's clock follows the
+host's, so on a loaded host that window measured the host. A vCPU the host did not run
+still ran out its window, and the fixed-rate sleepers above the process took a larger share
+of what the vCPU did execute. The 20-second run on `x86_64-qemu` failed three times in the
+seventh round with `user process: a process made no progress`, each time passing when rerun
+alone.
+
+Every wait in the cycle is now judged by what the scheduler gave the thread, as the timer
+interrupt counts it ([architecture](architecture.md)): slices it *ran*, and slices it was
+*passed over* for (ready on its CPU while a thread no more urgent ran there).
+
+- **It ran 16 slices and made no progress:** a process that runs without advancing fails,
+  however long that took.
+- **It was passed over for 64 slices per slice it ran, and made no progress:** a thread the
+  queue does not reach fails too. Round robin passes it over once for each of the four busy
+  workloads at its level. The bound was first 64 slices in total. The falsification below
+  showed that a process which runs without advancing reaches that at about the same moment it
+  reaches 16 slices run, and it was reported as passed over. Counting passes per slice run
+  leaves a thread that runs to the first rule.
+- **It did neither for 5 s:** the remaining case is a thread that is blocked, queued on a CPU
+  taking no interrupts, or ready behind more urgent threads. Fixed priority allows the last
+  of these, and only its length tells a busy moment from starvation, so this bound is still
+  guest time. It is 62 times the old window, and a sixth of the watchdog's 30 s.
+
+The heartbeat reports the most slices of each kind any passing wait needed. Unloaded,
+`x86_64-qemu` needs at most 2 run slices and 9 passed-over slices.
+
+**Under load.** Six other QEMU guests, each running this stress kernel on four vCPUs
+(host load average 13 to 24 on 16 cores), ran beside the single-CPU 20-second run:
+
+| Check | Runs | Failed |
+|---|---|---|
+| The old 80 ms window | 10 | 9: eight `a process made no progress`, one in the boot `preempt` check (below) |
+| Slices | 10 | 0; at most 5 slices run and 17 passed over before progress |
+
+With only other agents' work loading the host, the old window also failed 2 runs in 20.
+
+**Other wall-clock bounds**, and why each stays:
+
+- the stress audit's *progress since the last audit* (1 s): a workload that blocks on every
+  iteration needs one slice a second, and a real starvation must still fail it;
+- `sleep`'s 500 ms lateness and the boot `sleep` check's three slices: lateness *is* wall
+  time, and what they check;
+- `waits`' 10 s and 5 s patience, `procs::wait_exit`'s 1 s drain in the boot check, and
+  `PARK_WITHIN`'s 3 s: generous bounds on something that normally takes milliseconds;
+- the boot `preempt` check, which requires 12 interrupts in 300 ms and a 20 ms wake-up.
+  Under the load above it failed once: 11 interrupts, and a wake 51.8 ms late. It checks
+  interrupt delivery and latency, which are wall-clock properties, so it was not changed.
+  It is the next check a loaded host can break.
+
 **What each check was shown to catch**, by breaking the code and watching the run fail:
 
 | Mutation | Result |

@@ -1245,6 +1245,17 @@ split where the knowledge actually is:
   a call, and the thread that resumes calls into the same table; with `&mut self` that
   is two live exclusive references to one object.
 
+**What each thread was given is counted in slices, not time.** Every timer interrupt, before
+it wakes or switches anything, calls `Threads::charge` for its CPU: the running thread's
+`ran` count goes up by one, and so does the `passed` count of every thread ready on that CPU
+at a priority no lower than the running one's (`preempt::slices` reads both). A duration
+would be the obvious measure and is the wrong one under an emulator: the guest's clock
+follows the host's, so time charged between two switches includes every moment the host
+did not run the vCPU. A slice is charged once however late its interrupt was. The count is
+statistical — a thread that always blocks before the tick is never charged — and it is
+what checks that wait on a thread use instead of a wall-clock window
+([testing](testing.md#3a-stress)).
+
 **Preemption is `yield_now` called from the timer interrupt.** Each port's `tick`
 module drives a one-shot timer (the local APIC timer on x86_64, PIT mode 0 on i686, the
 generic timer on aarch64) and
