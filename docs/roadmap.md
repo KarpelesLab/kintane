@@ -11,11 +11,65 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 0 — Build system and first boot | **done**, including `kinboot-efi` |
 | 1 — The portability spine | **done**, including `kinboot-bios` |
 | 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
-| 3 — SMP and the device model | aarch64 and x86_64 SMP on one scheduler, devices from FDT and from ACPI/PCIe; 8 CPUs boot, 4 CPUs stress |
-| 4 — Configurability, scaling down | riscv32 and ARMv7-M ports, `mm::flat`, loadable modules, the full config language, random configs, size budgets |
+| 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
+| 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
 | 5 — Driver isolation | not started |
-| 6 — Userspace and the Linux personality | first native slice: processes, syscalls, an init program on x86_64 and aarch64 |
-| 7 onward | not started |
+| 6 — Userspace and the Linux personality | processes on the scheduler with their own address spaces, on x86_64 and aarch64 |
+| 7 — Real hardware and real work | started early: a block layer and a virtio-blk driver |
+
+### The fifth round of landings
+
+Fourteen presets now build and boot. Six branches landed, plus one integration fix.
+
+- **Phase 3 is finished.** Both SMP ports boot eight CPUs and pass the stress run there:
+  60 seconds, every audit, work on every CPU, with 300k+ TLB shootdowns and tens of
+  thousands of migrations per run.
+- **Device interrupts through the device model.** A bound driver's handler is registered
+  before its line is unmasked, and aarch64's GIC, x86_64's I/O APIC and i686's 8259A all
+  hand device lines to one table. The PL011 and a new 16550 driver receive on interrupt:
+  every x86 and aarch64 boot has the harness type a string that must arrive that way, and
+  the PCs unbind and rebind the driver in between with nothing left claimed.
+- **Storage.** `kernel/block` gives drivers one fallible, allocation-free interface;
+  `drivers/block/virtio-blk` is the first driver with DMA, host-tested against a fake
+  device. Both aarch64 presets read and write a build-time pattern disk on every boot.
+- **Processes on the scheduler.** A thread carries its address space, and the context
+  switch loads it wherever the thread lands. Two workers run concurrently, each reading
+  only its own memory at the same address, while a third is killed for touching kernel
+  memory. The stress run migrates a process between CPUs every second.
+- **Single-provider dispatch and the ARMv7-M RAM diet.** A build with one interrupt
+  controller driver has no indirect call on the interrupt path, while the default aarch64
+  image still picks GICv2 or GICv3 at run time from one binary. `armv7m-tiny` boots in
+  **55.9 KiB of RAM**, down from 329 KiB; flash is 64.6 KiB, 0.6 KiB over the goal.
+- **rv32i without atomics boots**, on a QEMU hart with A, M and C switched off — the case
+  [portability.md](portability.md) has claimed since Phase 1. The rv32imac image dies on
+  that hart at its first atomic instruction, which is how we know the hart refuses them.
+  riscv32 also gained PMP stack guards.
+
+**Three bugs that only integration could find**, each invisible to the branch that
+carried the code:
+
+- **A silent placement.** Every path that moves a thread to another CPU announces where it
+  went and interrupts that CPU — except a yield from a CPU the thread's affinity no longer
+  allows. An idle CPU sleeps until interrupted, so a process sat *ready on the CPU it had
+  been pinned to, never scheduled*, while four CPUs idled. At four CPUs the run queues are
+  never empty, so it could not appear; at eight it did. The check that found it was itself
+  hiding it, reporting a stale symptom ("a process did not stop when told") instead of the
+  cause.
+- **A size that came from configuration, and two tables that did not.** The thread-stack
+  array grew with the CPU count, but the per-port slot-name table and the address-space
+  planner's limit were still the literal `16`. A stress build at eight CPUs lays out
+  seventeen, so the kernel refused its own address space. The count is derived once now,
+  and both tables read it.
+- **`sync::IrqLock` registered with the lock-order checker before masking interrupts.** A
+  timer interrupt in that window looked like recursion and halted the CPU. No image had
+  used interrupt masking as its lock family until rv32i did; any uniprocessor build would
+  have hit it.
+
+**What the parallel work costs.** Two branches independently made thread-stack sizing
+configuration-driven, with two generators and two symbol names; merging them was a design
+decision, not a textual one. Three agents stalled waiting on their own background runs.
+The integration tax is paid by whoever merges, and it is the honest price of six branches
+at once.
 
 ### The fourth round of landings
 
