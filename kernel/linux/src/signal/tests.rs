@@ -15,6 +15,17 @@ fn delivery(sig: u64) -> Delivery {
         old_mask: bit(SIGTERM) | bit(SIGCHLD),
         code: SI_USER,
         pid: 3,
+        addr: None,
+    }
+}
+
+/// The same delivery, as a fault raises it: `si_addr` in place of the sender's pid.
+fn fault_delivery(sig: u64, addr: u64) -> Delivery {
+    Delivery {
+        code: SI_KERNEL,
+        pid: 0,
+        addr: Some(addr),
+        ..delivery(sig)
     }
 }
 
@@ -151,6 +162,26 @@ fn an_aarch64_frame_is_laid_out_as_linux_lays_it_and_reads_back() {
     let r = restore(abi, &bytes[..len], START, END).expect("a frame this built");
     assert_eq!(r.regs, ctx);
     assert_eq!(r.mask, d.old_mask);
+}
+
+#[test]
+fn a_faults_siginfo_carries_the_address_where_a_sent_signals_carries_a_pid() {
+    // The two fields share their bytes, so what a handler reads depends on which signal it
+    // was sent: `si_addr` for a fault, `si_pid` for a signal a process sent.
+    for (abi, info_at) in [(Abi::X86_64, 312), (Abi::Aarch64, 0)] {
+        let ctx = context(abi);
+        let addr = START + 0x9_1000;
+        let f = build(abi, &ctx, &fault_delivery(SIGSEGV, addr), START, END).expect("room");
+        assert_eq!(&f.head[info_at..info_at + 4], &(SIGSEGV as u32).to_le_bytes(), "{abi:?}");
+        assert_eq!(&f.head[info_at + 8..info_at + 12], &SI_KERNEL.to_le_bytes(), "{abi:?}");
+        assert_eq!(u64::from_le_bytes(array8(&f.head, info_at + 16)), addr, "{abi:?}");
+
+        let sent = build(abi, &ctx, &delivery(SIGUSR1), START, END).expect("room");
+        assert_eq!(&sent.head[info_at + 16..info_at + 20], &3u32.to_le_bytes(), "{abi:?}");
+        // A fault's signal is one a fault raises; one a process sent is not.
+        assert!(from_fault(SIGSEGV) && from_fault(SIGFPE) && from_fault(SIGILL));
+        assert!(!from_fault(SIGUSR1) && !from_fault(SIGCHLD) && !from_fault(SIGKILL));
+    }
 }
 
 #[test]

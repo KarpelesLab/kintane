@@ -79,6 +79,27 @@ and TLB maintenance, atomic primitives where the ISA needs help. This is where
 assembly lives and where the `unsafe` budget is spent. One `arch` crate is linked per
 image.
 
+#### Entries that save every register, and why some must
+
+A signal frame holds every register a thread had, because the handler it runs is the
+program's own code and may clobber the caller-saved registers the interrupted code was
+using. So any vector that can deliver a signal has to reach those registers.
+
+aarch64 always could: its exception entry saves `x0`–`x30`, `SP_EL0`, `ELR_EL1` and
+`SPSR_EL1` into a `TrapFrame` that the Rust handler is handed. x86_64 could not. Its
+handlers use the `extern "x86-interrupt"` ABI, which is what makes a handler whose
+signature disagrees with what the CPU pushes a compile error rather than a wild `iret` —
+and which saves the interrupted registers wherever the compiler likes, so a handler can
+read the return address and the stack pointer but not `rbx` or `r12`.
+
+The vectors that can reach user code are therefore entered from assembly instead
+(`idt::trap_entry`): the PIT, the local APIC timer and the reschedule IPI, which deliver
+on the way back to a thread that may never make a system call, and `#DE`, `#UD`, `#GP` and
+`#PF`, whose faults a process may handle itself. Each pushes the general registers, the
+vector, and a zero where the CPU pushes no error code, giving one `idt::TrapFrame` layout
+for every vector; the `repr(C)` struct and the push order are one layout in two languages.
+Everything else keeps the typed entries, which are shorter and check themselves.
+
 ### `mm` — memory management
 
 Two interchangeable implementations selected by config:

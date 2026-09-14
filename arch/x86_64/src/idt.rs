@@ -51,15 +51,6 @@ pub type Handler = extern "x86-interrupt" fn(InterruptFrame);
 pub type DivergingHandler = extern "x86-interrupt" fn(InterruptFrame) -> !;
 /// An entry point for a vector that pushes an error code and does not return.
 pub type HandlerWithCode = extern "x86-interrupt" fn(InterruptFrame, u64) -> !;
-/// An entry point for a vector that pushes an error code and may return.
-///
-/// Distinct from [`HandlerWithCode`] rather than a relaxation of it: a diverging
-/// handler is a promise that the interrupted instruction never runs again, and #PF is
-/// the vector where that promise stops being true. A handler that resolves the fault
-/// and returns causes the faulting instruction to re-execute, which is the entire
-/// mechanism behind demand paging, copy-on-write and a guard page that grows a stack.
-pub type ResumableHandlerWithCode = extern "x86-interrupt" fn(InterruptFrame, u64);
-
 /// The address of an interrupt entry point, with its ABI shape already checked.
 ///
 /// The constructor names are the whole point: an entry point can only reach
@@ -86,12 +77,126 @@ impl EntryPoint {
         EntryPoint(f as usize)
     }
 
-    /// A handler for a vector that pushes an error code and may return to the
-    /// interrupted instruction, which then re-executes.
-    pub fn resumable_with_code(f: ResumableHandlerWithCode) -> EntryPoint {
-        EntryPoint(f as usize)
+    /// An entry point written in assembly, which saves the interrupted general registers
+    /// itself rather than letting the compiler choose where to keep them.
+    ///
+    /// The four constructors above buy their safety from the `x86-interrupt` ABI, which is
+    /// also what makes them useless to a handler that must *read* the interrupted registers:
+    /// the ABI saves them where only the compiler knows. A signal frame holds every register
+    /// a thread had, so the vectors that can deliver one to user code — the scheduler's
+    /// interrupts and the faults a program can raise — are entered this way instead. See
+    /// `user::traps`, which writes them and owns the layout they push.
+    ///
+    /// # Safety
+    /// `entry` must be an assembly entry point built for exactly this vector: it must pop an
+    /// error code if and only if the vector pushes one, restore every register it saved, and
+    /// leave the stack as the CPU left it before its `iretq`.
+    pub unsafe fn raw(entry: unsafe extern "C" fn()) -> EntryPoint {
+        EntryPoint(entry as usize)
     }
 }
+
+/// Every register a trap took from the code it interrupted, as [`trap_entry`] saves them.
+///
+/// `repr(C)` and the push order in that macro are one layout in two languages: the general
+/// registers lowest, in the order the pushes leave them, then the vector and the error code
+/// the entry made uniform, then the frame the CPU itself pushed.
+///
+/// The `x86-interrupt` handlers above cannot offer this. That ABI saves the interrupted
+/// registers wherever the compiler likes, so a handler can read the return address and the
+/// stack pointer but not `rbx` or `r12` — and a signal frame has to hold every one of them,
+/// because the handler it runs is free to clobber the caller-saved registers the interrupted
+/// code was using. Vectors that can deliver a signal are therefore entered from assembly that
+/// saves the lot.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct TrapFrame {
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    /// The vector, which the entry pushes because the CPU does not.
+    pub vector: u64,
+    /// The error code the CPU pushed, or zero where the vector pushes none.
+    pub error: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+impl TrapFrame {
+    /// The frame the CPU pushed, for the reporting paths that take one.
+    pub fn interrupt_frame(&self) -> InterruptFrame {
+        InterruptFrame {
+            rip: self.rip,
+            cs: self.cs,
+            rflags: self.rflags,
+            rsp: self.rsp,
+            ss: self.ss,
+        }
+    }
+}
+
+/// Define an assembly entry point for `vector` that saves every register into a [`TrapFrame`]
+/// and calls `handler` with it.
+///
+/// `$error` says whether the CPU pushes an error code for this vector: where it does not, the
+/// entry pushes a zero in its place, so one frame layout serves every vector. The call is made
+/// on a 16-byte-aligned stack, as the C ABI requires, with the frame's address in `rdi`; `r15`
+/// keeps the real stack pointer across the call, which is sound because the frame already
+/// holds the interrupted `r15` and the pops read it back from there.
+macro_rules! trap_entry {
+    // A vector the CPU pushes no error code for: the entry pushes a zero in its place, so one
+    // frame layout serves every vector.
+    ($name:ident, $vector:literal, $handler:path) => {
+        $crate::idt::trap_entry!(@asm $name, $vector, $handler, "push 0");
+    };
+    // A vector that pushes one: it is already where the frame wants it.
+    (with_code $name:ident, $vector:literal, $handler:path) => {
+        $crate::idt::trap_entry!(@asm $name, $vector, $handler, "");
+    };
+    (@asm $name:ident, $vector:literal, $handler:path, $error:literal) => {
+        core::arch::global_asm!(
+            concat!(".section .text, \"ax\"\n.globl ", stringify!($name), "\n", stringify!($name), ":"),
+            $error,
+            concat!("push ", $vector),
+            "push r15", "push r14", "push r13", "push r12", "push r11", "push r10",
+            "push r9", "push r8", "push rbp", "push rdi", "push rsi", "push rbx",
+            "push rdx", "push rcx", "push rax",
+            "mov rdi, rsp",
+            "mov r15, rsp",
+            "and rsp, -16",
+            "call {handler}",
+            "mov rsp, r15",
+            "pop rax", "pop rcx", "pop rdx", "pop rbx", "pop rsi", "pop rdi", "pop rbp",
+            "pop r8", "pop r9", "pop r10", "pop r11", "pop r12", "pop r13", "pop r14",
+            "pop r15",
+            // The vector and the error code, which `iretq` does not pop.
+            "add rsp, 16",
+            "iretq",
+            handler = sym $handler,
+        );
+
+        unsafe extern "C" {
+            pub(crate) fn $name();
+        }
+    };
+}
+
+pub(crate) use trap_entry;
 
 /// A 64-bit IDT gate descriptor.
 #[derive(Clone, Copy)]

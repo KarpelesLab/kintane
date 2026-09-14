@@ -62,6 +62,7 @@ config BOOT_STACK_KIB
     default 32 if SMP
     default 32 if STRESS_TEST
     default 32 if INKERNEL_TESTS
+    default 32 if ABI_LINUX
     default 16
     help
         The stack the first thread of execution runs on, with a guard below it.
@@ -77,6 +78,13 @@ config BOOT_STACK_KIB
         where the port has pages, and asserts it; kbuild refuses a linked
         kernel whose __stack_bottom..__stack_top is any other size. Every boot
         reports how deep it used the stack, and fails past 75% of it.
+
+        A build with the Linux personality takes 32 KiB for a second reason: the
+        boot-time slice runs a Linux program on the boot thread itself, so a
+        signal delivered to it — from its own system call, or from the timer
+        interrupt that finds it spinning — builds the frame on this stack.
+        aarch64's frame is the larger, and staging its head took the deepest
+        boot to 81% of 16 KiB, past the 75% the check allows.
 
         An in-kernel test image runs its suite on the boot stack and reached
         78% of 16 KiB on x86_64 once the ninth round's landings grew it, so it

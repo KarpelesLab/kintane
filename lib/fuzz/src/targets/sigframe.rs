@@ -58,6 +58,9 @@ pub fn generate(rng: &mut Rng, _seeds: &[Vec<u8>]) -> Vec<u8> {
         old_mask: rng.next_u64(),
         code: signal::SI_USER,
         pid: rng.next_u32(),
+        // Half the frames are a fault's, whose `siginfo` carries the faulting address where
+        // the others carry a pid.
+        addr: rng.one_in(2).then(|| rng.next_u64()),
     };
     if let Ok(built) = signal::build(abi, &ctx, &d, USER_START, USER_END) {
         bytes.extend_from_slice(&built.head[..abi.restore_len()]);

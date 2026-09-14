@@ -22,6 +22,8 @@
 //! * `serve`: [`serve`], a TCP server kbuild connects to through a port QEMU forwards.
 //! * `files`: [`files`], writing the test disk: create, write, append, truncate, directories,
 //!   rename and remove, and a file left for kbuild to read after the guest exits.
+//! * `faults`: [`faults`], a handler run for a thread that only spins, and handlers for the faults
+//!   a program raises itself.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -176,6 +178,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"tcp" => tcp(s.arg),
         b"serve" => serve(),
         b"files" => files(),
+        b"faults" => faults(),
         _ => hello(&s),
     }
 }
@@ -795,6 +798,109 @@ fn signals() -> ! {
     let status = wait_child(child, 132);
     expect(status == SIGKILL as u32, if status == 131 << 8 { 131 } else { 132 });
     exit(SIGNALS_SUCCESS)
+}
+
+// ---- faults: a handler from an interrupt, and handlers for a program's own faults ---------
+
+/// Exits with this when every step behaved; `kernel/main/src/personality/signals.rs` mirrors it.
+const FAULTS_SUCCESS: u64 = 54;
+const SIGSEGV: u64 = 11;
+
+static SPIN_HITS: AtomicU64 = AtomicU64::new(0);
+static SPIN_READY: AtomicU64 = AtomicU64::new(0);
+static SPIN_TID: AtomicU32 = AtomicU32::new(u32::MAX);
+static SEGV_HITS: AtomicU64 = AtomicU64::new(0);
+static SEGV_ADDR: AtomicU64 = AtomicU64::new(0);
+static ARITH_HITS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn on_spin(_sig: i32) {
+    SPIN_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The thread [`faults`] signals: it spins in user mode and makes no system call at all, so
+/// nothing but an interrupt can deliver to it.
+extern "C" fn spinner() -> u64 {
+    SPIN_READY.store(1, Ordering::Release);
+    while SPIN_HITS.load(Ordering::Relaxed) == 0 {
+        core::hint::spin_loop();
+    }
+    0
+}
+
+/// `SIGSEGV`: `si_addr` names the address that faulted. Returning would run the store again,
+/// so the handler steps over it through the saved program counter, as [`on_arith`] does — and
+/// that the thread comes back at all is what proves the frame holds the context the fault was
+/// taken with.
+extern "C" fn on_segv(_sig: i32, info: *const u64, uc: *mut u8) {
+    SEGV_HITS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the `siginfo` the kernel pushed; `si_addr` is its third word.
+    let addr = unsafe { *info.add(2) };
+    SEGV_ADDR.store(addr, Ordering::Relaxed);
+    // SAFETY: as in `on_arith`: the `ucontext`'s saved program counter.
+    unsafe { uc.add(sys::UC_PC).cast::<u64>().write(sys::after_store()) };
+}
+
+/// The architecture's arithmetic trap. Returning would run the instruction again, so the
+/// handler steps over it by pointing the saved program counter past it — which is also what
+/// proves the frame's program counter is where the kernel says it is.
+extern "C" fn on_arith(_sig: i32, _info: *const u64, uc: *mut u8) {
+    ARITH_HITS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `uc` is the `ucontext` the kernel pushed, whose `sigcontext` keeps the program
+    // counter at this architecture's fixed offset.
+    unsafe { uc.add(sys::UC_PC).cast::<u64>().write(sys::after_arith()) };
+}
+
+fn faults() -> ! {
+    let pid = sys::call(sys::GETPID, [0; 6]) as u64;
+
+    // 210–212: a thread that only spins runs its handler. Its signal cannot wait for a system
+    // call, because it makes none: the timer interrupt that finds it is the delivery.
+    expect(sigaction(SIGUSR1, on_spin as *const () as u64, 0) == 0, 210);
+    let stack = map(4 * PAGE);
+    let block = map(PAGE);
+    expect(stack > 0 && block > 0, 210);
+    let mut parent_tid = 0u32;
+    let tid = sys::clone_thread(
+        (stack as u64) + 4 * PAGE,
+        &raw mut parent_tid,
+        SPIN_TID.as_ptr(),
+        block as u64,
+        spinner,
+    );
+    expect(tid > 0, 211);
+    while SPIN_READY.load(Ordering::Acquire) == 0 {
+        yield_now();
+    }
+    for _ in 0..LINGER {
+        yield_now();
+    }
+    expect(sys::call(sys::TGKILL, [pid, tid as u64, SIGUSR1, 0, 0, 0]) == 0, 211);
+    join(&SPIN_TID, 212);
+    expect(SPIN_HITS.load(Ordering::Relaxed) == 1, 212);
+
+    // 213–216: a store to an address with no mapping raises SIGSEGV; `si_addr` names exactly
+    // the address, and the handler steps over the store so the thread carries on.
+    let spare = map(PAGE);
+    expect(spare > 0, 213);
+    let gone = spare as u64;
+    expect(sys::call(sys::MUNMAP, [gone, PAGE, 0, 0, 0, 0]) == 0, 213);
+    expect(sigaction(SIGSEGV, on_segv as *const () as u64, SA_SIGINFO) == 0, 214);
+    // The store faults; the handler sends the thread to the instruction after it.
+    sys::bad_store(gone);
+    expect(SEGV_HITS.load(Ordering::Relaxed) == 1, 215);
+    expect(SEGV_ADDR.load(Ordering::Relaxed) == gone, 216);
+
+    // 217–218: the architecture's arithmetic trap — a division by zero on x86_64, an
+    // undefined instruction on aarch64 — raises its signal, and the handler steps over it.
+    expect(sigaction(sys::ARITH_SIG, on_arith as *const () as u64, SA_SIGINFO) == 0, 217);
+    sys::raise_arith();
+    expect(ARITH_HITS.load(Ordering::Relaxed) == 1, 218);
+
+    // 219: both dispositions go back to the default, which is also the last proof that the
+    // process is still its own after three handlers.
+    expect(sigaction(SIGSEGV, SIG_DFL, 0) == 0, 219);
+    expect(sigaction(sys::ARITH_SIG, SIG_DFL, 0) == 0, 219);
+    exit(FAULTS_SUCCESS)
 }
 
 // ---- tcp and serve: sockets ---------------------------------------------------------------

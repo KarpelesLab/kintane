@@ -568,8 +568,22 @@ handler to the default while an ignored signal stays ignored.
   the port's `set_registers`, which sanitises the address and the flags again.
 - **A signal whose action ends the process** is acted on when it is sent, not when a thread
   next returns: the process ends as `exit_group` ends it, a thread spinning in user mode
-  included. A handler, though, waits for its thread's next system call, since the interrupt path
-  has no registers to build a frame from.
+  included.
+- **A handler runs wherever the kernel has the thread's registers**, which is no longer only a
+  system call. A scheduler interrupt that took the thread out of user mode — the PIT, the local
+  APIC timer or a reschedule IPI — delivers on its way back, so a thread that spins and calls
+  nothing still runs its handler. That costs x86_64 an assembly entry for those vectors, since
+  the `x86-interrupt` ABI keeps the interrupted registers where only the compiler knows and a
+  frame must hold every one of them; aarch64's exception frame already did.
+- **A fault raises a signal on the thread that faulted**: `SIGSEGV` for a page it may not
+  touch, `SIGBUS`, `SIGFPE` for a division by zero on x86_64, and `SIGILL` for an undefined
+  instruction. Its `siginfo` carries `si_addr` — the faulting address for a page fault, the
+  instruction for the rest — in the bytes a sent signal uses for the sender's pid. Such a
+  signal cannot be held off, because the instruction that raised it runs again the moment the
+  thread does: one that is masked or ignored ends the process, and so does a handler that has
+  returned to the same instruction 16 times without fixing what it was sent for, which on
+  Linux loops forever. A process with no handler is ended and reported by that signal, where
+  every trap used to be reported as `SIGSEGV`.
 - **Blocking calls.** A pipe read or write, a futex wait and `wait4` look for a deliverable signal
   that is not ignored each time they wake, and sending one wakes the personality's queues. The
   call ends with `EINTR` when a handler without `SA_RESTART` runs after it. When the handler has
@@ -607,9 +621,20 @@ no corpus yet for a gap to fail.
 - **Signals are not complete.** Nothing stops a process: `SIGSTOP` is refused, and the default
   action of the other stop signals does nothing. There is no alternate signal stack,
   `rt_sigsuspend`, `rt_sigtimedwait` or `signalfd`. A pending signal is a bit, so a second one
-  sent before the first is delivered is lost, real-time signals included. A handler for a thread
-  spinning in user mode waits for its next system call, and no handler runs for a trap. The frame
-  holds no floating-point state.
+  sent before the first is delivered is lost, real-time signals included: nothing is queued, and
+  `sigqueue` does not exist.
+- **The frame still holds no floating-point or SIMD state,** and that is a gap rather than a
+  choice that is safe on either architecture. The kernel itself cannot clobber those registers
+  — every port is built `+soft-float` with SIMD off, so no kernel instruction touches them, and
+  that is why nothing has needed saving before now. A *handler* is a different matter: it is the
+  program's own code, and one that uses those registers changes them under the code it
+  interrupted, which a program is entitled to assume cannot happen. Saving them means an
+  `fxsave` area behind `sigcontext`'s `fpstate` pointer on x86_64 and an `fpsimd_context` record
+  in aarch64's reserved space, restored by `rt_sigreturn`.
+- **A handler cannot run from every trap.** Delivery from an interrupt covers the scheduler's
+  vectors, so a thread spinning in user mode is reached; a device interrupt that arrives while a
+  process runs still returns without delivering, and the signal waits for the next scheduler
+  interrupt or system call, which is at most a slice away.
 - **Sockets are IPv4 TCP streams only**, with no `poll`, `select` or `epoll` to wait on several
   at once, no `SHUT_RD`, no datagram sockets, and options that are accepted without effect, as
   listed above.

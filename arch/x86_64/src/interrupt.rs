@@ -214,22 +214,75 @@ extern "x86-interrupt" fn irq_entry<const LINE: u8>(frame: idt::InterruptFrame) 
     let irq = IrqNumber(u32::from(LINE));
     dispatch(irq);
     chip.eoi(irq);
+    smp::gs_leave(from_user);
+}
+
+/// A function-call IPI.
+extern "x86-interrupt" fn ipi_call_entry(frame: idt::InterruptFrame) {
+    let from_user = smp::gs_enter(frame.cs);
+    smp::on_ipi(smp::IPI_CALL);
+    irq_chip().eoi(IrqNumber(u32::from(IPI_CALL_VECTOR)));
+    smp::gs_leave(from_user);
+}
+
+/// The last thing a scheduler interrupt does before it returns: one that arrived in user mode
+/// may end the thread there instead, or deliver a signal to it, for which it is given every
+/// register the interrupt took (`hal::user::UserHooks::interrupted` and `deliver`). The two
+/// definitions keep the `cfg` at item level.
+///
+/// # Safety
+/// `frame` is the live trap frame of an interrupt taken from ring 3.
+#[cfg(CONFIG_USERSPACE)]
+unsafe fn returning(frame: *mut idt::TrapFrame) {
+    // SAFETY: forwarded; the frame is live and nothing else refers to it.
+    unsafe { crate::user::interrupted_frame(frame) };
+}
+
+/// No userspace port: nothing runs in ring 3 to return to.
+///
+/// # Safety
+/// None; matches the userspace form's signature.
+#[cfg(not(CONFIG_USERSPACE))]
+unsafe fn returning(_frame: *mut idt::TrapFrame) {}
+
+// ---- the scheduler's interrupts -----------------------------------------------------------
+//
+// The timer on either controller, and the reschedule IPI, are the interrupts that can return
+// to a thread with a signal waiting, so each is entered from assembly that saves every
+// register (`idt::trap_entry`). The rest of the lines keep the `x86-interrupt` entries above:
+// they never return to user code with anything to deliver.
+
+idt::trap_entry!(__trap_pit, 32, on_pit);
+idt::trap_entry!(__trap_timer, 0xEF, on_timer);
+idt::trap_entry!(__trap_reschedule, 0xF1, on_reschedule);
+
+const _: () = assert!(
+    pic::VECTOR_BASE == 32 && TIMER_VECTOR == 0xEF && IPI_RESCHEDULE_VECTOR == 0xF1,
+    "a full-register entry names its vector as a literal; the constants moved"
+);
+
+/// IRQ 0, the PIT: what `irq_entry::<0>` does, plus the chance to deliver a signal.
+extern "C" fn on_pit(frame: *mut idt::TrapFrame) {
+    // SAFETY: the entry built this frame on the kernel stack; it is live for this call.
+    let f = unsafe { &mut *frame };
+    let from_user = smp::gs_enter(f.cs);
+    dispatch(TIMER_IRQ);
+    irq_chip().eoi(TIMER_IRQ);
     // Last, and after the EOI: the hook may switch threads, and this line must be
     // acknowledged before the interrupted thread is suspended. See `tick`.
-    if irq == TIMER_IRQ {
-        tick::run_hook();
-        returning(from_user);
+    tick::run_hook();
+    if from_user {
+        // SAFETY: the frame is live and the interrupt came from ring 3.
+        unsafe { returning(frame) };
     }
     smp::gs_leave(from_user);
 }
 
-/// The local APIC timer.
-///
-/// On the boot CPU it is the scheduler's tick, exactly as IRQ 0 is: counted, acknowledged,
-/// then the hook. On a secondary it is counted in that CPU's block by `smp`, and once the
-/// scheduler owns the CPU it reaches the hook too, after the EOI, as on the boot CPU.
-extern "x86-interrupt" fn timer_entry(frame: idt::InterruptFrame) {
-    let from_user = smp::gs_enter(frame.cs);
+/// The local APIC timer, as `timer_entry` had it, plus the delivery.
+extern "C" fn on_timer(frame: *mut idt::TrapFrame) {
+    // SAFETY: as in `on_pit`.
+    let f = unsafe { &mut *frame };
+    let from_user = smp::gs_enter(f.cs);
     let chip = irq_chip();
     match smp::on_secondary_tick() {
         Some(run_hook) => {
@@ -245,41 +298,29 @@ extern "x86-interrupt" fn timer_entry(frame: idt::InterruptFrame) {
             tick::run_hook();
         }
     }
-    returning(from_user);
+    if from_user {
+        // SAFETY: as in `on_pit`.
+        unsafe { returning(frame) };
+    }
     smp::gs_leave(from_user);
 }
 
-/// A function-call IPI.
-extern "x86-interrupt" fn ipi_call_entry(frame: idt::InterruptFrame) {
-    let from_user = smp::gs_enter(frame.cs);
-    smp::on_ipi(smp::IPI_CALL);
-    irq_chip().eoi(IrqNumber(u32::from(IPI_CALL_VECTOR)));
-    smp::gs_leave(from_user);
-}
-
-/// A reschedule IPI. Once the scheduler owns this CPU, its hook runs after the EOI.
-extern "x86-interrupt" fn ipi_reschedule_entry(frame: idt::InterruptFrame) {
-    let from_user = smp::gs_enter(frame.cs);
+/// A reschedule IPI, as `ipi_reschedule_entry` had it, plus the delivery.
+extern "C" fn on_reschedule(frame: *mut idt::TrapFrame) {
+    // SAFETY: as in `on_pit`.
+    let f = unsafe { &mut *frame };
+    let from_user = smp::gs_enter(f.cs);
     let run_hook = smp::on_ipi(smp::IPI_RESCHEDULE);
     irq_chip().eoi(IrqNumber(u32::from(IPI_RESCHEDULE_VECTOR)));
     if run_hook {
         tick::run_hook();
     }
-    returning(from_user);
+    if from_user {
+        // SAFETY: as in `on_pit`.
+        unsafe { returning(frame) };
+    }
     smp::gs_leave(from_user);
 }
-
-/// The last thing a scheduler interrupt does before it returns: one that arrived in user mode
-/// may end the thread there instead (`hal::user::UserHooks::interrupted`). The two definitions
-/// keep the `cfg` at item level.
-#[cfg(CONFIG_USERSPACE)]
-fn returning(from_user: bool) {
-    crate::user::interrupted(from_user);
-}
-
-/// No userspace port: nothing runs in ring 3 to return to.
-#[cfg(not(CONFIG_USERSPACE))]
-fn returning(_from_user: bool) {}
 
 /// A TLB shootdown IPI: the kernel's handler flushes and acknowledges, and never switches.
 extern "x86-interrupt" fn ipi_tlb_entry(frame: idt::InterruptFrame) {
@@ -384,9 +425,9 @@ pub fn init() {
     // `READY` flag above makes it once, the caller's contract makes it masked, and no
     // other code in this kernel knows those port numbers.
     unsafe {
-        idt::set_gate(0, idt::EntryPoint::diverging(exception::divide_error));
+        idt::set_gate(0, idt::EntryPoint::raw(exception::__trap_divide_error));
         idt::set_gate(3, idt::EntryPoint::plain(exception::breakpoint));
-        idt::set_gate(6, idt::EntryPoint::diverging(exception::invalid_opcode));
+        idt::set_gate(6, idt::EntryPoint::raw(exception::__trap_invalid_opcode));
         // #DF is the one gate that does not run on the stack it was raised from: the
         // stack is the thing most likely to have caused it. `gdt::init` has already
         // filled that slot and loaded the task register.
@@ -395,11 +436,11 @@ pub fn init() {
             idt::EntryPoint::with_code(exception::double_fault),
             gdt::DF_IST_INDEX,
         );
-        idt::set_gate(13, idt::EntryPoint::with_code(exception::general_protection));
+        idt::set_gate(13, idt::EntryPoint::raw(exception::__trap_general_protection));
         // #PF is the one vector whose handler may return: it re-executes the faulting
         // instruction after resolving the fault, and falls through to the fatal
         // reporter when it cannot. See `exception::page_fault`.
-        idt::set_gate(14, idt::EntryPoint::resumable_with_code(exception::page_fault));
+        idt::set_gate(14, idt::EntryPoint::raw(exception::__trap_page_fault));
 
         // The rest of the architecturally defined range, so that an unexpected one
         // reports itself instead of escalating to a triple fault.
@@ -420,9 +461,12 @@ pub fn init() {
         // The lines message-signalled interrupts arrive on; see `MSI_LINES`. After the loop
         // above, which would otherwise overwrite them.
         irq_gates!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
-        idt::set_gate(TIMER_VECTOR, idt::EntryPoint::plain(timer_entry));
+        // The PIT's line, after `irq_gates!` above installed the typed entry for it: the
+        // timer is a scheduler interrupt and needs every register.
+        idt::set_gate(pic::VECTOR_BASE, idt::EntryPoint::raw(__trap_pit));
+        idt::set_gate(TIMER_VECTOR, idt::EntryPoint::raw(__trap_timer));
         idt::set_gate(IPI_CALL_VECTOR, idt::EntryPoint::plain(ipi_call_entry));
-        idt::set_gate(IPI_RESCHEDULE_VECTOR, idt::EntryPoint::plain(ipi_reschedule_entry));
+        idt::set_gate(IPI_RESCHEDULE_VECTOR, idt::EntryPoint::raw(__trap_reschedule));
         idt::set_gate(IPI_TLB_VECTOR, idt::EntryPoint::plain(ipi_tlb_entry));
         idt::set_gate(SPURIOUS_VECTOR, idt::EntryPoint::plain(spurious_entry));
 

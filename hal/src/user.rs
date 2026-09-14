@@ -103,6 +103,22 @@ pub struct UserHooks<F> {
     /// return: that is how a thread spinning in user mode, which makes no system call, is
     /// stopped when its process ends.
     pub interrupted: fn(),
+    /// Called on the same way back, with the registers the interrupt took from user code, so
+    /// that a signal can be delivered to a thread that makes no system call at all. `true`
+    /// means `regs` was changed and the port must return to it; `false` means return as the
+    /// interrupt found things. See [`UserRegisters::to_words`] for the order.
+    ///
+    /// Only the vectors that can reach it pass registers: the scheduler's interrupts, where a
+    /// port saves them itself. Everything else keeps [`UserHooks::interrupted`] alone.
+    pub deliver: fn(&mut [u64; REGISTER_WORDS]) -> bool,
+    /// A trap taken from user code, with the registers it was taken with: a fault a process
+    /// can be made to handle itself. `true` means the process handles it and `regs` — now the
+    /// handler's — is what to return to; `false` means it cannot, and the port kills the
+    /// thread with [`UserHooks::kill`] as it did before.
+    ///
+    /// Called only for a trap from user mode, on the thread's kernel stack with interrupts
+    /// masked, after [`UserHooks::fault`] has declined a page fault.
+    pub trap: fn(UserTrap, &mut [u64; REGISTER_WORDS]) -> bool,
 }
 
 /// A user address could not be copied from or to.

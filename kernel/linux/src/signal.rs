@@ -78,6 +78,13 @@ pub const fn bit(sig: u64) -> u64 {
 /// The two signals no mask blocks and no handler catches.
 pub const UNBLOCKABLE: u64 = bit(SIGKILL) | bit(SIGSTOP);
 
+/// Whether `sig` is one a fault raises on the thread that faulted, rather than one a process
+/// sends. Its `siginfo` carries the address that faulted in place of a sender's pid, and it
+/// cannot be held off: the instruction that raised it runs again as soon as the thread does.
+pub const fn from_fault(sig: u64) -> bool {
+    matches!(sig, SIGSEGV | SIGBUS | SIGFPE | SIGILL | SIGTRAP)
+}
+
 /// What a signal does when its disposition is the default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Default {
@@ -253,6 +260,10 @@ pub struct Delivery {
     /// `si_code`, and the sender's pid for a signal a process sent.
     pub code: i32,
     pub pid: u32,
+    /// For a signal a fault raised, the address that faulted: `siginfo`'s `si_addr`, which
+    /// shares its bytes with `si_pid`. `None` for every other signal, which leaves those
+    /// bytes to the sender's pid.
+    pub addr: Option<u64>,
 }
 
 /// A frame laid out for a thread's stack.
@@ -401,10 +412,17 @@ fn put32(b: &mut [u8], at: usize, v: u32) {
 }
 
 /// `siginfo` for `d`, at `at`.
+///
+/// The union after `si_signo`, `si_errno` and `si_code` is what the signal decides: a fault
+/// puts the address that raised it in `_sigfault.si_addr`, and everything else the sender's
+/// pid in `_kill.si_pid`. Both start at the same offset, which is why one field carries both.
 fn info(b: &mut [u8], at: usize, d: &Delivery) {
     put32(b, at, d.sig as u32);
     put32(b, at + 8, d.code as u32);
-    put32(b, at + 16, d.pid);
+    match d.addr {
+        Some(addr) => put(b, at + 16, addr),
+        None => put32(b, at + 16, d.pid),
+    }
 }
 
 /// Lay out the frame delivering `d` to a thread whose registers are `ctx`, below its stack, in

@@ -221,6 +221,75 @@ unsafe extern "C" {
     fn linux_raise_marked(pid: u64, sig: u64) -> u64;
 }
 
+// The arithmetic trap: `div` by zero is #DE, which the kernel reports as `SIGFPE`. The label
+// after it is where the handler sends the thread, since returning to the `div` would raise it
+// again for as long as the kernel let it.
+global_asm!(
+    ".pushsection .text.linux_arith, \"ax\"",
+    ".globl linux_raise_arith",
+    "linux_raise_arith:",
+    "    xor edx, edx",
+    "    mov eax, 1",
+    "    xor ecx, ecx",
+    "    div ecx",
+    ".globl linux_after_arith",
+    "linux_after_arith:",
+    "    ret",
+    ".popsection",
+);
+
+// A store to whatever address it is given, with the instruction after it labelled: the length
+// of a store is the architecture's business, so the handler that steps over one needs the
+// assembler to say where it ends rather than guessing.
+global_asm!(
+    ".pushsection .text.linux_bad_store, \"ax\"",
+    ".globl linux_bad_store",
+    "linux_bad_store:",
+    "    mov qword ptr [rdi], 1",
+    ".globl linux_after_store",
+    "linux_after_store:",
+    "    ret",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn linux_raise_arith();
+    fn linux_after_arith();
+    fn linux_bad_store(addr: u64);
+    fn linux_after_store();
+}
+
+/// Store to `addr`, which the caller has made sure has no mapping.
+pub fn bad_store(addr: u64) {
+    // SAFETY: the store faults, and the handler this mode installs points the saved program
+    // counter at the `ret` after it.
+    unsafe { linux_bad_store(addr) };
+}
+
+/// The instruction after the store.
+pub fn after_store() -> u64 {
+    linux_after_store as *const () as u64
+}
+
+/// The signal an arithmetic trap raises here.
+pub const ARITH_SIG: u64 = 8; // SIGFPE
+
+/// Where the program counter sits in a `ucontext`: its `sigcontext` starts 40 bytes in, and
+/// `rip` is the sixteenth of the registers there. Mirrors `kernel/linux`'s `x86` layout.
+pub const UC_PC: usize = 40 + 16 * 8;
+
+/// Divide by zero, and come back through the handler's redirect.
+pub fn raise_arith() {
+    // SAFETY: the instruction traps, and the handler this mode installs points the saved
+    // program counter at the `ret` after it.
+    unsafe { linux_raise_arith() };
+}
+
+/// The instruction after the one that traps.
+pub fn after_arith() -> u64 {
+    linux_after_arith as *const () as u64
+}
+
 /// The restorer every handler is installed with.
 pub fn restorer() -> u64 {
     linux_restorer as *const () as u64

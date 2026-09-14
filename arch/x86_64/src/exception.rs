@@ -62,24 +62,12 @@ pub const ERROR_CODE_VECTORS: u32 = (1 << 8)      // #DF
 // state through the kernel's `GS`; see that function. The diverging ones never swap back:
 // they either end the user thread, whose CPU goes on in the kernel arrangement, or halt.
 
-/// #DE, vector 0. Fatal: the faulting `div` would re-execute on return.
-pub extern "x86-interrupt" fn divide_error(frame: InterruptFrame) -> ! {
-    crate::smp::gs_enter(frame.cs);
-    fatal(Some(0), None, &frame)
-}
-
 /// #BP, vector 3. Counted and resumed — see the module comment.
 ///
 /// No `GS` swap: it touches no per-CPU state, and a handler that swaps nothing on entry
 /// and nothing on exit keeps the discipline.
 pub extern "x86-interrupt" fn breakpoint(_frame: InterruptFrame) {
     BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// #UD, vector 6. Fatal: the undefined instruction would re-execute on return.
-pub extern "x86-interrupt" fn invalid_opcode(frame: InterruptFrame) -> ! {
-    crate::smp::gs_enter(frame.cs);
-    fatal(Some(6), None, &frame)
 }
 
 /// #DF, vector 8. Fatal by architecture: `iret` from a double fault is undefined.
@@ -98,70 +86,85 @@ pub extern "x86-interrupt" fn double_fault(frame: InterruptFrame, code: u64) -> 
     fatal(Some(8), Some(code), &frame)
 }
 
-/// #GP, vector 13. The error code is the selector at fault, or zero.
-pub extern "x86-interrupt" fn general_protection(frame: InterruptFrame, code: u64) -> ! {
-    crate::smp::gs_enter(frame.cs);
-    fatal(Some(13), Some(code), &frame)
-}
+// ---- the vectors a program can raise ------------------------------------------------------
+//
+// These four are entered from assembly that saves every register (`idt::trap_entry`), because
+// a process may have a handler for the signal its fault raises and a signal frame holds the
+// lot. Everything else about them is what the `x86-interrupt` forms above did: the kernel's
+// own resolutions first, then the process's, then the fatal report.
 
-/// #PF, vector 14. CR2 holds the address that faulted; the error code says why.
-///
-/// The one handler that can return, and only when something has said in advance that
-/// it expects a fault at that exact page — see `paging::on_page_fault`. Returning
-/// re-executes the faulting instruction, so a handler that returns without having
-/// changed anything is an endless loop; the trap it consults is single-shot for
-/// precisely that reason, and a second fault on the same address falls through here.
-///
-/// Everything else still ends at [`fatal`], so an unexpected #PF is as fatal as it was
-/// before this path existed.
-pub extern "x86-interrupt" fn page_fault(frame: InterruptFrame, code: u64) {
-    let user = crate::smp::gs_enter(frame.cs);
-    if crate::paging::on_page_fault(cr2(), code) || crate::fault::route(cr2(), code) {
-        crate::smp::gs_leave(user);
+crate::idt::trap_entry!(__trap_divide_error, 0, on_trap);
+crate::idt::trap_entry!(__trap_invalid_opcode, 6, on_trap);
+crate::idt::trap_entry!(with_code __trap_general_protection, 13, on_trap);
+crate::idt::trap_entry!(with_code __trap_page_fault, 14, on_trap);
+
+/// The Rust side of all four: resolve it, hand it to the process, or report it and stop.
+extern "C" fn on_trap(frame: *mut crate::idt::TrapFrame) {
+    // SAFETY: the entry built this frame on the kernel stack and passed its address; it is
+    // live for this call and aliased by nothing.
+    let f = unsafe { &mut *frame };
+    let from_user = crate::smp::gs_enter(f.cs);
+    // #PF alone has resolutions that are the kernel's own: a page the fault hook maps, or a
+    // fault something asked to be told about. Neither is a program's business.
+    if f.vector == 14
+        && (crate::paging::on_page_fault(cr2(), f.error) || crate::fault::route(cr2(), f.error))
+    {
+        crate::smp::gs_leave(from_user);
         return;
     }
-    if from_user(&frame) {
-        // Returns only when the fault was resolved; a kill does not come back.
-        user_page_fault(cr2(), code, frame.rip);
-        crate::smp::gs_leave(user);
+    if from_user && user_trap(f) {
+        crate::smp::gs_leave(from_user);
         return;
     }
-    fatal(Some(14), Some(code), &frame)
+    // Not resolved, and not something the process could take: the report, which halts.
+    let vector = f.vector as u8;
+    let (code, interrupted) = (f.error, f.interrupt_frame());
+    fatal(Some(vector), Some(code), &interrupted)
 }
 
-/// A fault whose saved CS is a ring-3 selector came from user code.
-fn from_user(frame: &InterruptFrame) -> bool {
-    frame.cs & 3 == 3
-}
-
-/// A page fault taken in ring 3: resolve it against the faulting process, or kill the
-/// process. Never returns to `fatal`, which would halt the whole kernel for one program.
+/// A trap from ring 3: resolve a page fault against the process, or give the process the
+/// signal it raises. `true` when the thread resumes — at the faulting instruction, or in a
+/// handler. Never returns when the process is killed for it.
 #[cfg(CONFIG_USERSPACE)]
-fn user_page_fault(cr2: u64, code: u64, rip: u64) {
+fn user_trap(f: &mut crate::idt::TrapFrame) -> bool {
     use hal::fault::{Access, PageFault};
-    let access = if code & (1 << 4) != 0 {
-        Access::Execute
-    } else if code & (1 << 1) != 0 {
-        Access::Write
+    let pc = f.rip as usize;
+    let trap = if f.vector == 14 {
+        let access = if f.error & (1 << 4) != 0 {
+            Access::Execute
+        } else if f.error & (1 << 1) != 0 {
+            Access::Write
+        } else {
+            Access::Read
+        };
+        #[allow(clippy::as_conversions)]
+        let fault = PageFault {
+            addr: cr2() as usize,
+            access,
+        };
+        // The process's own address space first: a page it may have but does not yet.
+        if crate::user::user_fault(fault) {
+            return true;
+        }
+        hal::user::UserTrap::Page { fault, pc }
     } else {
-        Access::Read
+        hal::user::UserTrap::Exception {
+            code: u64::from(f.vector),
+            pc,
+        }
     };
-    #[allow(clippy::as_conversions)]
-    let fault = PageFault {
-        addr: cr2 as usize,
-        access,
-    };
-    if crate::user::user_fault(fault) {
-        return;
+    // SAFETY: `f` is the live trap frame of a trap taken from ring 3.
+    if unsafe { crate::user::trap_handled(trap, core::ptr::from_mut(f)) } {
+        return true;
     }
-    crate::user::kill(hal::user::UserTrap::Page {
-        fault,
-        pc: rip as usize,
-    })
+    crate::user::kill(trap)
 }
 
+/// No userspace port: nothing in ring 3 to hand a trap to.
 #[cfg(not(CONFIG_USERSPACE))]
-fn user_page_fault(_cr2: u64, _code: u64, _rip: u64) {}
+fn user_trap(_f: &mut crate::idt::TrapFrame) -> bool {
+    false
+}
 
 /// End the process if `frame` is a ring-3 exception; return otherwise. Diverges on a kill.
 #[cfg(CONFIG_USERSPACE)]
