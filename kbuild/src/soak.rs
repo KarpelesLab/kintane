@@ -32,6 +32,19 @@ pub struct Trail {
 /// Words that follow a number as its unit rather than labelling the next one.
 const UNITS: [&str; 6] = ["us", "s", "ms", "kib", "ok", "bytes"];
 
+/// Numbers that are a level rather than a running count: the worst seen so far, or how many
+/// are in hand right now. A rate means nothing for these — a high-water mark that stopped
+/// moving is good news, and reporting it as a rate that fell to nothing reads as alarm.
+const GAUGES: [&str; 7] = [
+    "latest",
+    "peak in flight",
+    "slices to park max",
+    "without progress max",
+    "none charged",
+    "stalled waits",
+    "worst",
+];
+
 /// The numbers in one heartbeat's text after `s:`, each with the words before it.
 ///
 /// The line is prose with punctuation — `heap 1036767 (refused 64901), ipc 423238` — so
@@ -39,13 +52,31 @@ const UNITS: [&str; 6] = ["us", "s", "ms", "kib", "ok", "bytes"];
 /// are dropped, because `latest +6479 us), vm 4762` would otherwise label the vm count
 /// `us vm`.
 fn fields(text: &str) -> Vec<(String, u64)> {
+    // A comma or a closing bracket ends a field, so the words after it belong to the next
+    // number and not to this one: without that, `late with the CPU elsewhere), vm 4762` labels
+    // the vm count `late with the CPU elsewhere vm`.
     let spaced: String = text
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .map(|c| match c {
+            c if c.is_ascii_alphanumeric() => c,
+            ',' | ')' => '\n',
+            _ => ' ',
+        })
         .collect();
     let mut out = Vec::new();
     let mut label: Vec<&str> = Vec::new();
-    for token in spaced.split_whitespace() {
+    for token in spaced.split_inclusive('\n').flat_map(|piece| {
+        let ends = piece.ends_with('\n');
+        piece
+            .split_whitespace()
+            .map(Some)
+            .chain(ends.then_some(None))
+            .collect::<Vec<_>>()
+    }) {
+        let Some(token) = token else {
+            label.clear();
+            continue;
+        };
         match token.parse::<u64>() {
             Ok(n) if !label.is_empty() => {
                 out.push((label.join(" "), n));
@@ -62,6 +93,12 @@ fn fields(text: &str) -> Vec<(String, u64)> {
         }
     }
     out
+}
+
+/// Whether `name` is a level rather than a count, either by name or because the run never
+/// saw it grow.
+fn is_gauge(name: &str, first: u64, last: u64) -> bool {
+    GAUGES.contains(&name) || last < first
 }
 
 /// Read a console's heartbeats, its verdict and its failure, in the order they arrived.
@@ -178,10 +215,12 @@ pub fn drift(t: &Trail, window: u64) -> Vec<Drift> {
                 to.saturating_sub(from) as f64 / secs
             }
         };
+        let gauge = is_gauge(name, a, d);
         out.push(Drift {
             name: name.clone(),
-            early_rate: rate(a, b, early_span),
-            late_rate: rate(c, d, late_span),
+            // A gauge has no rate: what it is worth reporting is where it stood at each end.
+            early_rate: if gauge { 0.0 } else { rate(a, b, early_span) },
+            late_rate: if gauge { 0.0 } else { rate(c, d, late_span) },
             early_value: b,
             late_value: d,
         });
@@ -283,6 +322,35 @@ mod tests {
         assert!((heap.late_rate - 10.0).abs() < 1.0, "{heap:?}");
         assert!(heap.rate_change().expect("a rate") < -0.5);
         assert!(drift_report(&d, 0.25).contains("<-"));
+    }
+
+    #[test]
+    fn a_field_ends_at_its_comma_and_does_not_label_the_next_one() {
+        let line = "stress heartbeat 3/9 s: sleeps 7 (latest +900 us, 2 late with the CPU \
+                    elsewhere), vm 4, audits 3 ok";
+        let h = &trail(line.as_bytes()).heartbeats[0];
+        let names: Vec<&str> = h.fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"vm"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("elsewhere vm")), "{names:?}");
+    }
+
+    #[test]
+    fn a_high_water_mark_is_reported_as_a_level_not_a_rate() {
+        // `latest` is the worst lateness seen so far: it stops moving when nothing gets
+        // worse, which is good news and must not read as a rate that collapsed.
+        let mut console = String::new();
+        for i in 1..=10u64 {
+            console.push_str(&format!(
+                "stress heartbeat {i}/10 s: heap {}, sleeps 1 (latest +500 us), audits {i} ok\n",
+                i * 100
+            ));
+        }
+        let d = drift(&trail(console.as_bytes()), 2);
+        let latest = d.iter().find(|d| d.name == "latest").expect("latest");
+        assert_eq!((latest.early_rate, latest.late_rate), (0.0, 0.0));
+        assert_eq!(latest.rate_change(), None);
+        let heap = d.iter().find(|d| d.name == "heap").expect("heap");
+        assert!(heap.early_rate > 0.0, "{heap:?}");
     }
 
     #[test]
