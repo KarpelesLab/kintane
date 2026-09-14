@@ -1999,10 +1999,16 @@ A message that arrived is proof the wake was not lost. So the slow case exits 0x
 is counted as a *slow exchange*, printed in the heartbeat beside the wait counters; a receive
 that saw nothing at all still exits 0x603 or 0x613 and still fails the run.
 
+The wait around that exchange had the same fault: the cycle gave its two threads
+`PAIR_PATIENCE` to finish and called them still alive a lost wake-up, which a 30-minute soak
+hit at 49 s. It is now judged like every other pair wait — `PAIR_SLICES` between the two
+threads, with the duration kept only for a pair the scheduler is barely running.
+
 | Mutation | Result |
 |---|---|
 | The peer never sends, so the wake really is lost | `a waiting process's receive timed out: a wake-up was lost`, at 2 s |
 | The pair reports a slow exchange on a receive that did arrive | the run **passes**, with `slow exchanges 23` in the heartbeat |
+| The pair never stops exchanging, so its threads cannot finish | `a waiting process did not finish: a wake-up was lost`, at 36 s — the wait's own slice bound, not its patience |
 | `LOST_NS` cut to a millisecond | the *boot* `waits` check fails and bring-up stops; it proves nothing about the stress cycle |
 
 #### A slow shootdown is not a broken one
@@ -2062,6 +2068,7 @@ evidence for that fix, not against it.
 | `x86_64-qemu-smp`, 8 CPUs | 42 s | `waiting process: a waiting process's receive timed out: a wake-up was lost` | a message that arrived a second late, reported as one that never came |
 | `aarch64-virt-smp`, 8 CPUs | 676 s | the same | the same, and the longest any attempt ran before its fix landed |
 | `aarch64-virt-smp`, 8 CPUs | 141 s | `spinning sibling: a spinning thread was never stopped: its process's exit did not reach it` | `spawn::PATIENCE` again: the spinner's CPU was not run, so no interrupt reached it |
+| `aarch64-virt-smp`, 8 CPUs | 49 s | `waiting process: a waiting process did not finish: a wake-up was lost` | `waits::PAIR_PATIENCE`, 5 s, over two threads passing a counter |
 
 Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
 
