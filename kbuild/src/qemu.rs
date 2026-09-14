@@ -177,6 +177,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             ]
             .into_iter()
             .chain(smp)
+            .chain(block_disk(res, image, "virtio-blk-device"))
             .chain([
                 s("-kernel"),
                 image.display().to_string(),
@@ -242,6 +243,36 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
 
     Err("no QEMU machine is defined for this configuration".into())
+}
+
+/// The test disk, attached to a virtio-blk device of the given kind, when the
+/// configuration asks for it.
+///
+/// `snapshot=on` keeps a run's writes off the file, so every boot reads the bytes kbuild
+/// wrote and the image stays reproducible. On `virt` a `virtio-blk-device` lands in one of
+/// the memory-mapped virtio slots the device tree already lists; which one is for the
+/// kernel's enumeration to find out, not for this command line to promise.
+fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
+    if !res.is_on(crate::testdisk::SYMBOL) {
+        return Vec::new();
+    }
+    let disk = crate::testdisk::beside(image);
+    let mut args = vec![
+        "-drive".to_string(),
+        format!("file={},if=none,id=kt_disk,format=raw,snapshot=on", disk.display()),
+        "-device".to_string(),
+        format!("{device},drive=kt_disk"),
+    ];
+    // QEMU's memory-mapped virtio transport presents the legacy (version 1) register
+    // layout unless told otherwise, and the driver speaks only virtio 1.x. Found when the
+    // first boot with a disk attached reported the slot as legacy and bound nothing.
+    if device == "virtio-blk-device" {
+        args.extend([
+            "-global".to_string(),
+            "virtio-mmio.force-legacy=false".to_string(),
+        ]);
+    }
+    args
 }
 
 /// The processors and devices an x86 guest's firmware describes, beyond the chipset's

@@ -276,6 +276,34 @@ Falsified (each mutation on x86_64, then restored):
 The ABI table and the ELF loader are also host-tested (`lib/abi`, `kernel/elf`), the
 loader against fuzzed and truncated files.
 
+### 2b. Block storage
+
+With `QEMU_BLOCK_TEST`, on by default on aarch64 test builds, kbuild writes
+`testdisk.img` beside the image. It is 2 MiB, and every byte is a function of its sector
+and offset, with a header in sector 0. QEMU attaches it to a `virtio-blk-device` with
+`snapshot=on`, so a run's writes never reach the file. The format is written twice, in
+`kernel/block/src/testdisk.rs` and `kbuild/src/testdisk.rs`, and a pinned set of bytes
+that both sides' tests assert keeps the two in step.
+
+The boot gates on the `block` line ([architecture.md](architecture.md#block--the-block-layer-and-the-first-driver-with-dma)):
+
+```
+  block      4096 sectors of 512 bytes, 23 per request; 32 sectors read back the pattern;
+             a write read back after a flush; a read past the end refused; the device's own
+             refusal was an error; 64 more requests, 0 in flight ok
+```
+
+The driver's protocol is host-tested without QEMU:
+
+- `test_support::FakeDevice` walks the rings from the device's side, at a different memory
+  offset, and answers virtio-blk requests against a RAM disk.
+- The tests cover the handshake and every refusal in it, reads, writes, splits, a device
+  error, a device that never answers, and a thousand requests with no descriptor lost.
+
+In a stress run the `block` workload writes random runs of the scratch area and reads them
+back, reads the untouched part against the pattern, and flushes. At every audit the driver
+must report nothing in flight and every descriptor on the ring.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

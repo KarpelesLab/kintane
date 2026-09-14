@@ -1,0 +1,139 @@
+//! Block I/O against the test disk, alongside everything else.
+//!
+//! One thread writes a random run of sectors inside the disk's scratch area, reads it back
+//! and compares, reads a random sector of the untouched part and checks it against the
+//! pattern kbuild wrote, and flushes now and then. At a checkpoint it holds nothing: every
+//! request it made has completed, so the driver must report nothing in flight and every
+//! descriptor back on its ring, which is the leak a descriptor that is freed twice or not
+//! at all would show.
+//!
+//! Present only when the machine has the disk. On one without, the workload is not
+//! spawned and the auditor does not ask it for progress; the audit of the driver's books
+//! has nothing to look at and passes.
+
+use core::cell::SyncUnsafeCell;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use block::testdisk::{self, SCRATCH_SECTORS, SCRATCH_START, SECTOR};
+
+use super::{Parked, Rng, Workload, after_ms, checkpoint, fail, park_requested, progress};
+use crate::preempt::{begin, sleep_until};
+
+/// The longest run of sectors one iteration writes. Larger than the driver's bounce
+/// buffer takes in one request on the smallest region it is given, so the block layer's
+/// split is exercised under load too.
+const MAX_RUN: usize = 32;
+
+/// SAFETY INVARIANT: touched only by [`worker`]'s thread, of which there is one.
+static WRITE_BUF: SyncUnsafeCell<[u8; MAX_RUN * SECTOR]> =
+    SyncUnsafeCell::new([0; MAX_RUN * SECTOR]);
+/// SAFETY INVARIANT: as [`WRITE_BUF`].
+static READ_BUF: SyncUnsafeCell<[u8; MAX_RUN * SECTOR]> =
+    SyncUnsafeCell::new([0; MAX_RUN * SECTOR]);
+
+/// Requests the workload has made, for the heartbeat.
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the machine has the disk this workload uses.
+pub fn present() -> bool {
+    crate::block::disk().is_some()
+}
+
+pub fn requests() -> u64 {
+    REQUESTS.load(Ordering::Relaxed)
+}
+
+/// Ready to run: a started disk with nothing outstanding.
+pub fn setup() -> Result<(), &'static str> {
+    let Some(disk) = crate::block::disk() else {
+        return Ok(());
+    };
+    let (issued, completed, in_flight, clean) = disk.counters();
+    if issued != completed || in_flight != 0 || !clean {
+        return Err("the disk has requests outstanding before the run");
+    }
+    Ok(())
+}
+
+/// Nothing in flight and every descriptor free. Called with the thread parked.
+pub fn audit() -> Result<(), &'static str> {
+    let Some(disk) = crate::block::disk() else {
+        return Ok(());
+    };
+    let (issued, completed, in_flight, clean) = disk.counters();
+    if in_flight != 0 || issued != completed {
+        return Err("a request is outstanding with the workload parked (a lost completion)");
+    }
+    if !clean {
+        return Err("descriptors are missing from the ring with nothing in flight (a leak)");
+    }
+    Ok(())
+}
+
+/// The byte a written run holds: a function of its tag and position that the disk's own
+/// pattern never produces at the same place by more than chance.
+fn written(tag: u8, lba: u64, i: usize) -> u8 {
+    (i as u8).wrapping_mul(29) ^ tag ^ (lba as u8).rotate_left(3)
+}
+
+pub extern "C" fn worker(_: usize) -> ! {
+    begin();
+    let w = Workload::Block;
+    let mut rng = Rng::new(0x800);
+    let Some(disk) = crate::block::disk() else {
+        fail(w, "spawned without a disk");
+        loop {
+            sleep_until(after_ms(1000));
+        }
+    };
+    // SAFETY: this thread is the only one that touches the buffers; see their invariant.
+    let (out, back) = unsafe { (&mut *WRITE_BUF.get(), &mut *READ_BUF.get()) };
+    let mut iterations = 0u64;
+    loop {
+        if park_requested() {
+            // Between iterations every request has completed, so there is nothing to
+            // hold: the driver's books must show that.
+            checkpoint(w, Parked::Empty);
+        }
+
+        // A run inside the scratch area, written and read back.
+        let run = 1 + rng.below(MAX_RUN as u64) as usize;
+        let lba = SCRATCH_START + rng.below(SCRATCH_SECTORS - run as u64 + 1);
+        let tag = rng.next() as u8;
+        let bytes = run * SECTOR;
+        for (i, b) in out[..bytes].iter_mut().enumerate() {
+            *b = written(tag, lba, i);
+        }
+        REQUESTS.fetch_add(1, Ordering::Relaxed);
+        if block::write(disk, lba, &out[..bytes]).is_err() {
+            fail(w, "a write to the scratch area failed");
+        }
+        back[..bytes].fill(0);
+        REQUESTS.fetch_add(1, Ordering::Relaxed);
+        if block::read(disk, lba, &mut back[..bytes]).is_err() {
+            fail(w, "a read of the scratch area failed");
+        } else if back[..bytes] != out[..bytes] {
+            fail(w, "the scratch area did not read back what was written");
+        }
+
+        // A sector of the part nothing writes, against the pattern kbuild wrote.
+        let sector = 1 + rng.below(SCRATCH_START - 1);
+        let piece = &mut back[..SECTOR];
+        REQUESTS.fetch_add(1, Ordering::Relaxed);
+        match block::read(disk, sector, piece) {
+            Ok(()) if testdisk::first_mismatch(sector, piece).is_none() => {}
+            Ok(()) => fail(w, "a sector outside the scratch area no longer holds the pattern"),
+            Err(_) => fail(w, "a read outside the scratch area failed"),
+        }
+
+        iterations += 1;
+        if iterations % 8 == 0 {
+            REQUESTS.fetch_add(1, Ordering::Relaxed);
+            if block::BlockDevice::flush(disk).is_err() {
+                fail(w, "a flush failed");
+            }
+        }
+        progress(w);
+        sleep_until(after_ms(1));
+    }
+}

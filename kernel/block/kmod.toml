@@ -1,0 +1,14 @@
+# The block layer: what a storage driver implements, and the request queue above it.
+#
+# At the `device` layer rather than above it, because a driver implements `BlockDevice`
+# and a unit may depend only on units of equal or lower rank. It names no architecture
+# and touches no hardware, so it is host-tested under every preset.
+[unit]
+name = "block"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = []

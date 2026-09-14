@@ -167,8 +167,12 @@ static CLAIMED: AtomicUsize = AtomicUsize::new(0);
 /// thread stack claim theirs after these.
 const THREAD_STACKS: usize = 4;
 
-/// Every slot the ports' linker scripts reserve.
-pub const MAX_STACKS: usize = 8;
+/// The most slots any port's linker script reserves: twelve on aarch64 and x86_64, eight
+/// on i686. A claim past a port's own array is refused by the port, so sizing this to the
+/// largest costs a port with fewer only table slots that stay empty. It was eight, from
+/// before aarch64 and x86_64 grew to twelve, and a stress run with the block workload's
+/// ninth thread found the stale limit.
+pub const MAX_STACKS: usize = 12;
 
 /// The scheduler state: the thread table, with a run queue per CPU.
 struct Sched {

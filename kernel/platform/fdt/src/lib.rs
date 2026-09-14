@@ -30,7 +30,12 @@ use hal::EarlyConsole;
 use hal::paging::DeviceWindow;
 
 /// Every driver this image carries, in the order ties between equally specific matches go.
-const DRIVERS: &[&dyn Driver] = &[&gic::v2::DRIVER, &gic::v3::DRIVER, &pl011::DRIVER];
+const DRIVERS: &[&dyn Driver] = &[
+    &gic::v2::DRIVER,
+    &gic::v3::DRIVER,
+    &pl011::DRIVER,
+    &virtio_blk::DRIVER,
+];
 
 /// Nodes in the tree. QEMU `virt` has 48; a large SoC tree a few hundred. Running out is
 /// an error, never a partly-read tree.
@@ -104,6 +109,43 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     // Probe everything first and start nothing until every claim is in: a start that ran
     // before a later probe's claim was refused would be driving hardware the ledger never
     // agreed was its.
+    // Which memory-mapped virtio slot holds a block device. The tree lists every slot the
+    // machine has, occupied or not, and only the slot's own registers say which is which:
+    // this is enumeration, done here as `pci::enumerate` is, so that the driver's probe
+    // keeps its rule of touching no hardware. See `virtio_blk::mmio`.
+    let mut block_slot = None;
+    let (mut slots, mut legacy) = (0usize, 0usize);
+    for id in tree
+        .ids()
+        .filter(|&id| tree.node(id).is_compatible("virtio,mmio"))
+    {
+        slots += 1;
+        let Ok((phys, len)) = tree.mmio(id, 0) else {
+            continue;
+        };
+        let (Ok(base), Ok(len)) = (usize::try_from(phys), usize::try_from(len)) else {
+            continue;
+        };
+        use virtio_blk::mmio::Slot;
+        // SAFETY: discovery runs on the boot identity map, which maps every device on this
+        // port, and the read is of the slot's identification registers only, which no
+        // driver owns yet.
+        match unsafe { virtio_blk::mmio::identify(base, len) } {
+            Slot::Device { device_id } if device_id == virtio_blk::transport::DEVICE_ID_BLOCK => {
+                block_slot = block_slot.or(Some(id));
+            }
+            Slot::Legacy { device_id } if device_id == virtio_blk::transport::DEVICE_ID_BLOCK => {
+                legacy += 1;
+            }
+            _ => {}
+        }
+    }
+    if slots > 0 && block_slot.is_none() && legacy > 0 {
+        // Not a failure of discovery: the machine has a disk this driver will not drive.
+        // Said here, because the block check can only report that no device was bound.
+        c.write_str(" (a legacy virtio-blk slot, which the driver does not drive)");
+    }
+
     let mut bound: [Option<(usize, Bound)>; MAX_BOUND] = [const { None }; MAX_BOUND];
     let mut ok = true;
     let mut n = 0;
@@ -111,6 +153,10 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         let Some((d, _)) = best_match(&tree, id, DRIVERS) else {
             continue;
         };
+        // An empty slot, or one holding a device this image has no driver for.
+        if tree.node(id).is_compatible("virtio,mmio") && Some(id) != block_slot {
+            continue;
+        }
         let Some(&drv) = DRIVERS.get(d) else { continue };
         c.write_str(" ");
         c.write_str(drv.name());
