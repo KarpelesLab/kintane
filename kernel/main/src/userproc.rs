@@ -885,6 +885,30 @@ pub(crate) fn start_linux(
     program: &Program,
     start: impl FnOnce(&mut Process, &Program) -> Option<usize>,
 ) -> Option<ThreadId> {
+    let begun = crate::spawn::start_thread(prepare_linux(slot, program, start)?);
+    if begun.is_none() {
+        teardown(slot);
+    }
+    begun
+}
+
+/// [`start_linux`] without starting the thread: build the process, install it, lay out its
+/// start, and return how its first thread enters it, for `spawn::start_thread`. `None` has
+/// torn down whatever it built.
+///
+/// A caller starting several processes prepares them all before starting any. Installing a
+/// program protects its segments, which shoots down TLBs holding the frame lock with
+/// interrupts masked, and a thread already running on another CPU may be spinning, masked,
+/// for that same lock in a fault: neither could go on (see `shootdown`).
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn prepare_linux(
+    slot: usize,
+    program: &Program,
+    start: impl FnOnce(&mut Process, &Program) -> Option<usize>,
+) -> Option<crate::spawn::Start> {
     let root = build_as(slot, program, Personality::Linux)?;
     // Masked from loading the space to putting the kernel's back: a switch in between would
     // load this kernel thread's own space, the kernel's, under the copy.
@@ -896,24 +920,22 @@ pub(crate) fn start_linux(
     unsafe { Cpu::set_root(kernel_root()) };
     // SAFETY: pairs with the `irq_save` above.
     unsafe { Cpu::irq_restore(irq) };
-    let begun = sp
-        .and_then(|user_sp| {
-            let mut held = lock(slot)?;
-            held.process().started = true;
-            Some(crate::spawn::Start {
-                slot,
-                root,
-                entry: program.entry as usize,
-                user_sp,
-                install: false,
-                args: [0; 4],
-            })
+    let prepared = sp.and_then(|user_sp| {
+        let mut held = lock(slot)?;
+        held.process().started = true;
+        Some(crate::spawn::Start {
+            slot,
+            root,
+            entry: program.entry as usize,
+            user_sp,
+            install: false,
+            args: [0; 4],
         })
-        .and_then(crate::spawn::start_thread);
-    if begun.is_none() {
+    });
+    if prepared.is_none() {
         teardown(slot);
     }
-    begun
+    prepared
 }
 
 /// Make a copy-on-write child of Linux process `parent` in a free slot, as `fork` does: its

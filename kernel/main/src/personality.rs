@@ -1829,8 +1829,12 @@ pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
     let frames_before = free_frames();
     let cpu = (pair as usize) % preempt::stats().cpus.max(1);
 
-    let a = userproc::start_linux(0, &program, start_with(&TLS_ARGV));
-    let b = userproc::start_linux(1, &program, start_with(&TLS_ARGV));
+    // Both built and installed before either starts: installing shoots down TLBs holding
+    // the frame lock, which a thread already running on another CPU could be waiting for
+    // with interrupts masked. On eight CPUs, starting one before installing the other hung.
+    let prepared =
+        [0, 1].map(|slot| userproc::prepare_linux(slot, &program, start_with(&TLS_ARGV)));
+    let [a, b] = prepared.map(|start| start.and_then(spawn::start_thread));
     for id in [a, b].into_iter().flatten() {
         preempt::set_affinity(id, 1 << cpu);
     }
