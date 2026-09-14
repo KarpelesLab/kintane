@@ -158,6 +158,12 @@ __exc_common:
     stp     x1, x2, [sp, #0x100]
     mrs     x1, far_el1
     str     x1, [sp, #0x110]
+    // SP_EL0 is a process's stack pointer, and banked rather than saved by the CPU on an
+    // exception. A handler that switches threads — a timer tick from EL0 — can return to
+    // EL0 in another process, which sets SP_EL0 to its own, so each frame keeps the value
+    // its own `eret` must restore.
+    mrs     x1, sp_el0
+    str     x1, [sp, #0x118]
 
     // (index, &mut TrapFrame) — the AAPCS64 argument registers, in order.
     mov     x1, sp
@@ -166,6 +172,8 @@ __exc_common:
     // SPSR and ELR are restored from the frame rather than left alone, so that a
     // handler may legitimately redirect the return and so that a nested exception
     // cannot silently corrupt the outer one's return state.
+    ldr     x1, [sp, #0x118]
+    msr     sp_el0, x1
     ldp     x1, x2, [sp, #0x100]
     msr     spsr_el1, x1
     ldp     x30, x1, [sp, #0xf0]
@@ -208,8 +216,9 @@ pub(crate) struct TrapFrame {
     esr: u64,
     /// Faulting address, when the syndrome says there is one.
     far: u64,
-    /// Keeps the frame a multiple of 16, which SP must always be.
-    _pad: u64,
+    /// The interrupted context's `SP_EL0`, restored on return. It is also what keeps the
+    /// frame a multiple of 16, which SP must always be.
+    sp_el0: u64,
 }
 
 /// Vector index for "current EL with `SP_ELx`, IRQ" — the only entry a working kernel
@@ -219,6 +228,9 @@ const VEC_CURRENT_SPX_IRQ: u64 = 5;
 /// Vector index for "current EL with `SP_ELx`, synchronous": where a kernel page fault
 /// arrives.
 const VEC_CURRENT_SPX_SYNC: u64 = 4;
+
+/// Vector index for "lower EL, AArch64, IRQ": an interrupt taken while a process runs.
+const VEC_LOWER_A64_IRQ: u64 = 9;
 
 /// Handle a synchronous exception from a lower EL (a system call or fault from EL0).
 /// Returns `true` if it took it. The two definitions keep the `cfg` at item level.
@@ -279,7 +291,12 @@ pub unsafe fn install_vectors() {
 /// from it resumes the interrupted context.
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
-    if index == VEC_CURRENT_SPX_IRQ {
+    // An interrupt is the same interrupt whether it arrived while the kernel ran or while
+    // a process did. From EL0 it lands on the running thread's kernel stack, exactly as
+    // one from EL1 does, so a timer tick that switches threads here resumes the process
+    // later through this same frame. Before processes ran under the scheduler nothing at
+    // EL0 was ever interrupted, and index 9 was reported as unhandled.
+    if index == VEC_CURRENT_SPX_IRQ || index == VEC_LOWER_A64_IRQ {
         crate::irq::dispatch();
         return;
     }

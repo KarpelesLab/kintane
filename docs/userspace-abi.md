@@ -52,12 +52,32 @@ and every use is refused — "a process with no handles can do nothing." A third
 kernel memory and is killed at the fault, the kernel continuing. Removing the rights
 check, the `rsp0` switch, or the copy validation each makes the check fail.
 
-**Not yet:** one process runs at a time, driven by a direct context switch rather than
-the scheduler, so `init`'s channel-to-a-kernel-thread step waits for the process to run
-scheduled; there is no `Process` object in the handle namespace, no explicit
-process-construction syscalls, no completion queues, no ELF loading from a filesystem,
-and no per-process teardown of shared page tables (the slice frees what it took but
-leaves the object store to own that). i686 and riscv32 have no userspace port.
+**Processes on the scheduler.** A process thread is an ordinary scheduler thread whose
+saved context carries its kernel stack and its address space (`hal::HasUserMode::bind`),
+recorded under the scheduler lock before any CPU can pick the thread up
+(`preempt::spawn_prepared`). The context switch loads that space wherever the thread
+resumes, and the kernel's own for a kernel thread, so the space a thread runs on is the
+thread's property rather than the CPU's. The kernel finds the process a system call or a
+fault belongs to by the address space loaded on the CPU that took it
+(`userproc::current`), which cannot go stale when a thread migrates. Two checks prove it:
+
+- **At boot** (`kernel/main/src/procs.rs`, the `processes` banner line), on every
+  x86_64 and aarch64 preset: two worker processes run together on the scheduler, each
+  writing its own signature to the *same* virtual address and reading it back on every
+  pass; both make progress in one window, and neither ever reads the other's signature. A
+  third process writes to kernel memory, is killed, and both workers keep running after
+  it. Every frame the three took comes back when they are torn down.
+- **Under stress** (`kbuild stress`), once per audit interval while every other workload
+  runs: a worker process is created, its thread is pinned to one CPU and then another, the
+  kernel must serve its system calls on each with its signature still intact, and the
+  process is destroyed with every frame returned. Migration is checked here and not at boot
+  because a secondary CPU joins the scheduler only after the boot verdict.
+
+**Not yet:** one thread per process — `userproc::current`'s safety rests on it; no
+`Process` object in the handle namespace and no process-construction system calls — the
+kernel builds processes, so a program cannot yet create one; no completion queues; no ELF
+loading from a filesystem; no ASIDs or PCIDs, so every change of address space flushes the
+TLB (see `docs/architecture.md`). i686 and riscv32 have no userspace port.
 
 ## Two ABIs, one kernel
 

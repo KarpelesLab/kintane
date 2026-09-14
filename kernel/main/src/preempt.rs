@@ -167,8 +167,11 @@ static CLAIMED: AtomicUsize = AtomicUsize::new(0);
 /// thread stack claim theirs after these.
 const THREAD_STACKS: usize = 4;
 
-/// Every slot the ports' linker scripts reserve.
-pub const MAX_STACKS: usize = 8;
+/// Guarded slots the scheduler may hold: the boot checks' four, the stress run's four,
+/// and one for the user process the stress run's auditor drives. The ports reserve twelve,
+/// and an SMP kernel's secondaries take one each (three on the four-CPU presets), so nine
+/// is what every preset can hand the scheduler.
+pub const MAX_STACKS: usize = 9;
 
 /// The scheduler state: the thread table, with a run queue per CPU.
 struct Sched {
@@ -509,9 +512,118 @@ fn spawn_with(
     })
 }
 
+/// As [`spawn`], with `prepare` run on the new thread's saved context before the thread
+/// can be picked up, and given the top of the stack it will run on.
+///
+/// A user thread needs its kernel stack and its address space recorded in its context
+/// (`hal::HasUserMode::bind`) *before* any CPU switches to it: the switch is what loads
+/// them. Spawning and preparing are therefore one critical section under the scheduler
+/// lock, not two calls with a window between them in which another CPU could take the
+/// thread and enter it with no address space of its own.
+///
+/// Takes a closure rather than the binding itself so that nothing here needs the user-mode
+/// capability: this file is compiled for ports that have no userspace at all.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only to start user threads, which need USERSPACE"
+    )
+)]
+pub fn spawn_prepared(
+    stack: usize,
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    level: u8,
+    prepare: impl FnOnce(&mut <Cpu as hal::HasContextSwitch>::Context, KernAddr),
+) -> Option<ThreadId> {
+    let (top, size) = STACKS.get(stack)?;
+    let (top, size) = (top.load(Ordering::Relaxed), size.load(Ordering::Relaxed));
+    if top == 0 {
+        return None;
+    }
+    with_table(|t| {
+        STARTS[stack].0.store(entry as usize, Ordering::Release);
+        STARTS[stack].1.store(arg, Ordering::Release);
+        let here = Cpu::cpu_index();
+        // SAFETY: as in `spawn_with`: a guarded slot claimed for the scheduler alone,
+        // whose previous thread the caller guarantees has been reaped.
+        let id = unsafe {
+            t.spawn_on(
+                thread_start,
+                stack,
+                priority(level),
+                KernAddr::new(top),
+                size,
+                CpuSet::all(mp::CPUS),
+                here,
+                false,
+            )
+        }
+        .ok()?;
+        // The thread is queued but not running, so its saved context is the one a switch
+        // into it will load, and `context_mut` refuses anything else.
+        prepare(t.context_mut(id).ok()?, KernAddr::new(top));
+        Some(id)
+    })
+}
+
 /// Free an exited thread's slot. `false` if it has not exited.
 pub fn reap(id: ThreadId) -> bool {
     with_table(|t| t.reap(id).is_ok())
+}
+
+/// Restrict `id` to the CPUs in `mask`, moving it if it is queued somewhere else.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only by the process checks, which need USERSPACE"
+    )
+)]
+pub fn set_affinity(id: ThreadId, mask: u64) -> bool {
+    let placed = with_table(|t| {
+        t.set_affinity(id, CpuSet::from_raw(mask))
+            .ok()
+            .map(|()| t.cpu_of(id))
+    });
+    let Some(on) = placed else {
+        return false;
+    };
+    // The table moves a thread but interrupts nobody. A thread queued on an idle CPU would
+    // wait for that CPU's next timer interrupt, which on a tickless secondary can be seconds
+    // away, and a running thread would keep a CPU it may no longer use until it next
+    // yields. So interrupt the CPU it is on now: it reschedules, and picks the thread up or
+    // hands it on. Nothing happens if there was nothing to do.
+    if let Some(cpu) = on.filter(|&cpu| cpu != Cpu::cpu_index()) {
+        mp::reschedule(cpu);
+    }
+    true
+}
+
+/// Whether `id` still exists in the table and has not exited.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only by the process checks, which need USERSPACE"
+    )
+)]
+pub fn alive(id: ThreadId) -> bool {
+    with_table(|t| !matches!(t.state(id), None | Some(thread::State::Exited)))
+}
+
+/// Whether the scheduler is running, so a thread that ends must go through
+/// [`exit_thread`] rather than any table of its own.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "asked only by user threads ending, which need USERSPACE"
+    )
+)]
+pub fn scheduled() -> bool {
+    SCHEDULER_BUILT.load(Ordering::Relaxed)
 }
 
 /// Claim guarded stack slots for threads named `names`, after those already claimed.

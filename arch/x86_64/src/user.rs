@@ -99,6 +99,30 @@ static HOOKS: Hooks = Hooks(UnsafeCell::new(None));
 /// The kernel's own root, loaded on a switch to a thread that runs no user code.
 static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
+/// Load the address space a thread that is about to run needs: its own if it runs user
+/// code (`root`, as `bind` recorded it), otherwise the kernel's.
+///
+/// Called by the context switch, which is where a thread's address space has to arrive: a
+/// user thread may resume on a different CPU from the one it left, and the space must
+/// follow it there. Nothing happens before `install` has recorded the kernel root, so a
+/// kernel built without userspace never writes CR3 here, and nothing happens when the
+/// wanted space is already loaded, so a kernel-to-kernel switch costs one register read
+/// rather than the TLB flush a CR3 write is.
+pub(crate) unsafe fn load_space(root: u64) {
+    let want = if root != 0 {
+        root
+    } else {
+        KERNEL_ROOT.load(Ordering::Relaxed)
+    };
+    if want == 0 || <X86_64 as hal::HasPageTables>::root().raw() == want {
+        return;
+    }
+    // SAFETY: `want` is either the kernel root `install` recorded or a root `bind`
+    // recorded for the thread being resumed, and every root maps the kernel half
+    // identically, so the code and stack running this switch stay mapped across the write.
+    unsafe { <X86_64 as hal::HasPageTables>::set_root(PhysAddr::new(want)) };
+}
+
 fn hooks() -> Option<&'static UserHooks<SyscallFrame>> {
     // SAFETY: see `Hooks`.
     unsafe { (*HOOKS.0.get()).as_ref() }

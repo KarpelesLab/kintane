@@ -156,6 +156,11 @@ impl HasContextSwitch for X86_64 {
             // to, which `bind` recorded.
             unsafe { crate::smp::install_kernel_stack(user_stack) };
         }
+        // And its address space. A thread that runs user code carries its own root; a
+        // kernel thread carries none and runs on the kernel's, so no kernel thread ever
+        // runs on tables a process might free.
+        // SAFETY: as above; `user_root` is what `bind` recorded, or zero.
+        unsafe { crate::user::load_space((*to).user_root) };
         // SAFETY: forwarded verbatim; the caller upholds `switch_raw`'s contract, which
         // is this function's own.
         unsafe { switch_raw(from, to) }

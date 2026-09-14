@@ -240,6 +240,14 @@ impl HasContextSwitch for Aarch64 {
 
     #[inline]
     unsafe fn switch(from: *mut Context, to: *const Context) {
+        // A thread that runs user code carries its own address space; a kernel thread
+        // carries none and runs on the kernel's, so no kernel thread ever runs on tables a
+        // process might free. On this port `SP_EL1` is the thread's own kernel stack, so
+        // there is nothing else to install for a trap from EL0 to land on.
+        // SAFETY: the caller's contract makes `to` a valid suspended context and the
+        // switch masked, on the CPU `to` is about to run on; `user_root` is what `bind`
+        // recorded, or zero.
+        unsafe { crate::user::load_space((*to).user_root) };
         // SAFETY: the caller upholds the contract — interrupts masked, `from` writable
         // and distinct from `to`, `to` a suspended context with a live stack. The call
         // is an ordinary AAPCS64 call, so the compiler already treats every caller-saved

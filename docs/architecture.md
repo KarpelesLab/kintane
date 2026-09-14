@@ -884,6 +884,40 @@ The kernel side is `kernel/main/src/mp_smp.rs`, selected by `SMP` with the paged
 model. A kernel without them gets `mp_up.rs`, which is one run queue, no lock, no IPIs
 and no shootdown, so a uniprocessor build pays for none of this.
 
+#### Address spaces follow threads
+
+A thread that runs user code carries its address space in its saved context, with its
+kernel stack (`hal::HasUserMode::bind`). The port's context switch loads it: on x86_64 the
+switch installs the kernel stack in the running CPU's `TSS.rsp0` and `syscall` stack and
+loads `CR3`; on aarch64 it loads `TTBR0_EL1`. A kernel thread carries no space and runs on
+the kernel's, so no kernel thread ever runs on tables a process might free. The switch
+writes the root only when it changes, so a switch between kernel threads costs one register
+read. The binding is made under the scheduler lock in the same critical section that
+creates the thread (`preempt::spawn_prepared`), because the switch is what loads the space:
+bound any later, another CPU could take the thread first and enter it on the wrong tables.
+
+**The TLB: no ASIDs or PCIDs, and why.** A change of root invalidates. On x86_64 the `CR3`
+write drops every non-global translation. On aarch64 the kernel is also mapped through
+`TTBR0`, so there is no split to lean on, and `set_root` ends with `tlbi vmalle1is`. That
+is correct with the fewest moving parts at the point where a process's pages can be freed
+while another CPU still ran it. ASIDs and PCIDs are an optimisation with a correctness
+obligation of their own: a recycled identifier must never meet translations its previous
+owner left. They should be adopted once measured, not before. The cost is real, and on
+aarch64 it is the first thing to replace: the flush is a broadcast, so every switch between
+processes reaches every CPU's TLB.
+
+**Interrupts from user mode.** Before processes ran on the scheduler, nothing at EL0 was
+ever interrupted. On aarch64 the "lower EL, IRQ" vector now goes to the same dispatch as
+the kernel's own IRQ vector. `SP_EL0`, which the CPU banks rather than saves, is kept in
+each exception frame. A timer tick that switches threads returns to user mode in a
+different process, and each frame must restore the stack pointer its own `eret` needs.
+
+**Moving a thread interrupts its new CPU.** `preempt::set_affinity` sends a reschedule IPI
+to the CPU the thread is on after the table moves it. Without it, a thread queued on an idle
+tickless secondary waited for that CPU's next timer interrupt, up to one full arming
+(2.15 s on aarch64). The stress run's process cycle found this as a process that did not
+stop within its one-second drain.
+
 #### The SMP scheduler
 
 After bring-up, `preempt::resume` releases every secondary into `preempt::join`, where

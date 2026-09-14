@@ -48,6 +48,81 @@ pub fn userspace_check(
     Check::Passed
 }
 
+/// Take the frames the scheduled processes are built from, while the boot allocator is
+/// alive. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_reserve(frames: &mut mm::phys::FrameAllocator<'static, Cpu>, live: Live) -> Check {
+    match live.direct {
+        Some(direct) => Check::from_ok(crate::procs::reserve(frames, direct)),
+        None => Check::Skipped,
+    }
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_reserve(frames: &mut mm::phys::FrameAllocator<'static, Cpu>, live: Live) -> Check {
+    let _ = (frames, live);
+    Check::Passed
+}
+
+/// The physical run [`process_reserve`] took, `(0, 0)` when there is none.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_region() -> (u64, u64) {
+    crate::procs::region()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_region() -> (u64, u64) {
+    (0, 0)
+}
+
+/// Several processes at once on the scheduler. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn processes_check(c: &dyn EarlyConsole) -> Check {
+    crate::procs::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn processes_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
+/// The stress run's user-process cycle: claim the stack its process thread runs on.
+/// Nothing to do, and `Ok`, without USERSPACE.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_stress_setup() -> Result<(), &'static str> {
+    crate::procs::stress_setup()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_stress_setup() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Create a user process, move its thread across the CPUs, and destroy it, checking its
+/// memory and every frame. `Ok` without USERSPACE.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_stress_cycle(round: u64) -> Result<(), &'static str> {
+    crate::procs::stress_cycle(round)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_stress_cycle(round: u64) -> Result<(), &'static str> {
+    let _ = round;
+    Ok(())
+}
+
+/// User processes the stress run has created and destroyed.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_stress_cycles() -> u64 {
+    crate::procs::stress_cycles()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_stress_cycles() -> u64 {
+    0
+}
+
 /// Demand paging over a window of the live kernel space.
 pub fn demand_check(
     c: &dyn EarlyConsole,

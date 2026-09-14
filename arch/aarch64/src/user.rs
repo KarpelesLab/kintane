@@ -67,6 +67,30 @@ fn hooks() -> Option<&'static UserHooks<SyscallFrame>> {
     unsafe { (*HOOKS.0.get()).as_ref() }
 }
 
+/// Load the address space a thread that is about to run needs: its own if it runs user
+/// code (`root`, as `bind` recorded it), otherwise the kernel's.
+///
+/// Called by the context switch, which is where a thread's address space has to arrive: a
+/// user thread may resume on a different CPU from the one it left, and the space must
+/// follow it there. Nothing happens before `install` has recorded the kernel root, so a
+/// kernel built without userspace never writes `TTBR0_EL1` here, and nothing happens when
+/// the wanted space is already loaded, so a kernel-to-kernel switch costs one system
+/// register read rather than the invalidation `set_root` ends with.
+pub(crate) unsafe fn load_space(root: u64) {
+    let want = if root != 0 {
+        root
+    } else {
+        KERNEL_ROOT.load(Ordering::Relaxed)
+    };
+    if want == 0 || <Aarch64 as hal::HasPageTables>::root().raw() == want {
+        return;
+    }
+    // SAFETY: `want` is either the kernel root `install` recorded or a root `bind`
+    // recorded for the thread being resumed, and every root maps the kernel half
+    // identically, so the code and stack running this switch stay mapped across the write.
+    unsafe { <Aarch64 as hal::HasPageTables>::set_root(PhysAddr::new(want)) };
+}
+
 /// A `svc` or a fault from EL0, routed from the exception handler. Returns to resume the
 /// process (a resolved fault, or a system call whose result is now in the frame); does not
 /// return when it kills the process.
