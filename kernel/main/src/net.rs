@@ -107,6 +107,12 @@ pub const UDP_REPLY: &[u8] = b"kintane-udp-reply ";
 /// `kintane-tcp-request <mode> <tag>` and a newline, and its reply is the same line with `reply`
 /// for `request`. The mode `guest-closes` has kbuild wait for the kernel's close before its own,
 /// and `peer-closes` has kbuild close as soon as it has replied.
+/// The datagram kbuild's downstream relay splits into two IPv4 fragments on its way here, and
+/// the pattern it carries after its number: `kbuild/src/qemu.rs`'s `NET_UDP_FRAGMENTED` and
+/// `NET_FRAGMENT_PATTERN`. A boot that cannot put a datagram back together never sees it.
+pub const FRAGMENTED: &[u8] = b"kintane-udp-fragmented ";
+const FRAGMENT_PATTERN: usize = 64;
+
 pub const TCP_ANNOUNCE: &[u8] = b"kintane-tcp-port ";
 pub const TCP_REQUEST: &[u8] = b"kintane-tcp-request ";
 pub const TCP_REPLY: &[u8] = b"kintane-tcp-reply ";
@@ -606,6 +612,21 @@ fn exchange(
     write_usize(c, ROUNDS as usize);
     c.write_str(" round trips");
 
+    // One datagram arrives as two IPv4 fragments, because kbuild's downstream relay splits it.
+    // Only a stack that holds the first until the second arrives ever sees its pattern.
+    if wait(card, PROBE_NS, now, spin, take_fragmented).is_none() {
+        return Some("THE FRAGMENTED DATAGRAM NEVER ARRIVED WHOLE AND INTACT");
+    }
+    let fragments = {
+        let s = STACK.lock_irqsave();
+        (s.counters().fragments_received, s.counters().datagrams_reassembled)
+    };
+    c.write_str("; ");
+    write_usize(c, fragments.0 as usize);
+    c.write_str(" fragments, ");
+    write_usize(c, fragments.1 as usize);
+    c.write_str(" datagrams reassembled");
+
     let Some(port) = wait(card, PROBE_NS, now, spin, |s, _| {
         drain(s);
         tcp_port()
@@ -623,6 +644,10 @@ fn exchange(
         Ok(round) => round,
         Err(why) => return Some(why),
     };
+    // Counted before the linger: kbuild's relay swaps a pair of the reply's segments and sends
+    // one of them twice, so a segment held out of order and a duplicate are what the rounds
+    // are *for*. What may not happen is either of them after the rounds are over.
+    let rounds = STACK.lock_irqsave().tcp_counters();
     // Anything the peer has to send again, for want of an acknowledgement, arrives in here.
     let _ = wait(card, LINGER_NS, now, spin, |s, _| {
         drain(s);
@@ -635,7 +660,11 @@ fn exchange(
     write_states(c, peer.visited);
     c.write_str("], ");
     write_usize(c, (guest.retransmits + peer.retransmits) as usize);
-    c.write_str(" data retransmits");
+    c.write_str(" data retransmits, ");
+    write_usize(c, (rounds.out_of_order_queued - before.out_of_order_queued) as usize);
+    c.write_str(" segments held out of order, ");
+    write_usize(c, (rounds.out_of_order_delivered - before.out_of_order_delivered) as usize);
+    c.write_str(" runs joined up");
 
     let through = |round: &TcpRound, states: &[State]| {
         round.closed && states.iter().all(|s| round.visited & s.bit() != 0)
@@ -651,10 +680,19 @@ fn exchange(
             "A CONNECTION RETRANSMITTED NO DATA, THOUGH KBUILD DROPS THE FIRST SEGMENT OF EACH",
         );
     }
-    let again = (after.duplicates - before.duplicates)
-        + (after.out_of_order - before.out_of_order)
-        + (after.resets_sent - before.resets_sent)
-        + (after.resets_received - before.resets_received);
+    if rounds.out_of_order_queued == before.out_of_order_queued {
+        return Some("NO SEGMENT WAS HELD OUT OF ORDER, THOUGH KBUILD'S RELAY SWAPS A PAIR");
+    }
+    if rounds.out_of_order_delivered == before.out_of_order_delivered {
+        return Some("A SEGMENT HELD OUT OF ORDER NEVER JOINED THE STREAM");
+    }
+    if rounds.out_of_order_dropped != before.out_of_order_dropped {
+        return Some("A SEGMENT ARRIVED OUT OF ORDER AND WAS GIVEN UP RATHER THAN HELD");
+    }
+    let again = (after.duplicates - rounds.duplicates)
+        + (after.out_of_order - rounds.out_of_order)
+        + (after.resets_sent - rounds.resets_sent)
+        + (after.resets_received - rounds.resets_received);
     if again != 0 {
         c.write_str(", ");
         write_usize(c, again as usize);
@@ -763,6 +801,33 @@ pub fn udp_round(
         None
     })
     .is_some()
+}
+
+/// Whether the datagram kbuild sends in two fragments has arrived whole, with the pattern it
+/// carries intact: the bytes are the ones sent, not merely bytes.
+fn take_fragmented(s: &mut Stack, _: u64) -> Option<()> {
+    let mut got = [0u8; net::stack::UDP_MAX];
+    while let Some((_, _, len)) = s.udp_recv(PORT, &mut got) {
+        let datagram = got.get(..len).unwrap_or(&[]);
+        let Some(rest) = datagram.strip_prefix(FRAGMENTED) else {
+            note(datagram);
+            continue;
+        };
+        // The number, a space, and then the pattern.
+        let Some(space) = rest.iter().position(|b| *b == b' ') else {
+            continue;
+        };
+        let pattern = rest.get(space + 1..).unwrap_or(&[]);
+        let whole = pattern.len() == FRAGMENT_PATTERN
+            && pattern
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == (i as u8) ^ 0x5a);
+        if whole {
+            return Some(());
+        }
+    }
+    None
 }
 
 /// The source of the first probe waiting on [`PORT`].

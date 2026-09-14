@@ -177,7 +177,7 @@ fn a_bad_ipv4_checksum_is_refused() {
 }
 
 #[test]
-fn a_fragment_is_refused_not_reassembled() {
+fn a_fragment_is_refused_by_the_whole_datagram_parser() {
     let mut buf = [0u8; 40];
     wire::write_ipv4(&mut buf, US, GATEWAY, wire::PROTO_UDP, 9, 20).unwrap();
     // More-fragments set, then the checksum made right again so only the flag is wrong.
@@ -186,6 +186,152 @@ fn a_fragment_is_refused_not_reassembled() {
     let sum = wire::checksum(&[&buf[..20]]);
     buf[10..12].copy_from_slice(&sum.to_be_bytes());
     assert_eq!(wire::parse_ipv4(&buf), Err(wire::WireError::Fragmented));
+    // The parser that takes one says where its bytes belong instead.
+    let (ip, part) = wire::parse_ipv4_part(&buf).unwrap();
+    assert_eq!(ip.payload.len(), 20);
+    assert_eq!(
+        part,
+        Some(wire::Fragment {
+            id: 9,
+            offset: 0,
+            more: true
+        })
+    );
+}
+
+// ---- putting a fragmented datagram back together -------------------------------------------
+
+/// One fragment from the gateway: `part`, belonging `offset` bytes into datagram `id`, with
+/// `more` set when another follows.
+fn fragment(id: u16, protocol: u8, offset: usize, more: bool, part: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; ETH_HEADER + 20 + part.len()];
+    wire::write_ipv4(&mut buf[ETH_HEADER..], GATEWAY, US, protocol, id, part.len()).unwrap();
+    buf[ETH_HEADER + 20..].copy_from_slice(part);
+    let flags = if more { 0x2000u16 } else { 0 } | (offset / 8) as u16;
+    buf[ETH_HEADER + 6..ETH_HEADER + 8].copy_from_slice(&flags.to_be_bytes());
+    buf[ETH_HEADER + 10..ETH_HEADER + 12].copy_from_slice(&[0, 0]);
+    let sum = wire::checksum(&[&buf[ETH_HEADER..ETH_HEADER + 20]]);
+    buf[ETH_HEADER + 10..ETH_HEADER + 12].copy_from_slice(&sum.to_be_bytes());
+    wire::write_ethernet(&mut buf, OUR_MAC, GATEWAY_MAC, wire::ETHERTYPE_IPV4).unwrap();
+    buf
+}
+
+/// A UDP datagram from the gateway to `port`, as bytes to be split into fragments.
+fn udp_bytes(port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut d = vec![0u8; 8 + payload.len()];
+    let n = wire::write_udp(&mut d, GATEWAY, US, 4321, port, payload).unwrap();
+    d.truncate(n);
+    d
+}
+
+/// What the stack made of a datagram delivered as fragments in the order given.
+fn reassemble(order: [usize; 2]) -> (Box<Stack>, Vec<u8>) {
+    let (mut s, link) = (stack(), Link::new());
+    let payload: Vec<u8> = (0..64u8).map(|i| i ^ 0x5a).collect();
+    let bytes = udp_bytes(5555, &payload);
+    let pieces = [
+        fragment(9, wire::PROTO_UDP, 0, true, &bytes[..16]),
+        fragment(9, wire::PROTO_UDP, 16, false, &bytes[16..]),
+    ];
+    for (t, i) in order.iter().enumerate() {
+        link.deliver(pieces[*i].clone());
+        s.poll(&link, (t as u64 + 1) * MS);
+    }
+    let mut got = [0u8; 256];
+    let n = s
+        .udp_recv(5555, &mut got)
+        .map(|(from, port, len)| {
+            assert_eq!((from, port), (GATEWAY, 4321), "the datagram's sender");
+            len
+        })
+        .unwrap_or(0);
+    (s, got[..n].to_vec())
+}
+
+#[test]
+fn a_datagram_in_two_fragments_is_put_back_together_in_either_order() {
+    let payload: Vec<u8> = (0..64u8).map(|i| i ^ 0x5a).collect();
+    for order in [[0, 1], [1, 0]] {
+        let (s, got) = reassemble(order);
+        assert_eq!(got, payload, "delivered in the order {order:?}");
+        let c = s.counters();
+        assert_eq!((c.fragments_received, c.datagrams_reassembled), (2, 1));
+        assert_eq!(c.fragments_dropped, 0);
+        assert_eq!(s.fragments_in_progress(), 0, "the set is given back");
+        assert!(s.balanced(), "a fragment holds no pool buffer");
+    }
+}
+
+#[test]
+fn a_set_whose_missing_fragment_never_comes_is_given_up() {
+    let (mut s, link) = (stack(), Link::new());
+    let bytes = udp_bytes(5555, &[3u8; 64]);
+    link.deliver(fragment(9, wire::PROTO_UDP, 0, true, &bytes[..16]));
+    s.poll(&link, MS);
+    assert_eq!(s.fragments_in_progress(), 1, "waiting for the rest of it");
+    s.poll(&link, MS + crate::reasm::TIMEOUT_NS);
+    assert_eq!(s.fragments_in_progress(), 0);
+    assert_eq!(s.counters().reassembly_timeouts, 1);
+    // The rest of it, far too late: it opens a set of its own rather than finishing that one.
+    link.deliver(fragment(9, wire::PROTO_UDP, 16, false, &bytes[16..]));
+    s.poll(&link, 2 * MS + crate::reasm::TIMEOUT_NS);
+    let mut got = [0u8; 256];
+    assert!(s.udp_recv(5555, &mut got).is_none(), "half a datagram is not a datagram");
+    assert_eq!(s.counters().datagrams_reassembled, 0);
+}
+
+#[test]
+fn more_part_finished_datagrams_than_sets_cost_nothing_more() {
+    let (mut s, link) = (stack(), Link::new());
+    let bytes = udp_bytes(5555, &[4u8; 64]);
+    for id in 0..crate::reasm::SETS as u16 + 2 {
+        link.deliver(fragment(id, wire::PROTO_UDP, 0, true, &bytes[..16]));
+        s.poll(&link, MS);
+    }
+    assert_eq!(s.fragments_in_progress(), crate::reasm::SETS, "a fixed number of sets");
+    assert!(s.balanced());
+}
+
+#[test]
+fn a_fragment_past_what_a_set_holds_gives_the_set_up_rather_than_growing_it() {
+    let (mut s, link) = (stack(), Link::new());
+    let bytes = udp_bytes(5555, &[5u8; 64]);
+    link.deliver(fragment(9, wire::PROTO_UDP, 0, true, &bytes[..16]));
+    s.poll(&link, MS);
+    assert_eq!(s.fragments_in_progress(), 1);
+    // A fragment that claims to belong past the end of what a set can hold: the set goes,
+    // rather than the stack finding room for whatever a sender says.
+    let far = crate::reasm::MAX - 8;
+    link.deliver(fragment(9, wire::PROTO_UDP, far, false, &[6u8; 64]));
+    s.poll(&link, 2 * MS);
+    assert_eq!(s.fragments_in_progress(), 0, "the set was given up");
+    assert_eq!(s.counters().fragments_dropped, 1);
+    assert_eq!(s.counters().datagrams_reassembled, 0);
+    assert!(s.balanced());
+}
+
+#[test]
+fn a_datagram_in_more_runs_than_a_set_describes_is_given_up() {
+    let (mut s, link) = (stack(), Link::new());
+    // Every other eight-byte unit, so each arrival is a run of its own with a hole in front.
+    for (n, at) in (0..crate::reasm::PIECES + 1).map(|n| (n, n * 16)) {
+        link.deliver(fragment(9, wire::PROTO_UDP, at, true, &[n as u8; 8]));
+        s.poll(&link, MS);
+    }
+    assert_eq!(s.fragments_in_progress(), 0, "the set was given up, not grown");
+    assert_eq!(s.counters().fragments_dropped, 1);
+    assert!(s.balanced());
+}
+
+#[test]
+fn a_fragmented_tcp_segment_is_counted_and_dropped() {
+    let (mut s, link) = (stack(), Link::new());
+    link.deliver(fragment(9, wire::PROTO_TCP, 0, true, &[0u8; 32]));
+    s.poll(&link, MS);
+    let c = s.counters();
+    assert_eq!((c.fragments_received, c.fragments_dropped), (1, 1));
+    assert_eq!(s.fragments_in_progress(), 0, "no set is opened for one");
+    assert!(s.balanced());
 }
 
 #[test]

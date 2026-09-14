@@ -1345,15 +1345,28 @@ The network is
 -chardev socket,id=kt_relay_in,host=127.0.0.1,port=<in>
 -object filter-redirector,id=kt_net_in,netdev=kt_net,queue=rx,indev=kt_relay_in
 -object filter-redirector,id=kt_net_out,netdev=kt_net,queue=rx,outdev=kt_relay_out
+-chardev socket,id=kt_down_out,host=127.0.0.1,port=<down out>
+-chardev socket,id=kt_down_in,host=127.0.0.1,port=<down in>
+-object filter-redirector,id=kt_net_down_out,netdev=kt_net,queue=tx,outdev=kt_down_out
+-object filter-redirector,id=kt_net_down_in,netdev=kt_net,queue=tx,indev=kt_down_in
 ```
+
+The two pairs are declared in opposite orders on purpose. A frame the guest sends passes the
+filters last to first, so the injector is declared first and what it puts back goes on to the
+network; a frame on its way to the guest passes them in declaration order, so there the
+redirector is declared first and what the injector puts back goes on to the card. Declared the
+other way round, the second pair swallowed every inbound frame and the boot reported that the
+gateway never answered an ARP request.
 
 where the ports are free loopback ports kbuild picks for the run. Nothing leaves the host.
 QEMU's user-mode stack answers ARP and echo requests for its gateway, 10.0.2.2, itself, and
 the only other party is kbuild, in three threads of `kbuild/src/qemu.rs`:
 
 - `udp_peer` sends `kintane-udp-probe` to the forwarded port four times a second, each followed
-  by `kintane-tcp-port <tcp>`, `kintane-udp-port <service>` and `kintane-udp-quiet <quiet>`, and
-  answers every `kintane-udp-echo <n>` the guest sends back with `kintane-udp-ack <n>`.
+  by `kintane-tcp-port <tcp>`, `kintane-udp-port <service>`, `kintane-udp-quiet <quiet>` and
+  `kintane-udp-fragmented 1 <64 bytes>`, and answers every `kintane-udp-echo <n>` the guest
+  sends back with `kintane-udp-ack <n>`. The 64 bytes are `i ^ 0x5a`, which the guest checks
+  one by one once it has the datagram whole.
 - `udp_service` answers `kintane-udp-request <tag>` on the loopback port `<service>` with
   `kintane-udp-reply <tag>`, to whoever sent it. The guest reaches it the way it reaches
   `tcp_service`, by addressing the gateway. `<quiet>` is a port kbuild found free and never
@@ -1361,14 +1374,32 @@ the only other party is kbuild, in three threads of `kbuild/src/qemu.rs`:
 - `tcp_service` listens on the loopback port `<tcp>`. The guest reaches it by connecting to the
   gateway's address, which QEMU's user network turns into a connection to the host's loopback
   interface. It reads `kintane-tcp-request <mode> <tag>` and writes back
-  `kintane-tcp-reply <mode> <tag>`. It closes first for `peer-closes`, and after the guest for
+  `kintane-tcp-reply <mode> <tag>`, in two writes with Nagle off, so the reply is two segments
+  and `downstream` has a pair to swap. It closes first for `peer-closes`, and after the guest for
   `guest-closes`.
-- `relay` sits between the card and QEMU's network. The two filters hand every frame the guest
-  transmits to kbuild on one socket and take it back on the other before the network sees it.
-  The injecting filter is declared first, because a guest's frames pass a network's filters last
-  to first. The relay passes every frame but one kind: the first data segment of each connection
-  to `<tcp>`, which it drops the first time it sees it. That is what lets a check require a
+- `relay` sits between the card and QEMU's network, on the frames the guest sends. The two
+  filters hand each to kbuild on one socket and take it back on the other before the network
+  sees it. It passes every frame but one kind: the first data segment of each connection to
+  `<tcp>`, which it drops the first time it sees it. That is what lets a check require a
   retransmission rather than hope for one.
+- `downstream` is the same thing on the frames the network sends the guest, and it is where the
+  network stops being orderly. It does three things, each of which the `net` check gates on:
+  - **fragmentation**: every datagram carrying `kintane-udp-fragmented ` is split into two IPv4
+    fragments, each with its own header checksum, at an eight-byte boundary. Put back together
+    the datagram is the bytes that were sent, so the guest checks a pattern rather than that
+    something arrived;
+  - **reordering**: the first data segment of the first connection to `<tcp>` is split into two
+    segments, each with its own sequence number and checksums, and the second half is sent
+    first, so the guest holds it until the half in front of it arrives;
+  - **duplication**: the half in front is then sent twice, so the guest must take it once.
+
+  The last two happen once per run; fragmentation happens every time, because the guest may not
+  be listening when the first one goes past. The relay never holds a frame back waiting for
+  another: an earlier version held the first data segment until the next frame went by, which
+  reordered a pair only when that next frame happened to be the rest of the reply. On
+  `x86_64-qemu-smp` it was an acknowledgement, nothing arrived out of order, and the boot failed
+  a check that was really about frame timing. Splitting one segment cannot be timed out of
+  happening.
 
 Like the serial probes, all three answer and never judge: the verdict is the exit code. The
 resolver at 10.0.2.3 is not used, because it forwards to the host's, which an offline machine
@@ -1379,9 +1410,11 @@ The boot gates on three lines ([architecture.md](architecture.md#net--the-networ
 ```
   nic        virtio-net 52:54:00:12:34:56, 8 receive buffers posted ok
   net        line 78; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555, 3 round trips;
-             tcp port 51092, closed by the kernel [syn-sent established fin-wait-1 fin-wait-2
-             time-wait] and by kbuild [syn-sent established close-wait last-ack], 2 data
-             retransmits; 46 frames in, 21 out, 50 interrupts, 0 polled, 0 stack buffers held ok
+             4 fragments, 2 datagrams reassembled; tcp port 55824, closed by the kernel
+             [syn-sent established fin-wait-1 fin-wait-2 time-wait] and by kbuild [syn-sent
+             established close-wait last-ack], 2 data retransmits, 1 segments held out of order,
+             1 runs joined up; 81 frames in, 22 out, 50 interrupts, 0 polled, 0 stack buffers
+             held ok
   sockets    tcp-client connected, sent, read its reply to kbuild's close; 1 established,
              1 data retransmits; waits woken by the card 5, armed for a TCP timer 5, polled 0;
              udp-client: a reply from the service, a truncation reported whole, a foreign
@@ -1417,16 +1450,37 @@ IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT`. Every wait is bounded by the cl
 the gateway, 3 s for each reply, 15 s for kbuild's first probe. A broken path fails the boot
 rather than timing it out.
 
+**The fragmented datagram.** Before the TCP part, the check waits for a datagram that arrived as
+two fragments and requires its 64-byte pattern to be exactly what kbuild sent, byte for byte:
+`4 fragments, 2 datagrams reassembled` above is the probe's copy and the check's. A stack that
+refuses fragments never sees one, and the boot fails with `THE FRAGMENTED DATAGRAM NEVER ARRIVED
+WHOLE AND INTACT`.
+
 The TCP part of `net` makes two connections to `tcp_service`, each step bounded at 10 s. The
 first is closed by the kernel first and must pass through FIN-WAIT-1 to TIME-WAIT. The second
 is closed by kbuild first and must pass through CLOSE-WAIT and LAST-ACK to CLOSED, and be
-reaped. Each must have had a data segment retransmitted, since the relay dropped its first.
-Then the check lingers 3 s, and no segment may arrive twice or out of order, and no reset may
-be sent or received: a segment the kernel failed to acknowledge would come again, since QEMU's
-TCP retransmits after a second or so. Every buffer must be back afterwards, as before.
+reaped. Each must have had a data segment retransmitted, since the relay dropped its first. The
+first connection also meets `downstream`'s swapped pair, so the rounds must show at least one
+segment held out of order and at least one run of held bytes joining the stream, and none given
+up: a stack that dropped what arrived early would still deliver the reply, from the peer's
+retransmission, which is exactly what the counters tell apart. Then the check lingers 3 s, and
+*from there on* no segment may arrive twice or out of order and no reset may be exchanged: a
+segment the kernel failed to acknowledge would come again, since QEMU's TCP retransmits after a
+second or so. (Duplicates and reordering during the rounds are what the relay is for; after them
+there is no excuse for either.) Every buffer must be back afterwards, as before.
 `sockets`, on x86_64 and aarch64, runs `user/tcp-client` over the socket calls on the scheduler
 ([userspace-abi.md](userspace-abi.md)); i686 has no userspace, and gates on the TCP part of
 `net` alone.
+
+**What the congestion control costs, measured.** A 60-second stress run at four CPUs on
+`x86_64-qemu-smp` made **204 TCP round trips with 205 data retransmits and no retried round**,
+with 6,181 socket waits woken by the card and none polled. The same run shape recorded before
+this work made 162 round trips with 163 retransmits (and 154/154 on `aarch64-virt-smp`). Two
+caveats, and they matter more than the numbers: the guest is emulated, so TCG's cost dominates a
+loopback path with no real latency or loss to control for; and the relay drops one data segment
+of every connection on purpose, so retransmits track round trips by construction rather than
+telling you anything about loss recovery. What the figures support is that a window, an estimate
+and a queue did not cost throughput — not that TCP got faster on a network.
 
 **Waits woken by the card.** From `sockets` on, the card's interrupt handler runs the stack and
 wakes the socket calls' queue, and a waiter otherwise looks again only at the stack's next TCP

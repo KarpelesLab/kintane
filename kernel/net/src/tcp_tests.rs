@@ -9,7 +9,8 @@ use core::cell::RefCell;
 use std::collections::VecDeque;
 
 use crate::tcp::{
-    BACKLOG, CONNECTIONS, Conn, MSS, RETRIES, RING, RTO_INITIAL_NS, State, TIME_WAIT_NS,
+    BACKLOG, CONNECTIONS, Conn, DUP_ACK_THRESHOLD, INITIAL_WINDOW, MSS, OOO_SEGMENTS, RETRIES,
+    RING, RTO_INITIAL_NS, RTO_MIN_NS, State, TIME_WAIT_NS,
 };
 use crate::wire::{
     self, ARP_REPLY, ARP_REQUEST, Arp, ETH_HEADER, ETHERTYPE_ARP, ETHERTYPE_IPV4, Frame, PROTO_TCP,
@@ -417,24 +418,29 @@ fn a_lost_data_segment_is_sent_again_when_the_timer_runs_out() {
     let (me, iss) = (syn.src_port, syn.seq);
     s.tcp_send(&w, c, b"lost", 10 * MS).unwrap();
     let first = w.one();
+    // The timeout is what the handshake's round trip works out to, not a fixed wait.
+    let rto = s.tcp_status(c).unwrap().rto_ns;
+    let sent_at = 10 * MS;
     // The peer never sees it. Nothing is sent again before the timeout...
-    s.poll(&w, 10 * MS + RTO_INITIAL_NS - 1);
+    s.poll(&w, sent_at + rto - 1);
     w.nothing();
     // ...and exactly the same segment is at it.
-    s.poll(&w, 10 * MS + RTO_INITIAL_NS);
+    s.poll(&w, sent_at + rto);
     let again = w.one();
     assert_eq!((again.seq, &again.payload), (first.seq, &first.payload));
     let counters = s.tcp_counters();
     assert_eq!((counters.retransmit_timeouts, counters.data_retransmits), (1, 1));
-    // Lost again: the timeout has doubled.
-    s.poll(&w, 10 * MS + 3 * RTO_INITIAL_NS - 1);
+    // Lost again: the timeout has doubled, and the estimate is left alone, since a
+    // measurement of a segment sent twice would belong to neither copy (Karn's rule).
+    let second = sent_at + rto;
+    s.poll(&w, second + 2 * rto - 1);
     w.nothing();
-    s.poll(&w, 10 * MS + 3 * RTO_INITIAL_NS);
+    s.poll(&w, second + 2 * rto);
     assert_eq!(w.one().seq, iss + 1);
     // Acknowledged at last: the timer stops.
     w.peer(me, PEER_ISS + 1, iss + 5, TCP_ACK, &[]);
-    s.poll(&w, 10 * MS + 3 * RTO_INITIAL_NS + MS);
-    s.poll(&w, 10 * MS + 100 * RTO_INITIAL_NS);
+    s.poll(&w, second + 2 * rto + MS);
+    s.poll(&w, second + 100 * rto);
     w.nothing();
     assert_eq!(s.tcp_counters().data_retransmits, 2);
 }
@@ -464,9 +470,10 @@ fn go_back_n_resends_from_the_oldest_unacknowledged_byte() {
     w.peer(me, PEER_ISS + 1, iss + 5, TCP_ACK, &[]);
     s.poll(&w, 3 * MS);
     w.nothing();
-    s.poll(&w, 3 * MS + RTO_INITIAL_NS - 1);
+    let rto = s.tcp_status(c).unwrap().rto_ns;
+    s.poll(&w, 3 * MS + rto - 1);
     w.nothing();
-    s.poll(&w, 3 * MS + RTO_INITIAL_NS);
+    s.poll(&w, 3 * MS + rto);
     let again = w.one();
     assert_eq!((again.seq, &again.payload[..]), (iss + 5, &b"bbbb"[..]));
 }
@@ -493,24 +500,33 @@ fn a_duplicated_segment_is_acknowledged_and_delivered_once() {
 }
 
 #[test]
-fn reordered_segments_are_repaired_by_the_retransmission() {
+fn a_reordered_segment_is_held_and_the_stream_comes_out_in_order() {
     let (mut s, w) = ready();
     let (c, syn) = open(&mut s, &w);
     let (me, iss) = (syn.src_port, syn.seq);
-    // The second segment arrives first: dropped, with an ACK for what is still expected.
+    // The second segment arrives first: held, and acknowledged with what is still expected,
+    // which is what tells the peer which segment to send again.
     w.peer(me, PEER_ISS + 4, iss + 1, TCP_ACK | TCP_PSH, b"def");
     s.poll(&w, 2 * MS);
     assert_eq!(w.one().ack, PEER_ISS + 1);
-    assert_eq!(read_all(&mut s, &w, c), b"");
-    assert_eq!(s.tcp_counters().out_of_order, 1);
+    assert_eq!(read_all(&mut s, &w, c), b"", "nothing is readable across a hole");
+    let counters = s.tcp_counters();
+    assert_eq!((counters.out_of_order, counters.out_of_order_queued), (1, 1));
+    assert_eq!(s.tcp_status(c).unwrap().held_out_of_order, 1);
+    // The hole is filled: both runs are the stream now, acknowledged together and read in
+    // order, without the peer sending the second one again.
     w.peer(me, PEER_ISS + 1, iss + 1, TCP_ACK | TCP_PSH, b"abc");
     s.poll(&w, 3 * MS);
-    assert_eq!(w.one().ack, PEER_ISS + 4);
-    // The peer's timer sends the second again.
+    assert_eq!(w.one().ack, PEER_ISS + 7);
+    assert_eq!(read_all(&mut s, &w, c), b"abcdef");
+    assert_eq!(s.tcp_counters().out_of_order_delivered, 1);
+    assert_eq!(s.tcp_status(c).unwrap().held_out_of_order, 0);
+    // A copy the peer sent again anyway is old news: acknowledged, and delivered to nobody.
     w.peer(me, PEER_ISS + 4, iss + 1, TCP_ACK | TCP_PSH, b"def");
     s.poll(&w, 4 * MS);
     assert_eq!(w.one().ack, PEER_ISS + 7);
-    assert_eq!(read_all(&mut s, &w, c), b"abcdef");
+    assert_eq!(read_all(&mut s, &w, c), b"");
+    assert!(s.books_consistent());
 }
 
 #[test]
@@ -744,4 +760,187 @@ fn closing_with_unread_data_resets() {
     s.tcp_close(&w, c, 3 * MS).unwrap();
     assert_eq!(w.one().flags, TCP_RST | TCP_ACK);
     assert!(s.balanced());
+}
+
+// ---- congestion control --------------------------------------------------------------------
+//
+// A hundred-byte segment size throughout, so a window of a few segments is a few hundred bytes
+// and every number below is one a reader can check by hand.
+
+/// An established connection whose peer announced `window` and a segment size of `mss`: the
+/// connection, the port it opened from, and its initial sequence number.
+fn open_with(s: &mut Stack, w: &Wire, window: u16, mss: u16) -> (Conn, u16, u32) {
+    let c = s.tcp_connect(w, PEER, PORT, 0).unwrap();
+    let syn = w.one();
+    let (me, iss) = (syn.src_port, syn.seq);
+    w.peer_with(PORT, me, PEER_ISS, iss + 1, TCP_SYN | TCP_ACK, window, Some(mss), &[]);
+    s.poll(w, MS);
+    w.one();
+    assert_eq!(s.tcp_status(c).unwrap().state, State::Established);
+    (c, me, iss)
+}
+
+#[test]
+fn the_congestion_window_starts_at_four_segments_and_bounds_what_is_sent() {
+    let (mut s, w) = ready();
+    let (c, _, _) = open_with(&mut s, &w, 8192, 100);
+    assert_eq!(s.tcp_status(c).unwrap().cwnd, INITIAL_WINDOW as usize * 100);
+    // A thousand bytes queued and a window of four segments: four go, though the peer's
+    // window would take all of it.
+    s.tcp_send(&w, c, &[7u8; 1000], 2 * MS).unwrap();
+    let sent = w.take();
+    assert_eq!(sent.len(), INITIAL_WINDOW as usize, "{sent:?}");
+    assert!(sent.iter().all(|s| s.payload.len() == 100), "{sent:?}");
+}
+
+#[test]
+fn in_slow_start_each_acknowledgement_is_worth_another_segment() {
+    let (mut s, w) = ready();
+    let (c, me, iss) = open_with(&mut s, &w, 8192, 100);
+    s.tcp_send(&w, c, &[7u8; 1000], 2 * MS).unwrap();
+    w.take();
+    // One segment acknowledged: the window grows by one, so two more go out — the one the
+    // acknowledgement made room for, and the one the window grew by.
+    w.peer_with(PORT, me, PEER_ISS + 1, iss + 101, TCP_ACK, 8192, None, &[]);
+    s.poll(&w, 3 * MS);
+    assert_eq!(s.tcp_status(c).unwrap().cwnd, 500);
+    let sent = w.take();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+}
+
+#[test]
+fn three_duplicate_acknowledgements_resend_the_lost_segment_without_waiting_for_the_timer() {
+    let (mut s, w) = ready();
+    let (c, me, iss) = open_with(&mut s, &w, 8192, 100);
+    s.tcp_send(&w, c, &[9u8; 1000], 2 * MS).unwrap();
+    assert_eq!(w.take().len(), INITIAL_WINDOW as usize);
+    // The first segment is lost, so each one after it draws the same acknowledgement. Two
+    // duplicates are reordering as far as the sender knows, and nothing is sent again.
+    for _ in 1..DUP_ACK_THRESHOLD {
+        w.peer_with(PORT, me, PEER_ISS + 1, iss + 1, TCP_ACK, 8192, None, &[]);
+        s.poll(&w, 3 * MS);
+        w.nothing();
+    }
+    // The third says the segment is gone.
+    w.peer_with(PORT, me, PEER_ISS + 1, iss + 1, TCP_ACK, 8192, None, &[]);
+    s.poll(&w, 3 * MS);
+    let again = w.one();
+    assert_eq!((again.seq, again.payload.len()), (iss + 1, 100), "the oldest, at once");
+    let st = s.tcp_status(c).unwrap();
+    // Half the flight of four hundred, and three segments for the three that left the network.
+    assert_eq!((st.ssthresh, st.cwnd), (200, 500));
+    let counters = s.tcp_counters();
+    assert_eq!((counters.fast_retransmits, counters.dup_acks), (1, 3));
+    assert_eq!(counters.retransmit_timeouts, 0, "the timer never ran out");
+    // Everything outstanding when the loss was found is acknowledged: out of recovery and
+    // back to the threshold.
+    w.peer_with(PORT, me, PEER_ISS + 1, iss + 401, TCP_ACK, 8192, None, &[]);
+    s.poll(&w, 4 * MS);
+    assert_eq!(s.tcp_status(c).unwrap().cwnd, 200);
+    w.take();
+    // Above the threshold, growth is congestion avoidance: a segment per round trip, which
+    // for a hundred-byte segment and a two-hundred-byte window is half a segment per
+    // acknowledgement.
+    w.peer_with(PORT, me, PEER_ISS + 1, iss + 501, TCP_ACK, 8192, None, &[]);
+    s.poll(&w, 5 * MS);
+    assert_eq!(s.tcp_status(c).unwrap().cwnd, 250);
+}
+
+#[test]
+fn a_timeout_collapses_the_window_to_one_segment_and_halves_the_threshold() {
+    let (mut s, w) = ready();
+    let (c, _, _) = open_with(&mut s, &w, 8192, 100);
+    s.tcp_send(&w, c, &[1u8; 1000], 2 * MS).unwrap();
+    assert_eq!(w.take().len(), INITIAL_WINDOW as usize);
+    let rto = s.tcp_status(c).unwrap().rto_ns;
+    s.poll(&w, 2 * MS + rto);
+    let again = w.one();
+    assert_eq!(again.payload.len(), 100, "one segment, from the oldest byte");
+    let st = s.tcp_status(c).unwrap();
+    assert_eq!((st.cwnd, st.ssthresh), (100, 200));
+    assert_eq!(s.tcp_counters().retransmit_timeouts, 1);
+}
+
+#[test]
+fn the_timeout_follows_the_round_trip_estimate_once_there_is_one() {
+    let (mut s, w) = ready();
+    // Nothing measured yet: the initial timeout stands.
+    let c = s.tcp_connect(&w, PEER, PORT, 0).unwrap();
+    let syn = w.one();
+    assert_eq!(s.tcp_status(c).unwrap().rto_ns, RTO_INITIAL_NS);
+    assert_eq!(s.tcp_counters().rtt_samples, 0);
+    // The handshake is a measurement, and the timeout follows it, down to its floor.
+    w.peer_with(
+        PORT,
+        syn.src_port,
+        PEER_ISS,
+        syn.seq + 1,
+        TCP_SYN | TCP_ACK,
+        8192,
+        Some(1460),
+        &[],
+    );
+    s.poll(&w, 5 * MS);
+    w.one();
+    let st = s.tcp_status(c).unwrap();
+    assert_eq!(st.state, State::Established);
+    assert_eq!(st.rto_ns, RTO_MIN_NS, "a five-millisecond round trip is under the floor");
+    assert_eq!(s.tcp_counters().rtt_samples, 1);
+}
+
+#[test]
+fn a_held_run_the_stream_overtakes_is_forgotten_rather_than_delivered_again() {
+    let (mut s, w) = ready();
+    let (c, syn) = open(&mut s, &w);
+    let (me, iss) = (syn.src_port, syn.seq);
+    let base = PEER_ISS + 1;
+    // A hole of ten bytes, and four bytes held past it.
+    w.peer(me, base + 10, iss + 1, TCP_ACK | TCP_PSH, b"jklm");
+    s.poll(&w, 2 * MS);
+    assert_eq!(w.one().ack, base);
+    assert_eq!(s.tcp_status(c).unwrap().held_out_of_order, 1);
+    // The peer sends one segment covering the hole *and* the bytes held past it, so the
+    // stream overtakes the run: those bytes are already in it, and the run is simply gone.
+    w.peer(me, base, iss + 1, TCP_ACK | TCP_PSH, b"abcdefghijklmn");
+    s.poll(&w, 3 * MS);
+    assert_eq!(w.one().ack, base + 14);
+    assert_eq!(read_all(&mut s, &w, c), b"abcdefghijklmn", "each byte once, in order");
+    assert_eq!(s.tcp_status(c).unwrap().held_out_of_order, 0);
+    assert!(s.books_consistent());
+}
+
+#[test]
+fn held_runs_are_bounded_and_the_furthest_gives_way_to_a_nearer_one() {
+    let (mut s, w) = ready();
+    let (c, syn) = open(&mut s, &w);
+    let (me, iss) = (syn.src_port, syn.seq);
+    let base = PEER_ISS + 1;
+    // A hole, and then runs with gaps between them, so no two merge into one.
+    for i in 0..OOO_SEGMENTS as u32 {
+        w.peer(me, base + 10 + i * 10, iss + 1, TCP_ACK | TCP_PSH, b"abcd");
+        s.poll(&w, 2 * MS);
+        assert_eq!(w.one().ack, base, "still asking for the byte the hole starts at");
+    }
+    assert_eq!(s.tcp_status(c).unwrap().held_out_of_order, OOO_SEGMENTS);
+    assert_eq!(s.tcp_counters().out_of_order_queued, OOO_SEGMENTS as u64);
+    // Further ahead than everything held, with every run taken: this is the one dropped.
+    w.peer(me, base + 200, iss + 1, TCP_ACK | TCP_PSH, b"zzzz");
+    s.poll(&w, 3 * MS);
+    w.one();
+    assert_eq!(s.tcp_status(c).unwrap().held_out_of_order, OOO_SEGMENTS);
+    assert_eq!(s.tcp_counters().out_of_order_dropped, 1);
+    // Nearer than the furthest run held: it takes that run's place, because the stream needs
+    // the nearest bytes first.
+    w.peer(me, base + 5, iss + 1, TCP_ACK | TCP_PSH, b"ab");
+    s.poll(&w, 4 * MS);
+    w.one();
+    assert_eq!(s.tcp_counters().out_of_order_dropped, 2);
+    assert_eq!(s.tcp_status(c).unwrap().held_out_of_order, OOO_SEGMENTS);
+    // The hole is filled: what is contiguous from the first byte comes out in order, and the
+    // runs still separated by holes stay held.
+    w.peer(me, base, iss + 1, TCP_ACK | TCP_PSH, b"xxxxx");
+    s.poll(&w, 5 * MS);
+    assert_eq!(w.one().ack, base + 7);
+    assert_eq!(read_all(&mut s, &w, c), b"xxxxxab");
+    assert!(s.books_consistent());
 }

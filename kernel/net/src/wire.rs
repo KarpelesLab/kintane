@@ -41,6 +41,10 @@ pub const PROTO_UDP: u8 = 17;
 const IPV4_DF: u16 = 0x4000;
 /// More fragments, and the fragment offset: either set means this is a fragment.
 const IPV4_FRAGMENT: u16 = 0x3fff;
+/// More fragments follow this one.
+const IPV4_MF: u16 = 0x2000;
+/// Where this fragment's payload belongs, in eight-byte units.
+const IPV4_OFFSET: u16 = 0x1fff;
 
 pub const ICMP_HEADER: usize = 8;
 pub const ICMP_ECHO_REPLY: u8 = 0;
@@ -214,9 +218,37 @@ pub struct Ipv4<'a> {
     pub payload: &'a [u8],
 }
 
+/// Where a packet's bytes sit in the datagram they are one fragment of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Fragment {
+    /// The identification field: fragments of one datagram share it, along with the
+    /// addresses and the protocol.
+    pub id: u16,
+    /// Where this fragment's payload starts in the whole datagram, in bytes. The field on
+    /// the wire counts eight-byte units, so this is always a multiple of eight.
+    pub offset: usize,
+    /// Another fragment follows this one; the one without it ends the datagram.
+    pub more: bool,
+}
+
 /// Parse an IPv4 packet. The header checksum is verified before any field is trusted, and a
-/// fragment is refused.
+/// fragment is refused: [`parse_ipv4_part`] is what takes one, and `stack` reassembles.
 pub fn parse_ipv4(p: &[u8]) -> Result<Ipv4<'_>, WireError> {
+    match parse_ipv4_part(p)? {
+        (ip, None) => Ok(ip),
+        (_, Some(_)) => Err(WireError::Fragmented),
+    }
+}
+
+/// Parse an IPv4 packet whether or not it is a fragment of a larger datagram: the header, the
+/// payload *these* bytes carry, and where that payload belongs in the datagram when they are
+/// one fragment of several.
+///
+/// Everything [`parse_ipv4`] checks is checked here: the version, the header length against
+/// the bytes there, the total length against both, and the header checksum before any field
+/// is trusted. A fragment's payload is its own bytes; putting the datagram back together is
+/// the stack's business, because it is what owns the memory to do it in.
+pub fn parse_ipv4_part(p: &[u8]) -> Result<(Ipv4<'_>, Option<Fragment>), WireError> {
     let first = *p.first().ok_or(WireError::Short)?;
     if first >> 4 != 4 {
         return Err(WireError::NotIpv4);
@@ -232,17 +264,23 @@ pub fn parse_ipv4(p: &[u8]) -> Result<Ipv4<'_>, WireError> {
     if checksum(&[&p[..header]]) != 0 {
         return Err(WireError::BadChecksum);
     }
-    if be16(p, 6).ok_or(WireError::Short)? & IPV4_FRAGMENT != 0 {
-        return Err(WireError::Fragmented);
-    }
     let short = WireError::Short;
-    Ok(Ipv4 {
-        ttl: *p.get(8).ok_or(short)?,
-        protocol: *p.get(9).ok_or(short)?,
-        src: ip_at(p, 12).ok_or(short)?,
-        dst: ip_at(p, 16).ok_or(short)?,
-        payload: &p[header..total],
-    })
+    let flags = be16(p, 6).ok_or(short)?;
+    let fragment = (flags & IPV4_FRAGMENT != 0).then(|| Fragment {
+        id: be16(p, 4).unwrap_or(0),
+        offset: usize::from(flags & IPV4_OFFSET) * 8,
+        more: flags & IPV4_MF != 0,
+    });
+    Ok((
+        Ipv4 {
+            ttl: *p.get(8).ok_or(short)?,
+            protocol: *p.get(9).ok_or(short)?,
+            src: ip_at(p, 12).ok_or(short)?,
+            dst: ip_at(p, 16).ok_or(short)?,
+            payload: &p[header..total],
+        },
+        fragment,
+    ))
 }
 
 /// Write a 20-byte IPv4 header for a payload of `payload_len`, with its checksum.
