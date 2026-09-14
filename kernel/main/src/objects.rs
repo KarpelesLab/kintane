@@ -39,6 +39,7 @@ use sync::SpinLock;
 use sync::lockdep::LockClass;
 
 use crate::Locks;
+use crate::wait::WaitQueue;
 
 /// Objects that can exist at once, across every process. A spawn sequence uses six — an
 /// image, a process, a thread, a completion queue and two channel endpoints — so this is
@@ -66,7 +67,13 @@ pub enum Object {
         waiter: Option<(ObjectId, u64)>,
     },
     /// A thread of a process.
-    Thread { id: ThreadId },
+    Thread {
+        #[expect(
+            dead_code,
+            reason = "no call acts on a thread through its handle yet; every thread a program starts is reaped through `spawn`'s own record"
+        )]
+        id: ThreadId,
+    },
     /// Anonymous memory, not yet mapped anywhere.
     Region { len: usize },
     /// Where finished asynchronous operations report.
@@ -74,6 +81,19 @@ pub enum Object {
         ring: [(u64, u64); QUEUE_DEPTH],
         head: usize,
         len: usize,
+    },
+    /// A latch: signalled by one thread, consumed by the thread that waits on it.
+    Event { signalled: bool },
+    /// A timer delivering to a completion queue. `deadline` is nanoseconds of the kernel
+    /// clock, or [`DISARMED`].
+    Timer {
+        queue: ObjectId,
+        key: u64,
+        deadline: u64,
+        /// Zero for a one-shot timer.
+        period: u64,
+        /// Expirations delivered so far.
+        fires: u64,
     },
 }
 
@@ -96,6 +116,8 @@ impl Object {
             Object::Process { .. } => ObjectType::Process,
             Object::Thread { .. } => ObjectType::Thread,
             Object::Completion { .. } => ObjectType::Completion,
+            Object::Event { .. } => ObjectType::Event,
+            Object::Timer { .. } => ObjectType::Timer,
         })
     }
 }
@@ -107,6 +129,12 @@ pub struct Cell {
 }
 
 impl Cell {
+    /// This cell's position in [`CELLS`], which is also its wait queue's in [`WAITS`].
+    fn index(&self) -> usize {
+        (self as *const Cell as usize).wrapping_sub(CELLS.as_ptr() as usize)
+            / core::mem::size_of::<Cell>()
+    }
+
     const fn new() -> Cell {
         Cell {
             state: SpinLock::with_class(Object::Free, &CELL_CLASS),
@@ -141,6 +169,11 @@ static IDS: ObjectIds = ObjectIds::new();
 /// object is gone, with no store lock held.
 fn destroy(_id: ObjectId, cell: &'static Cell) {
     cell.with(|o| *o = Object::Free);
+    // A thread waiting on the object checks again and finds it gone, rather than waiting
+    // for a wake the object can no longer send.
+    if let Some(waiters) = WAITS.get(cell.index()) {
+        waiters.wake_all();
+    }
 }
 
 /// The store, once [`init`] has made it.
@@ -225,27 +258,6 @@ pub fn with_handle<R, const N: usize>(
     Ok(reference.with(f))
 }
 
-/// Collect the thread every live thread object names into `out`, and return how many.
-///
-/// The ids are copied out under each cell's lock and nothing is done with them here, on
-/// purpose: reaping takes the scheduler's lock, and `thread_create` already takes the
-/// scheduler's lock before a cell's. Doing the reverse here would invert that order, and
-/// `DEBUG_LOCKDEP` would fail the boot for it — correctly.
-pub fn thread_ids(out: &mut [ThreadId]) -> usize {
-    let mut n = 0;
-    for cell in CELLS.iter() {
-        cell.with(|o| {
-            if let Object::Thread { id } = o {
-                if let Some(slot) = out.get_mut(n) {
-                    *slot = *id;
-                    n += 1;
-                }
-            }
-        });
-    }
-    n
-}
-
 /// Give up the store's reference to `id`: nothing new finds it, and it is destroyed once
 /// every outstanding reference is gone.
 pub fn retire(id: ObjectId) {
@@ -256,7 +268,7 @@ pub fn retire(id: ObjectId) {
 
 /// Post `(key, value)` to the completion queue `queue` names. `Full` if the queue is.
 pub fn post(queue: ObjectId, key: u64, value: u64) -> Result<(), ()> {
-    with(queue, |o| match o {
+    let posted = with(queue, |o| match o {
         Object::Completion { ring, head, len } => {
             if *len >= QUEUE_DEPTH {
                 return Err(());
@@ -268,7 +280,14 @@ pub fn post(queue: ObjectId, key: u64, value: u64) -> Result<(), ()> {
         }
         _ => Err(()),
     })
-    .unwrap_or(Err(()))
+    .unwrap_or(Err(()));
+    // After the queue's lock is released: a waker takes no cell lock while waking.
+    if posted.is_ok()
+        && let Some(waiters) = waiters(queue)
+    {
+        waiters.wake_all();
+    }
+    posted
 }
 
 /// Take the oldest completion from `queue`, or `None` if it is empty.
@@ -313,4 +332,168 @@ pub fn on_process_exit(slot: usize, code: u64) {
     if let Some((queue, key)) = post_to {
         let _ = post(queue, key, code);
     }
+}
+
+// ---- waiting on objects -------------------------------------------------------------------
+
+/// One wait queue per cell, beside it. A queue belongs to whatever object occupies its cell;
+/// a waiter on an object that is destroyed and whose cell is reused may be woken spuriously,
+/// which a waiter tolerates by checking again.
+static WAITS: [WaitQueue; MAX_OBJECTS] = [const { WaitQueue::new() }; MAX_OBJECTS];
+
+/// The identities every object is issued from, store object or channel endpoint alike.
+///
+/// One source for both, and not one per process: a channel is found by its endpoints'
+/// identities in a kernel-wide table, so two processes' channels must never share one.
+pub fn ids() -> &'static ObjectIds {
+    &IDS
+}
+
+/// Wake every thread waiting on any object. For a process ending while some of its threads
+/// wait: each checks again, finds its process ending, and ends too.
+pub fn wake_all_waiters() {
+    for waiters in &WAITS {
+        waiters.wake_all();
+    }
+}
+
+/// The wait queue of the object `id` names, while it is live.
+pub fn waiters(id: ObjectId) -> Option<&'static WaitQueue> {
+    let reference = store()?.get(id).ok()?;
+    WAITS.get(reference.index())
+}
+
+/// Signal the event `id` names and wake whoever waits on it. `false` if it is not an event.
+pub fn signal_event(id: ObjectId) -> bool {
+    let signalled = with(id, |o| match o {
+        Object::Event { signalled } => {
+            *signalled = true;
+            true
+        }
+        _ => false,
+    })
+    .unwrap_or(false);
+    if signalled && let Some(waiters) = waiters(id) {
+        waiters.wake_all();
+    }
+    signalled
+}
+
+/// Consume the event `id`'s signal. `Some(true)` if it was signalled, `Some(false)` if not,
+/// `None` if `id` is no longer a live event.
+pub fn consume_event(id: ObjectId) -> Option<bool> {
+    with(id, |o| match o {
+        Object::Event { signalled } => Some(core::mem::replace(signalled, false)),
+        _ => None,
+    })?
+}
+
+// ---- timers -------------------------------------------------------------------------------
+
+/// A timer's deadline when it is not armed.
+pub const DISARMED: u64 = u64::MAX;
+
+static DELIVERY_CLASS: LockClass = LockClass::new("objects.delivery");
+
+/// Serialises every change to a timer's schedule and every delivery, so one expiration is
+/// posted once however many threads wait on its queue. Taken before any cell lock, and cell
+/// locks are taken inside it one at a time, never two at once.
+static DELIVERY: SpinLock<(), Cpu> = SpinLock::with_class((), &DELIVERY_CLASS);
+
+/// Arm (`deadline` in kernel-clock nanoseconds) or disarm ([`DISARMED`]) the timer `id`.
+/// Wakes its queue's waiters, whose deadline may now be sooner. `false` if `id` is not a timer.
+pub fn set_timer(id: ObjectId, deadline: u64, period: u64) -> bool {
+    let queue = {
+        let _serial = DELIVERY.lock_irqsave();
+        with(id, |o| match o {
+            Object::Timer {
+                queue,
+                deadline: d,
+                period: p,
+                ..
+            } => {
+                *d = deadline;
+                *p = period;
+                Some(*queue)
+            }
+            _ => None,
+        })
+        .flatten()
+    };
+    match queue {
+        Some(queue) => {
+            if let Some(waiters) = waiters(queue) {
+                waiters.wake_all();
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Deliver every timer on `queue` whose deadline is at or before `now`, and return the
+/// earliest deadline still armed on it.
+///
+/// Delivery happens when the queue is looked at — by a wait, which [`crate::userproc`]
+/// makes end at the earliest armed deadline, or by a poll — not from the timer interrupt.
+/// A thread blocked on the queue is therefore woken at the deadline, which is when the
+/// completion can be seen, and nothing posts to a completion queue in interrupt context.
+///
+/// Each delivery's value is how many expirations it reports: one for a one-shot timer, and
+/// every period that elapsed for a periodic one. A full queue leaves the timer due, so its
+/// expirations are delivered once there is room rather than lost.
+pub fn deliver_due_timers(queue: ObjectId, now: u64) -> Option<u64> {
+    let _serial = DELIVERY.lock_irqsave();
+    let mut earliest: Option<u64> = None;
+    let mut note = |d: u64| earliest = Some(earliest.map_or(d, |e| e.min(d)));
+    for cell in CELLS.iter() {
+        let due = cell.with(|o| match o {
+            Object::Timer {
+                queue: q,
+                key,
+                deadline,
+                period,
+                ..
+            } if *q == queue && *deadline != DISARMED => {
+                if *deadline > now {
+                    Some(Err(*deadline))
+                } else if *period == 0 {
+                    Some(Ok((*key, 1)))
+                } else {
+                    Some(Ok((*key, (now - *deadline) / *period + 1)))
+                }
+            }
+            _ => None,
+        });
+        match due {
+            Some(Ok((key, expirations))) => {
+                if post(queue, key, expirations).is_err() {
+                    continue;
+                }
+                let next = cell.with(|o| match o {
+                    Object::Timer {
+                        deadline,
+                        period,
+                        fires,
+                        ..
+                    } => {
+                        *fires += expirations;
+                        if *period == 0 {
+                            *deadline = DISARMED;
+                        } else {
+                            *deadline = deadline.saturating_add(expirations * *period);
+                        }
+                        (*deadline != DISARMED).then_some(*deadline)
+                    }
+                    _ => None,
+                });
+                if let Some(next) = next {
+                    note(next);
+                }
+            }
+            Some(Err(deadline)) => note(deadline),
+            None => {}
+        }
+    }
+    earliest
 }

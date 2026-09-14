@@ -97,7 +97,7 @@ use hal::{Arch, EarlyConsole, KernAddr};
 use sched::balance::CpuSet;
 use sched::{Priority, ThreadId};
 use thread::Threads;
-use time::{Duration, Instant};
+use time::{Duration, Instant, TimerId};
 
 use crate::{
     AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Check, kheap, mp, shared, timekeeping,
@@ -343,6 +343,8 @@ fn on_tick() {
         let woke = timekeeping::with_timers(|q| {
             let mut all = true;
             while let Some(expired) = q.pop_expired(now) {
+                // The sleeper's timer is gone now; an early wake must not try to cancel it.
+                let _ = forget_timer(expired.payload);
                 match s.threads.wake_on(expired.payload) {
                     Ok(w) if w.cpu != cpu && w.reschedule => wakes_elsewhere |= 1 << w.cpu,
                     Ok(_) => {}
@@ -392,48 +394,155 @@ fn on_tick() {
 /// Block the calling thread until `deadline`, on the kernel's timer queue. Returns at
 /// once if the deadline has passed.
 pub fn sleep_until(deadline: Instant) {
-    let irq = Cpu::irq_save();
-    if deadline <= timekeeping::now() {
-        // SAFETY: pairs with the `irq_save` above, on this thread.
-        unsafe { Cpu::irq_restore(irq) };
-        return;
+    // A flag nothing ever sets: a sleep is a wait whose only way out is its deadline.
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    let _ = block_until(Some(deadline), &NEVER);
+}
+
+/// The timer each thread blocked with a deadline is waiting on, so that a wake arriving
+/// first can disarm it.
+///
+/// Without this an early wake would leave the timer armed, and when it later expired it
+/// would wake whatever the thread was doing by then: a stale timer ending an unrelated wait
+/// early. A thread holds at most one entry, so one per table slot is enough.
+///
+/// SAFETY INVARIANT: read and written only with interrupts masked and the scheduler lock
+/// held (on a uniprocessor kernel the mask alone is that lock).
+static SLEEP_TIMERS: SyncUnsafeCell<[Option<(ThreadId, TimerId)>; SLOTS]> =
+    SyncUnsafeCell::new([None; SLOTS]);
+
+/// Record that `id` is blocked on `timer`. Masked, with the scheduler lock held.
+fn remember_timer(id: ThreadId, timer: TimerId) {
+    // SAFETY: see `SLEEP_TIMERS`; the caller holds the scheduler lock, masked.
+    let timers = unsafe { &mut *SLEEP_TIMERS.get() };
+    if let Some(free) = timers.iter_mut().find(|t| t.is_none()) {
+        *free = Some((id, timer));
     }
+}
+
+/// Forget the timer `id` was blocked on, returning it. Masked, with the scheduler lock held.
+fn forget_timer(id: ThreadId) -> Option<TimerId> {
+    // SAFETY: see `SLEEP_TIMERS`; the caller holds the scheduler lock, masked.
+    let timers = unsafe { &mut *SLEEP_TIMERS.get() };
+    let held = timers
+        .iter_mut()
+        .find(|t| t.is_some_and(|(t, _)| t == id))?;
+    held.take().map(|(_, timer)| timer)
+}
+
+/// Block the calling thread until `woken` is set or `deadline` passes, whichever comes
+/// first, and return whether `woken` was set. `None` waits for `woken` alone.
+///
+/// This is the primitive every wait is built on ([`crate::wait`]), and its contract with
+/// [`wake_blocked`] is what makes a wake impossible to lose. The flag is read with the
+/// scheduler lock held, and a waker sets the flag *before* it takes that lock to wake the
+/// thread. So a wake either lands before this check, which then sees the flag and does not
+/// block, or after the thread has blocked, where [`wake_blocked`] finds it.
+pub fn block_until(deadline: Option<Instant>, woken: &AtomicBool) -> bool {
+    let irq = Cpu::irq_save();
     let cpu = Cpu::cpu_index();
     // The lock before the timer: another CPU's timer interrupt wakes sleepers under this
     // lock, so it cannot find this timer due while this thread is still running.
     mp::lock();
+    let already =
+        woken.load(Ordering::Acquire) || deadline.is_some_and(|d| d <= timekeeping::now());
     // SAFETY: masked and locked; the reference ends with the statement, before `block_on`
     // switches.
     let me = unsafe { (*threads()).current_on(cpu) };
-    let armed = me.and_then(|me| {
-        timekeeping::with_timers(|q| {
-            q.arm_oneshot(deadline, me)
-                .map(|_| timekeeping::sleep_needs_kick(deadline))
-        })
-    });
-    match armed {
-        Some(Ok(kick)) => {
-            // The boot CPU keeps time; if it will not wake by this deadline, tell it to
-            // re-arm (see `timekeeping::program`).
-            if kick && mp::reschedule(0) {
-                KICKS.fetch_add(1, Ordering::Relaxed);
-            }
-            // Whoever runs next may have a peer waiting, and this thread cannot see who
-            // that is, so a slice is armed; idle re-arms for the deadline alone.
-            // SAFETY: masked.
-            unsafe { timekeeping::program(Some(SLICE)) };
-            // SAFETY: masked and locked, no reference live; see `reschedule_here`.
-            if unsafe { Threads::block_on(threads(), cpu) }.is_err() {
-                broke(BROKE_SLEEP);
+    let armed = match (already, me, deadline) {
+        (true, _, _) => false,
+        (false, None, _) => {
+            broke(BROKE_SLEEP);
+            false
+        }
+        (false, Some(_), None) => true,
+        (false, Some(me), Some(deadline)) => {
+            let timer = timekeeping::with_timers(|q| {
+                q.arm_oneshot(deadline, me)
+                    .map(|timer| (timer, timekeeping::sleep_needs_kick(deadline)))
+            });
+            match timer {
+                Some(Ok((timer, kick))) => {
+                    remember_timer(me, timer);
+                    // The boot CPU keeps time; if it will not wake by this deadline, tell it
+                    // to re-arm (see `timekeeping::program`).
+                    if kick && mp::reschedule(0) {
+                        KICKS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    true
+                }
+                _ => {
+                    broke(BROKE_SLEEP);
+                    false
+                }
             }
         }
-        _ => broke(BROKE_SLEEP),
+    };
+    if armed {
+        // Whoever runs next may have a peer waiting, and this thread cannot see who that
+        // is, so a slice is armed; idle re-arms for the deadline alone.
+        // SAFETY: masked.
+        unsafe { timekeeping::program(Some(SLICE)) };
+        // SAFETY: masked and locked, no reference live; see `reschedule_here`.
+        if unsafe { Threads::block_on(threads(), cpu) }.is_err() {
+            broke(BROKE_SLEEP);
+        }
     }
     // SAFETY: held on the CPU this thread now runs on, by the thread whose switch resumed
     // it (or by this thread, if nothing switched). See the module docs.
     unsafe { mp::unlock() };
     // SAFETY: pairs with the `irq_save` above, on this thread.
     unsafe { Cpu::irq_restore(irq) };
+    woken.load(Ordering::Acquire)
+}
+
+/// Wake `id` if it is blocked in [`block_until`], disarming the timer it was waiting on.
+/// Returns whether it was woken. A thread that is not blocked is left alone, which is the
+/// case a wake racing a thread on its way to blocking relies on (see [`block_until`]).
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "used only by wait queues, which need USERSPACE")
+)]
+pub fn wake_blocked(id: ThreadId) -> bool {
+    let irq = Cpu::irq_save();
+    let here = Cpu::cpu_index();
+    mp::lock();
+    let placed = {
+        // SAFETY: masked and locked, so by `SCHED`'s invariant this is the only reference;
+        // it ends with the block, before the lock is released.
+        let s = unsafe { &mut *sched() };
+        match s.threads.state(id) {
+            Some(thread::State::Blocked) => {
+                // The timer lock nests inside the scheduler lock, as in `on_tick`.
+                if let Some(timer) = forget_timer(id) {
+                    let _ = timekeeping::with_timers(|q| q.cancel(timer));
+                }
+                s.threads.wake_on(id).ok()
+            }
+            _ => None,
+        }
+    };
+    // SAFETY: taken above, on this CPU; nothing switched.
+    unsafe { mp::unlock() };
+    if let Some(w) = placed
+        && w.cpu != here
+        && w.reschedule
+        && mp::reschedule(w.cpu)
+    {
+        RESCHEDULES.fetch_add(1, Ordering::Relaxed);
+    }
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { Cpu::irq_restore(irq) };
+    placed.is_some()
+}
+
+/// The thread running on this CPU, if the scheduler has one here.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "used only by wait queues, which need USERSPACE")
+)]
+pub fn current_thread() -> Option<ThreadId> {
+    with_table(|t| t.current_on(Cpu::cpu_index()))
 }
 
 /// End the calling thread.

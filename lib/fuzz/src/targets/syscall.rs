@@ -161,6 +161,104 @@ impl Handler for Mock {
         let _ = (process, region);
         Ok(0)
     }
+
+    // The waiting calls. A timeout of zero polls and anything else would block in a kernel,
+    // so the mock answers by the timeout: a poll finds nothing, a wait runs out.
+
+    fn channel_send(
+        &mut self,
+        channel: Handle,
+        bytes: UserPtr,
+        len: usize,
+        handles: UserPtr,
+        count: usize,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (channel, bytes, handles);
+        if len > 64 || count > 2 {
+            Err(Error::TooLarge)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn channel_recv(
+        &mut self,
+        channel: Handle,
+        buf: UserPtr,
+        cap: usize,
+        handles: UserPtr,
+        hcap: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = timeout_ns;
+        let _ = (channel, buf, cap, handles, hcap);
+        Err(if timeout_ns == 0 {
+            Error::ShouldWait
+        } else {
+            Error::TimedOut
+        })
+    }
+
+    fn completion_wait(
+        &mut self,
+        queue: Handle,
+        out: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = timeout_ns;
+        let _ = (queue, out);
+        Err(if timeout_ns == 0 {
+            Error::ShouldWait
+        } else {
+            Error::TimedOut
+        })
+    }
+
+    fn event_create(&mut self) -> Result<u64, Error> {
+        self.calls += 1;
+        Ok(5)
+    }
+
+    fn event_signal(&mut self, event: Handle) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = event;
+        Ok(0)
+    }
+
+    fn event_wait(&mut self, event: Handle, timeout_ns: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = timeout_ns;
+        let _ = event;
+        Err(Error::TimedOut)
+    }
+
+    fn timer_create(&mut self, queue: Handle, key: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = key;
+        let _ = queue;
+        Ok(6)
+    }
+
+    fn timer_set(&mut self, timer: Handle, delay_ns: u64, period_ns: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (timer, delay_ns);
+        self.last = period_ns;
+        Ok(0)
+    }
+
+    fn timer_cancel(&mut self, timer: Handle) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = timer;
+        Ok(0)
+    }
+
+    fn clock_now(&mut self) -> Result<u64, Error> {
+        self.calls += 1;
+        Ok(self.calls as u64)
+    }
 }
 
 /// Each record is a number and six argument words: 8 bytes for the number, 48 for the

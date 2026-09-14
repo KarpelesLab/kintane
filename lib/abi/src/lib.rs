@@ -101,6 +101,8 @@ pub enum Error {
     Full = 11,
     /// This kernel does not implement the call on this machine.
     Unsupported = 12,
+    /// A wait ran out before what it waited for happened.
+    TimedOut = 13,
     /// A status this version of the ABI does not know. Never sent by a kernel that shares
     /// this crate's version; it exists so decoding is total.
     Unknown = 0xffff,
@@ -108,7 +110,7 @@ pub enum Error {
 
 impl Error {
     /// Every error, in code order, except [`Error::Unknown`].
-    pub const ALL: [Error; 12] = [
+    pub const ALL: [Error; 13] = [
         Error::NoSuchCall,
         Error::BadHandle,
         Error::WrongType,
@@ -121,6 +123,7 @@ impl Error {
         Error::TooLarge,
         Error::Full,
         Error::Unsupported,
+        Error::TimedOut,
     ];
 
     pub const fn code(self) -> u64 {
@@ -151,6 +154,27 @@ pub fn decode(status: u64, value: u64) -> Result<u64, Error> {
     } else {
         Err(Error::from_code(status))
     }
+}
+
+/// The rights a handle can carry, as the bits of the mask `channel_send` narrows a moved
+/// handle with.
+///
+/// The kernel's `kobject::Rights` is the definition; these are its bit positions for a
+/// program, which cannot link a kernel crate. `kernel/main/src/userproc.rs` asserts at
+/// compile time that the two agree, so a renumbering in one fails the build rather than
+/// quietly granting the wrong right.
+pub mod rights {
+    pub const READ: u32 = 1 << 0;
+    pub const WRITE: u32 = 1 << 1;
+    pub const EXECUTE: u32 = 1 << 2;
+    pub const DUPLICATE: u32 = 1 << 3;
+    pub const TRANSFER: u32 = 1 << 4;
+    pub const WAIT: u32 = 1 << 5;
+    pub const SIGNAL: u32 = 1 << 6;
+    pub const MAP: u32 = 1 << 7;
+    pub const DESTROY: u32 = 1 << 8;
+    pub const INSPECT: u32 = 1 << 9;
+    pub const ALL: u32 = (1 << 10) - 1;
 }
 
 /// A handle value as a program holds it: an opaque number the kernel issued. Only the

@@ -24,7 +24,7 @@ rustflags = [
 ]
 
 [deps]
-units = ["abi", "rt"]
+units = ["abi", "rt", "vfsproto"]
 
 [config]
 requires = "USERSPACE"

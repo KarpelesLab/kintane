@@ -67,3 +67,16 @@ pub fn check_shootdown(c: &dyn EarlyConsole, live: crate::Live) -> Check {
 pub fn shootdown_stats() -> (usize, usize, usize) {
     crate::shootdown::stats()
 }
+
+/// Answer any TLB shootdown addressed to this CPU, from a lock's spin loop with interrupts
+/// masked: the lock's holder may be waiting, masked too, for this CPU's flush.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only by the process locks, which need USERSPACE"
+    )
+)]
+pub fn answer_shootdowns() {
+    crate::shootdown::service_here();
+}

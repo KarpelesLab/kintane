@@ -112,6 +112,22 @@ fn on_ipi() {
     service(Cpu::cpu_index());
 }
 
+/// Answer any request addressed to this CPU, from a thread rather than the IPI handler.
+///
+/// For a CPU spinning with interrupts masked on a lock another CPU holds: if that CPU is
+/// waiting for this one's answer to a shootdown, the spin must answer it, or the two wait
+/// for each other. `shoot`'s own wait for the serial lock does exactly this.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only by the process locks, which need USERSPACE"
+    )
+)]
+pub fn service_here() {
+    service(Cpu::cpu_index());
+}
+
 /// Extend an invalidation the caller already made locally to every other online CPU,
 /// and return once each has made it. The port's `flush_tlb` calls this.
 fn shoot(addr: Option<usize>) {

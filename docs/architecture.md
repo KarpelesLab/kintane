@@ -421,9 +421,9 @@ substrate the syscall layer exposes as capabilities; see
   - Everything runs under one lock per store, with no allocation and no `unsafe`.
 - **The kernel's object namespace** (`kernel/main/src/objects.rs`), the first user of the
   store: the objects a program can create and name.
-  - **Kinds.** A program image, a process, a thread, an anonymous memory region and a
-    completion queue, each an `Object` variant carrying only what the kernel must remember.
-    Images and regions are both `ObjectType::MemoryRegion`.
+  - **Kinds.** A program image, a process, a thread, an anonymous memory region, a completion
+    queue, an event and a timer, each an `Object` variant carrying only what the kernel must
+    remember. Images and regions are both `ObjectType::MemoryRegion`.
   - **Storage.** One static arena of `Cell`s, each a spinlock around an `Object`, behind a
     single `ObjectStore`. There is no allocator here yet. A cell is claimed on creation and
     freed by the store's `destroy`, so it is reused only after its object is gone.
@@ -435,12 +435,55 @@ substrate the syscall layer exposes as capabilities; see
     count a check compares against its baseline.
   - **The locking rule.** A cell's lock is never held while another's is taken; every cell
     shares one lock class, so `DEBUG_LOCKDEP` fails the boot if one ever is. Posting an exit
-    reads the waiter under the process's lock, drops it, then locks the queue. Collecting
-    thread ids for reaping copies them out under the cells' locks and reaps afterwards,
-    because `thread_create` takes the scheduler's lock before a cell's.
+    reads the waiter under the process's lock, drops it, then locks the queue. A timer's
+    delivery takes one cell at a time under a delivery lock of its own, which serialises
+    deliveries so one expiration is posted once.
+  - **Waiting.** Every cell has a wait queue beside it, which posting a completion, signalling
+    an event, re-arming a timer and destroying the object all wake. A timer is delivered when its
+    queue is looked at; a wait on the queue ends at the earliest armed deadline, so the delivery
+    is on time without posting from the timer interrupt.
   - **Channels** are kept in their own kernel table, keyed by their endpoints' identities, so
-    an endpoint moved into another process still names its channel there. They are not yet
-    store objects.
+    an endpoint moved into another process still names its channel there. Each has a wait queue,
+    woken by every send and by an endpoint closing. Endpoint identities come from the same
+    kernel-wide source as store objects, so two processes' channels never share one. Channels
+    are not yet store objects.
+
+### Wait queues
+
+`kernel/main/src/wait.rs` is how a thread waits for something another thread, another CPU
+or an interrupt will do. Everything that blocks is built on it: the waiting system calls,
+the kernel's own file service, and the Linux personality's blocking calls to come.
+
+- **The primitive.** `preempt::block_until(deadline, &woken)` takes the scheduler lock, checks
+  the flag, arms the thread's timer if there is a deadline, and blocks. `preempt::wake_blocked(id)`
+  makes a blocked thread runnable, cancels the timer it was sleeping on, and sends a reschedule IPI
+  if the thread lands on another CPU. The timer is recorded per thread
+  (`SLEEP_TIMERS`), so an early wake cannot leave it armed to end some later, unrelated wait.
+  `sleep_until` is `block_until` on a flag nothing sets.
+- **The queue.** `WaitQueue::wait_until(deadline, ready)` waits until `ready` returns `Some`.
+  `wait_once` blocks at most once and lets the caller recompute its deadline, which a completion
+  queue with a timer on it needs. `wake_all` wakes every registered thread, and a waker calls it
+  after changing the condition.
+- **Why no wake is lost.** A waiter checks `ready`, registers, checks `ready` again, and only then
+  blocks. A waker that changed the condition before the registration is seen by the second check.
+  A waker after it finds the registration and sets the flag *before* taking the scheduler lock, and
+  `block_until` reads the flag under that lock, so the wake lands either before the block, which
+  then does not happen, or after it, where `wake_blocked` finds the thread blocked.
+- **Lock order.** The scheduler lock is taken inside a queue's lock, so nothing takes a queue's
+  lock while holding the scheduler's. A waker may hold other locks: a process's lock when it
+  ends the process, the timer delivery lock when it posts an expiration.
+- **Limits.** Eight threads per queue. A ninth polls its condition every millisecond instead of
+  blocking, and is counted in `wait::stats`, so an undersized queue shows as a count, not a hang.
+- **Evidence.** `wait::stats` counts blocks, wakes, wakes from another CPU than the waiter's, and
+  timeouts. The `waits` boot check requires blocks, wakes and timeouts, and the stress run's
+  waiting-process cycle requires wakes across CPUs on every SMP preset.
+
+A process's threads share its address space and handle table, so a system call takes the
+process's lock (`userproc::lock`). The lock is an atomic owner word rather than a spinlock, for two
+reasons. A CPU spinning on it answers TLB shootdowns, since the holder may be changing mappings
+and waiting for that CPU's flush. And a fault inside a system call finds the lock held by its own
+CPU and uses it instead of deadlocking on itself. Two process locks are taken in slot order, a
+higher slot giving its own up when the other is busy.
 
 ### `ipc` — channels
 

@@ -79,7 +79,7 @@ the handle namespace holds objects a program can create, and a process is built 
 program that has the handles to build it with — there is still no `fork`:
 
 - **Objects** (`kernel/main/src/objects.rs`): a program image, a process, a thread, an
-  anonymous memory region and a completion queue. They live in one static arena behind
+  anonymous memory region, a completion queue, an event and a timer. They live in one static arena behind
   `kobject::store::ObjectStore`, which owns their identity and lifetime: an object is found
   by the identity its handles carry, retired when its last name is closed, and destroyed
   once nothing holds a reference. **Objects are the kernel's; handles are a process's.** That
@@ -95,10 +95,9 @@ program that has the handles to build it with — there is still no `fork`:
   lives in a kernel table keyed by its endpoints' identities, so a transferred endpoint works
   in whichever table holds it.
 - **`lib/rt`**, the native runtime: typed wrappers (`Process::create`, `give`, `start`,
-  `join`), channel and completion helpers, and the *blocking* wrappers. No system call
-  blocks: `recv` and `completion_wait` loop over the call that answers `ShouldWait`,
-  yielding between tries. That is the honest shape of a kernel without wait queues, and the
-  one place that changes when it grows them.
+  `start_at`, `join`), channel, completion, event and timer helpers. Its waiting wrappers
+  (`recv`, `completion_wait`, `Event::wait`, `Process::join`) block in the kernel; the
+  non-blocking forms remain as `try_recv` and `try_completion`.
 
 **What the check proves** (`kernel/main/src/spawn.rs`, the `spawn` banner line, on every
 x86_64 and aarch64 preset including both SMP ones). The kernel starts one process, `init`,
@@ -114,12 +113,64 @@ reply, and exits with a code of its own. `init` checks that code and exits with 
 kernel checks, so the kernel grades a sequence it did not perform. Both processes are then
 torn down and every object and every frame must be back.
 
-**Not yet:** one thread per process — `userproc::current`'s safety rests on it, and
-`thread_create` refuses a second; no `Event`, `Timer`, `Mapping` or `Job` objects; no
-blocking system call and no wait queues; handles are not yet moved by `channel_write`, only
-by `process_transfer`; no ELF loading from a filesystem; no ASIDs or PCIDs, so every change
-of address space flushes the TLB (see `docs/architecture.md`). i686 and riscv32 have no
-userspace port.
+**Waiting properly.** A wait used to be a loop of a non-blocking call and a yield. The
+kernel now has wait queues (`kernel/main/src/wait.rs`, described in `docs/architecture.md`),
+and the calls numbered 17–26 are built on them:
+
+- **`channel_send`** moves up to two handles with a message, each with a mask of the rights the
+  receiver may keep — rights only narrow — all or nothing. **`channel_recv`** blocks for a
+  message and returns its length and handle count. `channel_write` and `channel_read` remain,
+  non-blocking and without handles.
+- **`completion_wait`** blocks for a completion. `process_wait` still only arms a completion; the
+  wait for a process is `completion_wait` on that queue, which `rt::Process::join` does.
+- **Events** (`event_create`, `event_signal`, `event_wait`): a latch. Signalling needs `SIGNAL`,
+  waiting needs `WAIT`, and a wait consumes the signal.
+- **Timers** (`timer_create`, `timer_set`, `timer_cancel`) deliver to a completion queue, once or
+  periodically, each delivery carrying how many expirations it reports. A timer is delivered when
+  its queue is looked at — by `completion_wait`, which ends its wait at the timer's deadline, or
+  by `completion_poll` — not from the timer interrupt, so nothing posts in interrupt context.
+- **`clock_now`**, the monotonic clock in nanoseconds.
+
+Every waiting call takes a timeout in nanoseconds: zero polls and answers `ShouldWait`,
+`u64::MAX` waits for as long as it takes, and anything else ends in `TimedOut` (error 13).
+
+**Threads.** `thread_create` starts further threads in a process, each with a four-page
+user stack of its own, up to three beyond the first over the process's life. Two threads of
+one process may be in the kernel on two CPUs at once, so a system call takes its process's
+lock and releases it around anything that blocks. A process ends when any thread calls
+`process_exit` or faults. Its other threads end at their next system call, or at once if
+they are waiting, because the exit wakes every wait. Its exit is posted to `process_wait`'s
+queue when the last thread has gone.
+
+**A file service.** `lib/vfsproto` is a channel protocol (open, read, close, one 64-byte
+message each). The boot check serves it from a kernel thread over `kernel/vfs` on the
+mounted test volume, and `init` reads `/HELLO.TXT` through it. That is the VFS as a service a
+program reaches through a channel it was handed, not a set of system calls.
+
+**What the check proves** (`kernel/main/src/waits.rs`, the `waits` banner line, gating the
+verdict on every x86_64 and aarch64 preset including both SMP ones). `init`:
+- polls an empty queue and is told `ShouldWait`, and a 30 ms wait ends in `TimedOut` no earlier
+  than 30 ms;
+- sees a one-shot timer deliver once and on time, and a periodic one deliver until cancelled;
+- starts a second thread that writes to a page the first mapped and signals an event, which wakes
+  the first; that thread reads the write back at the same address;
+- blocks the second thread in `channel_recv` and wakes it with a send;
+- moves an event handle with `WAIT` only, and finds the receiver able to wait on it, refused a
+  signal, and the sender's handle gone. A send naming a handle it does not hold moves nothing;
+- reads `/HELLO.TXT` through the file service, and has a missing file refused.
+
+The kernel also requires its own counters to show threads blocked, were woken, and timed out,
+and every thread, object and frame back. A wake from another CPU cannot happen before the
+verdict, because secondary CPUs join the scheduler after it. The stress run shows it instead:
+once per audit interval a two-threaded process with its threads pinned to two CPUs passes a
+counter back and forth, blocking for each message. A lost wake-up is a receive that times out
+and fails the run, and the run requires a wake counted as crossing CPUs.
+
+**Not yet:** no `Mapping` or `Job` objects; a thread spinning in user mode is not stopped when
+another thread ends its process, only one that makes a system call or waits; the file service
+runs inside the boot check, not as a standing server, and serves reads only; no ASIDs or PCIDs,
+so every change of address space flushes the TLB (see `docs/architecture.md`). i686 and riscv32
+have no userspace port.
 
 ## Two ABIs, one kernel
 

@@ -73,6 +73,10 @@ mod procs;
 mod spawn;
 #[cfg(CONFIG_USERSPACE)]
 mod userproc;
+#[cfg(CONFIG_USERSPACE)]
+mod wait;
+#[cfg(CONFIG_USERSPACE)]
+mod waits;
 
 // The memory model's part of bring-up: the kernel address space, demand paging and the
 // test modes that need a guard page on a paged kernel; the flat region allocator on one

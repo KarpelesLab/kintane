@@ -18,6 +18,12 @@
 //!   stop, writing a signature to the private address every worker shares and reading it back on
 //!   every pass; see [`worker`]. It exits with [`SUCCESS`], or with a code saying it read memory
 //!   that was not its own.
+//! * [`MODE_SPAWN`] builds a process out of an image and talks to it; see [`spawn`].
+//! * [`MODE_WAITS`] waits on the kernel's objects — timeouts, timers, an event, a channel — with a
+//!   second thread of its own, moves a handle with fewer rights, and reads a file through the
+//!   kernel's file service; see [`waits`].
+//! * [`MODE_PAIR`] and [`MODE_PAIR_PEER`] are two threads of one process passing a counter back and
+//!   forth, each blocking for the other; the stress run pins them to two CPUs. See [`pair`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -38,6 +44,12 @@ const MODE_FAULT: usize = 2;
 const MODE_WORKER: usize = 3;
 /// Create a process and talk to it; see [`spawn`].
 const MODE_SPAWN: usize = 4;
+/// Wait on the kernel's objects, with a second thread and a file service; see [`waits`].
+const MODE_WAITS: usize = 5;
+/// Pass a counter to a second thread and back, blocking each time; see [`pair`].
+const MODE_PAIR: usize = 6;
+/// The second thread of [`MODE_PAIR`]; see [`peer`].
+const MODE_PAIR_PEER: usize = 7;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -76,6 +88,9 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_FAULT => fault(a),
         MODE_WORKER => worker(a, b, c as u64),
         MODE_SPAWN => spawn(handle(a), handle(b)),
+        MODE_WAITS => waits(handle(a), handle(b), handle(c)),
+        MODE_PAIR => pair(handle(a)),
+        MODE_PAIR_PEER => peer(handle(a)),
         _ => 0xbad0,
     };
     exit(code)
@@ -343,6 +358,384 @@ const CHILD_KEY: u64 = 0x9001;
 const CHILD_DIED_SILENT: u64 = 0x4_0000;
 /// [`MODE_SPAWN`]'s exit code when every step behaved.
 const SPAWN_SUCCESS: u64 = 0x5a;
+
+// ---- waiting ------------------------------------------------------------------------------
+
+/// [`MODE_WAITS`]' exit code when every step behaved. Mirrors `kernel/main/src/waits.rs`.
+const WAITS_SUCCESS: u64 = 0x6b;
+/// [`MODE_PAIR`]'s.
+const PAIR_SUCCESS: u64 = 0x6c;
+
+/// The timeout the timing steps use.
+const TIMEOUT_NS: u64 = 30_000_000;
+/// How late a timeout may end. Generous, because an emulated CPU can be descheduled by its
+/// host, and still far below what a wait that only ended at some unrelated later event
+/// would take.
+const LATE_NS: u64 = 500_000_000;
+/// The timeout on a wait that should end by a wake: long enough that running out means the
+/// wake was lost.
+const WAKE_NS: u64 = 2_000_000_000;
+/// How long a wait that a wake should end may take before the wake counts as lost. A wait
+/// whose wake never came still ends at its timeout and finds what it waited for there, so
+/// without this bound a lost wake-up would look like a slow success.
+const LOST_NS: u64 = 1_000_000_000;
+
+/// Receive on `channel`, as a wait a wake must end: `TimedOut` if the message took
+/// [`LOST_NS`] or longer to be received.
+fn recv_promptly(channel: Handle, buf: &mut [u8]) -> Result<usize, Error> {
+    let start = rt::now_ns();
+    let got = rt::recv_timeout(channel, buf, WAKE_NS)?;
+    if rt::now_ns().wrapping_sub(start) >= LOST_NS {
+        return Err(Error::TimedOut);
+    }
+    Ok(got)
+}
+
+/// Wait for `event`'s signal, as a wait a wake must end; see [`recv_promptly`].
+fn wait_promptly(event: &rt::Event) -> bool {
+    let start = rt::now_ns();
+    event.wait(WAKE_NS).is_ok() && rt::now_ns().wrapping_sub(start) < LOST_NS
+}
+
+const KEY_ONESHOT: u64 = 0x71;
+const KEY_PERIODIC: u64 = 0x72;
+
+/// What the test disk's `/HELLO.TXT` holds.
+const HELLO: &[u8] = b"hello from the KinTane test disk\n";
+
+/// Wait on the kernel's objects. Returns [`WAITS_SUCCESS`], or `0x500 + step` for the first
+/// that did not behave.
+///
+/// `me` is a handle to this process, which is what starting a thread in it takes. `files` is
+/// a channel to the kernel's file service, or zero when there is no volume to serve.
+fn waits(console: Handle, me: Handle, files: Handle) -> u64 {
+    let _ = rt::print(console, b"init: waiting on the kernel\n");
+    let Ok(queue) = rt::completion_queue() else {
+        return 0x500;
+    };
+    if !times_out_on_time(queue) {
+        return 0x501;
+    }
+    let steps = [
+        timers(queue),
+        two_threads(me),
+        rights_narrow(),
+        if files.0 == 0 {
+            Ok(())
+        } else {
+            read_through_the_service(console, files)
+        },
+    ];
+    for step in steps {
+        if let Err(code) = step {
+            return code;
+        }
+    }
+    WAITS_SUCCESS
+}
+
+/// A poll answers at once, and a wait that runs out does so on time: not early, and not
+/// long after.
+fn times_out_on_time(queue: Handle) -> bool {
+    if rt::completion_wait_timeout(queue, rt::NO_WAIT) != Err(Error::ShouldWait) {
+        return false;
+    }
+    let start = rt::now_ns();
+    let result = rt::completion_wait_timeout(queue, TIMEOUT_NS);
+    let took = rt::now_ns().wrapping_sub(start);
+    result == Err(Error::TimedOut) && took >= TIMEOUT_NS && took < TIMEOUT_NS + LATE_NS
+}
+
+/// A one-shot timer delivers once, on time; a periodic one keeps delivering until it is
+/// cancelled, and then stops.
+fn timers(queue: Handle) -> Result<(), u64> {
+    let once = rt::Timer::create(queue, KEY_ONESHOT).map_err(|_| 0x510u64)?;
+    let start = rt::now_ns();
+    once.set(TIMEOUT_NS, 0).map_err(|_| 0x511u64)?;
+    match rt::completion_wait_timeout(queue, WAKE_NS) {
+        Ok(c) if c.key == KEY_ONESHOT && c.value == 1 => {}
+        _ => return Err(0x512),
+    }
+    let took = rt::now_ns().wrapping_sub(start);
+    if took < TIMEOUT_NS || took >= TIMEOUT_NS + LATE_NS {
+        return Err(0x513);
+    }
+    if rt::completion_wait_timeout(queue, TIMEOUT_NS) != Err(Error::TimedOut) {
+        return Err(0x514);
+    }
+    let every = rt::Timer::create(queue, KEY_PERIODIC).map_err(|_| 0x515u64)?;
+    every.set(10_000_000, 10_000_000).map_err(|_| 0x516u64)?;
+    let mut expirations = 0;
+    while expirations < 3 {
+        match rt::completion_wait_timeout(queue, WAKE_NS) {
+            Ok(c) if c.key == KEY_PERIODIC && c.value >= 1 => expirations += c.value,
+            _ => return Err(0x517),
+        }
+    }
+    every.cancel().map_err(|_| 0x518u64)?;
+    if rt::completion_wait_timeout(queue, TIMEOUT_NS) != Err(Error::TimedOut) {
+        return Err(0x519);
+    }
+    if call::handle_close(every.handle).is_err() || call::handle_close(once.handle).is_err() {
+        return Err(0x51a);
+    }
+    Ok(())
+}
+
+/// What two threads of this process share: a page one maps and both address.
+#[repr(C)]
+struct Meeting {
+    event: u32,
+    channel: u32,
+    written: u64,
+}
+
+const MEETING_MAGIC: u64 = 0x7e57_0000_0000_5eed;
+
+/// Start a second thread in this process. It writes to a page this thread mapped and
+/// signals an event, which wakes this thread; then it blocks receiving on a channel until
+/// this thread sends, and answers.
+fn two_threads(me: Handle) -> Result<(), u64> {
+    let page = call::vm_map(PAGE).map_err(|_| 0x520u64)?;
+    let event = rt::Event::create().map_err(|_| 0x521u64)?;
+    let (mine, theirs) = rt::channel().map_err(|_| 0x522u64)?;
+    if event.wait(rt::NO_WAIT) != Err(Error::ShouldWait) {
+        return Err(0x523);
+    }
+    let meeting = page as *mut Meeting;
+    // SAFETY: the page `vm_map` just returned, readable and writable, and no other thread
+    // exists yet to touch it.
+    unsafe {
+        meeting.write_volatile(Meeting {
+            event: event.handle.0,
+            channel: theirs.0,
+            written: 0,
+        })
+    };
+    let this = rt::Process { handle: me };
+    let entry = second_thread as extern "C" fn(usize, usize, usize, usize) -> !;
+    if this.start_at(entry as usize as u64, page).is_err() {
+        return Err(0x524);
+    }
+    if !wait_promptly(&event) {
+        return Err(0x525);
+    }
+    // The second thread's write, seen here at the address it wrote to: one address space.
+    // SAFETY: as above; the other thread wrote this word before it signalled, and does not
+    // write it again.
+    if unsafe { core::ptr::addr_of!((*meeting).written).read_volatile() } != MEETING_MAGIC {
+        return Err(0x526);
+    }
+    // Give it time to block in its receive, so what follows is a wake rather than a message
+    // already waiting when it looks. Nothing signals the event meanwhile.
+    if event.wait(TIMEOUT_NS) != Err(Error::TimedOut) {
+        return Err(0x527);
+    }
+    if rt::send(mine, b"wake").is_err() {
+        return Err(0x528);
+    }
+    let mut buf = [0u8; 8];
+    match recv_promptly(mine, &mut buf) {
+        Ok(n) if rt::starts_with(&buf, n, b"woke") => {}
+        _ => return Err(0x529),
+    }
+    // It signals once more as it ends its thread.
+    if !wait_promptly(&event) {
+        return Err(0x52a);
+    }
+    Ok(())
+}
+
+/// The second thread [`two_threads`] starts, handed the page they share.
+extern "C" fn second_thread(page: usize, _: usize, _: usize, _: usize) -> ! {
+    let meeting = page as *mut Meeting;
+    // SAFETY: the page the first thread mapped and filled in before starting this one.
+    let (event, channel) = unsafe {
+        (
+            core::ptr::addr_of!((*meeting).event).read_volatile(),
+            core::ptr::addr_of!((*meeting).channel).read_volatile(),
+        )
+    };
+    // SAFETY: as above; the first thread reads this word only after the signal below.
+    unsafe { core::ptr::addr_of_mut!((*meeting).written).write_volatile(MEETING_MAGIC) };
+    let event = rt::Event {
+        handle: Handle(event),
+    };
+    let _ = event.signal();
+    let mut buf = [0u8; 8];
+    let code = match recv_promptly(Handle(channel), &mut buf) {
+        Ok(n) if rt::starts_with(&buf, n, b"wake") => match rt::send(Handle(channel), b"woke") {
+            Ok(()) => 0,
+            Err(_) => 2,
+        },
+        _ => 1,
+    };
+    let _ = event.signal();
+    rt::exit_thread(code)
+}
+
+/// Move a handle across a channel with fewer rights, and check the receiver holds exactly
+/// those, the sender holds nothing, and a send that cannot move everything moves nothing.
+fn rights_narrow() -> Result<(), u64> {
+    let (a, b) = rt::channel().map_err(|_| 0x530u64)?;
+    let event = rt::Event::create().map_err(|_| 0x531u64)?;
+    let mut buf = [0u8; 8];
+    let mut got = [Handle(0); 2];
+    // A handle this program does not hold cannot be sent, and the refusal takes the other
+    // handle in the same message with it: nothing arrives, and the event is still here.
+    let forged = Handle(0x7fff_0001);
+    let refused =
+        rt::send_handles(a, b"no", &[(event.handle, abi::rights::ALL), (forged, abi::rights::ALL)]);
+    if refused != Err(Error::BadHandle) {
+        return Err(0x532);
+    }
+    if rt::recv_with_handles(b, &mut buf, &mut got, rt::NO_WAIT) != Err(Error::ShouldWait) {
+        return Err(0x533);
+    }
+    if event.signal().is_err() {
+        return Err(0x534);
+    }
+    // Moved with WAIT alone.
+    if rt::send_handles(a, b"cap", &[(event.handle, abi::rights::WAIT)]).is_err() {
+        return Err(0x535);
+    }
+    // Moved, not copied: this program's handle is gone.
+    if event.signal() != Err(Error::BadHandle) {
+        return Err(0x536);
+    }
+    match rt::recv_with_handles(b, &mut buf, &mut got, WAKE_NS) {
+        Ok(r) if r.handles == 1 && rt::starts_with(&buf, r.bytes, b"cap") => {}
+        _ => return Err(0x537),
+    }
+    let [first, _] = got;
+    let narrowed = rt::Event { handle: first };
+    // It carries WAIT, and the signal sent before the move is still there to consume...
+    if narrowed.wait(rt::NO_WAIT).is_err() {
+        return Err(0x538);
+    }
+    // ...and it does not carry SIGNAL.
+    if narrowed.signal() != Err(Error::AccessDenied) {
+        return Err(0x539);
+    }
+    for h in [a, b, first] {
+        if call::handle_close(h).is_err() {
+            return Err(0x53a);
+        }
+    }
+    Ok(())
+}
+
+/// Read `/HELLO.TXT` through the file service, sixteen bytes at a time, and print it.
+fn read_through_the_service(console: Handle, files: Handle) -> Result<(), u64> {
+    let mut buf = [0u8; vfsproto::MESSAGE];
+    let open = vfsproto::open(b"/HELLO.TXT").ok_or(0x540u64)?;
+    let file = match ask(files, open.as_bytes(), &mut buf) {
+        Some(r) if r.status == vfsproto::Status::Ok => r.a,
+        _ => return Err(0x541),
+    };
+    let mut contents = [0u8; 64];
+    let mut len = 0;
+    loop {
+        let reply = match ask(files, vfsproto::read(file, 16).as_bytes(), &mut buf) {
+            Some(r) if r.status == vfsproto::Status::Ok => r,
+            _ => return Err(0x542),
+        };
+        if reply.data.is_empty() {
+            break;
+        }
+        for byte in reply.data {
+            let Some(slot) = contents.get_mut(len) else {
+                return Err(0x543);
+            };
+            *slot = *byte;
+            len += 1;
+        }
+    }
+    match ask(files, vfsproto::close(file).as_bytes(), &mut buf) {
+        Some(r) if r.status == vfsproto::Status::Ok => {}
+        _ => return Err(0x544),
+    }
+    if !rt::starts_with(&contents, len, HELLO) {
+        return Err(0x545);
+    }
+    // A file that is not there is refused, not invented.
+    let missing = vfsproto::open(b"/NOPE.TXT").ok_or(0x546u64)?;
+    match ask(files, missing.as_bytes(), &mut buf) {
+        Some(r) if r.status == vfsproto::Status::NotFound => {}
+        _ => return Err(0x547),
+    }
+    let _ = rt::print(console, b"init: through the file service: ");
+    let _ = rt::print(console, contents.get(..len).unwrap_or(&[]));
+    Ok(())
+}
+
+/// Send `request` to the file service and wait for its reply, read into `buf`.
+fn ask<'a>(service: Handle, request: &[u8], buf: &'a mut [u8]) -> Option<vfsproto::Reply<'a>> {
+    rt::send(service, request).ok()?;
+    let n = rt::recv_timeout(service, buf, WAKE_NS).ok()?;
+    vfsproto::parse_reply(buf.get(..n)?)
+}
+
+/// Pass a counter to [`peer`] and back until a tenth of a second has gone, blocking in the
+/// kernel for every answer. The kernel pins the two threads to two CPUs, so each answer is a
+/// wake from another CPU. A receive that times out is a wake-up the kernel lost.
+fn pair(channel: Handle) -> u64 {
+    let start = rt::now_ns();
+    let mut rounds = 0u64;
+    loop {
+        if rt::send(channel, &rounds.to_le_bytes()).is_err() {
+            return 0x602;
+        }
+        let mut buf = [0u8; 8];
+        match recv_promptly(channel, &mut buf) {
+            Ok(8) => {}
+            Err(Error::TimedOut) => return 0x603,
+            _ => return 0x604,
+        }
+        if u64::from_le_bytes(buf) != rounds + 1 {
+            return 0x605;
+        }
+        rounds += 1;
+        if rounds >= 8 && rt::now_ns().wrapping_sub(start) >= 100_000_000 {
+            break;
+        }
+    }
+    if rt::send(channel, &u64::MAX.to_le_bytes()).is_err() {
+        return 0x606;
+    }
+    let mut buf = [0u8; 8];
+    match recv_promptly(channel, &mut buf) {
+        Ok(8) if u64::from_le_bytes(buf) == u64::MAX => PAIR_SUCCESS,
+        _ => 0x607,
+    }
+}
+
+/// [`pair`]'s other half: answer each counter with the next, and every fourth time make the
+/// other thread wait first, with a timed wait on an event nothing signals.
+fn peer(channel: Handle) -> u64 {
+    let Ok(pause) = rt::Event::create() else {
+        return 0x611;
+    };
+    loop {
+        let mut buf = [0u8; 8];
+        match recv_promptly(channel, &mut buf) {
+            Ok(8) => {}
+            Err(Error::TimedOut) => return 0x613,
+            _ => return 0x614,
+        }
+        let n = u64::from_le_bytes(buf);
+        if n == u64::MAX {
+            let _ = rt::send(channel, &buf);
+            rt::exit_thread(0)
+        }
+        if n % 4 == 0 && pause.wait(1_000_000) != Err(Error::TimedOut) {
+            return 0x615;
+        }
+        if rt::send(channel, &(n + 1).to_le_bytes()).is_err() {
+            return 0x616;
+        }
+    }
+}
 
 /// Write to `target`, which is kernel memory. The kernel must end the process here.
 fn fault(target: usize) -> u64 {

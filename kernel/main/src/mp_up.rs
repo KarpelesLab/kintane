@@ -49,3 +49,13 @@ pub fn check_shootdown<L>(c: &dyn EarlyConsole, _live: L) -> Check {
 pub fn shootdown_stats() -> (usize, usize, usize) {
     (0, 0, 0)
 }
+
+/// Answer TLB shootdowns while spinning on a lock: on one CPU there are none to answer.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only by the process locks, which need USERSPACE"
+    )
+)]
+pub fn answer_shootdowns() {}

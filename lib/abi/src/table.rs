@@ -69,4 +69,46 @@ crate::syscalls! {
     /// which needs `WRITE`. Pages are provided when first touched. Returns the address the
     /// region has in that process.
     16 => fn vm_map_in(process: Handle, region: Handle);
+
+    // ---- waiting ------------------------------------------------------------------------
+    //
+    // A timeout is nanoseconds of the kernel's monotonic clock. Zero answers at once without
+    // waiting, with `ShouldWait` if nothing is ready, and `u64::MAX` waits for as long as it
+    // takes. A wait that runs out is `TimedOut` and leaves the object as it found it: nothing
+    // is half-received. A wait ends early with `PeerClosed` when another thread ends the
+    // process, so that the waiting thread can end too.
+
+    /// Send `len` bytes at `bytes` on `channel` (`WRITE`), moving the `count` handles described
+    /// at `handles` out of the caller's table with the message. Each is eight bytes: the handle
+    /// as a little-endian `u32`, then a `u32` mask of the rights the receiver may keep. Rights
+    /// only narrow. All or nothing: on any error every handle is still the caller's. At most two
+    /// handles and 64 bytes. Wakes a thread waiting to receive.
+    17 => fn channel_send(channel: Handle, bytes: UserPtr, len: usize, handles: UserPtr, count: usize);
+    /// Receive the front message on `channel` (`READ`) into `cap` bytes at `buf`, install the
+    /// handles it carries in the caller's table, and write their values at `handles` as
+    /// little-endian `u32`s, with room for `hcap`. Waits up to `timeout_ns` for a message.
+    /// Returns the message's length in the low 32 bits and its handle count in the high 32.
+    18 => fn channel_recv(channel: Handle, buf: UserPtr, cap: usize, handles: UserPtr, hcap: usize, timeout_ns: u64);
+    /// As `completion_poll`, waiting up to `timeout_ns` for a completion. A timer delivering to
+    /// this queue ends the wait when it expires.
+    19 => fn completion_wait(completion: Handle, out: UserPtr, timeout_ns: u64);
+    /// Create an event: a latch one thread signals and another waits on. Returns a handle with
+    /// every right.
+    20 => fn event_create();
+    /// Signal `event` (`SIGNAL`), waking a thread waiting on it. Signalling a signalled event
+    /// changes nothing: an event records that something happened, not how often.
+    21 => fn event_signal(event: Handle);
+    /// Wait up to `timeout_ns` for `event` (`WAIT`) to be signalled, and consume the signal.
+    22 => fn event_wait(event: Handle, timeout_ns: u64);
+    /// Create a timer, disarmed, that delivers to `completion` (`WRITE`) under `key`. Returns a
+    /// handle with every right.
+    23 => fn timer_create(completion: Handle, key: u64);
+    /// Arm `timer` (`WRITE`) to expire `delay_ns` from now and then, if `period_ns` is not
+    /// zero, every `period_ns`. Each delivery's value is how many expirations it reports.
+    /// Arming an armed timer replaces its schedule.
+    24 => fn timer_set(timer: Handle, delay_ns: u64, period_ns: u64);
+    /// Disarm `timer` (`WRITE`). Expirations already delivered stay delivered.
+    25 => fn timer_cancel(timer: Handle);
+    /// The kernel's monotonic clock, in nanoseconds.
+    26 => fn clock_now();
 }
