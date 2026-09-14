@@ -61,6 +61,7 @@ config BOOT_STACK_KIB
     default 32 if IOMMU
     default 32 if SMP
     default 32 if STRESS_TEST
+    default 32 if INKERNEL_TESTS
     default 16
     help
         The stack the first thread of execution runs on, with a guard below it.
@@ -76,6 +77,13 @@ config BOOT_STACK_KIB
         where the port has pages, and asserts it; kbuild refuses a linked
         kernel whose __stack_bottom..__stack_top is any other size. Every boot
         reports how deep it used the stack, and fails past 75% of it.
+
+        An in-kernel test image runs its suite on the boot stack and reached
+        78% of 16 KiB on x86_64 once the ninth round's landings grew it, so it
+        takes 32 KiB too. The ports whose test images stay lower, i686 at 55%
+        and aarch64 at 66%, are raised with them: a test image is not what a
+        small machine ships, and a preset that knows its RAM says so itself,
+        as armv7m-tiny does with 14 KiB.
 
 config HANDLER_STACK_KIB
     int "Size of the exception stack (KiB)"
