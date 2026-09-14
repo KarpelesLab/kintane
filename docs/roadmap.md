@@ -15,7 +15,88 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
 | 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
 | 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Stopping signals, queued real-time signals, floating-point state in a signal frame, `MSG_PEEK` and scatter/gather are not built |
-| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, FAT16 written as well as read and a FAT32 second volume, both checked after every run; virtio-net with IPv4 reassembly, TCP with congestion control and out-of-order delivery, datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The twelfth round of landings
+
+Eighteen presets build and boot. Six branches ran; three of them declined their headline item and
+said why, which is the round's real result.
+
+- **The soak's comparison now knows what it is comparing.** The guest names each heartbeat number's
+  kind in a line printed beside the code that prints the numbers, so the two cannot be edited apart,
+  and kbuild no longer guesses from a hardcoded list: a count is judged by its rate, a level by
+  whether it is still climbing at the end, a mean by its value. The four marks the eleventh round's
+  two-hour soak produced were every one a rate test applied to a high-water mark or a mean, and they
+  are gone. Reading the comparison for those artifacts exposed the opposite hole, and a worse one: a
+  count that stood at zero through the first window had no rate to compare, so it printed as a dash
+  and was passed over — **a leak beginning after the first window was invisible**, which is precisely
+  what a long run exists to catch. That is a finding of its own now, as is a count that goes
+  backwards, and three fields silenced by being called gauges are counts that should stay at zero.
+- **Selective acknowledgement has both halves.** A peer's blocks are recorded against the connection
+  and clamped to what was actually sent, so recovery starts at the first byte the peer has not
+  reported and a retransmission steps over the runs it holds; a block naming data this end never
+  sent is discarded rather than believed, and a timeout still falls back to go-back-N. Separating
+  the two took care: with or without the blocks, **the first retransmission starts at the same
+  byte** — go-back-N and selective recovery agree on where a hole begins, and only its length
+  differs, so that is what the tests compare.
+- **An interrupt belongs to a device, not to a driver.** `Driver::interrupt` now names the bound
+  device, and virtio-blk keeps an indexed slot per disk where it kept one cell and turned a second
+  device away. Each slot dispatches through a trampoline of its own, because the device model's
+  interrupt table holds a bare function pointer with nothing to say which device fired, and a slot
+  count that outgrows its trampolines is a compile error. Every preset still completes 32 requests
+  in 32 interrupts — on MSI-X, on a plain line, through a ring-3 domain, and across CPUs.
+- **A user program can be built for a hard-float target**, which nothing in this kernel could do
+  before: two specifications drop the ABI field that was rejecting the floating-point features, and
+  a unit opts in and gets a `core` of its own in a flavour whose cache keys cannot be confused with
+  the soft-float one. It is an opt-in rather than a switch for every user program, because the
+  compiler emits floating-point instructions to move bytes with no float in the source, and nothing
+  saves those registers across a context switch yet. That a program really was built this way is
+  checked by disassembling it — a soft-float build computes identical answers — and **that check was
+  wrong twice before it was right**: matching register names matched the disassembler's encoding
+  bytes, so a soft-float binary scored higher than the hard-float one, and the mnemonic parser
+  skipped `fadd` because that word is four hexadecimal digits.
+- **FAT32 reaches the machinery that was FAT16-only**, and a Linux program can ask what filesystem
+  it is on. The crash workload writes both volumes and kbuild reads both back after every cut,
+  tolerating the lost clusters and one-step-apart tables the write ordering allows while still
+  refusing inconsistency; the stress workload writes the second volume under the same lease; and the
+  fuzz target gained the second format over a sparse disk, because a 34 MiB volume cannot be copied
+  per cut point. `statfs` answers for the filesystem covering a path and `fstatfs` for the one an
+  open descriptor's file is on, on both architectures. **Two vacuous passes were closed by evidence
+  rather than assumption:** a volume below FAT32's cluster boundary is FAT16 to every reader, so
+  without a test that the second format really is FAT32, every FAT32 input would have exercised
+  FAT16 and passed — the one failure a fuzz target cannot report about itself.
+
+**Three refusals, each with its measurement.**
+
+- **Floating-point state in a signal frame, again — and now the reason beneath the reason.** User
+  programs were compiled from the kernel's own soft-float target, so no code in the image could name
+  a floating-point register at all: `a * b` in a user program became a call to `__muldf3`. Every
+  check `HasFpu` would need was therefore unwritable, and the branch declined to land the
+  context-switch half alone rather than ship save-and-restore code with no test that could fail. The
+  hard-float target above exists because of that refusal, and makes the work falsifiable.
+- **A peer that could exercise selective acknowledgement in a guest.** This host has no tap device,
+  no `ip`, no `tunctl`, and QEMU's `vmnet` backends need root; the one usable backend replaces the
+  user-mode network outright, so kbuild would have to answer ARP, echo, the probes, the UDP service,
+  the fragmented datagram and the whole TCP service before a single block could be sent. The design
+  is decided and recorded; the kernel half it would gate was built instead.
+- **The second drive.** Verifying the survey found it incomplete: `platform::block_line()` alone has
+  fifteen callers that each need a device index, and the platforms, the IOMMU, the driver domain and
+  the filesystem each keep their own singleton besides. The device layer was made plural and left at
+  a clean line, with nothing half-applied and no disk layout moved.
+
+**What the round taught about its own instructions.** Numbers assigned in advance again produced no
+collisions, and the two defects the eleventh round found in *my* assignments did not recur. But two
+briefs were wrong in substance, and both were overruled with evidence: one told a branch to switch
+every user program to a hard-float target, which would have had user threads clobbering each other
+silently; another told a branch to require a refusal that nothing on the network can send. A fourth
+stale-tool incident also went into the record — a rebuilt binary turned a passing crash campaign
+with no FAT32 columns into the real result.
+
+**Still open.** `HasFpu` itself, now falsifiable; a boot check that runs the hard-float program, so
+the enable bits are tested at runtime; the second drive, starting at `platform::block_line()`; a peer
+that can exercise selective acknowledgement or an ICMP refusal in a guest; `getdents`, without which
+a program cannot list a long name; a kernel-side check that a program's `statfs` answers match the
+kernel's walk; and, as before, real hardware, Secure Boot with a TPM, and the 24-hour soak.
 
 ### The eleventh round of landings
 
