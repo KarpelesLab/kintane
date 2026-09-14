@@ -452,21 +452,106 @@ static STRESS_STACK: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Processes the stress run has created and destroyed.
 static CYCLES: AtomicU64 = AtomicU64::new(0);
 
-/// How long a stress cycle gives its process on each CPU, twice over: once to get there,
-/// once to be measured there. Four of them and the stop fit well inside the auditor's
-/// one-second interval.
-const STRESS_WINDOW: Duration = Duration::from_nanos(80_000_000);
+// A stress cycle judges its process by what the scheduler gave it, not by how long it
+// waited. It used to give the process a fixed 80 ms of guest time on one CPU, and on a
+// loaded host that window measured the host: under an emulator the guest's clock follows
+// the host's, so a vCPU the host did not run still had its window run out, and the fixed-rate
+// sleepers above the process took a larger share of what the vCPU did execute. The 20 s run
+// on `x86_64-qemu` failed that way three times, each passing when rerun alone.
 
-/// The longest a cycle waits to see its pinned thread served on the CPU it was moved to
-/// and making progress there. A bound on a scheduling delay, so it is generous; the delay
-/// itself is measured and reported rather than assumed.
-const SERVE_WAIT: Duration = Duration::from_nanos(1_000_000_000);
+/// Slices a cycle's process thread may run, as the timer interrupt counts them
+/// ([`preempt::slices`]), while making no progress. Its loop publishes a pass every few
+/// instructions, so one slice is plenty; sixteen leave room for slices charged across a
+/// host stall in which it barely ran.
+const RAN_SLICES: u64 = 16;
 
-/// How often that wait looks.
+/// Slices it may be passed over for — ready on its CPU while a thread no more urgent runs
+/// there — for each slice it ran, while making no progress. Round robin passes it over once
+/// for each of the four busy workloads that share its level; sixty-four to one is a queue
+/// that does not reach it. Per slice run, because a thread taking its turns among peers
+/// reaches sixty-four passes at about the moment it reaches [`RAN_SLICES`]: counted alone,
+/// a process that ran without advancing was reported as passed over.
+const PASSED_SLICES: u64 = 64;
+
+/// The longest a cycle waits when neither count reaches its bound, which only a thread that
+/// neither runs nor is passed over can do: one that is blocked, queued on a CPU taking no
+/// interrupts, or ready behind more urgent threads. Fixed priority allows that last, and
+/// only its length tells a busy moment from starvation, so this one bound is still guest
+/// time. It is sixty-two of the old windows, and a sixth of the thirty seconds kbuild allows
+/// between heartbeats.
+const STARVE_WAIT: Duration = Duration::from_nanos(5_000_000_000);
+
+/// How often a wait looks.
 const POLL: Duration = Duration::from_nanos(5_000_000);
+
+/// How a wait by [`await_slices`] ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    Done,
+    /// It ran [`RAN_SLICES`] without making progress.
+    Ran,
+    /// It was passed over for [`PASSED_SLICES`] per slice it ran, without making progress.
+    PassedOver,
+    /// [`STARVE_WAIT`] passed with neither.
+    Starved,
+    /// The table has no such thread.
+    Lost,
+}
+
+/// Wait until `done`, judging thread `id` meanwhile by the slices it is charged. `moving`
+/// says whether it is making progress, which suspends that judgement: a thread that is
+/// advancing, but has not yet done what is waited for, has only [`STARVE_WAIT`] to meet.
+fn await_slices(
+    id: ThreadId,
+    mut done: impl FnMut() -> bool,
+    mut moving: impl FnMut() -> bool,
+) -> Waited {
+    let Some(start) = preempt::slices(id) else {
+        return Waited::Lost;
+    };
+    let give_up = timekeeping::now().saturating_add(STARVE_WAIT);
+    loop {
+        if done() {
+            if let Some(now) = preempt::slices(id) {
+                RAN_WORST.fetch_max(now.ran.wrapping_sub(start.ran), Ordering::Relaxed);
+                PASSED_WORST.fetch_max(now.passed.wrapping_sub(start.passed), Ordering::Relaxed);
+            }
+            return Waited::Done;
+        }
+        // The counts before `moving`, so a count that reached its bound was reached with
+        // no progress made up to the moment it was read.
+        let Some(now) = preempt::slices(id) else {
+            return Waited::Lost;
+        };
+        if !moving() {
+            let ran = now.ran.wrapping_sub(start.ran);
+            if ran >= RAN_SLICES {
+                return Waited::Ran;
+            }
+            let passed = now.passed.wrapping_sub(start.passed);
+            if passed >= PASSED_SLICES.saturating_mul(ran + 1) {
+                return Waited::PassedOver;
+            }
+        }
+        if timekeeping::now() >= give_up {
+            return Waited::Starved;
+        }
+        nap(POLL);
+    }
+}
 
 /// The longest any cycle waited for its thread on the CPU it pinned it to.
 static SERVE_WORST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The most slices any wait by [`await_slices`] ran, and was passed over for, before it
+/// succeeded: how close a passing run came to [`RAN_SLICES`] and [`PASSED_SLICES`].
+static RAN_WORST: AtomicU64 = AtomicU64::new(0);
+static PASSED_WORST: AtomicU64 = AtomicU64::new(0);
+
+/// Those two counts, for the stress heartbeat.
+pub fn stress_slices_worst() -> (u64, u64) {
+    (RAN_WORST.load(Ordering::Relaxed), PASSED_WORST.load(Ordering::Relaxed))
+}
 
 /// That wait in microseconds, for the stress heartbeat.
 pub fn stress_serve_worst_us() -> u64 {
@@ -541,7 +626,7 @@ pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
     let _ = preempt::set_affinity(id, u64::MAX);
     set_stop(0);
     let before = passes(0);
-    if !wait_exit(id) {
+    if await_slices(id, || !preempt::alive(id), || false) != Waited::Done {
         // Its tables cannot be freed while it may still run on them. The run is failing
         // anyway; leaving the process is the only safe thing to do.
         //
@@ -588,9 +673,28 @@ fn exercise(id: ThreadId, round: u64) -> Result<(), &'static str> {
     let cpus = preempt::stats().cpus.max(1);
     if cpus < 2 {
         let before = passes(0);
-        nap(STRESS_WINDOW);
-        if passes(0) <= before {
-            return Err("a process made no progress");
+        let moved = || passes(0) > before;
+        match await_slices(id, moved, moved) {
+            Waited::Done => {}
+            Waited::Ran => return Err("a process ran its slices and made no progress"),
+            Waited::PassedOver => {
+                return Err("a process was passed over for its slices and made no progress");
+            }
+            Waited::Lost => return Err("a process made no progress: the table lost its thread"),
+            // Neither count moved, so the state is the diagnosis.
+            Waited::Starved => {
+                return Err(match preempt::where_is(id) {
+                    Some((thread::State::Running, _)) => {
+                        "a process made no progress: running, and never charged a slice"
+                    }
+                    Some((thread::State::Ready, _)) => {
+                        "a process made no progress: ready, behind more urgent threads"
+                    }
+                    Some((thread::State::Blocked, _)) => "a process made no progress: blocked",
+                    Some((thread::State::Exited, _)) => "a process made no progress: it had exited",
+                    None => "a process made no progress: the table lost its thread",
+                });
+            }
         }
     } else {
         let first = (round as usize) % cpus;
@@ -609,15 +713,26 @@ fn exercise(id: ThreadId, round: u64) -> Result<(), &'static str> {
             // an idle CPU slept through its arrival. With that fixed the worst wait any
             // cycle has taken is about 13 ms, reported in the heartbeat, so this bound is
             // measured rather than guessed.
+            //
+            // The wait is now judged in slices (see `RAN_SLICES`): a thread that ran or was
+            // passed over for its share without moving fails at once, and only one that did
+            // neither waits out `STARVE_WAIT`.
             let start = timekeeping::now();
-            let give_up = start.saturating_add(SERVE_WAIT);
-            loop {
-                let served = userproc::cpus(WORKERS[0]) & (1 << cpu) != 0;
-                if served && passes(0) > before {
-                    break;
+            let served = || userproc::cpus(WORKERS[0]) & (1 << cpu) != 0;
+            let waited = await_slices(id, || served() && passes(0) > before, || passes(0) > before);
+            match waited {
+                Waited::Done => {}
+                Waited::Ran => {
+                    return Err("a process ran its slices after it moved and made no progress");
                 }
-                if timekeeping::now() >= give_up {
-                    if served {
+                Waited::PassedOver => {
+                    return Err(
+                        "never served: passed over for its slices on the CPU it was pinned to",
+                    );
+                }
+                Waited::Lost => return Err("never served: the table lost its thread"),
+                Waited::Starved => {
+                    if served() {
                         return Err("a process stopped making progress after it moved");
                     }
                     // Where it is says which half failed: a thread the table never moved to
@@ -643,7 +758,6 @@ fn exercise(id: ThreadId, round: u64) -> Result<(), &'static str> {
                         None => "never served: the table lost its thread",
                     });
                 }
-                nap(POLL);
             }
             let waited = timekeeping::now().saturating_duration_since(start);
             SERVE_WORST_NS.fetch_max(waited.as_nanos(), Ordering::Relaxed);

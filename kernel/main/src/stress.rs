@@ -673,7 +673,14 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         // this replaced.
         c.write_str(" (served after max ");
         write_usize(c, crate::model::process_stress_serve_worst_us() as usize);
-        c.write_str(" us)");
+        // And the most slices any of its waits was charged before it succeeded, against the
+        // bounds that fail one: the margin the progress check really has.
+        let (ran, passed) = crate::model::process_stress_slices_worst();
+        c.write_str(" us, slices ran max ");
+        write_usize(c, ran as usize);
+        c.write_str(", passed over max ");
+        write_usize(c, passed as usize);
+        c.write_str(")");
     }
     crate::model::wait_stress_heartbeat(c);
     c.write_str(", audits ");
