@@ -541,6 +541,9 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `linux`, whose process slot and stacks it reuses: one process waiting on a
     // channel, an event and a timer at once.
     let readiness = crate::model::readiness_check(c);
+    // After `readiness`, which has ended its threads: this races a wake into the window
+    // that check could not reach. Passes silently without WAIT_RACE_TEST.
+    let waitrace = crate::waitrace::check(c);
     let sockets = crate::model::sockets_check(c);
     // After `sockets`, which has torn its process down by now, reusing the same process slot:
     // the Linux program as a TCP client, and as a server kbuild connects to.
@@ -573,6 +576,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(files_statfs)
         .and(linux)
         .and(readiness)
+        .and(waitrace)
         .and(sockets)
         .and(linux_net)
         .and(isolation)

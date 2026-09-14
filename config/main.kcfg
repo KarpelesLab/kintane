@@ -561,6 +561,24 @@ config NULL_DEREF_TEST
 
         A test mode, never a production setting; see STACK_GUARD_TEST.
 
+config WAIT_RACE_TEST
+    bool "Stall a wait between its first look and registering, on purpose"
+    depends on QEMU_EXIT && MM_PAGED
+    default n
+    help
+        Compile a stall point into WaitQueue::wait_once, between the look
+        that precedes registering and the registration itself, and run a
+        check that parks a thread there while another makes the thing it
+        waits for ready. That window is sub-microsecond, so no thread can
+        aim at it from outside; without this the check that closes it — the
+        second look — can be deleted and every existing test still passes.
+
+        A test mode, never a production setting. The kernel it builds stops
+        a thread in the middle of a wait on demand. Without this symbol the
+        stall is an empty inline function in a module of its own, so a
+        release build carries neither a branch nor a symbol for it; see
+        kernel/main/src/waitrace_off.rs.
+
 config STRESS_TEST
     bool "Run the stress workload after bring-up"
     depends on QEMU_EXIT && MM_PAGED
