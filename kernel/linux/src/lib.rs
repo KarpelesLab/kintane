@@ -155,11 +155,13 @@ pub enum Call {
     EpollCtl,
     EpollWait,
     EpollPwait,
+    Sendmsg,
+    Recvmsg,
 }
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 61] = [
+    pub const ALL: [Call; 63] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -221,6 +223,8 @@ impl Call {
         Call::EpollCtl,
         Call::EpollWait,
         Call::EpollPwait,
+        Call::Sendmsg,
+        Call::Recvmsg,
     ];
 
     /// The name the tables give it.
@@ -287,6 +291,8 @@ impl Call {
             Call::EpollCtl => "epoll_ctl",
             Call::EpollWait => "epoll_wait",
             Call::EpollPwait => "epoll_pwait",
+            Call::Sendmsg => "sendmsg",
+            Call::Recvmsg => "recvmsg",
         }
     }
 
@@ -355,6 +361,8 @@ impl Call {
             Call::EpollCtl => (233, 21),
             Call::EpollWait => (232, NONE),
             Call::EpollPwait => (281, 22),
+            Call::Sendmsg => (46, 211),
+            Call::Recvmsg => (47, 212),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,
@@ -477,20 +485,29 @@ pub mod socket {
 
     pub const AF_INET: u64 = 2;
     pub const SOCK_STREAM: u64 = 1;
+    /// A datagram socket: `socket(AF_INET, SOCK_DGRAM)`, carried over UDP.
+    pub const SOCK_DGRAM: u64 = 2;
     /// The bits of `socket`'s type that name the type; the rest are flags.
     pub const SOCK_TYPE_MASK: u64 = 0xf;
     /// `socket`'s and `accept4`'s flags, which are `open`'s values.
     pub const SOCK_NONBLOCK: u64 = super::O_NONBLOCK;
     pub const SOCK_CLOEXEC: u64 = super::O_CLOEXEC;
     pub const IPPROTO_TCP: u64 = 6;
+    pub const IPPROTO_UDP: u64 = 17;
 
     pub const SOL_SOCKET: u64 = 1;
     pub const SO_REUSEADDR: u64 = 2;
     pub const SO_TYPE: u64 = 3;
     pub const SO_ERROR: u64 = 4;
+    pub const SO_BROADCAST: u64 = 6;
     pub const SO_KEEPALIVE: u64 = 9;
+    /// How long a receive and a send wait, as a `struct timeval`.
+    pub const SO_RCVTIMEO: u64 = 20;
+    pub const SO_SNDTIMEO: u64 = 21;
     pub const TCP_NODELAY: u64 = 1;
 
+    /// Answer with the length the datagram had, not the length that fit.
+    pub const MSG_TRUNC: u64 = 0x20;
     pub const MSG_DONTWAIT: u64 = 0x40;
     pub const MSG_NOSIGNAL: u64 = 0x4000;
 
@@ -501,6 +518,31 @@ pub mod socket {
     /// Bytes of `struct sockaddr_in`: the family, the port and the address, then eight of
     /// padding.
     pub const SOCKADDR_IN_LEN: usize = 16;
+
+    /// `struct msghdr` on both ports: the address and its length, the iovec array and its
+    /// length, the control buffer and its length, and the flags. Eight bytes each, and the two
+    /// lengths that are `int` in the C are followed by four of padding.
+    pub const MSGHDR_LEN: usize = 56;
+    pub const MSGHDR_NAME: usize = 0;
+    pub const MSGHDR_NAMELEN: usize = 8;
+    pub const MSGHDR_IOV: usize = 16;
+    pub const MSGHDR_IOVLEN: usize = 24;
+    pub const MSGHDR_FLAGS: usize = 48;
+
+    /// `struct iovec`: a pointer and a length.
+    pub const IOVEC_LEN: usize = 16;
+
+    /// A `struct timeval`'s seconds and microseconds, which is how `SO_RCVTIMEO` is set.
+    pub const TIMEVAL_LEN: usize = 16;
+
+    /// The word at `at` in `bytes`, for reading the structures above.
+    pub fn word(bytes: &[u8], at: usize) -> u64 {
+        let mut w = [0u8; 8];
+        if let Some(part) = bytes.get(at..at + 8) {
+            w.copy_from_slice(part);
+        }
+        u64::from_le_bytes(w)
+    }
 
     /// `ip`:`port` as a `struct sockaddr_in`: the family in the machine's byte order, the port
     /// and the address in the network's.
@@ -563,6 +605,7 @@ pub mod errno {
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
     pub const ENOTEMPTY: i64 = 39;
+    pub const EMSGSIZE: i64 = 90;
     pub const ENOTSOCK: i64 = 88;
     pub const ENOPROTOOPT: i64 = 92;
     pub const EPROTONOSUPPORT: i64 = 93;
@@ -635,6 +678,8 @@ pub enum Failure {
     Interrupted,
     /// `kill` or `tgkill` named no Linux process or thread.
     NoProcess,
+    /// A datagram longer than the stack carries in one frame.
+    MessageTooLong,
     /// A socket call named a descriptor that is not a socket.
     NotASocket,
     /// A socket of an address family other than IPv4.
@@ -700,6 +745,7 @@ pub const fn errno(f: Failure) -> i64 {
         Failure::NotImplemented => ENOSYS,
         Failure::Interrupted => EINTR,
         Failure::NoProcess => ESRCH,
+        Failure::MessageTooLong => EMSGSIZE,
         Failure::NotASocket => ENOTSOCK,
         Failure::AddressFamilyNotSupported => EAFNOSUPPORT,
         Failure::ProtocolNotSupported => EPROTONOSUPPORT,

@@ -76,6 +76,32 @@ pub const PROBE: &[u8] = b"kintane-udp-probe";
 pub const ECHO: &[u8] = b"kintane-udp-echo ";
 pub const ACK: &[u8] = b"kintane-udp-ack ";
 
+/// kbuild's datagram service, for the socket calls rather than for this check: the datagrams
+/// that name its port and a port nothing answers on, and the request and reply a datagram
+/// socket exchanges with it. `kbuild/src/qemu.rs` has the same four.
+///
+/// The service is reached at the gateway's address, as kbuild's TCP service is. The quiet port
+/// is one kbuild found free and never bound, so a datagram sent there is answered by nobody,
+/// which is what the check that sends one is about.
+pub const UDP_ANNOUNCE: &[u8] = b"kintane-udp-port ";
+pub const UDP_QUIET: &[u8] = b"kintane-udp-quiet ";
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "the datagram rounds a socket makes are their only users"
+    )
+)]
+pub const UDP_REQUEST: &[u8] = b"kintane-udp-request ";
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "the datagram rounds a socket makes are their only users"
+    )
+)]
+pub const UDP_REPLY: &[u8] = b"kintane-udp-reply ";
+
 /// What kbuild's TCP service is told and answers, and the datagram that tells the kernel which
 /// port it is on: `kbuild/src/qemu.rs` has the same three. A request is
 /// `kintane-tcp-request <mode> <tag>` and a newline, and its reply is the same line with `reply`
@@ -125,6 +151,10 @@ static PEER_PORT: AtomicU32 = AtomicU32::new(0);
 /// The port kbuild's TCP service listens on, on the host's loopback interface, as its
 /// announcement said. Zero until one has arrived.
 static TCP_PORT: AtomicU32 = AtomicU32::new(0);
+/// The port kbuild's datagram service answers on, and the port it leaves unbound, from the
+/// announcements beside the TCP one. Zero until they have arrived.
+static UDP_SERVICE_PORT: AtomicU32 = AtomicU32::new(0);
+static QUIET_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the card's interrupt handler runs the stack itself ([`serve_by_interrupt`]). Until
 /// then, and on a port with no interrupt route, whoever uses the stack polls it.
@@ -213,6 +243,39 @@ pub fn tcp_port() -> Option<u16> {
     (port != 0).then_some(port as u16)
 }
 
+/// kbuild's datagram service's port, once it has announced it.
+pub fn udp_service_port() -> Option<u16> {
+    let port = UDP_SERVICE_PORT.load(Ordering::Acquire);
+    (port != 0).then_some(port as u16)
+}
+
+/// The port kbuild leaves unbound, once it has announced it: what a datagram sent nowhere is
+/// sent to.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "the datagram checks are its only users, and they need processes"
+    )
+)]
+pub fn quiet_port() -> Option<u16> {
+    let port = QUIET_PORT.load(Ordering::Acquire);
+    (port != 0).then_some(port as u16)
+}
+
+/// Take every datagram waiting on [`PORT`], learning from any announcement among them.
+///
+/// A datagram socket's receive does this first. kbuild probes this port four times a second
+/// whether anything reads it or not, and the inbox those probes fill is the one a socket's
+/// replies arrive in; nothing else drains it once the checks that do are over.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "the socket calls are its only users")
+)]
+pub fn drain_probes() {
+    let _ = with_stack(|s, _, _| drain(s));
+}
+
 /// Run `f` on the stack, after polling it, on the scheduler's clock: for the socket calls,
 /// which run once the check is over. `None` without a started card.
 ///
@@ -229,21 +292,36 @@ pub fn with_stack<R>(f: impl FnOnce(&mut Stack, &VirtioNet<Locks>, u64) -> R) ->
     Some(f(&mut s, card, t))
 }
 
-/// Remember kbuild's TCP port if `datagram` announces it.
+/// Remember whichever of kbuild's ports `datagram` announces: its TCP service's, its datagram
+/// service's, or the port it leaves unbound.
 fn note(datagram: &[u8]) {
-    let Some(digits) = datagram.strip_prefix(TCP_ANNOUNCE) else {
-        return;
-    };
+    for (prefix, port) in [
+        (TCP_ANNOUNCE, &TCP_PORT),
+        (UDP_ANNOUNCE, &UDP_SERVICE_PORT),
+        (UDP_QUIET, &QUIET_PORT),
+    ] {
+        if let Some(digits) = datagram.strip_prefix(prefix)
+            && let Some(announced) = decimal_port(digits)
+        {
+            port.store(announced, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// The port `digits` spells, or `None` for anything that is not one port in decimal.
+fn decimal_port(digits: &[u8]) -> Option<u32> {
     let mut port: u32 = 0;
+    if digits.is_empty() {
+        return None;
+    }
     for &d in digits {
         if !d.is_ascii_digit() || port > u32::from(u16::MAX) {
-            return;
+            return None;
         }
         port = port * 10 + u32::from(d - b'0');
     }
-    if port != 0 && port <= u32::from(u16::MAX) {
-        TCP_PORT.store(port, Ordering::Release);
-    }
+    (port != 0 && port <= u32::from(u16::MAX)).then_some(port)
 }
 
 /// Take every datagram waiting on [`PORT`], remembering an announcement among them.
@@ -946,7 +1024,7 @@ pub fn audit() -> Result<(), &'static str> {
 }
 
 /// `prefix` followed by `n` in decimal. Returns the length written.
-fn numbered(buf: &mut [u8; 32], prefix: &[u8], n: u32) -> usize {
+pub(crate) fn numbered(buf: &mut [u8; 32], prefix: &[u8], n: u32) -> usize {
     let mut digits = [0u8; 10];
     let mut i = digits.len();
     let mut v = n;

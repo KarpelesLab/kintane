@@ -460,6 +460,18 @@ const NET_TCP_INBOUND_REPLY: &[u8] = b"kintane-tcp-inbound-reply ";
 const NET_TCP_INBOUND_VERIFIED: &[u8] = b"kintane-tcp-inbound-verified ";
 const NET_TCP_INBOUND_WRONG: &[u8] = b"kintane-tcp-inbound-wrong ";
 
+/// [`udp_service`]'s protocol, and the datagrams that tell the guest which port it is on and
+/// which port nothing answers on. `kernel/main/src/net.rs` has the same four.
+///
+/// A request is `kintane-udp-request <tag>` and its reply is the same line with `reply` for
+/// `request`, so a reply names the request it answers and a datagram from anywhere else is
+/// visibly not it. The quiet port is one kbuild found free and never bound: what a datagram
+/// sent there earns is the point of the check that sends one.
+const NET_UDP_ANNOUNCE: &[u8] = b"kintane-udp-port ";
+const NET_UDP_QUIET: &[u8] = b"kintane-udp-quiet ";
+const NET_UDP_REQUEST: &[u8] = b"kintane-udp-request ";
+const NET_UDP_REPLY: &[u8] = b"kintane-udp-reply ";
+
 /// The loopback ports a run with a network card is served on: the UDP port QEMU forwards to
 /// the guest, the TCP port of [`tcp_service`], which the guest reaches at the gateway's
 /// address, the two ports of [`relay`], which QEMU connects to, and the TCP port QEMU forwards
@@ -471,6 +483,10 @@ pub struct NetPorts {
     pub relay_out: u16,
     pub relay_in: u16,
     pub inbound: u16,
+    /// [`udp_service`]'s port, which the guest reaches at the gateway's address.
+    pub udp_service: u16,
+    /// A port nothing ever binds, for the guest's check of a datagram nobody answers.
+    pub quiet: u16,
 }
 
 /// Free loopback ports for the guest's network check, when the configuration attaches a card.
@@ -483,10 +499,16 @@ fn net_port(res: &Resolution) -> Result<Option<NetPorts>, String> {
     if !res.is_on("QEMU_NET_TEST") {
         return Ok(None);
     }
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .map_err(|e| format!("no loopback UDP port for the network check: {e}"))?
-        .port();
+    let udp_port = || {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .map(|a| a.port())
+            .map_err(|e| format!("no loopback UDP port for the network check: {e}"))
+    };
+    let udp = udp_port()?;
+    // The service binds its port for real in its own thread; the quiet one is never bound
+    // again, which is what makes it quiet.
+    let (udp_service, quiet) = (udp_port()?, udp_port()?);
     let tcp = || {
         std::net::TcpListener::bind("127.0.0.1:0")
             .map_err(|e| format!("no loopback TCP port for the network check: {e}"))
@@ -503,6 +525,8 @@ fn net_port(res: &Resolution) -> Result<Option<NetPorts>, String> {
         relay_out: port(&out)?,
         relay_in: port(&inject)?,
         inbound: port(&inbound)?,
+        udp_service,
+        quiet,
     }))
 }
 
@@ -568,11 +592,10 @@ fn net_card(res: &Resolution, device: &str, ports: Option<NetPorts>) -> Vec<Stri
 ///
 /// It answers; it does not judge. The verdict is still the guest's exit code.
 fn udp_peer(
-    port: u16,
-    tcp_port: u16,
-    inbound: u16,
+    ports: NetPorts,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
+    let (port, tcp_port, inbound) = (ports.udp, ports.tcp, ports.inbound);
     use std::io::ErrorKind;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -591,11 +614,15 @@ fn udp_peer(
         let mut last: Option<Instant> = None;
         let mut buf = [0u8; 512];
         let announce = [NET_TCP_ANNOUNCE, tcp_port.to_string().as_bytes()].concat();
+        let udp_announce = [NET_UDP_ANNOUNCE, ports.udp_service.to_string().as_bytes()].concat();
+        let quiet_announce = [NET_UDP_QUIET, ports.quiet.to_string().as_bytes()].concat();
         let mut listeners = std::collections::HashSet::new();
         while !stop.load(Ordering::Relaxed) {
             if last.is_none_or(|t| t.elapsed() >= NET_PROBE_EVERY) {
                 let _ = socket.send(NET_PROBE);
                 let _ = socket.send(&announce);
+                let _ = socket.send(&udp_announce);
+                let _ = socket.send(&quiet_announce);
                 last = Some(Instant::now());
             }
             match socket.recv(&mut buf) {
@@ -621,6 +648,46 @@ fn udp_peer(
 fn listening_tag(datagram: &[u8]) -> Option<&[u8]> {
     let tag = datagram.strip_prefix(NET_TCP_LISTENING)?;
     (!tag.is_empty() && tag.len() <= 16 && tag.iter().all(u8::is_ascii_digit)).then_some(tag)
+}
+
+/// kbuild's datagram service: answer `NET_UDP_REQUEST <tag>` on the loopback `port` with
+/// `NET_UDP_REPLY <tag>`, to whoever sent it.
+///
+/// The guest reaches it at the gateway's address, which QEMU's user-mode network turns into a
+/// datagram to the host's loopback interface, as it does a connection to [`tcp_service`]. A
+/// datagram that is not a request is answered with nothing at all, so a guest waiting for a
+/// reply learns nothing from noise.
+fn udp_service(
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::ErrorKind;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    std::thread::spawn(move || {
+        let Ok(socket) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
+            return;
+        };
+        if socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .is_err()
+        {
+            return;
+        }
+        let mut buf = [0u8; 2048];
+        while !stop.load(Ordering::Relaxed) {
+            match socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    if let Some(tag) = buf[..n].strip_prefix(NET_UDP_REQUEST) {
+                        let _ = socket.send_to(&[NET_UDP_REPLY, tag].concat(), from);
+                    }
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    })
 }
 
 /// kbuild's side of the guest's listener: connect to the loopback `port` QEMU forwards to it,
@@ -1111,7 +1178,8 @@ pub fn run_watched(
         .take()
         .ok_or("QEMU's console was not captured")?;
     if let Some(ports) = m.net_port {
-        peers.push(udp_peer(ports.udp, ports.tcp, ports.inbound, stop_peer.clone()));
+        peers.push(udp_peer(ports, stop_peer.clone()));
+        peers.push(udp_service(ports.udp_service, stop_peer.clone()));
     }
     let start = std::time::Instant::now();
     // Heartbeats seen, and when the last arrived, in milliseconds since `start`.

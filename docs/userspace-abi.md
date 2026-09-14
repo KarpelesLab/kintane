@@ -143,9 +143,9 @@ and the calls numbered 17–26 are built on them:
 Every waiting call takes a timeout in nanoseconds: zero polls and answers `ShouldWait`,
 `u64::MAX` waits for as long as it takes, and anything else ends in `TimedOut` (error 13).
 
-**Sockets.** Calls 27–34 put the kernel's TCP (`kernel/net`, described in
-`docs/architecture.md`) behind handles. A socket is a `Socket` object in the store, and an
-address is one word: the IPv4 address in bits 47..16 and the port in bits 15..0
+**Sockets.** Calls 27–36 put the kernel's TCP and UDP (`kernel/net`, described in
+`docs/architecture.md`) behind handles. A socket is a `Socket` or `Datagram` object in the
+store, and an address is one word: the IPv4 address in bits 47..16 and the port in bits 15..0
 (`abi::socket::address`).
 
 - **`socket_create(STREAM)`** makes a socket with every right, neither bound nor connected.
@@ -159,6 +159,22 @@ address is one word: the IPv4 address in bits 47..16 and the port in bits 15..0
 - **`socket_shutdown`** (`WRITE`) sends a FIN after what is queued and waits for the peer to
   acknowledge everything. Closing the handle closes the connection in order without waiting,
   or resets it if data arrived that was never read.
+- **`socket_create(DATAGRAM)`** makes a datagram socket instead: a `Datagram` object, which
+  holds a local port rather than a connection. `socket_bind` gives it the port it receives on,
+  and `socket_connect` names the one address it sends to and takes datagrams from — there is no
+  handshake, so nothing to wait for. A socket with neither is given a port by its first send,
+  and the port goes back when the last handle to the socket closes.
+- **`socket_send_to`** (`WRITE`) sends one datagram to the address given, or to the address the
+  socket connected to when that is zero, waiting only for the next hop's hardware address and a
+  buffer. At most 256 bytes — what the stack's inbox keeps of one — and more is
+  `InvalidArgument`, so a datagram that is sent is one that could have been received.
+- **`socket_recv_from`** (`READ`) takes the oldest datagram waiting, writes where it came from
+  unless the address is null, and answers **the length the datagram had**. That is more than
+  the buffer held when it did not fit: the rest went with it, because a datagram is taken whole
+  or not at all. A connected socket passes over datagrams from any other address, dropping them
+  as it goes.
+- The stream calls refuse a datagram socket, and `socket_listen`, `socket_accept` and
+  `socket_shutdown` have no meaning for one.
 - A socket call that waits blocks on the socket calls' wait queue. The card's interrupt handler
   runs the network stack over every frame it collects and wakes that queue, so a waiter looks
   again when a segment may have moved its connection; otherwise it looks again only when the
@@ -436,9 +452,9 @@ process, its descriptors or its mappings, and waits on the kernel's wait queues 
 so that another thread of the process can make the call that ends the wait.
 
 **The numbers and the tables.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 99 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
+`syscall_64.tbl`, in its format: 101 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
 the generic table arm64 numbers its calls by, in the format of Linux's `scripts/syscall.tbl`:
-92 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
+94 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
 each with its number under each `linux::Abi`; a host test pins every number to its name in
 that ABI's table, and the kernel reads a table at run time only to name a call it does not
 implement. The kernel picks the ABI from its port's ELF machine at compile time, and dispatches
@@ -517,7 +533,9 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `openat` | `AT_FDCWD` or an absolute path; the working directory is `/`. Read-only (`O_ACCMODE` other than `O_RDONLY` is `EROFS`); `O_DIRECTORY`, in the architecture's own numbering, is honoured, and so is `O_CLOEXEC`; other flags are ignored. A relative path against any other descriptor is `ENOTDIR` |
 | `close`, `fstat` | `fstat` reports a regular file or directory with its size, a FIFO for a pipe end, a socket, or a character device for 0–2, in the architecture's own `struct stat`; `st_ino` is a hash of the path |
 | `pipe2`, `pipe` | `O_CLOEXEC` and `O_NONBLOCK`; any other flag is `EINVAL`. `pipe` is x86_64's only |
-| `socket` | `AF_INET` and `SOCK_STREAM`, protocol 0 or `IPPROTO_TCP`, with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`. Another family is `EAFNOSUPPORT`, another type or protocol `EPROTONOSUPPORT`, another flag `EINVAL`, and a machine with no started card `ENETDOWN` |
+| `socket` | `AF_INET` with `SOCK_STREAM` (protocol 0 or `IPPROTO_TCP`) or `SOCK_DGRAM` (protocol 0 or `IPPROTO_UDP`), with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`. Another family is `EAFNOSUPPORT`, another type or protocol `EPROTONOSUPPORT`, another flag `EINVAL`, and a machine with no started card `ENETDOWN` |
+| datagram sockets | `bind` gives the port received on; `connect` names the one address sent to and taken from, without a handshake, and may be made again; a socket with neither is given a port by its first send. `listen`, `accept` and `shutdown` are `EOPNOTSUPP`, and a datagram past 256 bytes is `EMSGSIZE`. A receive answers what fit, or, with `MSG_TRUNC`, the length the datagram had; either way the rest is gone. A connected socket passes over datagrams from anywhere else |
+| `sendmsg`, `recvmsg` | one `iovec`; more is `EOPNOTSUPP`. `sendmsg` sends to `msg_name` when it has one, `recvmsg` writes the sender there and its length into `msg_namelen`. Control data is ignored |
 | `connect` | a `struct sockaddr_in`; waits for the handshake, and is `ECONNREFUSED` if the peer refused and `ETIMEDOUT` if it never answered. Non-blocking, it is `EINPROGRESS`, then `EALREADY` until the connection is established, then `EISCONN`; connecting a connected socket is `EISCONN` |
 | `bind`, `listen` | `bind` to a port of this machine's, on `0.0.0.0` or `10.0.2.15`; another address is `EADDRNOTAVAIL`, port 0 `EINVAL`, and a port already listened on `EADDRINUSE` at `listen`. `listen` needs a bound port, and its backlog is ignored |
 | `accept`, `accept4` | wait for a connection and answer a new descriptor, with `SOCK_NONBLOCK` and `SOCK_CLOEXEC` for `accept4`; the peer's address is written when asked for |

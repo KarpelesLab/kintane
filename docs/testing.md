@@ -1352,8 +1352,12 @@ QEMU's user-mode stack answers ARP and echo requests for its gateway, 10.0.2.2, 
 the only other party is kbuild, in three threads of `kbuild/src/qemu.rs`:
 
 - `udp_peer` sends `kintane-udp-probe` to the forwarded port four times a second, each followed
-  by `kintane-tcp-port <tcp>`, and answers every `kintane-udp-echo <n>` the guest sends back with
-  `kintane-udp-ack <n>`.
+  by `kintane-tcp-port <tcp>`, `kintane-udp-port <service>` and `kintane-udp-quiet <quiet>`, and
+  answers every `kintane-udp-echo <n>` the guest sends back with `kintane-udp-ack <n>`.
+- `udp_service` answers `kintane-udp-request <tag>` on the loopback port `<service>` with
+  `kintane-udp-reply <tag>`, to whoever sent it. The guest reaches it the way it reaches
+  `tcp_service`, by addressing the gateway. `<quiet>` is a port kbuild found free and never
+  bound, which is how a check can send a datagram nobody will answer.
 - `tcp_service` listens on the loopback port `<tcp>`. The guest reaches it by connecting to the
   gateway's address, which QEMU's user network turns into a connection to the host's loopback
   interface. It reads `kintane-tcp-request <mode> <tag>` and writes back
@@ -1380,11 +1384,31 @@ The boot gates on three lines ([architecture.md](architecture.md#net--the-networ
              retransmits; 46 frames in, 21 out, 50 interrupts, 0 polled, 0 stack buffers held ok
   sockets    tcp-client connected, sent, read its reply to kbuild's close; 1 established,
              1 data retransmits; waits woken by the card 5, armed for a TCP timer 5, polled 0;
-             closed in order, every buffer back; 0 objects left, 0 frames left ok
-  linux net  tcp client ok; server ok (kbuild told of its listener 1 time); waits woken by the
-             card 10, armed for a TCP timer 9, polled 0; closed in order, every buffer back;
+             udp-client: a reply from the service, a truncation reported whole, a foreign
+             datagram refused, nothing on the quiet port (7 sent, 106 received, 24 with the
+             inbox full, 0 for want of a buffer); closed in order, every buffer back;
              0 objects left, 0 frames left ok
+  linux net  tcp client ok; server ok; udp ok (kbuild told of its listener 1 time); waits woken
+             by the card 10, armed for a TCP timer 9, polled 0; closed in order, every buffer
+             back; 0 objects left, 0 frames left ok
 ```
+
+**Datagrams.** After its stream client, `sockets` runs `user/udp-client`, a native program over
+the datagram socket calls. It sends a request to `udp_service` from a socket the kernel gives a
+port to at its first send and checks the reply and where it came from; takes a second reply into
+four bytes, which must report the length the datagram had rather than the four that fit;
+connects a socket to `<quiet>`, sends to the service from it anyway, and requires that the
+service's reply is *not* delivered, since a connected socket takes datagrams only from the
+address it connected to; and finally sends to `<quiet>` itself. The Linux program's `udp` mode
+does the same over Linux's calls, and adds what a wrong call earns: `EOPNOTSUPP` for `listen`
+and `shutdown` on a datagram socket, `EMSGSIZE` past 256 bytes, `EAGAIN` when `SO_RCVTIMEO`
+expires, `ENOPROTOOPT` for `SO_BROADCAST`, and a `sendmsg`/`recvmsg` round trip of one buffer.
+
+**What the quiet port answers is nothing.** A datagram sent to a port nobody listens on earns a
+timeout, not `ECONNREFUSED`: the stack parses no ICMP destination-unreachable message, so
+nothing turns one into an error on the socket. Both programs accept a timeout there, and would
+accept a refusal if the stack ever learned to deliver one; the check says which it got by
+passing at all.
 
 That is aarch64, where every frame arrives by interrupt. i686 reads the same on line 10,
 through the 8259A, and x86_64 on `line 17, MSI-X`. On a platform that delivers

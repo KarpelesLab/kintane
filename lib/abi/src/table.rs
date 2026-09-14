@@ -174,4 +174,24 @@ crate::syscalls! {
     ///
     /// At most 8 entries, and an interest outside `ready::ALL` is `InvalidArgument`.
     35 => fn object_wait_any(entries: UserPtr, count: usize, ready: UserPtr, timeout_ns: u64);
+    // A socket of `socket::DATAGRAM` carries datagrams instead: no connection, no stream, and
+    // no order or delivery owed. `socket_bind` gives it the port it receives on, and
+    // `socket_connect` the one address it sends to and takes datagrams from; a socket that has
+    // neither is given a port of the kernel's choosing by its first send. The two calls below
+    // are what such a socket sends and receives with; the stream calls refuse it.
+
+    /// Send `len` bytes at `bytes` from `socket` (`WRITE`) to `address`, or to the address it
+    /// connected to when `address` is zero. Waits up to `timeout_ns` for the next hop's
+    /// hardware address and a buffer, which is all that a send waits for. At most 256 bytes,
+    /// the largest datagram the stack keeps; more is `InvalidArgument`. Returns how many were
+    /// sent — a datagram goes whole or not at all.
+    36 => fn socket_send_to(socket: Handle, address: u64, bytes: UserPtr, len: usize, timeout_ns: u64);
+    /// Take the oldest datagram waiting for `socket` (`READ`) into `buf`, waiting up to
+    /// `timeout_ns` for one, and write the address it came from to `from` unless `from` is
+    /// null.
+    ///
+    /// Returns the length the datagram had, which is more than `cap` when it did not fit: the
+    /// rest went with it, because a datagram is taken whole or not at all. A connected socket
+    /// passes over datagrams from anywhere but the address it connected to.
+    37 => fn socket_recv_from(socket: Handle, buf: UserPtr, cap: usize, from: UserPtr, timeout_ns: u64);
 }

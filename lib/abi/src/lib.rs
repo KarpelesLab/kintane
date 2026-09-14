@@ -179,8 +179,12 @@ pub mod rights {
 
 /// What the socket calls take.
 pub mod socket {
-    /// A TCP byte stream: the one kind of socket there is.
+    /// A TCP byte stream.
     pub const STREAM: u64 = 1;
+
+    /// A datagram: a message sent whole, with no connection, and nothing owed about order,
+    /// duplication or delivery. What `socket_send_to` and `socket_recv_from` carry.
+    pub const DATAGRAM: u64 = 2;
 
     /// The one-word address the socket calls take: `ip` in bits 47..16, `port` in 15..0.
     pub const fn address(ip: [u8; 4], port: u16) -> u64 {

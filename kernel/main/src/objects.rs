@@ -107,6 +107,11 @@ pub enum Object {
         conn: Option<u64>,
         listening: bool,
     },
+    /// A datagram socket. `port` is the local port it was bound to or given, zero until it has
+    /// one; `peer` is the address a connected one sends to and takes datagrams from, as an
+    /// `abi::socket` address word. It holds no connection, because UDP has none: what it holds
+    /// is its port, which [`crate::sockets`] gives back when the object is destroyed.
+    Datagram { port: u16, peer: Option<u64> },
 }
 
 impl Object {
@@ -131,7 +136,7 @@ impl Object {
             Object::Event { .. } => ObjectType::Event,
             Object::Endpoint { .. } => ObjectType::Channel,
             Object::Timer { .. } => ObjectType::Timer,
-            Object::Socket { .. } => ObjectType::Socket,
+            Object::Socket { .. } | Object::Datagram { .. } => ObjectType::Socket,
         })
     }
 }
@@ -183,11 +188,12 @@ static IDS: ObjectIds = ObjectIds::new();
 /// object is gone, with no store lock held.
 fn destroy(_id: ObjectId, cell: &'static Cell) {
     crate::readiness::wake();
-    let (endpoint_of, connection) = cell.with(|o| {
+    let (endpoint_of, connection, datagram_port) = cell.with(|o| {
         let taken = match o {
-            Object::Endpoint { channel } => (Some(*channel), None),
-            Object::Socket { conn, .. } => (None, conn.take()),
-            _ => (None, None),
+            Object::Endpoint { channel } => (Some(*channel), None, 0),
+            Object::Socket { conn, .. } => (None, conn.take(), 0),
+            Object::Datagram { port, .. } => (None, None, *port),
+            _ => (None, None, 0),
         };
         *o = Object::Free;
         taken
@@ -196,6 +202,11 @@ fn destroy(_id: ObjectId, cell: &'static Cell) {
     // is released: the network stack's lock is never taken inside a cell's.
     if let Some(conn) = connection {
         crate::sockets::release(conn);
+    }
+    // A datagram socket holds a port rather than a connection, and it is free for the next
+    // socket once nothing names this one.
+    if datagram_port != 0 {
+        crate::sockets::release_port(datagram_port);
     }
     // A thread waiting on the object checks again and finds it gone, rather than waiting
     // for a wake the object can no longer send.
