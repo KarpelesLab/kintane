@@ -296,8 +296,9 @@ loader against fuzzed and truncated files.
 ### 2b. Block storage
 
 With `QEMU_BLOCK_TEST`, on by default on aarch64 test builds, kbuild writes
-`testdisk.img` beside the image. It is 2 MiB, and every byte is a function of its sector
-and offset, with a header in sector 0. QEMU attaches it to a `virtio-blk-device` with
+`testdisk.img` beside the image. It is 6 MiB in three regions: 4096 sectors in which every
+byte is a function of its sector and offset, with a header in sector 0; a scratch area the
+write checks use; and a FAT16 volume for the [files check](#2c-files). QEMU attaches it to a `virtio-blk-device` with
 `snapshot=on`, so a run's writes never reach the file. The format is written twice, in
 `kernel/block/src/testdisk.rs` and `kbuild/src/testdisk.rs`, and a pinned set of bytes
 that both sides' tests assert keeps the two in step.
@@ -305,7 +306,7 @@ that both sides' tests assert keeps the two in step.
 The boot gates on the `block` line ([architecture.md](architecture.md#block--the-block-layer-and-the-first-driver-with-dma)):
 
 ```
-  block      4096 sectors of 512 bytes, 23 per request; 32 sectors read back the pattern;
+  block      12544 sectors of 512 bytes, 23 per request; 32 sectors read back the pattern;
              a write read back after a flush; a read past the end refused; the device's own
              refusal was an error; 64 more requests, 0 in flight ok
 ```
@@ -320,6 +321,62 @@ The driver's protocol is host-tested without QEMU:
 In a stress run the `block` workload writes random runs of the scratch area and reads them
 back, reads the untouched part against the pattern, and flushes. At every audit the driver
 must report nothing in flight and every descriptor on the ring.
+
+### 2c. Files
+
+On the presets with the test disk — every aarch64 preset, where `QEMU_BLOCK_TEST` defaults on — every boot runs an
+`fs` check right after the block check, on the FAT16 volume kbuild writes into the disk's third
+region ([architecture.md](architecture.md#vfs-bcache-and-fat--files)). The check requires:
+
+- the volume mounts at `FS_START` and is FAT16 by its cluster count;
+- `/` lists exactly the names kbuild placed there, and nothing else;
+- `/HELLO.TXT`, `/SUB/NESTED.TXT` and the 196-cluster `/BIG.BIN` read back byte for byte, the
+  last through a chain walk;
+- a read past the end of `/BIG.BIN` returns nothing, and a buffer too small for it is refused
+  rather than filled with part of it;
+- a block written through a cache reads back fresh, both from the cache and from the device;
+- the volume's cache was hit, missed and made to replace slots, and its books hold;
+- with userspace, `/KINTANE/INIT.ELF` loads from the volume and runs to its success exit code. From
+  then on the scheduled process check and the stress run's process cycles run that copy.
+
+On `aarch64-virt` the line reads:
+
+```
+  fs         FAT16 at sector 4352; / lists 4; files read back, 100 KB through a chain; /KINTANE/INIT.ELF (113320 bytes):
+             hello from userspace
+             ran from the disk; cache 43746 hits, 426 misses; a write through the cache read back fresh ok
+```
+
+The stress run adds a filesystem workload on the same presets. It reads random ranges of
+`/BIG.BIN`, reads the small files whole, and lists the root, all through a namespace, dropping the
+whole cache every 64 iterations. The disk it reads is the one the block workload is writing at the
+same time. The audit requires every handle closed and the cache's books balanced.
+
+`vfs`, `bcache` and `fat` are host-tested (13, 10 and 17 tests). The FAT reader's tests build their
+volumes with a writer of their own, independent of kbuild's.
+
+Each property was falsified: the mutation was applied and checked, the check failed, and the file
+was restored and compared byte for byte.
+
+| Mutation | What caught it |
+|---|---|
+| The chain walk reads the table one entry off | 4 `fat` host tests; boot: `/BIG.BIN DIFFERS AT BYTE 512` |
+| Directory entries read 31 bytes apart | 10 `fat` host tests; boot: `THE ROOT IS MISSING AN ENTRY KBUILD WROTE` |
+| A write-through leaves the cached copy stale | a `bcache` host test; boot: `A WRITE THROUGH THE CACHE READ BACK STALE FROM THE CACHE` |
+| A write drops its reference to the slot already holding the block | a `bcache` host test; boot: the same stale read |
+| The stress workload never closes a handle, its counters still balanced | stress, at 1 s: `a handle was left open at the end of an iteration` |
+| The reader starts the root directory one entry late | only the label-less `fat` host test — **the boot check still passes** |
+
+The last row is the one worth remembering. kbuild's volume, like almost every real one, has its
+label in the root's first entry, and a reader skips the label. So a reader that starts one entry
+late skips the label by accident and still lists everything correctly. With that mutation every
+other check passed, including the boot check on the real disk. A host test on a volume with no label
+is what catches it, and it was added because the mutation showed nothing else would.
+
+Moving kbuild's FAT writer into `kbuild/src/fat16.rs` was checked for the ESP by building the old
+writer and the new one as standalone programs over the same files. The two images are
+byte-identical, and a copy of the new writer with one boot-sector field changed is not, so the
+comparison can see a difference.
 
 ### 3. Boot and integration tests
 

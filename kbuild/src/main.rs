@@ -11,6 +11,7 @@ mod cache;
 mod codegen;
 mod dwarf;
 mod esp;
+mod fat16;
 mod graph;
 mod hosttest;
 mod kcfg;
@@ -843,9 +844,17 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     } else {
         image
     };
-    // The disk a test build's virtio-blk device reads, beside the image QEMU boots.
+    // The disk a test build's virtio-blk device reads, beside the image QEMU boots. Its
+    // volume carries the user program when this configuration links one, so the kernel can
+    // load a program from a disk rather than only from its own image. `userinit` is a
+    // provider name: only the real program has a path to embed, and the empty provider a
+    // configuration without userspace selects has none.
     if res.is_on(testdisk::SYMBOL) {
-        testdisk::write(image.parent().unwrap_or(Path::new(".")))?;
+        let program = built
+            .get("userinit")
+            .filter(|b| b.embed.is_some())
+            .map(|b| b.path.clone());
+        testdisk::write(image.parent().unwrap_or(Path::new(".")), program.as_deref())?;
     }
     // A module asking for another configuration gets this one with its overrides on top.
     // A `--set` the overridden configuration cannot honour is dropped for that build only:

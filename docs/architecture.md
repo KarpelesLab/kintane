@@ -775,6 +775,52 @@ device up on three frames and gates the boot on the following:
 
 The started device lives on for the stress run's block workload.
 
+### `vfs`, `bcache` and `fat` — files
+
+Three units above the block layer, each at the `subsystem` layer, each host-tested, and each
+compiled by `kbuild portability` for the machines with no atomics:
+
+- **`vfs`** is the namespace: a mount table, path walking, and a table of open files, over a trait
+  of five operations a filesystem implements — `lookup`, `stat`, `read_at`, `write_at` and
+  `readdir`, all by an opaque `NodeId`. Both tables are fixed arrays and a filesystem is borrowed
+  rather than owned, so nothing allocates and the kernel mounts a volume during bring-up. A handle
+  carries a generation, as an object handle does, so a closed one cannot name the file that takes
+  its slot. `.` and empty components resolve; `..` does not yet. `vfs::memfs` is the in-memory
+  reference filesystem the namespace's own tests run against.
+- **`bcache`** caches whole blocks between a filesystem and a device: fixed slots from the caller,
+  least-recently-used replacement, and **write-through**. A write goes to the device first and
+  updates the cached copy only if the device took it, so the cache is never the only place a byte
+  lives, nothing is lost that a flush would have saved, and `flush` is the device's own. A
+  write-back cache would be faster and would need an ordering policy and a story about what a
+  crash loses; neither is worth inventing before something writes enough to measure. The cache's
+  books — every miss read the device exactly once, no block held by two slots — are checked by
+  `Cache::check`.
+- **`fat`** is FAT16, read-only. FAT rather than a format of our own because the tree already
+  writes it twice — the ESP and the test disk, both through `kbuild/src/fat16.rs` — and
+  `kinboot-efi` already reads it. The type is decided by the cluster count, as the specification
+  says, and a volume outside FAT16's range is refused by name. Every boot-sector field, every
+  cluster number and every chain step is checked before it is used, and a chain walk is bounded,
+  so a corrupt volume is an error rather than a hang.
+
+**The VFS as a service over channels**, which Phase 6a describes, is a wrapper that has not been
+written: a server would decode a message into one of the namespace's calls and encode what came
+back. Nothing in `vfs` knows about channels, processes or rights, so nothing there has to change
+when it arrives — and the kernel can read a volume long before a channel exists.
+
+**Where a volume lives.** The test disk (`kernel/block/src/testdisk.rs`, version 2) has three
+regions: the pattern sectors the block check verifies, the scratch area tests may overwrite, and a
+4 MiB FAT16 volume from `FS_START`. The scratch area sits between the other two so every sector the
+block check and the block workload read is still the pattern exactly as it was. kbuild places
+`/HELLO.TXT`, the 200-cluster `/BIG.BIN`, `/SUB/NESTED.TXT`, and — when the configuration links a
+user program — that program at `/KINTANE/INIT.ELF`.
+
+**Loading a program from a disk.** The boot `fs` check reads `/KINTANE/INIT.ELF` from the volume
+into frames it keeps, runs it once, and only after it exits with the success code makes it the
+program `userproc::program()` returns. So on a machine with the disk — aarch64 today — the
+scheduled process check and the stress run's process cycles run the copy read from the disk. The
+copy embedded in the image is still what the sequential userspace slice runs, because that slice
+runs before the disk is brought up, and what every machine without a disk runs.
+
 ### `sched` — scheduling
 
 Pluggable policy behind a trait, with the config selecting one or more:

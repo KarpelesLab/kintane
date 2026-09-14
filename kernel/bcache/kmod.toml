@@ -1,0 +1,14 @@
+# The block cache: fixed slots over a block device, write-through.
+#
+# At the `subsystem` layer, above the `device` layer the block interface lives at: a cache
+# is policy over a device, and the block layer says so in its own documentation. It names
+# no architecture and allocates nothing, so it is host-tested under every preset.
+[unit]
+name = "bcache"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "subsystem"
+
+[deps]
+units = ["block"]

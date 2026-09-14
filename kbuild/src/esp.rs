@@ -1,299 +1,61 @@
 //! EFI system partition disk images, written from scratch.
 //!
 //! A UEFI machine boots from a FAT file system on a partition marked as an EFI system
-//! partition. Producing one usually means `mkfs.fat` and `mtools`, which are not part of
-//! the pinned toolchain and would make a release depend on whatever versions the build
-//! machine has. So kbuild writes the image itself. The subset needed is small:
+//! partition. The volume itself comes from [`crate::fat16`], which also writes the test
+//! disk's; what is particular to the ESP is its shape and the disk around it:
 //!
 //! - an MBR with one partition of type `0xEF`;
 //! - FAT16, with a fixed 32 MiB size and 2 KiB clusters, which gives 16 000-odd clusters,
 //!   comfortably inside FAT16's range at both ends;
 //! - 8.3 names only. The firmware looks up `\EFI\BOOT\BOOTX64.EFI` and the loader looks up
-//!   `\KINTANE\KERNEL.ELF`, and neither needs a long-name entry;
-//! - files and directories written once and never modified.
+//!   `\KINTANE\KERNEL.ELF`, and neither needs a long-name entry.
 //!
-//! The image is **reproducible**. Timestamps are the FAT epoch (1980-01-01, the earliest
-//! it can represent), the volume serial number is a constant, and directory entries are
-//! written in name order, so the same inputs give the same bytes on any machine.
+//! The image is **reproducible**: see [`crate::fat16`] for why the volume is, and the MBR
+//! below has no field that depends on when or where it was written.
 //!
 //! MBR rather than GPT because the UEFI specification requires firmware to accept both,
 //! OVMF does, and an MBR is 66 bytes where a GPT is two headers, two partition arrays
 //! and four CRCs. GPT becomes worth it with a second partition to describe.
 
-use std::collections::BTreeMap;
+pub use crate::fat16::File;
+#[cfg(test)]
+use crate::fat16::short_name;
+use crate::fat16::{self, Params};
 
-const SECTOR: usize = 512;
+const SECTOR: usize = fat16::SECTOR;
 /// The partition starts at 1 MiB, the alignment every partitioning tool uses.
 const PARTITION_START: u32 = 2048;
 /// 32 MiB of FAT16.
 const PARTITION_SECTORS: u32 = 65536;
 const SECTORS_PER_CLUSTER: u8 = 4;
+#[cfg(test)]
 const CLUSTER: usize = SECTOR * SECTORS_PER_CLUSTER as usize;
-const RESERVED_SECTORS: u16 = 1;
-const FATS: u8 = 2;
-const ROOT_ENTRIES: u16 = 512;
-const ENTRY: usize = 32;
-
+#[cfg(test)]
 const ATTR_VOLUME_ID: u8 = 0x08;
+#[cfg(test)]
 const ATTR_DIRECTORY: u8 = 0x10;
-const ATTR_ARCHIVE: u8 = 0x20;
-/// 1980-01-01, as a FAT date: day 1, month 1, year 0 of the FAT epoch.
-const FAT_EPOCH_DATE: u16 = (1 << 5) | 1;
-const END_OF_CHAIN: u16 = 0xFFFF;
 
-/// One file to place on the partition, by a `/`-separated path of 8.3 names.
-pub struct File<'a> {
-    pub path: &'a str,
-    pub data: &'a [u8],
-}
-
-#[derive(Default)]
-struct Dir<'a> {
-    dirs: BTreeMap<[u8; 11], Dir<'a>>,
-    files: BTreeMap<[u8; 11], &'a [u8]>,
-    /// First cluster, assigned during layout. Unused for the root, which lives in its
-    /// own fixed region.
-    cluster: u16,
-}
-
-impl Dir<'_> {
-    /// Entries this directory holds, `.` and `..` included for a subdirectory.
-    fn entries(&self, is_root: bool) -> usize {
-        self.dirs.len() + self.files.len() + if is_root { 1 } else { 2 }
-    }
-}
-
-/// An 8.3 name as the 11 bytes a directory entry stores.
-fn short_name(component: &str) -> Result<[u8; 11], String> {
-    let bad = || {
-        format!(
-            "`{component}` is not an 8.3 name: at most 8 characters, an optional extension of \
-             at most 3, letters, digits, `_` and `-` only"
-        )
-    };
-    let (base, ext) = component.split_once('.').unwrap_or((component, ""));
-    if base.is_empty() || base.len() > 8 || ext.len() > 3 || ext.contains('.') {
-        return Err(bad());
-    }
-    let mut name = [b' '; 11];
-    for (i, c) in base.bytes().enumerate() {
-        if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
-            return Err(bad());
-        }
-        name[i] = c.to_ascii_uppercase();
-    }
-    for (i, c) in ext.bytes().enumerate() {
-        if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
-            return Err(bad());
-        }
-        name[8 + i] = c.to_ascii_uppercase();
-    }
-    Ok(name)
-}
-
-struct Geometry {
-    fat_sectors: u16,
-    root_sectors: u32,
-    data_start: u32,
-    clusters: u32,
-}
-
-fn geometry() -> Geometry {
-    let root_sectors = (u32::from(ROOT_ENTRIES) * ENTRY as u32).div_ceil(SECTOR as u32);
-    // The FAT's size depends on the cluster count, which depends on the FAT's size: take
-    // the smallest FAT that covers the clusters left over after it.
-    let mut fat_sectors = 1u16;
-    loop {
-        let data_start =
-            u32::from(RESERVED_SECTORS) + u32::from(FATS) * u32::from(fat_sectors) + root_sectors;
-        let clusters = (PARTITION_SECTORS - data_start) / u32::from(SECTORS_PER_CLUSTER);
-        if u32::from(fat_sectors) * SECTOR as u32 / 2 >= clusters + 2 {
-            return Geometry {
-                fat_sectors,
-                root_sectors,
-                data_start,
-                clusters,
-            };
-        }
-        fat_sectors += 1;
-    }
-}
-
-struct Writer {
-    part: Vec<u8>,
-    fat: Vec<u16>,
-    next: u16,
-    geo: Geometry,
-}
-
-impl Writer {
-    /// Claim a chain of clusters for `bytes`, returning its first cluster, or 0 for an
-    /// empty file, which FAT represents with no chain at all.
-    fn chain(&mut self, bytes: usize) -> Result<u16, String> {
-        let n = bytes.div_ceil(CLUSTER);
-        if n == 0 {
-            return Ok(0);
-        }
-        let first = self.next;
-        let last = u32::from(first) + n as u32 - 1;
-        if last >= self.geo.clusters + 2 {
-            return Err(format!(
-                "the EFI system partition is full: {} MiB of FAT16 cannot hold these files",
-                PARTITION_SECTORS as usize * SECTOR >> 20
-            ));
-        }
-        for c in u32::from(first)..last {
-            self.fat[c as usize] = (c + 1) as u16;
-        }
-        self.fat[last as usize] = END_OF_CHAIN;
-        self.next = (last + 1) as u16;
-        Ok(first)
-    }
-
-    fn cluster_offset(&self, cluster: u16) -> usize {
-        (self.geo.data_start as usize + (usize::from(cluster) - 2) * SECTORS_PER_CLUSTER as usize)
-            * SECTOR
-    }
-
-    /// Assign clusters: each directory's own, then its files', then its children's.
-    fn layout(&mut self, dir: &mut Dir<'_>, is_root: bool) -> Result<(), String> {
-        if !is_root {
-            dir.cluster = self.chain(dir.entries(false) * ENTRY)?;
-        }
-        for sub in dir.dirs.values_mut() {
-            self.layout(sub, false)?;
-        }
-        Ok(())
-    }
-
-    fn write_dir(&mut self, dir: &Dir<'_>, is_root: bool, parent: u16) -> Result<(), String> {
-        let mut entries: Vec<[u8; ENTRY]> = Vec::new();
-        if is_root {
-            entries.push(entry(*b"KINTANE    ", ATTR_VOLUME_ID, 0, 0));
-        } else {
-            entries.push(entry(*b".          ", ATTR_DIRECTORY, dir.cluster, 0));
-            entries.push(entry(*b"..         ", ATTR_DIRECTORY, parent, 0));
-        }
-        for (name, sub) in &dir.dirs {
-            entries.push(entry(*name, ATTR_DIRECTORY, sub.cluster, 0));
-        }
-        for (name, data) in &dir.files {
-            let size = u32::try_from(data.len()).map_err(|_| "a file larger than 4 GiB")?;
-            let first = self.chain(data.len())?;
-            if first != 0 {
-                let at = self.cluster_offset(first);
-                self.part[at..at + data.len()].copy_from_slice(data);
-            }
-            entries.push(entry(*name, ATTR_ARCHIVE, first, size));
-        }
-
-        let at = if is_root {
-            if entries.len() > usize::from(ROOT_ENTRIES) {
-                return Err("too many entries in the ESP's root directory".into());
-            }
-            (usize::from(RESERVED_SECTORS) + usize::from(FATS) * usize::from(self.geo.fat_sectors))
-                * SECTOR
-        } else {
-            self.cluster_offset(dir.cluster)
-        };
-        for (i, e) in entries.iter().enumerate() {
-            self.part[at + i * ENTRY..at + (i + 1) * ENTRY].copy_from_slice(e);
-        }
-
-        // A subdirectory's `..` names the root as cluster 0, whatever the root's position.
-        let me = if is_root { 0 } else { dir.cluster };
-        for sub in dir.dirs.values() {
-            self.write_dir(sub, false, me)?;
-        }
-        Ok(())
-    }
-}
-
-fn entry(name: [u8; 11], attr: u8, cluster: u16, size: u32) -> [u8; ENTRY] {
-    let mut e = [0u8; ENTRY];
-    e[..11].copy_from_slice(&name);
-    e[11] = attr;
-    // Creation, access and modification dates all the FAT epoch; times zero.
-    e[16..18].copy_from_slice(&FAT_EPOCH_DATE.to_le_bytes());
-    e[18..20].copy_from_slice(&FAT_EPOCH_DATE.to_le_bytes());
-    e[24..26].copy_from_slice(&FAT_EPOCH_DATE.to_le_bytes());
-    e[26..28].copy_from_slice(&cluster.to_le_bytes());
-    e[28..32].copy_from_slice(&size.to_le_bytes());
-    e
-}
+/// The ESP's shape. Every value is what it was when this module wrote its own volume, so
+/// the image's bytes did not change when the writer moved to `fat16`.
+const ESP: Params = Params {
+    sectors: PARTITION_SECTORS,
+    sectors_per_cluster: SECTORS_PER_CLUSTER,
+    reserved_sectors: 1,
+    fats: 2,
+    root_entries: 512,
+    hidden_sectors: PARTITION_START,
+    label: *b"KINTANE    ",
+    volume_id: 0x4B49_4E54,
+    what: "the EFI system partition",
+};
 
 /// A whole disk: an MBR, then one EFI system partition holding `files`.
 pub fn disk_image(files: &[File<'_>]) -> Result<Vec<u8>, String> {
-    let mut root = Dir::default();
-    for f in files {
-        let mut dir = &mut root;
-        let mut parts = f.path.split('/').peekable();
-        while let Some(component) = parts.next() {
-            let name = short_name(component)?;
-            if parts.peek().is_none() {
-                if dir.dirs.contains_key(&name) || dir.files.insert(name, f.data).is_some() {
-                    return Err(format!("`{}` is on the ESP twice", f.path));
-                }
-            } else {
-                if dir.files.contains_key(&name) {
-                    return Err(format!(
-                        "`{component}` in `{}` is a file, not a directory",
-                        f.path
-                    ));
-                }
-                dir = dir.dirs.entry(name).or_default();
-            }
-        }
-    }
-
-    let geo = geometry();
-    let mut w = Writer {
-        part: vec![0u8; PARTITION_SECTORS as usize * SECTOR],
-        fat: vec![0u16; (geo.clusters + 2) as usize],
-        next: 2,
-        geo,
-    };
-    w.fat[0] = 0xFFF8;
-    w.fat[1] = END_OF_CHAIN;
-    w.layout(&mut root, true)?;
-    w.write_dir(&root, true, 0)?;
-
-    boot_sector(&mut w.part[..SECTOR], &w.geo);
-    let fat_bytes: Vec<u8> = w.fat.iter().flat_map(|c| c.to_le_bytes()).collect();
-    for i in 0..usize::from(FATS) {
-        let at = (usize::from(RESERVED_SECTORS) + i * usize::from(w.geo.fat_sectors)) * SECTOR;
-        w.part[at..at + fat_bytes.len()].copy_from_slice(&fat_bytes);
-    }
-
+    let volume = fat16::volume(files, &ESP)?;
     let mut disk = vec![0u8; PARTITION_START as usize * SECTOR];
     mbr(&mut disk[..SECTOR]);
-    disk.extend_from_slice(&w.part);
+    disk.extend_from_slice(&volume);
     Ok(disk)
-}
-
-fn boot_sector(s: &mut [u8], geo: &Geometry) {
-    s[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
-    s[3..11].copy_from_slice(b"KINTANE ");
-    s[11..13].copy_from_slice(&(SECTOR as u16).to_le_bytes());
-    s[13] = SECTORS_PER_CLUSTER;
-    s[14..16].copy_from_slice(&RESERVED_SECTORS.to_le_bytes());
-    s[16] = FATS;
-    s[17..19].copy_from_slice(&ROOT_ENTRIES.to_le_bytes());
-    // The 16-bit total is zero because 65 536 sectors does not fit in it.
-    s[19..21].copy_from_slice(&0u16.to_le_bytes());
-    s[21] = 0xF8;
-    s[22..24].copy_from_slice(&geo.fat_sectors.to_le_bytes());
-    s[24..26].copy_from_slice(&63u16.to_le_bytes());
-    s[26..28].copy_from_slice(&255u16.to_le_bytes());
-    s[28..32].copy_from_slice(&PARTITION_START.to_le_bytes());
-    s[32..36].copy_from_slice(&PARTITION_SECTORS.to_le_bytes());
-    s[36] = 0x80;
-    s[38] = 0x29;
-    s[39..43].copy_from_slice(&0x4B49_4E54u32.to_le_bytes());
-    s[43..54].copy_from_slice(b"KINTANE    ");
-    s[54..62].copy_from_slice(b"FAT16   ");
-    s[510..512].copy_from_slice(&[0x55, 0xAA]);
-    let _ = geo.root_sectors;
 }
 
 fn mbr(s: &mut [u8]) {
@@ -309,6 +71,12 @@ fn mbr(s: &mut [u8]) {
     p[8..12].copy_from_slice(&PARTITION_START.to_le_bytes());
     p[12..16].copy_from_slice(&PARTITION_SECTORS.to_le_bytes());
     s[510..512].copy_from_slice(&[0x55, 0xAA]);
+}
+
+/// The ESP volume's layout, for the tests below that check it against the specification.
+#[cfg(test)]
+fn geometry() -> fat16::Layout {
+    fat16::layout(&ESP).unwrap()
 }
 
 #[cfg(test)]

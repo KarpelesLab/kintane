@@ -1,0 +1,15 @@
+# The file namespace: paths, mounts, open files, and the trait a filesystem implements.
+#
+# At the `subsystem` layer: above `device`, because a filesystem reads through the block
+# layer, and below `kernel`, because nothing here names an architecture or a machine. It
+# depends on no unit at all — a namespace is data structures over a trait — so it is
+# host-tested under every preset and compiles for the machines with no atomics.
+[unit]
+name = "vfs"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "subsystem"
+
+[deps]
+units = []

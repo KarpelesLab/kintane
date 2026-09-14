@@ -1,0 +1,14 @@
+# FAT16, read-only: the first filesystem on a real disk.
+#
+# At the `subsystem` layer, with the namespace it implements and the cache it reads
+# through. It names no architecture and allocates nothing, so it is host-tested under every
+# preset against volumes the tests build byte by byte.
+[unit]
+name = "fat"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "subsystem"
+
+[deps]
+units = ["block", "bcache", "vfs"]

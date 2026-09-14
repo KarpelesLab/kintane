@@ -128,7 +128,7 @@ config NR_CPUS
 config KERNEL_THREAD_SLOTS
     int "Guarded stack slots for kernel threads"
     range 2 256
-    default 10 if STRESS_TEST
+    default 11 if STRESS_TEST
     default 8
     help
         How many kernel threads may hold a guarded stack at once, not
@@ -612,12 +612,16 @@ config QEMU_BLOCK_TEST
     depends on QEMU_EXIT && MM_PAGED
     default y if ARCH_AARCH64
     help
-        Attach a 2 MiB disk image kbuild writes at build time to a virtio-blk
+        Attach a 6 MiB disk image kbuild writes at build time to a virtio-blk
         device, and gate the boot on the block check: the driver reads sectors
         whose contents are a function of their position, writes and reads
         back a scratch area, flushes, and must refuse a read past the end
         with no request or descriptor left outstanding. The image is attached
         with snapshot=on, so a run's writes never reach the file.
+
+        The disk also holds a FAT16 volume, and the boot gates on the fs
+        check too: it mounts the volume, reads files back through a block
+        cache, and with USERSPACE loads and runs a program from it.
 
         On aarch64, where the device is a memory-mapped virtio slot the
         device tree describes. Needs MM_PAGED, because the check maps the
