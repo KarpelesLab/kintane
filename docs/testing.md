@@ -2059,6 +2059,14 @@ without a pass after a thread was re-pinned; a passing soak had already reported
 wait that succeeded, and a 60-second run at eight CPUs needed thirteen. It is now a hundred and
 twenty-eight, derived from those measurements rather than from what looked generous.
 
+| Mutation | Result |
+|---|---|
+| `passes` reports nothing at all | the *boot* process check fails first: `bring-up failed; not starting the scheduler`, and the stress cycle never runs |
+| The stress cycle's own wait never sees progress, leaving the boot check intact | `user process: a process ran its slices after it moved and made no progress`, at 0 s |
+
+The first mutation is the lesson, not the test: a check that dies during bring-up says nothing
+about the bound in the stress run, so the mutation has to be scoped to the cycle's own wait.
+
 ### 4. Hardware — deferred
 
 Not "cancelled". See [The hardware debt](#the-hardware-debt) for what deferring it
