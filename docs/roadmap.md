@@ -13,9 +13,97 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | a first prototype: one driver body in the kernel and in a domain, a rogue domain killed; no IOMMU, so no DMA confinement |
-| 6 — Userspace and the Linux personality | a program creates a program through handles and construction calls; a VFS; `init` loaded from disk. The Linux personality is not started |
-| 7 — Real hardware and real work | started early: disks on every tier-1 port, a read-only FAT16 filesystem, an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+| 5 — Driver isolation | VT-d confines the disk's DMA on x86_64: an out-of-grant DMA is stopped and the device restarts. The driver still runs in the kernel, so the exit criterion is open |
+| 6 — Userspace and the Linux personality | 6a closed: blocking calls, threads, events, timers, the VFS as a channel service. 6b begun: a static Linux program runs unmodified on x86_64 |
+| 7 — Real hardware and real work | started early: disks and MSI-X, a read-only FAT16 filesystem, virtio-net and an IPv4 stack (no TCP), an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The seventh round of landings
+
+Sixteen presets now build and boot, with `x86_64-iommu` new. Six branches ran in parallel;
+the round's work was as much in coordinating them as in any one of them.
+
+- **The x86_64 device-memory bug is fixed.** Device memory on x86_64 and aarch64 lives in a
+  kernel-half window at 1 TiB above its physical address, and `hal::paging::device_virt` is
+  the only way to turn a device's physical address into a pointer. The machine that exposed
+  the bug runs unchanged, its BAR still at 768 GiB, and every boot checks that the user
+  half holds no kernel mapping.
+- **The Linux personality has begun** (Phase 6b). A process's personality is decided at
+  load from a KinTane ABI note — no note and a System V or Linux `EI_OSABI` means Linux —
+  and the syscall entry calls a per-process table without branching on it. A static
+  program that knows nothing of KinTane runs unmodified from the test disk on every x86_64
+  boot: it writes, reads `/HELLO.TXT`, uses `brk` and `mmap`, and exits with the code the
+  kernel checks. An unimplemented call returns `-ENOSYS` and is logged by name.
+- **MSI-X on x86_64.** `device::msi` claims vectors like lines and reaches the MSI-X table
+  only through a claimed window. The x86_64 disk completes 32 of 32 requests by interrupt
+  on every x86_64 preset, and `x86_64-qemu-smp` routes its interrupt to CPU 1 and counts
+  every completion there. INTx stays the fallback; what `_PRT` would need is written down.
+- **Phase 6a is closed.** A reusable wait queue on the scheduler, blocking calls with
+  timeouts, handles moved over channels with rights narrowed, events, timers, processes
+  with several threads, and the VFS reachable as a channel service. Over 60 s at 8 CPUs the
+  stress run proves cross-CPU wakes with none lost: 4,339 on x86_64 and 6,170 on aarch64.
+- **Hardware DMA confinement** (Phase 5). The ACPI DMAR is parsed, a host-tested VT-d driver
+  programs per-device translation domains, and in `x86_64-iommu` the disk runs behind a
+  domain that maps exactly its DMA grant. Every boot stops a deliberate out-of-grant DMA,
+  logs it with the faulting address and source id, resets the device, and has it serve
+  again. virtio-blk is split into a `user`-layer core over `hwproxy`, so the same source
+  can build into a domain.
+- **Networking** (Phase 7). virtio-net and a minimal IPv4 stack — Ethernet, ARP, IPv4,
+  ICMP echo and UDP — run on aarch64, x86_64 and i686, taking every frame by interrupt:
+  the GIC, the 8259A and MSI-X. Every test boot resolves QEMU's gateway from a reply to its
+  own ARP request, gets echo replies with matching sequence numbers, and completes UDP
+  round trips with kbuild acting as the peer, with no host network needed; every buffer
+  must come back to the pool. The packet parsers are fuzz targets, and a network workload
+  joins the stress audit. virtio-blk and virtio-net now share one virtio crate at the
+  `user` layer over `hwproxy`, beneath virtio-blk's protocol core, with the kernel's binding
+  glue a layer above. TCP, fragment reassembly and a socket API are not built.
+
+  The branch found a bug in code that had already landed: nothing in the kernel ever set a
+  PCI function's bus-master bit, and QEMU drops MSIs from a function that is not a bus
+  master. The x86_64 disk had completed by MSI-X only because SeaBIOS set the bit to boot
+  from it.
+
+**Phase 5's exit criterion is still open, on three counts.** The IOMMU confines the disk,
+but the disk's driver still runs in the kernel: nothing yet runs `virtio-blk-core` in a
+ring-3 domain on x86_64, no interrupt reaches a domain as a message, and there is no
+domain-versus-kernel cost comparison. IOMMU map, unmap and invalidate came in below the boot
+clock's resolution under QEMU, and that is recorded as not measurable here rather than
+published as zero.
+
+**What coordinating six branches taught this round:**
+
+- **Merging early beats merging well.** Three branches depended on device addresses the
+  device-window fix changed, two on the syscall dispatch the Linux personality reworked,
+  and two restructured virtio-blk in incompatible directions. Each agent was told as soon as
+  the change it depended on landed, and merged it in its own worktree before its final
+  verification. Integration happened where the knowledge was.
+- **Git records no conflict for an identical change that is still wrong.** Phase 6a and
+  the network work each raised the stress stack-slot defaults to the same values, which
+  together are one short. The build-time assertion that counts every thread is what turns
+  that into a compile error instead of a run that cannot start.
+- **A shared machine is a shared process table.** One branch's `pkill -f qemu-system`
+  killed a QEMU in the main checkout's verification, which reported a chainload failure
+  that was not there. The gate held — nothing was pushed until the test was rerun alone and
+  passed — and every agent now kills only processes it started.
+- **An agent's turn budget is finite.** The IOMMU branch reached its limit mid-verification
+  and had to be resumed; the work survived because its commits were already in the tree.
+- **The gate held twice on failures that were not regressions,** and each time the push
+  waited for an isolated rerun rather than being forced through: the killed QEMU above, and
+  a stress audit described next.
+
+**A flaky check, named as open work.** Twice this round, the 20 s stress run on
+single-CPU `x86_64-qemu` stopped at its first audit with "user process: a process made no
+progress", once in the Phase 6a branch and once on the IOMMU merge. Both times the same run
+passed alone. The process check waits a fixed window for progress, and on one CPU, with
+other QEMU instances loading the host, that window can end before the process has been
+scheduled at all. That check is measuring host load, not the kernel. It needs a progress
+measure in the process's own run time rather than wall time, and it is not to be loosened
+until that is understood.
+
+**Size budgets moved.** The wait queues, threads and file service took `x86_64-qemu` to 95%
+of its budget before VT-d landed, so every x86_64 and aarch64 preset that this round's
+growth reached was raised, none lowered: 1280 to 1536 KiB, and `aarch64-virt-smp` to
+1792 KiB. Budgets exist to catch a regression, and each raise is recorded with the landing
+that needed it.
 
 ### The sixth round of landings
 
