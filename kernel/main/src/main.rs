@@ -57,6 +57,12 @@ mod iommu;
 #[cfg(not(CONFIG_IOMMU))]
 #[path = "iommu_off.rs"]
 mod iommu;
+// PCI pins routed through `_PRT`, which only the PC platform does; elsewhere, none routed.
+#[cfg(any(CONFIG_ARCH_X86_64, CONFIG_ARCH_I686))]
+mod intx;
+#[cfg(not(any(CONFIG_ARCH_X86_64, CONFIG_ARCH_I686)))]
+#[path = "intx_off.rs"]
+mod intx;
 // The block check on a paged kernel; on a flat one, the same call doing nothing.
 #[cfg(CONFIG_MM_PAGED)]
 mod block;

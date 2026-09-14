@@ -28,7 +28,7 @@ use mm::phys::FrameAllocator;
 use virtio_blk::VirtioBlk;
 use virtio_blk::mem::Dma;
 
-use crate::{Check, Live, Locks, iommu, write_usize};
+use crate::{Check, Live, Locks, intx, iommu, write_usize};
 
 /// Frames for the rings and for every request that may be in flight: each has its own
 /// header, status byte and bounce buffer, so the driver can have several outstanding.
@@ -476,9 +476,9 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
     // anything else fell back somewhere; one whose function has none must be on its pin,
     // routed through `_PRT`. Falling back to polling would turn this check and the next into
     // skips where they should have measured.
-    let pin = platform::block_line().and_then(platform::pin_route);
+    let pin = platform::block_line().and_then(intx::pin_route);
     if kconfig::QEMU_BLOCK_TEST && platform::delivers_msi() && !blk.uses_msix() {
-        if platform::block_has_msix() {
+        if intx::block_has_msix() {
             c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
             return Check::Failed;
         }
@@ -507,7 +507,7 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
         });
         // The entry as the I/O APIC holds it, read back: the line's vector, the boot CPU,
         // unmasked, and the trigger and polarity the route gave.
-        if let Err(why) = platform::check_pin_entry(line) {
+        if let Err(why) = intx::check_pin_entry(line) {
             c.write_str(": ");
             c.write_str(why);
             return Check::Failed;
