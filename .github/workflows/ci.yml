@@ -336,7 +336,9 @@ jobs:
       # set BOOT_ARGS_CHECK. These prove the rest of the boot path: safe mode reaches the
       # kernel and has its effect on every preset, a key typed at each loader's menu picks
       # an entry the default would not, and each loader's chainload hands over what a
-      # chainloaded system relies on. See docs/testing.md.
+      # chainloaded system relies on. The last proves the EFI stub's boot counter: three
+      # failed boots fall back to safe mode, and that boot clears the count. See
+      # docs/testing.md.
       - name: Boot modes, the boot menu and chainloading
         run: |
           set -uo pipefail
@@ -376,6 +378,17 @@ jobs:
             fi
             echo "::endgroup::"
           done
+          echo "::group::last-known-good x86_64-efistub"
+          if ./kbuild/target/release/kbuild run --preset x86_64-efistub --set BOOT_COUNTER_TEST=y \
+              --timeout 300 > build/lastgood.log 2>&1 \
+            && [ "$(grep -c 'failed on purpose' build/lastgood.log)" -eq 3 ]; then
+            echo "last-known-good ok"
+          else
+            cat build/lastgood.log
+            echo "::error title=last-known-good failed::three failed boots did not fall back and confirm"
+            fail=1
+          fi
+          echo "::endgroup::"
           exit $fail
 
       # A backtrace is read only after something has gone wrong, which is the worst time

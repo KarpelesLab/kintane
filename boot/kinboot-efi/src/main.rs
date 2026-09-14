@@ -420,7 +420,9 @@ unsafe fn boot_kernel(
     let file = unsafe { read_file(bs, image, path)? };
     // SAFETY: the caller's guarantees are the handover's: this application's handle and
     // system table, with boot services live.
-    unsafe { handover::hand_over(image, st, file, command_line) }.map_err(Failure::Handover)
+    // It passes no counter: the menu is this loader's fallback, and a counter here waits on
+    // a way to tell which entry a confirmed boot came from.
+    unsafe { handover::hand_over(image, st, file, command_line, None) }.map_err(Failure::Handover)
 }
 
 /// Read a whole file from the boot partition into a pool allocation.

@@ -360,7 +360,7 @@ config BOOT_MENU_TIMEOUT
 
 config BOOT_ARGS_CHECK
     bool "Require the command line the build wrote"
-    depends on QEMU_EXIT
+    depends on QEMU_EXIT && !BOOT_COUNTER_TEST
     default y if QEMU_EXIT
     help
         Fail the boot unless the kernel received `mode=` BOOT_EXPECT_MODE
@@ -398,6 +398,19 @@ config CHAIN_TEST
         expects: through LoadImage/StartImage with the loader's options on
         UEFI, and from its partition's boot record with the boot drive in DL
         on BIOS.
+
+config BOOT_COUNTER_TEST
+    bool "Fail normal boots on purpose, to prove the last-known-good counter"
+    depends on QEMU_EXIT && KINBOOT_STUB
+    default n
+    help
+        Every boot the EFI stub did not fall back to safe mode for fails on
+        purpose and resets the machine through the firmware. The run passes
+        only if the fallback comes on the attempt the limit promises, in safe
+        mode, and that boot's confirmation reads back as cleared. `kbuild run`
+        boots such an image without -no-reboot, so the boots are one machine
+        whose variable store lives through the resets it counts. Replaces
+        BOOT_ARGS_CHECK, whose mode would be wrong on the fallback boot.
 
 config MOCK_ARCH
     bool
@@ -643,7 +656,9 @@ config QEMU_BLOCK_TEST
 
 config SERIAL_IRQ_TEST
     bool "Prove the console UART receives on interrupt under QEMU"
-    depends on QEMU_EXIT
+    # The harness answers each prompt once per run, and a BOOT_COUNTER_TEST run is four
+    # boots of one machine: from the second on, nobody would type.
+    depends on QEMU_EXIT && !BOOT_COUNTER_TEST
     default y if ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64
     help
         The boot prints a prompt, the harness types a known string on the

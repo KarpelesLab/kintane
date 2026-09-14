@@ -37,13 +37,23 @@ use core::{ptr, slice};
 use boot_protocol::Firmware;
 use boot_protocol::image::{Image, ImageError};
 use boot_protocol::tags::Builder;
-use boot_protocol::uefi::{PAGE_SIZE, memory_type, region};
+use boot_protocol::uefi::boot_counter::FAILURES_BEFORE_SAFE;
+use boot_protocol::uefi::{PAGE_SIZE, Runtime, memory_type, region};
 
+use crate::counter::Attempt;
 use crate::{BootServices, Handle, MemoryDescriptor, SimpleTextOutput, Status, SystemTable, arch};
 
 /// The kernel's bootstrap page tables identity-map the first gigabyte, so the image and
 /// the boot information must both lie below it.
 pub const HANDOVER_LIMIT: u64 = 1 << 30;
+
+/// The firmware call space maps the first 4 GiB, so it, and everything a runtime call
+/// touches, must lie below this.
+const CALL_SPACE_LIMIT: u64 = 1 << 32;
+
+/// Pages of stack under the kernel's runtime calls: 64 KiB, several times what the variable
+/// driver's deepest path, reclaiming a full store, is documented to need.
+const CALL_STACK_PAGES: usize = 16;
 
 /// Pages for the boot information structure: 16 KiB, room for [`MAP_CAPACITY`] regions
 /// and the few small tags.
@@ -187,6 +197,10 @@ fn check(what: &'static str, s: Status) -> Result<(), Error> {
 
 /// Place `kernel`, leave boot services, and enter it with `command_line`.
 ///
+/// With `counter`, this boot's attempt as a counting loader recorded it, the kernel is also
+/// given what it needs to confirm the boot later: a firmware call space and the runtime
+/// entry points, in a `UefiRuntime` tag. See [`crate::counter`].
+///
 /// Returns only on a failure that happened while the firmware was still there to return
 /// to. Anything that goes wrong after `ExitBootServices` stops the machine with a message,
 /// because there is nothing left to return to that can be trusted.
@@ -199,6 +213,7 @@ pub unsafe fn hand_over(
     st: &SystemTable,
     kernel: &[u8],
     command_line: &[u8],
+    counter: Option<Attempt>,
 ) -> Result<Infallible, Error> {
     // SAFETY: boot services are live, per the caller.
     let bs = unsafe { &*st.boot_services };
@@ -246,6 +261,14 @@ pub unsafe fn hand_over(
     ));
 
     let rsdp = find_rsdp(st);
+
+    // Allocated while allocating is allowed. The final map, fetched below, then reports the
+    // call space as the reserved memory it is.
+    let runtime = match counter {
+        // SAFETY: boot services are live, per the caller.
+        Some(attempt) => Some(unsafe { call_space(st, bs, attempt) }?),
+        None => None,
+    };
 
     let mut info_at = HANDOVER_LIMIT - 1;
     // SAFETY: a boot services call with valid arguments.
@@ -322,7 +345,7 @@ pub unsafe fn hand_over(
         ));
     }
 
-    build_boot_info(info, &map[..map_len], descriptor_size, &parsed, rsdp, command_line)
+    build_boot_info(info, &map[..map_len], descriptor_size, &parsed, rsdp, command_line, runtime)
         .unwrap_or_else(|e| fatal(format_args!("kinboot: writing the boot information: {e:?}")));
 
     // SAFETY: boot services have exited; the kernel is loaded at its link addresses and
@@ -384,8 +407,9 @@ fn find_rsdp(st: &SystemTable) -> Option<u64> {
     find(crate::ACPI_20_TABLE_GUID).or_else(|| find(crate::ACPI_10_TABLE_GUID))
 }
 
-/// Write the boot information: firmware kind, kernel range, RSDP, command line, and the
-/// memory map translated from the firmware's final descriptors. Calls no firmware.
+/// Write the boot information: firmware kind, kernel range, RSDP, command line, the memory
+/// map translated from the firmware's final descriptors, and the runtime call space when
+/// there is one and the firmware lies inside it. Calls no firmware.
 fn build_boot_info(
     buf: &mut [u8],
     map: &[u8],
@@ -393,6 +417,7 @@ fn build_boot_info(
     kernel: &Image<'_>,
     rsdp: Option<u64>,
     command_line: &[u8],
+    runtime: Option<Runtime>,
 ) -> Result<usize, boot_protocol::Error> {
     use MemoryDescriptor as D;
     // A descriptor smaller than the fields read below is not one this loader can walk.
@@ -407,15 +432,76 @@ fn build_boot_info(
     }
     b.command_line(command_line)?;
     let mut m = b.memory_map(MAP_CAPACITY)?;
+    // Whether every region the firmware needs at runtime lies inside the call space.
+    let mut reachable = true;
     for d in map.chunks_exact(descriptor_size) {
         let field = |at: usize| u64::from_ne_bytes(d[at..at + 8].try_into().unwrap_or([0; 8]));
         let at = offset_of!(D, kind);
         let kind = u32::from_ne_bytes(d[at..at + 4].try_into().unwrap_or([0; 4]));
         let (start, pages) = (offset_of!(D, physical_start), offset_of!(D, number_of_pages));
+        if field(offset_of!(D, attribute)) & crate::MEMORY_RUNTIME != 0 {
+            let end = field(start).saturating_add(field(pages).saturating_mul(PAGE_SIZE));
+            reachable &= end <= CALL_SPACE_LIMIT;
+        }
         if let Some(r) = region(kind, field(start), field(pages)) {
             m.push(r)?;
         }
     }
     m.close();
+    if let Some(r) = runtime {
+        let entries = [r.get_variable, r.set_variable, r.reset_system];
+        if reachable && entries.iter().all(|&e| e < CALL_SPACE_LIMIT) {
+            b.uefi_runtime(&r)?;
+        } else {
+            // The count stands and this boot cannot clear it, so safe mode will come. That
+            // is better than a kernel calling firmware its call space does not map.
+            log(format_args!(
+                "kinboot: the firmware's runtime regions lie above 4 GiB; this boot cannot be \
+                 confirmed\n"
+            ));
+        }
+    }
     Ok(b.finish())
+}
+
+/// Build what the kernel needs to call runtime services after the handover: an identity map
+/// of the first 4 GiB and a stack, in memory the kernel sees as reserved, and the three
+/// entry points it calls.
+///
+/// # Safety
+/// Boot services must be live, and `st` and `bs` the calling application's.
+unsafe fn call_space(
+    st: &SystemTable,
+    bs: &BootServices,
+    attempt: Attempt,
+) -> Result<Runtime, Error> {
+    let pages = arch::CALL_TABLE_PAGES + CALL_STACK_PAGES;
+    let mut at = CALL_SPACE_LIMIT - 1;
+    // SAFETY: a boot services call with valid arguments.
+    check("allocating the firmware call space", unsafe {
+        (bs.allocate_pages)(
+            crate::ALLOCATE_MAX_ADDRESS,
+            memory_type::KINTANE_FIRMWARE_CALL,
+            pages,
+            &mut at,
+        )
+    })?;
+    let len = pages * PAGE_SIZE as usize;
+    // SAFETY: just allocated for us, identity-mapped, `len` bytes long.
+    let space = unsafe {
+        slice::from_raw_parts_mut(ptr::with_exposed_provenance_mut::<u8>(at as usize), len)
+    };
+    let root = arch::identity_4gib(space, at)
+        .ok_or(Error::Firmware("building the firmware call space", Status::OUT_OF_RESOURCES))?;
+    // SAFETY: runtime services are live while boot services are.
+    let rt = unsafe { &*st.runtime_services };
+    Ok(Runtime {
+        call_root: root,
+        call_stack_top: at + len as u64,
+        get_variable: rt.get_variable as usize as u64,
+        set_variable: rt.set_variable as usize as u64,
+        reset_system: rt.reset_system as usize as u64,
+        attempt: attempt.number,
+        failures_before_safe: FAILURES_BEFORE_SAFE,
+    })
 }

@@ -14,6 +14,7 @@
 
 #![no_std]
 
+pub mod counter;
 pub mod handover;
 
 /// What the handover needs that is not UEFI: a console for after the firmware's is gone,
@@ -171,9 +172,21 @@ pub struct RuntimeServices {
     pub set_wakeup_time: Unused,
     pub set_virtual_address_map: Unused,
     pub convert_pointer: Unused,
-    pub get_variable: Unused,
+    pub get_variable: unsafe extern "efiapi" fn(
+        name: *const u16,
+        vendor: *const Guid,
+        attributes: *mut u32,
+        data_size: *mut usize,
+        data: *mut c_void,
+    ) -> Status,
     pub get_next_variable_name: Unused,
-    pub set_variable: Unused,
+    pub set_variable: unsafe extern "efiapi" fn(
+        name: *const u16,
+        vendor: *const Guid,
+        attributes: u32,
+        data_size: usize,
+        data: *const c_void,
+    ) -> Status,
     pub get_next_high_monotonic_count: Unused,
     pub reset_system: unsafe extern "efiapi" fn(
         kind: u32,
@@ -182,6 +195,10 @@ pub struct RuntimeServices {
         data: *const c_void,
     ) -> !,
 }
+
+/// `EFI_MEMORY_RUNTIME`: a memory map descriptor the firmware needs after
+/// `ExitBootServices`.
+pub const MEMORY_RUNTIME: u64 = 1 << 63;
 
 /// `EFI_RESET_TYPE`.
 pub const RESET_COLD: u32 = 0;

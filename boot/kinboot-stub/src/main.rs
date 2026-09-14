@@ -34,8 +34,9 @@ use core::convert::Infallible;
 use core::mem::offset_of;
 use core::{fmt, ptr};
 
+use cmdline::Mode;
 use uefi::handover::{self, fatal, log};
-use uefi::{Handle, Status, SystemTable};
+use uefi::{Handle, Status, SystemTable, counter};
 
 /// What precedes the words kbuild stamps. Must match `KERNEL_BLOB_MARKER` in
 /// `kbuild/src/pe.rs`.
@@ -178,8 +179,71 @@ unsafe fn boot(image: Handle, st: &SystemTable, words: [u64; 5]) -> Result<Infal
         kernel.len()
     ));
 
+    // SAFETY: runtime services are live while boot services are.
+    let attempt = match unsafe { counter::count(st) } {
+        Ok(attempt) => {
+            log(format_args!(
+                "kinboot-stub: boot attempt {} since the last confirmed boot{}\n",
+                attempt.number,
+                if attempt.safe {
+                    ", past the limit: starting safe mode"
+                } else {
+                    ""
+                }
+            ));
+            Some(attempt)
+        }
+        Err(s) => {
+            log(format_args!(
+                "kinboot-stub: no boot counter, the firmware refused its variable: {:#x}\n",
+                s.0
+            ));
+            None
+        }
+    };
+    let mut line = [0u8; cmdline::MAX_LINE];
+    let command_line = match attempt {
+        Some(a) if a.safe => in_mode(Mode::Safe, command_line, &mut line).unwrap_or_else(|| {
+            // Booting as built is still a boot. The kernel sees a fallback that did not
+            // happen and fails its verdict, so the count keeps its evidence.
+            log(format_args!(
+                "kinboot-stub: the command line does not parse; booting it as built\n"
+            ));
+            command_line
+        }),
+        _ => command_line,
+    };
+
     // SAFETY: this application's handle and system table, with boot services live.
-    unsafe { handover::hand_over(image, st, kernel, command_line) }.map_err(Failure::Handover)
+    unsafe { handover::hand_over(image, st, kernel, command_line, attempt) }
+        .map_err(Failure::Handover)
+}
+
+/// `line` with its `mode=` word replaced by `mode=<mode>`, written into `out`.
+///
+/// Every other word is kept as it was written, quotes and all, by copying the bytes around
+/// the mode word rather than rendering the words again. `None` if the line does not parse
+/// or the result would not fit, which the kernel's parser would refuse as well.
+fn in_mode<'a>(mode: Mode, line: &[u8], out: &'a mut [u8; cmdline::MAX_LINE]) -> Option<&'a [u8]> {
+    let args = cmdline::Args::parse(line).ok()?;
+    let mut rest = [0u8; cmdline::MAX_LINE];
+    let mut n = 0;
+    let mut from = 0;
+    let mut words = args.words().peekable();
+    while let Some(word) = words.next() {
+        if word.key != b"mode" {
+            continue;
+        }
+        let kept = line.get(from..word.offset)?;
+        rest.get_mut(n..n + kept.len())?.copy_from_slice(kept);
+        n += kept.len();
+        from = words.peek().map_or(line.len(), |next| next.offset);
+    }
+    let tail = line.get(from..)?;
+    rest.get_mut(n..n + tail.len())?.copy_from_slice(tail);
+    n += tail.len();
+    let len = cmdline::compose(mode, &rest[..n], &mut out[..])?;
+    out.get(..len)
 }
 
 /// `len` bytes at `at` within this loaded image, which is `size` bytes from `base`.

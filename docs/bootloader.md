@@ -454,11 +454,50 @@ This is a small amount of machinery that turns an unbootable machine into a mach
 that boots badly, which on hardware without a serial console is the difference between
 debuggable and bricked.
 
-**Not built yet, deliberately.** The loader half is small: an EFI variable, or a reserved
-sector. The kernel half is not. The kernel clears the counter, so it needs to write an
-EFI variable through runtime services, or a sector through a disk driver, and it has
-neither. A counter that nothing clears would put every machine into safe mode on its
-third boot. It lands with the first kernel-side writer.
+#### As built: the EFI stub counts, the kernel confirms
+
+The counter is the EFI variable `KinTaneBootAttempts`. Its name, vendor GUID and limit
+are in `boot_protocol::uefi::boot_counter`, which both sides link.
+
+- **The stub counts** (`boot/uefi/src/counter.rs`). Before anything else in the boot path
+  can fail, it reads the number of attempts since the last confirmed boot, adds this one
+  and writes it back. After three unconfirmed attempts in a row, the fourth starts with
+  `mode=safe` in place of the built mode. The rest of the line is kept byte for byte.
+- **The kernel confirms** (`kernel/lastgood/uefi`). Once `kmain`'s bring-up verdict is a
+  pass, it deletes the variable with `SetVariable` and reads it back with `GetVariable`,
+  requiring `EFI_NOT_FOUND`: a confirmation the firmware dropped would otherwise surface
+  as safe mode a few boots later, with nothing in any log. A failed verdict leaves the
+  count standing, and so does anything that stops the kernel before the verdict. A boot
+  the tag says is past the limit must have arrived in safe mode, or the verdict fails.
+- **How the kernel calls firmware.** Runtime code lives in memory the kernel does not map,
+  and nothing the kernel maps outside its text is executable. So, while boot services are
+  still up, the stub allocates a call space in memory the kernel sees as reserved:
+  - six pages of page tables identity-mapping the first 4 GiB, writable and executable as
+    the firmware ran on them;
+  - a 64 KiB stack.
+
+  It passes the call space and the three entry points it needs in a `UefiRuntime` tag. A
+  call masks interrupts, loads that root, switches to that stack, calls, and restores
+  both. The kernel's own tables never gain a page that is both writable and executable.
+  `SetVirtualAddressMap` is never called, so the firmware runs at the addresses it was
+  built for. The stub passes no tag if any runtime region lies above 4 GiB.
+- **How it is proved.** `BOOT_COUNTER_TEST` runs on `x86_64-efistub`. It boots one QEMU
+  machine without `-no-reboot`, so its variable store lives through the resets. Every
+  boot before the fallback fails on purpose and resets through `ResetSystem`. The run
+  passes only if:
+  - attempts 1 to 3 arrive in normal mode;
+  - attempt 4 arrives in safe mode;
+  - that boot's confirmation reads back as gone.
+
+  Every other `x86_64-efistub` boot confirms as well, so the runtime call also runs under
+  the in-kernel, safe-mode and stack guard tests.
+
+**Not built.**
+- `kinboot-efi` and `kinboot-bios` do not count. For the first, the menu is the fallback,
+  and a counter waits on a way to tell which entry a confirmed boot came from.
+- Escalation stops at safe mode. There is no previously installed kernel to fall back to.
+- A kernel that hangs rather than fails needs a watchdog, or a person, to reset it before
+  the count moves.
 
 ## Chainloading other operating systems
 

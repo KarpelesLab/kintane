@@ -84,7 +84,6 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             s("stdio"),
             s("-display"),
             s("none"),
-            s("-no-reboot"),
             // Guest errors only, not every interrupt: the firmware takes thousands of
             // timer interrupts before the kernel runs, and logging each one would bury
             // the kernel's few in megabytes of OVMF.
@@ -93,6 +92,11 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             s("-D"),
             log.display().to_string(),
         ]);
+        // A reset ends the run, except in the boot counter test, which is a sequence of
+        // boots of one machine: its variable store must live through the resets it counts.
+        if !res.is_on("BOOT_COUNTER_TEST") {
+            args.push(s("-no-reboot"));
+        }
         return Ok(Machine {
             binary: "qemu-system-x86_64",
             args,

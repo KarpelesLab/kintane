@@ -161,6 +161,17 @@ pub unsafe fn command_line(boot_arg: u64, out: &mut [u8]) -> Result<Option<usize
     command_line_from(bytes, out)
 }
 
+/// What the loader passed for calling UEFI runtime services, if it passed anything: today
+/// only the EFI stub, which counts boots and needs the kernel to confirm them.
+///
+/// # Safety
+/// As [`memory_regions`].
+pub unsafe fn uefi_runtime(boot_arg: u64) -> Option<boot_protocol::uefi::Runtime> {
+    // SAFETY: this function's contract is `structure`'s, passed through unchanged.
+    let bytes = unsafe { structure(boot_arg) }.ok()?;
+    tags::parse(bytes).ok()?.uefi_runtime().ok()?
+}
+
 /// [`command_line`] for a structure already in hand as bytes.
 pub fn command_line_from(bytes: &[u8], out: &mut [u8]) -> Result<Option<usize>, Error> {
     let parsed = tags::parse(bytes).map_err(translate)?;

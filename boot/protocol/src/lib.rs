@@ -45,6 +45,8 @@ pub enum TagKind {
     EntropySeed = 8,
     KernelRange = 9,
     Firmware = 10,
+    /// What the kernel needs to call UEFI runtime services: [`uefi::Runtime`].
+    UefiRuntime = 11,
 }
 
 #[repr(C)]
