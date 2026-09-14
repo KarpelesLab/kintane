@@ -308,6 +308,8 @@ pub fn wait_stress_heartbeat(c: &dyn EarlyConsole) {
     crate::write_usize(c, s.cross_cpu_wakes as usize);
     c.write_str(", timeouts ");
     crate::write_usize(c, s.timeouts as usize);
+    c.write_str(", slow exchanges ");
+    crate::write_usize(c, crate::waits::stress_slow() as usize);
     c.write_str(")");
     let siblings = crate::sibling::stress_cycles();
     if siblings > 0 {
