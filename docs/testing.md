@@ -1018,8 +1018,10 @@ left open and every frame back. On `x86_64-qemu` and `aarch64-virt`, and on both
 ```
 
 A check that forks three children and clones a thread starts five process threads, more than the
-pool of three holds at once. `spawn` now reaps a pool entry whose thread has exited when it looks
-for a free one; before that, the first run stopped at step 128, its second `fork` refused.
+pool of three holds at once. A Linux `fork` or `clone` now reaps a pool entry whose thread has exited
+before it looks for a free one; before that, the first run stopped at step 128, its second `fork`
+refused. Native thread starts do not reap: a native thread that has exited stays in the table until
+its check reaps it.
 
 **In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
 the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.

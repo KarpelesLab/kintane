@@ -223,11 +223,14 @@ pub fn start_resumed(
         install: false,
         args: [0; 4],
     };
+    // Only here, for a Linux process's `fork` or `clone`: a native thread that has exited stays
+    // in the table until its check reaps it, which is what `thread_join` and the checks that
+    // wait for a thread read.
+    reap_exited();
     start_on_pool(start, Some((regs, tls)))
 }
 
 fn start_on_pool(start: Start, resume: Option<Resume>) -> Option<ThreadId> {
-    reap_exited();
     let index = (0..POOL).find(|&i| {
         STACK[i].load(Ordering::Relaxed) != usize::MAX
             && THREAD[i]
