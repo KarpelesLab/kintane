@@ -13,9 +13,94 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | VT-d confines the disk's DMA on x86_64: an out-of-grant DMA is stopped and the device restarts. The driver still runs in the kernel, so the exit criterion is open |
-| 6 — Userspace and the Linux personality | 6a closed: blocking calls, threads, events, timers, the VFS as a channel service. 6b begun: a static Linux program runs unmodified on x86_64 |
-| 7 — Real hardware and real work | started early: disks and MSI-X, a read-only FAT16 filesystem, virtio-net and an IPv4 stack (no TCP), an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+| 5 — Driver isolation | **exit criterion met** on x86_64: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
+| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b's second slice on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve` and `wait4`. Signals and Linux sockets are not started |
+| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, a read-only FAT16 filesystem, virtio-net with IPv4 and TCP, sockets over handles, an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The eighth round of landings
+
+Seventeen presets now build and boot, with `x86_64-isolated` new. Six branches ran in parallel
+again, and all six landed.
+
+- **Phase 5's exit criterion is met on x86_64.** `virtio-blk-core` runs in an unprivileged ring-3
+  domain, `user/blkdomain`, over a grant of the disk's register window and the DMA buffer VT-d
+  already confines it to. The kernel's block layer serves it over a channel, and the disk's MSI-X
+  interrupt reaches the domain as a message the kernel forwards. The same driver source runs in
+  the kernel on `x86_64-iommu` and in the domain on `x86_64-isolated`, and both pass the same
+  `block` checks on every boot. Every `x86_64-isolated` boot stops a rogue DMA from inside the
+  domain, kills a deliberately faulting domain alone, marks the disk failed, and has a new domain
+  serve reads again. The domain-versus-kernel costs are in isolation.md, with the caveat that they
+  are QEMU's: an interrupt forwarded as a message took about 45 µs on average under TCG. User
+  programs on x86_64 are now built position-independent, because the domain links at the user
+  half's 512 GiB, beyond the small code model's reach.
+- **The flaky progress check is fixed, not loosened.** The scheduler now counts, per thread, the
+  slices it ran and the times it was passed over. The stress run's process cycle fails a thread
+  that ran 16 slices, or was passed over 64 times per slice it ran, without progress, instead of
+  one that made none in a fixed 80 ms of wall time. Beside six busy guests, the old check failed
+  9 runs of 10 and the new one none of 10; a process never scheduled, one that runs and never
+  advances, and a real priority inversion all still fail. The network workload's pacing, added for
+  that margin, is gone.
+- **The Linux personality's second slice** (Phase 6b), on x86_64 and aarch64. A thread's thread
+  pointer travels with it through the context switch. Pipes block on the Phase 6a wait queues;
+  `clone` for threads, futexes, copy-on-write `fork`, `wait4` and `execve` from the VFS work; and
+  aarch64 has its own in-tree table. One static program that knows nothing of KinTane pipes,
+  forks, execs, waits and joins a futex-synchronised thread on every Linux boot of both
+  architectures, and two of it share one CPU in the stress run. Signals and Linux sockets are not
+  started.
+- **TCP and sockets** (Phase 7). `kernel/net` speaks TCP with every RFC 793 state, go-back-N
+  retransmission on a timer, a fixed receive window and pool-bounded memory, and says plainly that
+  it has no congestion control. Sockets are handle objects with rights, and their calls block on
+  the Phase 6a wait queues with timeouts. kbuild relays the guest's frames and drops each
+  connection's first data segment, so every network boot on x86_64, aarch64 and i686 must
+  retransmit, close in both orders, and return every buffer; a native program talks TCP to kbuild
+  on x86_64 and aarch64.
+- **Phase 6a's leftovers are closed.** Channels are counted store objects: the race the seventh
+  round named, a channel freed and reused under another process's lookup, is reproduced by a boot
+  check that failed on the old code. `process_wait` takes a timeout, a thread spinning in user mode
+  is stopped from an interrupt when its process ends, and the VFS service is a standing kernel
+  file server that serves any process given a connection.
+- **x86 interrupt routing.** A bounded AML interpreter, fuzzed and host-tested against QEMU's q35
+  and pc DSDTs, evaluates `_PRT` and link devices, so a PCI function without MSI-X gets a real INTx
+  route: `x86_64-bios` takes its disk's interrupts on GSI 22, level, active high. On the IOMMU
+  presets the disk's MSI-X goes through a VT-d interrupt remapping table, and an interrupt from an
+  absent entry or another function is blocked and logged.
+
+**What merging six branches found this round:**
+
+- **A stack overflow no branch had.** The driver domain passed its stress run alone, and so did
+  the object-layer checks, but together they overflowed the boot stack as the domain handed the
+  disk back to the kernel: kmain's frame had grown by the new checks' inlined state, and the path
+  measured about 15.7 KiB of a 16 KiB stack. The root cause was older. x86_64 reserved a fixed
+  16 KiB in its boot assembly and ignored `BOOT_STACK_KIB`; the linker script now reserves the
+  configured size, and a driver-domain build takes 32 KiB. aarch64, i686 and riscv32 still reserve
+  a fixed 16 KiB.
+- **The identical-edit trap, again.** The Phase 6a leftovers and TCP each raised the stress
+  stack-slot defaults by one from the same base; git merged the identical lines silently, and
+  the build-time count of every thread is what makes a missed increment a compile error. The
+  defaults are now 16, 17 with driver isolation and 18 with a driver domain.
+- **An API one branch removed and another used.** The domain served its requests with a blocking
+  channel receive that the channel rework replaced with a non-blocking one; the merge restored a
+  deadline receive over the new store objects.
+- **A stale tool looks like a regression.** After the interrupt-remapping merge, the remap check
+  failed at "no extended interrupt mode" and the BIOS preset still reported MSI-X. Nothing in the
+  kernel was wrong: the kbuild binary predated the branch's QEMU flags. kbuild is now rebuilt after
+  every merge that touches it, before anything is run.
+- **Warnings that no gate counted.** The flat ports had carried dead-code warnings since the
+  seventh round, and this round added more. They are gone, and each stand-in now *expects* its dead
+  code on a flat kernel, so one that starts being called fails the build.
+
+**Size budgets moved again.** The Linux second slice, interrupt routing with its AML interpreter,
+and TCP grew every x86_64 image by about 240 KB in one round, which took `x86_64-iommu`,
+`x86_64-isolated` and `x86_64-qemu-smp` past their budgets and `x86_64-qemu` to 99%. Every x86_64
+preset was raised, none lowered: 1536 to 2048 KiB, and `x86_64-qemu-smp` from 1792 to 2304 KiB.
+aarch64 grew by about 215 KB and stays within its budgets, at 93%.
+
+**Still open.** Signals and Linux sockets; a frame-lock hazard where a `fork`, `execve` or program
+install on a multiprocessor can deadlock against another CPU's page fault; socket waiters woken by
+the card's interrupt rather than polling; congestion control and fragment reassembly; VT-d
+queued invalidation and delivery to an x2APIC ID above 255 on a real CPU; remapping every function
+and the I/O APIC; the boot `preempt` check, now the wall-clock check a loaded host breaks first;
+and, as before, the 24-hour soak, real hardware, and Secure Boot with a TPM.
 
 ### The seventh round of landings
 
