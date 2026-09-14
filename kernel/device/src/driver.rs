@@ -33,7 +33,7 @@
 
 use hal::IrqNumber;
 
-use crate::resource::{ClaimError, IrqLine, Mmio, Owner, Resources};
+use crate::resource::{ClaimError, IrqLine, Mmio, Owner, PortRange, Resources};
 use crate::tree::{self, DeviceTree, NodeId};
 
 /// A driver, bound by `compatible` string.
@@ -73,6 +73,20 @@ pub trait Driver: Sync {
 
     /// Forget the device. Its claims are released by [`remove`] after this returns.
     fn remove(&self, _bound: &Bound) {}
+
+    /// The interrupt this driver wants dispatched to it: the line it claimed during
+    /// probe, and the function to run when it fires.
+    ///
+    /// The platform wires it up after [`Driver::start`] — translate the specifier with the
+    /// machine's controller, register the handler, enable it, unmask the line — because
+    /// only the platform knows the controller and owns the table. A driver that polls, or
+    /// whose device has no interrupt, says `None` and is never dispatched to.
+    ///
+    /// The returned reference is `'static` because a bound driver's claims live as long as
+    /// the machine: they are in the driver's own boot cell.
+    fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
+        None
+    }
 }
 
 /// Why a probe failed.
@@ -121,6 +135,18 @@ impl<'a, 's> Probe<'_, 'a, 's, '_> {
         Ok(self
             .resources
             .claim_mmio(self.owner, self.node, phys, len, what)?)
+    }
+
+    /// Claim the `index`th range of I/O ports of the node.
+    pub fn claim_ports(
+        &mut self,
+        index: usize,
+        what: &'static str,
+    ) -> Result<PortRange, ProbeError> {
+        let (base, len) = self.tree.ports(self.node, index)?;
+        Ok(self
+            .resources
+            .claim_ports(self.owner, self.node, base, len, what)?)
     }
 
     /// Claim the `index`th interrupt of the node.
@@ -272,10 +298,22 @@ pub fn best_match(
 /// a device that does not hold it. Enabling takes [`Started`]. Dispatch calls only
 /// enabled handlers.
 ///
-/// Nothing dispatches through this yet: the architectures' interrupt paths still know
-/// only their timer, and move over when the first interrupt-driven driver arrives.
-pub struct Handlers<'h> {
-    slots: &'h mut [Option<Handler>],
+/// # How dispatch reaches it
+///
+/// The architectures' interrupt paths call this through a function the platform installs
+/// (`arch::irq::set_device_dispatch` and its x86 equivalents), because `arch` is below
+/// `device` and may not name it. The table itself lives in the platform, inside a lock of
+/// the kernel's lock family, since a device interrupt can be taken on any CPU.
+///
+/// Interrupt handlers run *outside* that lock: [`Self::lookup`] copies the handler out
+/// and the caller drops the lock before calling it. So a handler may register or enable
+/// another device's line without deadlocking, and a long handler does not hold off the
+/// other CPUs' dispatch.
+///
+/// Storage is owned and fixed, because the table is a `static` in the platform and there
+/// is no allocator when the first driver binds.
+pub struct Handlers<const N: usize> {
+    slots: [Option<Handler>; N],
 }
 
 /// One registered handler.
@@ -296,15 +334,20 @@ pub enum HandlerError {
     Busy,
     /// No handler is registered for this number and device.
     NotRegistered,
+    /// The handler is still enabled: disable it, and the line at the controller, first.
+    StillEnabled,
     NoRoom,
 }
 
-impl<'h> Handlers<'h> {
-    pub fn new(slots: &'h mut [Option<Handler>]) -> Self {
-        for s in slots.iter_mut() {
-            *s = None;
-        }
-        Handlers { slots }
+impl<const N: usize> Default for Handlers<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> Handlers<N> {
+    pub const fn new() -> Self {
+        Handlers { slots: [None; N] }
     }
 
     /// Register `handler` for `line`, which the controller translated to `number`.
@@ -347,17 +390,62 @@ impl<'h> Handlers<'h> {
         Ok(())
     }
 
-    /// Run the handler for `number`, if one is registered and enabled. Returns whether
-    /// one ran.
-    pub fn dispatch(&self, number: IrqNumber) -> bool {
-        match self
+    /// Stop `number`'s handler running, leaving it registered. Only a started device may,
+    /// as for [`Self::enable`]: a device that is stopping disables its line and then
+    /// unregisters.
+    pub fn disable(&mut self, started: &Started, number: IrqNumber) -> Result<(), HandlerError> {
+        let h = self
             .slots
+            .iter_mut()
+            .flatten()
+            .find(|h| h.number == number && h.owner == started.0.owner)
+            .ok_or(HandlerError::NotRegistered)?;
+        h.enabled = false;
+        Ok(())
+    }
+
+    /// Take `number`'s handler out of the table.
+    ///
+    /// Takes [`Bound`] rather than [`Started`], because unregistering is what a device
+    /// does on its way out: stopped, about to be removed, its claims about to go back.
+    /// A handler that is still enabled is refused — the line has to be quiet first, and
+    /// on the machine that means disabled at the controller too.
+    pub fn unregister(&mut self, owner: &Bound, number: IrqNumber) -> Result<(), HandlerError> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.is_some_and(|h| h.number == number && h.owner == owner.owner))
+            .ok_or(HandlerError::NotRegistered)?;
+        if slot.is_some_and(|h| h.enabled) {
+            return Err(HandlerError::StillEnabled);
+        }
+        *slot = None;
+        Ok(())
+    }
+
+    /// The handler for `number`, if one is registered and enabled.
+    ///
+    /// What the interrupt path calls: it takes the handler out from under the table's
+    /// lock and runs it with the lock released. See the type's documentation.
+    pub fn lookup(&self, number: IrqNumber) -> Option<fn()> {
+        self.slots
             .iter()
             .flatten()
             .find(|h| h.number == number && h.enabled)
-        {
-            Some(h) => {
-                (h.handler)();
+            .map(|h| h.handler)
+    }
+
+    /// Whether a handler is registered for `number`, enabled or not.
+    pub fn registered(&self, number: IrqNumber) -> bool {
+        self.slots.iter().flatten().any(|h| h.number == number)
+    }
+
+    /// Run the handler for `number`, if one is registered and enabled. Returns whether
+    /// one ran. For a table nothing shares: the interrupt path uses [`Self::lookup`].
+    pub fn dispatch(&self, number: IrqNumber) -> bool {
+        match self.lookup(number) {
+            Some(handler) => {
+                handler();
                 true
             }
             None => false,

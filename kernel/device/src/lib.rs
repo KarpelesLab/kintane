@@ -15,6 +15,8 @@
 //! * [`resource`] — the ledger of claimed register windows and interrupt lines, which refuses
 //!   overlapping claims and is what the kernel maps device memory from.
 //! * [`registers`] — access to a claimed window, checked against its bounds.
+//! * [`ports`] — the same for a claimed range of I/O ports, on the machines that have them.
+//! * [`fifo`] — the byte queue a receiving driver hands what its interrupt handler took.
 //!
 //! Nothing here allocates, and nothing here names an architecture. Storage for nodes
 //! and claims comes from the caller, because the model runs before any allocator does.
@@ -26,7 +28,9 @@
 
 pub mod cell;
 pub mod driver;
+pub mod fifo;
 pub mod pci;
+pub mod ports;
 pub mod registers;
 pub mod resource;
 pub mod table;
@@ -40,8 +44,13 @@ pub use driver::{
 /// The parser the tree is built from, so a consumer of the model does not have to name
 /// `boot/fdt` itself.
 pub use fdt::Fdt;
+#[cfg(all(target_has_atomic = "8", target_has_atomic = "32"))]
+pub use fifo::Fifo;
+pub use ports::Ports;
 pub use registers::Registers;
-pub use resource::{ClaimError, IrqClaim, IrqLine, Mmio, MmioClaim, Resources};
+pub use resource::{
+    ClaimError, IrqClaim, IrqLine, Mmio, MmioClaim, PortClaim, PortRange, Resources,
+};
 pub use table::Described;
 pub use tree::{Builder, DeviceTree, Node, NodeId, Origin, Specifier};
 
@@ -50,3 +59,6 @@ mod tests;
 
 #[cfg(test)]
 mod pci_tests;
+
+#[cfg(test)]
+mod port_tests;

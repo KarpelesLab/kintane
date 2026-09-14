@@ -23,9 +23,12 @@
 //! same ledger, and a parent precedes its children, so a function behind a PCI bridge is
 //! the bridge node's child.
 //!
-//! Interrupts of such nodes are not modelled yet. A PCI function's pin is in its record;
-//! turning it into a controller input needs the ACPI `_PRT` or an `interrupt-map`, and
-//! [`DeviceTree::interrupt`] reports no entry rather than guess.
+//! A record a firmware table or the platform declares may carry one interrupt line and a
+//! range of I/O ports. [`DeviceTree::interrupt`] returns that line as a one-cell specifier
+//! whose controller is the root, and [`DeviceTree::ports`] the range. A PCI function's
+//! interrupts are still not modelled: its pin is in its record, but turning a pin into a
+//! controller input needs the ACPI `_PRT` or an `interrupt-map`, and `interrupt` reports
+//! no entry rather than guess.
 //!
 //! # Cell counts
 //!
@@ -804,9 +807,34 @@ impl<'a, 's> DeviceTree<'a, 's> {
         Ok((controller, cells))
     }
 
+    /// The `index`th range of I/O ports of `id`, as `(base, length)`.
+    ///
+    /// Only a device a firmware table or the platform describes has ports: a device-tree
+    /// node's `reg` is memory on every binding this model reads. The platform's own
+    /// controller is what gives the range meaning, exactly as for a window.
+    pub fn ports(&self, id: NodeId, index: usize) -> Result<(u16, u16), Error> {
+        let ports = match self.node(id).origin {
+            Origin::Table(d) if index == 0 => d.ports(),
+            _ => None,
+        };
+        ports.ok_or(Error::NoSuchEntry { node: id, index })
+    }
+
     /// The `index`th interrupt of `id`: its controller, and the specifier cells whose
     /// meaning that controller defines.
+    ///
+    /// A device a firmware table describes carries the line itself rather than cells to
+    /// interpret, so its specifier is that one number, and its controller is the root:
+    /// the platform has exactly one, and no table names it as a node.
     pub fn interrupt(&self, id: NodeId, index: usize) -> Result<Specifier, Error> {
+        if let Origin::Table(d) = self.node(id).origin {
+            let line = d
+                .interrupt()
+                .filter(|_| index == 0)
+                .ok_or(Error::NoSuchEntry { node: id, index })?;
+            return Specifier::new(NodeId::ROOT, &[line])
+                .ok_or(Error::NoSuchEntry { node: id, index });
+        }
         let raw = self
             .node(id)
             .interrupts

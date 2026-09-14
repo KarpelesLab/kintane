@@ -608,3 +608,18 @@ config QEMU_BLOCK_TEST
         On aarch64, where the device is a memory-mapped virtio slot the
         device tree describes. Needs MM_PAGED, because the check maps the
         driver's DMA region through the kernel's direct map.
+
+config SERIAL_IRQ_TEST
+    bool "Prove the console UART receives on interrupt under QEMU"
+    depends on QEMU_EXIT
+    default y if ARCH_X86_64 || ARCH_I686 || ARCH_AARCH64
+    help
+        The boot prints a prompt, the harness types a known string on the
+        serial console, and the console UART bound through the device model
+        must receive every byte through its interrupt: the handler the
+        device model's table holds must run for the line the controller
+        routed, and no interrupt may reach no handler. On the PCs the
+        driver is then unbound -- its handler unregistered, its ports and
+        its line given back -- and bound again, and a second string must
+        arrive the same way. Test builds only: nobody types at a production
+        kernel's console on its way up.

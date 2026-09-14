@@ -25,9 +25,13 @@ mod smp;
 use core::cell::SyncUnsafeCell;
 
 use device::driver::{self, best_match};
-use device::{BootCell, Bound, DeviceTree, Driver, Fdt, IrqClaim, MmioClaim, Node, Resources};
-use hal::EarlyConsole;
+use device::{
+    BootCell, Bound, DeviceTree, Driver, Fdt, Handlers, IrqClaim, MmioClaim, Node, Resources,
+    Started,
+};
 use hal::paging::DeviceWindow;
+use hal::{EarlyConsole, IrqChip, IrqNumber};
+use sync::{LockClass, SpinLock};
 
 /// Every driver this image carries, in the order ties between equally specific matches go.
 ///
@@ -104,6 +108,20 @@ static IRQS: SyncUnsafeCell<[Option<IrqClaim>; MAX_CLAIMS]> =
 
 /// What the address space maps, set by [`discover`].
 static WINDOWS: BootCell<([DeviceWindow; MAX_CLAIMS], usize)> = BootCell::new();
+
+/// The device model's interrupt handlers.
+///
+/// Registered on the boot path by [`discover`], and read by [`dispatch`] from the IRQ
+/// vector on whichever CPU took the interrupt — so behind a lock, not a boot cell, even
+/// though today nothing registers after boot: removal and a second binding change it, and
+/// a handler table that is only safe while nobody changes it is a trap for the first
+/// driver that does. Handlers run with the lock released; see `device::Handlers`.
+static HANDLERS: SpinLock<Handlers<MAX_BOUND>, arch::Cpu> =
+    SpinLock::with_class(Handlers::new(), &HANDLERS_CLASS);
+static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
+
+/// The console UART's receive line, once its handler is wired.
+static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
 
 /// Where this platform's devices come from, for the banner.
 pub const SOURCE: &str = "device tree";
@@ -235,25 +253,46 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     ok &= console_ok;
     let console_node = tree.stdout();
 
-    for (d, b) in bound.iter_mut().filter_map(Option::take) {
+    // Kept past start, because wiring a device's interrupt takes its `Started` token, and
+    // the controller the lines are wired at is only installed below.
+    let mut started: [Option<(usize, Started)>; MAX_BOUND] = [const { None }; MAX_BOUND];
+    for (slot, (d, b)) in started
+        .iter_mut()
+        .zip(bound.iter_mut().filter_map(Option::take))
+    {
         let Some(&drv) = DRIVERS.get(d) else { continue };
         if !console_ok && Some(b.node()) == console_node {
             continue;
         }
-        if let Err((_, why)) = driver::start(drv, b) {
-            c.write_str("; ");
-            c.write_str(drv.name());
-            c.write_str(" did not start: ");
-            c.write_str(why);
-            ok = false;
+        match driver::start(drv, b) {
+            Ok(s) => *slot = Some((d, s)),
+            Err((_, why)) => {
+                c.write_str("; ");
+                c.write_str(drv.name());
+                c.write_str(" did not start: ");
+                c.write_str(why);
+                ok = false;
+            }
         }
     }
 
     // One interrupt controller, started.
-    match started_chip() {
-        // SAFETY: once, from `discover`'s single call, with interrupts masked, and the
-        // controller was initialised by its driver's start — `set_chip`'s contract.
-        Some(chip) => unsafe { arch::irq::set_chip(chip) },
+    let chip = started_chip();
+    match chip {
+        Some(chip) => {
+            // SAFETY: once, from `discover`'s single call, with interrupts masked, and the
+            // controller was initialised by its driver's start — `set_chip`'s contract.
+            unsafe { arch::irq::set_chip(chip) };
+            // SAFETY: once, masked, and before `wire` enables any device line below.
+            unsafe { arch::irq::set_device_dispatch(dispatch) };
+            for (d, s) in started.iter().flatten() {
+                let Some(&drv) = DRIVERS.get(*d) else {
+                    continue;
+                };
+                let console = Some(s.bound().node()) == console_node;
+                ok &= wire(c, chip, drv, s, console);
+            }
+        }
         None => {
             c.write_str("; NO INTERRUPT CONTROLLER BOUND");
             ok = false;
@@ -292,6 +331,95 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         }
     }
     Some(ok)
+}
+
+/// Look `number` up in the handler table and run what is registered, with the table's lock
+/// released. What the architecture's interrupt path calls for every device line.
+fn dispatch(number: IrqNumber) -> bool {
+    let handler = HANDLERS.lock_irqsave().lookup(number);
+    match handler {
+        Some(handler) => {
+            handler();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Wire a started device's interrupt: translate its specifier with the GIC's binding,
+/// register and enable its handler in the table, then unmask the line at the controller.
+///
+/// In that order, because each step is only meaningful after the one before: a line
+/// unmasked before its handler is registered delivers into nothing, and the table refuses a
+/// handler for a line the device does not hold.
+fn wire(
+    c: &dyn EarlyConsole,
+    chip: &'static dyn IrqChip,
+    drv: &dyn Driver,
+    started: &Started,
+    console: bool,
+) -> bool {
+    let Some((line, handler)) = drv.interrupt() else {
+        return true;
+    };
+    let Ok(number) = gic::translate(line.specifier().cells()) else {
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" INTERRUPT NOT TRANSLATABLE");
+        return false;
+    };
+    let registered = {
+        let mut table = HANDLERS.lock_irqsave();
+        table
+            .register(started.bound(), line, number, handler)
+            .and_then(|()| table.enable(started, number))
+    };
+    if registered.is_err() {
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" HANDLER NOT REGISTERED");
+        return false;
+    }
+    chip.enable(number);
+    if console {
+        // SAFETY: once, on the single-threaded boot path.
+        let _ = unsafe { CONSOLE_LINE.set(number) };
+    }
+    c.write_str("; ");
+    c.write_str(drv.name());
+    c.write_str(" receives on IRQ ");
+    write_usize(c, number.0 as usize);
+    true
+}
+
+/// The console UART's receive line, once its handler is wired.
+pub fn console_line() -> Option<u32> {
+    CONSOLE_LINE.get().map(|n| n.0)
+}
+
+/// Receive interrupts the console driver has taken, and the bytes they carried.
+pub fn console_received() -> (u32, u32) {
+    pl011::received()
+}
+
+/// The oldest byte the console's receive interrupt queued.
+pub fn console_read() -> Option<u8> {
+    pl011::read_byte()
+}
+
+/// Device interrupts dispatched to a handler, and ones that reached none.
+pub fn device_interrupts() -> (u64, u64) {
+    (arch::irq::device_irqs(), arch::irq::unhandled_irqs())
+}
+
+/// Unbind and rebind the console. `None`: the PL011 driver is the console on this port and
+/// its state is write-once for the machine's life, so it is not taken away. The PCs'
+/// 16550 driver is the one that is; see `kernel/platform/acpi`.
+///
+/// # Safety
+/// None required; `unsafe` only so every provider has one signature.
+pub unsafe fn rebind_console(_c: &dyn EarlyConsole) -> Option<bool> {
+    None
 }
 
 /// Whether the console the tree names is bound and is the one the early console uses.

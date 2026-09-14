@@ -483,8 +483,7 @@ fn phases_gate_handlers_and_carry_through_power_transitions() {
     let bound = driver::probe(&Holder, &tree, node, &mut res).unwrap();
     let line = HELD.lock().unwrap().take().unwrap();
 
-    let mut slots = vec![None; 4];
-    let mut handlers = Handlers::new(&mut slots);
+    let mut handlers: Handlers<4> = Handlers::new();
     handlers
         .register(&bound, &line, IrqNumber(33), handler)
         .unwrap();
@@ -518,9 +517,29 @@ fn phases_gate_handlers_and_carry_through_power_transitions() {
     assert!(!handlers.dispatch(IrqNumber(34)));
     assert_eq!(RAN.load(Ordering::Relaxed), 1);
 
+    // A registered, enabled handler cannot be unregistered: the line is still live.
+    assert_eq!(
+        handlers.unregister(started.bound(), IrqNumber(33)),
+        Err(HandlerError::StillEnabled)
+    );
+
     let suspended = driver::suspend(&Holder, started).unwrap();
     let started = driver::resume(&Holder, suspended).unwrap();
+
+    // Taking the device away: disable, unregister, and dispatch finds nothing. This is
+    // the order `remove` needs, and each step is refused out of it.
+    handlers.disable(&started, IrqNumber(33)).unwrap();
+    assert!(!handlers.dispatch(IrqNumber(33)), "disabled: the handler does not run");
+    assert!(handlers.registered(IrqNumber(33)), "but it is still registered");
     let bound = driver::stop(&Holder, started);
+    handlers.unregister(&bound, IrqNumber(33)).unwrap();
+    assert!(!handlers.registered(IrqNumber(33)));
+    assert_eq!(
+        handlers.unregister(&bound, IrqNumber(33)),
+        Err(HandlerError::NotRegistered),
+        "twice is refused"
+    );
+    assert_eq!(RAN.load(Ordering::Relaxed), 1, "nothing ran after the disable");
     driver::remove(&Holder, bound, &mut res);
     assert_eq!(res.irq_claims().count(), 1, "remove released exactly its own binding's claims");
     driver::remove(&Holder, other, &mut res);

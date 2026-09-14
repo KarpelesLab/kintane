@@ -529,6 +529,36 @@ Discovery also re-reads every BAR it sized and fails the boot if any reads diffe
 Each of these was falsified by mutation; see the device model in
 [architecture.md](architecture.md#device--the-device-framework).
 
+Every x86_64, i686 and aarch64 test build also proves the console UART receives on
+interrupt through the device model (`SERIAL_IRQ_TEST`, the `serial` banner line). The
+kernel prints `serial probe 1: waiting for input`; kbuild, watching the console, types
+`kintane-probe-1` on the guest's serial input (`SERIAL_PROBES` in `kbuild/src/qemu.rs`,
+the same mechanism that types boot-menu keys); and the round passes only if every byte
+comes back from the driver's queue, at least one receive interrupt ran, the interrupts
+were dispatched through the device model's handler table, and no interrupt reached a line
+with no handler. On the PCs the 16550 is then unbound — line disabled, driver stopped,
+handler unregistered, ports and line given back to the ledger, which must then show
+nothing held for the node — and bound again, and a second string must arrive the same
+way. The PL011 is aarch64's console and its state is write-once, so aarch64 runs one
+round and says so. The check waits at most 15 seconds a round, by the clock, so a broken
+path fails the boot rather than timing it out.
+
+Each property was falsified: the mutation was asserted to apply, the boot failed, and the
+file was restored byte for byte.
+
+| Mutation | Preset | What caught it |
+|---|---|---|
+| the line never unmasked at the controller | `x86_64-qemu` | `0 bytes in 0 receive interrupts`, both rounds; exit 35 |
+| the handler registered in the table for the wrong line | `aarch64-virt` | `0 bytes … 1 unhandled`; exit 1 (before the fix below: a hang) |
+| no handler ever registered | `aarch64-virt` | `0 bytes … 1 unhandled`; exit 1 |
+| the architecture's interrupt path never calls the device model | `i686-qemu` | `0 dispatched through the device model, 1 unhandled`, both rounds; exit 35 |
+| removal does not give the claims back | `x86_64-qemu` | `1 port ranges and 1 lines still claimed`, then the rebind's probe refused; exit 35 |
+| unbinding leaves the handler registered | `i686-qemu` | `HANDLER STILL REGISTERED`, then the rebind refused a second handler for the line; exit 35 |
+
+The second row found a real hang: the PL011's receive interrupt is level-triggered, and
+with no handler to read the byte it was re-delivered the moment it was acknowledged. The
+interrupt path now masks and counts a line nobody handles.
+
 The ACPI parser's host tests read the firmware's tables from three of these machines,
 captured without booting anything: `boot/acpi/src/testdata/capture.sh` starts the
 machine with no kernel, lets the firmware build its tables and fail to find a boot

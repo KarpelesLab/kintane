@@ -68,11 +68,12 @@ use device::driver::{self, best_match};
 use device::pci::{self, Address, Bar, ConfigSpace, Function};
 use device::table::Kind;
 use device::{
-    BootCell, Bound, Builder, Described, DeviceTree, Driver, IrqClaim, MmioClaim, Node, NodeId,
-    Origin, Probe, ProbeError, Resources,
+    BootCell, Bound, Builder, Described, DeviceTree, Driver, Handlers, IrqClaim, MmioClaim, Node,
+    NodeId, Origin, PortClaim, Probe, ProbeError, Resources, Started,
 };
-use hal::EarlyConsole;
 use hal::paging::DeviceWindow;
+use hal::{EarlyConsole, IrqChip, IrqNumber};
+use sync::{LockClass, SpinLock};
 
 /// PCI functions modelled. QEMU's q35 has about ten; a desktop board a few dozen.
 const MAX_FUNCTIONS: usize = 128;
@@ -106,9 +107,50 @@ static MMIO: SyncUnsafeCell<[Option<MmioClaim>; MAX_CLAIMS]> =
     SyncUnsafeCell::new([None; MAX_CLAIMS]);
 static IRQS: SyncUnsafeCell<[Option<IrqClaim>; MAX_CLAIMS]> =
     SyncUnsafeCell::new([None; MAX_CLAIMS]);
+static PORTS: SyncUnsafeCell<[Option<PortClaim>; MAX_PORT_CLAIMS]> =
+    SyncUnsafeCell::new([None; MAX_PORT_CLAIMS]);
+
+/// I/O port ranges bound drivers may claim between them. The serial port is the only
+/// port-mapped device bound today.
+const MAX_PORT_CLAIMS: usize = 4;
 
 /// What the address space maps, set by [`discover`].
 static WINDOWS: BootCell<([DeviceWindow; MAX_CLAIMS], usize)> = BootCell::new();
+
+/// The device model's interrupt handlers, looked up by [`dispatch`] on whichever CPU took
+/// the interrupt. Behind a lock because removing and rebinding a device changes it; see
+/// `kernel/platform/fdt` for the same table on aarch64 and `device::Handlers` for why the
+/// handler runs with the lock released.
+static HANDLERS: SpinLock<Handlers<MAX_BOUND>, arch::Cpu> =
+    SpinLock::with_class(Handlers::new(), &HANDLERS_CLASS);
+static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
+
+/// The console UART's receive line, once wired. It does not change across a rebind.
+static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
+
+/// The console's binding, kept after discovery so the serial check can take the device
+/// away and bind it again: the tree it was bound from, the ledger its claims are in, its
+/// node, and its `Started` token.
+struct Console {
+    tree: DeviceTree<'static, 'static>,
+    resources: Resources<'static>,
+    node: NodeId,
+    started: Option<Started>,
+}
+
+/// SAFETY INVARIANT: written once, at the end of [`discover`], and read and written after
+/// that only by [`rebind_console`] — both on the single-threaded boot path, with
+/// interrupts masked. The interrupt handler never reaches it: it reads the driver's own
+/// state.
+static CONSOLE: SyncUnsafeCell<Option<Console>> = SyncUnsafeCell::new(None);
+
+/// The PC's first serial port: eight ports from 0x3f8, on ISA IRQ 4. Fixed by the
+/// architecture, and described only in AML, which this kernel does not interpret.
+const COM1: (u16, u16) = (0x3f8, 8);
+const COM1_IRQ: u32 = 4;
+
+/// ISA lines the interrupt path has an entry point for.
+const ISA_LINES: u32 = 16;
 
 /// Where this platform's devices come from, for the banner.
 pub const SOURCE: &str = "ACPI and PCI";
@@ -337,13 +379,14 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     c.write_str(" tables;");
 
     // SAFETY: the only borrows of these statics, once, on the boot path; see the invariant.
-    let (functions, described, nodes, mmio, irqs) = unsafe {
+    let (functions, described, nodes, mmio, irqs, ports) = unsafe {
         (
             &mut *FUNCTIONS.get(),
             &mut *DESCRIBED.get(),
             &mut *NODES.get(),
             &mut *MMIO.get(),
             &mut *IRQS.get(),
+            &mut *PORTS.get(),
         )
     };
     let mut records = Records {
@@ -364,6 +407,13 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     // SAFETY: once, on the single-threaded boot path, before anything reads it.
     let facts = unsafe { MADT.set(facts) }.ok();
     let (access, host) = config_access(c, &tables, &mut records, &mut ok);
+    // The serial port no table lists; see `Kind::LegacyUart`. The driver checks the part
+    // answers before it drives it, so declaring it on a machine without one fails that
+    // driver's start rather than programming an empty bus.
+    records.push(
+        Described::new(Kind::LegacyUart, format_args!("serial@3f8"), &[])
+            .map(|d| d.with_ports(Some(COM1), Some(COM1_IRQ))),
+    );
     if records.overflowed {
         c.write_str(" TOO MANY DESCRIBED DEVICES");
         ok = false;
@@ -388,12 +438,22 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         c.write_str("; TOO MANY NODES TO MODEL");
         return Some(false);
     };
-    let mut resources = Resources::new(mmio, irqs);
-    ok &= bind(c, &tree, &mut resources);
+    let mut resources = Resources::new(mmio, irqs).with_ports(ports);
+    let mut started: [Option<(usize, Started)>; MAX_BOUND] = [const { None }; MAX_BOUND];
+    ok &= bind(c, &tree, &mut resources, &mut started);
     if ok {
         // SAFETY: the caller's contract, and the drivers have just probed: `install`'s.
         ok &= unsafe { controller::install(c, facts) };
     }
+    // After the controller, so the lines are unmasked at the one that will deliver them.
+    let console = if ok {
+        // SAFETY: the caller's contract: once, masked, on the boot path.
+        let (wired, console) = unsafe { wire_all(c, &mut started) };
+        ok &= wired;
+        console
+    } else {
+        None
+    };
 
     if kconfig::QEMU_PCI_TEST_DEVICE {
         ok &= qemu_agrees(c, functions, cpus, matches!(access, Access::Ecam(_)));
@@ -431,6 +491,18 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
             write_hex(c, w.len);
             c.write_str(" ");
             c.write_str(w.what);
+        }
+    }
+    if let Some((node, started)) = console {
+        // SAFETY: the one write, at the end of discovery on the single-threaded boot path;
+        // see `CONSOLE`'s invariant.
+        unsafe {
+            *CONSOLE.get() = Some(Console {
+                tree,
+                resources,
+                node,
+                started: Some(started),
+            });
         }
     }
     Some(ok)
@@ -742,7 +814,12 @@ fn build_tree(
 }
 
 /// Probe every node a driver matches, then start every bound device.
-fn bind(c: &dyn EarlyConsole, tree: &DeviceTree<'_, '_>, resources: &mut Resources<'_>) -> bool {
+fn bind(
+    c: &dyn EarlyConsole,
+    tree: &DeviceTree<'_, '_>,
+    resources: &mut Resources<'_>,
+    started: &mut [Option<(usize, Started)>; MAX_BOUND],
+) -> bool {
     let mut bound: [Option<(usize, Bound)>; MAX_BOUND] = [const { None }; MAX_BOUND];
     let mut ok = true;
     let mut n = 0;
@@ -774,20 +851,242 @@ fn bind(c: &dyn EarlyConsole, tree: &DeviceTree<'_, '_>, resources: &mut Resourc
             }
         }
     }
-    for (d, b) in bound.iter_mut().filter_map(Option::take) {
+    for (slot, (d, b)) in started
+        .iter_mut()
+        .zip(bound.iter_mut().filter_map(Option::take))
+    {
         let Some(&drv) = drivers.get(d) else { continue };
-        if let Err((_, why)) = driver::start(drv, b) {
-            c.write_str("; ");
-            c.write_str(drv.name());
-            c.write_str(" did not start: ");
-            c.write_str(why);
-            ok = false;
+        match driver::start(drv, b) {
+            Ok(s) => *slot = Some((d, s)),
+            Err((_, why)) => {
+                c.write_str("; ");
+                c.write_str(drv.name());
+                c.write_str(" did not start: ");
+                c.write_str(why);
+                ok = false;
+            }
         }
     }
     c.write_str("; ");
     write_usize(c, n);
     c.write_str(" bound");
     ok
+}
+
+/// What wiring one device's interrupt came to.
+enum Wired {
+    /// The driver takes no interrupt.
+    Nothing,
+    Line(IrqNumber),
+    Failed,
+}
+
+/// Wire every started device's interrupt, and find the console among them. Returns
+/// whether all of it worked, and the console's node and token for [`CONSOLE`].
+///
+/// # Safety
+/// Once, from `discover`, with interrupts masked, after the controller is installed.
+unsafe fn wire_all(
+    c: &dyn EarlyConsole,
+    started: &mut [Option<(usize, Started)>; MAX_BOUND],
+) -> (bool, Option<(NodeId, Started)>) {
+    // Before any line is unmasked: the first `init` remaps and masks the 8259A, and on
+    // i686, where the 8259A is the controller, a line enabled before it would be masked
+    // again by whatever called `init` next.
+    arch::interrupt::init();
+    // SAFETY: the caller's contract: once, masked, before a device line is unmasked below.
+    unsafe { arch::interrupt::set_device_dispatch(dispatch) };
+    let chip = arch::interrupt::irq_chip();
+    let mut ok = true;
+    let mut console = None;
+    for entry in started.iter_mut() {
+        let Some((d, s)) = entry.as_ref() else {
+            continue;
+        };
+        let Some(&drv) = controller::DRIVERS.get(*d) else {
+            continue;
+        };
+        match wire(c, chip, drv, s) {
+            Wired::Nothing => {}
+            Wired::Failed => ok = false,
+            Wired::Line(line) => {
+                if drv.name() == uart16550::DRIVER.name() && console.is_none() {
+                    // SAFETY: once, on the single-threaded boot path.
+                    let _ = unsafe { CONSOLE_LINE.set(line) };
+                    let node = s.bound().node();
+                    console = entry.take().map(|(_, s)| (node, s));
+                }
+            }
+        }
+    }
+    (ok, console)
+}
+
+/// Wire a started device's interrupt: its ISA line, the handler registered and enabled in
+/// the table, then the line unmasked at the controller — in that order, so a line is never
+/// live before its handler is.
+fn wire(
+    c: &dyn EarlyConsole,
+    chip: &'static dyn IrqChip,
+    drv: &dyn Driver,
+    started: &Started,
+) -> Wired {
+    let Some((line, handler)) = drv.interrupt() else {
+        return Wired::Nothing;
+    };
+    // A declared device's specifier is the ISA line itself.
+    let number = match line.specifier().cells() {
+        [isa] if *isa < ISA_LINES => IrqNumber(*isa),
+        _ => {
+            c.write_str("; ");
+            c.write_str(drv.name());
+            c.write_str(" INTERRUPT IS NOT AN ISA LINE");
+            return Wired::Failed;
+        }
+    };
+    let registered = {
+        let mut table = HANDLERS.lock_irqsave();
+        table
+            .register(started.bound(), line, number, handler)
+            .and_then(|()| table.enable(started, number))
+    };
+    if registered.is_err() {
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" HANDLER NOT REGISTERED");
+        return Wired::Failed;
+    }
+    chip.enable(number);
+    c.write_str("; ");
+    c.write_str(drv.name());
+    c.write_str(" receives on IRQ ");
+    write_usize(c, number.0 as usize);
+    Wired::Line(number)
+}
+
+/// Look `number` up in the handler table and run what is registered, with the table's lock
+/// released. What the architecture's interrupt path calls for every device line.
+fn dispatch(number: IrqNumber) -> bool {
+    let handler = HANDLERS.lock_irqsave().lookup(number);
+    match handler {
+        Some(handler) => {
+            handler();
+            true
+        }
+        None => false,
+    }
+}
+
+/// The console UART's receive line, once its handler is wired.
+pub fn console_line() -> Option<u32> {
+    CONSOLE_LINE.get().map(|n| n.0)
+}
+
+/// Receive interrupts the console driver has taken, and the bytes they carried.
+pub fn console_received() -> (u32, u32) {
+    uart16550::received()
+}
+
+/// The oldest byte the console's receive interrupt queued.
+pub fn console_read() -> Option<u8> {
+    uart16550::read_byte()
+}
+
+/// Device interrupts dispatched to a handler, and ones that reached none.
+pub fn device_interrupts() -> (u64, u64) {
+    (arch::interrupt::device_irqs(), arch::interrupt::unhandled_irqs())
+}
+
+/// Take the console away and bind it again, checking each step of the removal.
+///
+/// The removal, in the order the phase tokens require: disable the line at the controller
+/// and in the table, stop the device, unregister its handler, and remove it, which gives
+/// its ports and its line back to the ledger. Then the ledger is asked what the device
+/// still holds, which must be nothing. The binding is then made again from the same node,
+/// started, and wired, and must come back on the same line.
+///
+/// `None` when discovery wired no console, so there was nothing to take away. `Some(false)`
+/// for any step that did not do what it says.
+///
+/// # Safety
+/// From the boot path, masked, after [`discover`], with nothing else using the console
+/// driver's binding: see `CONSOLE`'s invariant.
+pub unsafe fn rebind_console(c: &dyn EarlyConsole) -> Option<bool> {
+    // SAFETY: the caller's contract is `CONSOLE`'s invariant.
+    let console = unsafe { (*CONSOLE.get()).as_mut() }?;
+    let line = *CONSOLE_LINE.get()?;
+    let started = console.started.take()?;
+    let drv: &dyn Driver = &uart16550::DRIVER;
+    let chip = arch::interrupt::irq_chip();
+
+    c.write_str("\n             unbinding: ");
+    chip.disable(line);
+    let disabled = HANDLERS.lock_irqsave().disable(&started, line);
+    let bound = driver::stop(drv, started);
+    let unregistered = HANDLERS.lock_irqsave().unregister(&bound, line);
+    let registered_after = HANDLERS.lock_irqsave().registered(line);
+    driver::remove(drv, bound, &mut console.resources);
+    let node = console.node;
+    let ports_left = console
+        .resources
+        .port_claims()
+        .filter(|p| p.node == node)
+        .count();
+    let lines_left = console
+        .resources
+        .irq_claims()
+        .filter(|l| l.node == node)
+        .count();
+
+    let removed = disabled.is_ok() && unregistered.is_ok() && !registered_after;
+    c.write_str(if disabled.is_ok() {
+        "line disabled, "
+    } else {
+        "LINE NOT DISABLED IN THE TABLE, "
+    });
+    c.write_str(if unregistered.is_ok() && !registered_after {
+        "handler unregistered, "
+    } else {
+        "HANDLER STILL REGISTERED, "
+    });
+    write_usize(c, ports_left);
+    c.write_str(" port ranges and ");
+    write_usize(c, lines_left);
+    c.write_str(" lines still claimed");
+    let released = ports_left == 0 && lines_left == 0;
+
+    c.write_str("\n             rebinding: ");
+    let bound = match driver::probe(drv, &console.tree, node, &mut console.resources) {
+        Ok(b) => b,
+        Err(_) => {
+            c.write_str("PROBE FAILED");
+            return Some(false);
+        }
+    };
+    let started = match driver::start(drv, bound) {
+        Ok(s) => s,
+        Err((_, why)) => {
+            c.write_str("DID NOT START: ");
+            c.write_str(why);
+            return Some(false);
+        }
+    };
+    c.write_str("binding ");
+    write_usize(c, uart16550::bindings());
+    let rewired = match wire(c, chip, drv, &started) {
+        Wired::Line(again) if again == line => true,
+        Wired::Line(_) => {
+            c.write_str(", ON A DIFFERENT LINE");
+            false
+        }
+        Wired::Nothing => {
+            c.write_str(", NO INTERRUPT OFFERED");
+            false
+        }
+        Wired::Failed => false,
+    };
+    console.started = Some(started);
+    Some(removed && released && rewired)
 }
 
 /// The checks that hold only on QEMU's PC machines; see the module documentation.

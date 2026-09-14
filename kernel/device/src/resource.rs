@@ -74,6 +74,34 @@ impl IrqLine {
     }
 }
 
+/// An exclusive claim on a range of I/O ports.
+///
+/// The PC's second address space, and the same promise as [`Mmio`]: the ledger has
+/// recorded `[base, base + len)` as this driver's. [`crate::Ports`] turns it into
+/// accesses. Nothing maps it — the port space is addressed by the instruction — so
+/// unlike a window it never reaches the kernel's address space.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PortRange {
+    base: u16,
+    len: u16,
+    owner: Owner,
+    slot: usize,
+}
+
+impl PortRange {
+    pub fn base(&self) -> u16 {
+        self.base
+    }
+
+    pub fn len(&self) -> u16 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// One granted window, as the ledger records it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MmioClaim {
@@ -91,6 +119,18 @@ pub struct MmioClaim {
 pub struct IrqClaim {
     pub spec: Specifier,
     pub node: NodeId,
+    owner: Owner,
+}
+
+/// One granted range of I/O ports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PortClaim {
+    pub base: u16,
+    pub len: u16,
+    /// The node whose ports they are.
+    pub node: NodeId,
+    /// What the driver says answers there, for diagnostics.
+    pub what: &'static str,
     owner: Owner,
 }
 
@@ -115,6 +155,9 @@ pub enum ClaimError {
 pub struct Resources<'s> {
     mmio: &'s mut [Option<MmioClaim>],
     irqs: &'s mut [Option<IrqClaim>],
+    /// `None` on a machine with no port space, where nothing describes ports and so
+    /// nothing can claim one.
+    ports: Option<&'s mut [Option<PortClaim>]>,
     next_owner: u32,
 }
 
@@ -129,8 +172,22 @@ impl<'s> Resources<'s> {
         Resources {
             mmio,
             irqs,
+            ports: None,
             next_owner: 0,
         }
+    }
+
+    /// Let drivers claim I/O ports as well, out of `ports`.
+    ///
+    /// Separate from [`Self::new`] because only the PC has a port space: a platform that
+    /// does not pass storage refuses every port claim, which is the right answer on a
+    /// machine whose devices have no ports to claim.
+    pub fn with_ports(mut self, ports: &'s mut [Option<PortClaim>]) -> Self {
+        for s in ports.iter_mut() {
+            *s = None;
+        }
+        self.ports = Some(ports);
+        self
     }
 
     /// Every window currently granted.
@@ -141,6 +198,11 @@ impl<'s> Resources<'s> {
     /// Every interrupt currently granted.
     pub fn irq_claims(&self) -> impl Iterator<Item = &IrqClaim> + '_ {
         self.irqs.iter().flatten()
+    }
+
+    /// Every port range currently granted.
+    pub fn port_claims(&self) -> impl Iterator<Item = &PortClaim> + '_ {
+        self.ports.iter().flat_map(|p| p.iter().flatten())
     }
 
     /// A fresh owner for a probe about to run.
@@ -219,6 +281,63 @@ impl<'s> Resources<'s> {
         Ok(IrqLine { spec, owner, slot })
     }
 
+    pub(crate) fn claim_ports(
+        &mut self,
+        owner: Owner,
+        node: NodeId,
+        base: u16,
+        len: u16,
+        what: &'static str,
+    ) -> Result<PortRange, ClaimError> {
+        if len == 0 {
+            return Err(ClaimError::Empty);
+        }
+        let last = base.checked_add(len - 1).ok_or(ClaimError::Empty)?;
+        if let Some(held) = self.port_claims().find(|h| {
+            let held_last = h.base.saturating_add(h.len.saturating_sub(1));
+            base <= held_last && h.base <= last
+        }) {
+            return Err(ClaimError::Overlaps {
+                holder: held.node,
+                phys: u64::from(held.base),
+                len: u64::from(held.len),
+            });
+        }
+        let ports = self.ports.as_deref_mut().ok_or(ClaimError::NoRoom)?;
+        let slot = ports
+            .iter()
+            .position(Option::is_none)
+            .ok_or(ClaimError::NoRoom)?;
+        if let Some(s) = ports.get_mut(slot) {
+            *s = Some(PortClaim {
+                base,
+                len,
+                node,
+                what,
+                owner,
+            });
+        }
+        Ok(PortRange {
+            base,
+            len,
+            owner,
+            slot,
+        })
+    }
+
+    /// Give a port range back, on the same terms as [`Self::release_mmio`].
+    pub fn release_ports(&mut self, range: PortRange) {
+        if let Some(s) = self
+            .ports
+            .as_deref_mut()
+            .and_then(|p| p.get_mut(range.slot))
+        {
+            if s.is_some_and(|c| c.owner == range.owner && c.base == range.base) {
+                *s = None;
+            }
+        }
+    }
+
     /// Give a window back. Consumes the handle, so it cannot be used afterwards.
     ///
     /// The slot is cleared only if it still holds this claim: a probe that failed has had
@@ -249,6 +368,11 @@ impl<'s> Resources<'s> {
             }
         }
         for s in self.irqs.iter_mut() {
+            if s.is_some_and(|c| c.owner == owner) {
+                *s = None;
+            }
+        }
+        for s in self.ports.iter_mut().flat_map(|p| p.iter_mut()) {
             if s.is_some_and(|c| c.owner == owner) {
                 *s = None;
             }

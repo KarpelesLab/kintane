@@ -255,15 +255,63 @@ extern "x86-interrupt" fn ipi_tlb_entry(frame: idt::InterruptFrame) {
 /// acknowledged it. It sets no in-service bit, so it must not be acknowledged.
 extern "x86-interrupt" fn spurious_entry(_frame: idt::InterruptFrame) {}
 
-/// Route a line to its handler.
-///
-/// A `match` and not a table because there is one entry. The table arrives with the
-/// device framework, which is what owns the question of who registered for a line;
-/// inventing the registry here would put it in the wrong layer.
+/// Route a line to its handler: the timer is the architecture's own, everything else
+/// belongs to whichever driver the device model bound to it.
 fn dispatch(irq: IrqNumber) {
     if irq == TIMER_IRQ {
         TICKS.fetch_add(1, Ordering::Relaxed);
+        return;
     }
+    // SAFETY: by `DispatchSlot`'s invariant the write happened before any reader.
+    let installed = unsafe { *DEVICE_DISPATCH.0.get() };
+    match installed {
+        Some(dispatch) if dispatch(irq) => {
+            DEVICE_IRQS.fetch_add(1, Ordering::Release);
+        }
+        _ => {
+            // Nobody handles this line. Masked, so a source that stays asserted cannot hold
+            // the CPU in the interrupt path, and counted, so the mistake is visible.
+            irq_chip().disable(irq);
+            UNHANDLED.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// Write-once storage for the device model's dispatch, on the same terms as [`ChipSlot`].
+struct DispatchSlot(UnsafeCell<Option<fn(IrqNumber) -> bool>>);
+
+// SAFETY: the invariant is [`ChipSlot`]'s. `set_device_dispatch` writes once, on the boot
+// CPU with interrupts masked, before any device line is unmasked at the controller and so
+// before any reader can exist, and nothing writes again.
+unsafe impl Sync for DispatchSlot {}
+
+static DEVICE_DISPATCH: DispatchSlot = DispatchSlot(UnsafeCell::new(None));
+
+/// Device interrupts a registered handler ran for, and ones that reached no handler.
+static DEVICE_IRQS: AtomicU64 = AtomicU64::new(0);
+static UNHANDLED: AtomicU64 = AtomicU64::new(0);
+
+/// Send device lines to `dispatch`, which returns whether it found a handler.
+///
+/// The seam to the device model: `arch` is below `device` and may not name its handler
+/// table, so `kernel/platform` installs a function that looks a line up in it.
+///
+/// # Safety
+/// At most once, with interrupts masked, before any device line is unmasked.
+pub unsafe fn set_device_dispatch(dispatch: fn(IrqNumber) -> bool) {
+    // SAFETY: the caller guarantees this is the only write and that no reader exists yet.
+    unsafe { *DEVICE_DISPATCH.0.get() = Some(dispatch) };
+}
+
+/// How many device interrupts have been dispatched to a handler.
+pub fn device_irqs() -> u64 {
+    DEVICE_IRQS.load(Ordering::Acquire)
+}
+
+/// How many interrupts arrived for a line with no enabled handler. Each such line was
+/// masked when it did.
+pub fn unhandled_irqs() -> u64 {
+    UNHANDLED.load(Ordering::Acquire)
 }
 
 /// Build and load the IDT, then initialise the interrupt controller.

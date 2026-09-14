@@ -95,6 +95,7 @@ mod tests {
             args: vec!["-d".into(), "int,guest_errors".into(), "-m".into()],
             success_code: 0,
             input: Vec::new(),
+            serial_probe: false,
         });
         assert_eq!(m.args, ["-d", "guest_errors,cpu_reset", "-m"]);
     }

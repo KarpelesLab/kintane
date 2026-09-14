@@ -43,3 +43,32 @@ pub fn call_on_secondary(_cpu: usize, _f: fn(u64) -> u64, _arg: u64) -> Option<u
 pub fn device_windows() -> Option<&'static [DeviceWindow]> {
     Some(arch::kspace::device_windows())
 }
+
+/// No console on these ports receives on interrupt yet, so there is no line to report.
+pub fn console_line() -> Option<u32> {
+    None
+}
+
+/// Nothing received: `(interrupts, bytes)`.
+pub fn console_received() -> (u32, u32) {
+    (0, 0)
+}
+
+/// Nothing to read.
+pub fn console_read() -> Option<u8> {
+    None
+}
+
+/// No device interrupts are dispatched through the device model here: `(dispatched,
+/// unhandled)`.
+pub fn device_interrupts() -> (u64, u64) {
+    (0, 0)
+}
+
+/// Nothing bound, so nothing to unbind. `None`: not checked.
+///
+/// # Safety
+/// None required; `unsafe` only so every provider has one signature.
+pub unsafe fn rebind_console(_c: &dyn EarlyConsole) -> Option<bool> {
+    None
+}
