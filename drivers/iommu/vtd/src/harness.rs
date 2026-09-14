@@ -21,6 +21,9 @@ const CAP_FRO: u64 = FRO_UNITS << 24;
 /// ECAP.IRO: the IOTLB register block, 0x100 bytes in (0x10 sixteen-byte units).
 pub const IRO_UNITS: u64 = 0x10;
 const ECAP_IRO: u64 = IRO_UNITS << 8;
+/// ECAP.IR and ECAP.EIM: interrupt remapping, with extended interrupt mode, as QEMU's
+/// `intel-iommu,intremap=on` behind a split irqchip reports.
+const ECAP_REMAPPING: u64 = reg::ecap::IR | reg::ecap::EIM;
 
 /// The IOTLB command register this CAP/ECAP places: IRO block + 8.
 pub const IOTLB_CMD: usize = (IRO_UNITS as usize) * 16 + 8;
@@ -41,7 +44,25 @@ impl MockRegs {
             words: RefCell::new(HashMap::new()),
         };
         regs.words.borrow_mut().insert(reg::CAP, CAP_MGAW | CAP_FRO);
+        regs.words
+            .borrow_mut()
+            .insert(reg::ECAP, ECAP_IRO | ECAP_REMAPPING);
+        regs
+    }
+
+    /// A unit with no interrupt remapping.
+    pub fn without_remapping() -> MockRegs {
+        let regs = MockRegs::new();
         regs.words.borrow_mut().insert(reg::ECAP, ECAP_IRO);
+        regs
+    }
+
+    /// A unit that remaps interrupts in xAPIC mode only: 8-bit destinations.
+    pub fn xapic_remapping() -> MockRegs {
+        let regs = MockRegs::new();
+        regs.words
+            .borrow_mut()
+            .insert(reg::ECAP, ECAP_IRO | reg::ecap::IR);
         regs
     }
 

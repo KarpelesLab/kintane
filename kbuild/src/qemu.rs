@@ -375,11 +375,24 @@ fn x86_platform(
 ) -> Vec<String> {
     let mut args = vec!["-smp".to_string(), res.int("QEMU_CPUS").max(1).to_string()];
     // The IOMMU device must be created before the PCI devices it governs, so it goes first.
-    // `intremap=on` needs the split irqchip the machine line asks for.
+    // `intremap=on` needs the split irqchip the machine line asks for. `eim=on`: extended
+    // interrupt mode, whose remapping entries carry a 32-bit x2APIC ID. Left on `auto`, QEMU
+    // turns it on only with an in-kernel irqchip, which TCG does not have.
     if res.is_on("IOMMU") {
-        args.extend(["-device".to_string(), "intel-iommu,intremap=on".to_string()]);
+        args.extend([
+            "-device".to_string(),
+            "intel-iommu,intremap=on,eim=on".to_string(),
+        ]);
     }
-    args.extend(block_disk(res, image, "virtio-blk-pci,disable-legacy=on"));
+    // On x86_64-bios the disk has no MSI-X table (`vectors=0`), so its interrupt is its pin,
+    // which only `_PRT` routes: that preset proves INTx through the ACPI namespace while the
+    // other x86_64 presets keep proving MSI-X. i686 keeps the table its 8259A never uses.
+    let disk = if res.is_on("ARCH_X86_64") && res.is_on("KINBOOT_BIOS") {
+        "virtio-blk-pci,disable-legacy=on,vectors=0"
+    } else {
+        "virtio-blk-pci,disable-legacy=on"
+    };
+    args.extend(block_disk(res, image, disk));
     // On `pc`, slot 0x1e: the chipset routes its INTA to a different line from the disk's
     // function, and a line has one handler (`device::Handlers`), so the two cannot share.
     // On q35 no PCI line is trusted (`PCI_LINE_TRUSTED`) and the card is polled wherever

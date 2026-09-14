@@ -14,8 +14,8 @@
 //!   is memory-mapped. See [`mcfg`].
 //! - the **FADT** (§5.2.9), for the PM timer and the reset register only. See [`fadt`].
 //!
-//! Nothing here interprets AML. The DSDT's device namespace is a later piece of work,
-//! and what it holds, such as interrupt routing for PCI (`_PRT`), is not claimed here.
+//! - the **DSDT and SSDTs** (§5.2.11), whose AML [`aml`] loads into a namespace and evaluates as
+//!   far as routing a PCI function's interrupt pin needs: `_PRT` and interrupt link devices.
 //!
 //! # Untrusted input
 //!
@@ -35,6 +35,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod aml;
 pub mod dmar;
 pub mod fadt;
 pub mod madt;

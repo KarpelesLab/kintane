@@ -134,31 +134,55 @@ static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
 /// The network card's interrupt line, once its handler is wired.
 static NET_LINE: BootCell<IrqNumber> = BootCell::new();
 
-/// Message-signalled lines there can be; `controller::MSI_LINES` is at most this long.
+/// Whether the block device's PCI function has an MSI-X table, whatever it came up on.
+static BLOCK_MSIX: BootCell<bool> = BootCell::new();
+
+/// Lines past the ISA ones there can be; `controller::MSI_LINES` is at most this long.
 const MAX_MSI_ROUTES: usize = 16;
 /// CPUs whose interrupts on a message-signalled line are counted apart.
 const MSI_COUNTED_CPUS: usize = 8;
+/// PCI interrupt pins routed through the ACPI namespace during discovery.
+const MAX_PIN_ROUTES: usize = 32;
 
-/// Where each message-signalled line is delivered from, indexed from the start of
-/// `controller::MSI_LINES`. `None` for a line nothing was wired to.
+/// Where each line past the ISA ones is delivered from, indexed from the start of
+/// `controller::MSI_LINES`: a message-signalled interrupt, or a PCI pin through the I/O APIC
+/// entry `_PRT` named. `None` for a line nothing was wired to.
 ///
 /// Behind a lock because moving an interrupt to another CPU writes the entry after
 /// discovery, from whichever CPU asks; see [`route_interrupt`].
-static MSI_ROUTES: SpinLock<[Option<MsiRoute>; MAX_MSI_ROUTES], arch::Cpu> =
-    SpinLock::with_class([const { None }; MAX_MSI_ROUTES], &MSI_ROUTES_CLASS);
-static MSI_ROUTES_CLASS: LockClass = LockClass::new("platform.msi-routes");
+static LINE_ROUTES: SpinLock<[Option<LineRoute>; MAX_MSI_ROUTES], arch::Cpu> =
+    SpinLock::with_class([const { None }; MAX_MSI_ROUTES], &LINE_ROUTES_CLASS);
+static LINE_ROUTES_CLASS: LockClass = LockClass::new("platform.line-routes");
 
-/// Interrupts on each message-signalled line whose handler ran on each CPU, counted by
-/// [`dispatch`], which runs on the CPU that took the interrupt.
+/// Interrupts on each of those lines whose handler ran on each CPU, counted by [`dispatch`],
+/// which runs on the CPU that took the interrupt.
 static MSI_TAKEN: [[AtomicU64; MSI_COUNTED_CPUS]; MAX_MSI_ROUTES] =
     [const { [const { AtomicU64::new(0) }; MSI_COUNTED_CPUS] }; MAX_MSI_ROUTES];
 
-/// One wired message-signalled interrupt.
-struct MsiRoute {
-    /// The MSI-X table and the entry in it, which is what moving the interrupt rewrites.
-    /// `None` for MSI, whose message is in configuration space and so is programmed only
-    /// during discovery, the one time configuration space is reachable.
-    entry: Option<(MsixTable, u16)>,
+/// What one wired line past the ISA ones is delivered from.
+enum LineRoute {
+    /// A message-signalled interrupt. `entry` is the MSI-X table and the entry in it, which
+    /// is what moving the interrupt rewrites; `None` for MSI, whose message is in
+    /// configuration space and so is programmed only during discovery, the one time
+    /// configuration space is reachable.
+    ///
+    /// `remapped` once an IOMMU's remapping table, not the message, says where it goes; see
+    /// [`set_line_message`].
+    Message {
+        entry: Option<(MsixTable, u16)>,
+        remapped: bool,
+    },
+    /// A PCI interrupt pin, through the I/O APIC entry its route names.
+    Pin(PinRoute),
+}
+
+/// A PCI function's interrupt pin as the ACPI namespace routes it: the global system
+/// interrupt it drives, and its trigger and polarity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinRoute {
+    pub gsi: u32,
+    pub active_low: bool,
+    pub level: bool,
 }
 
 /// The console's binding, kept after discovery so the serial check can take the device
@@ -485,10 +509,20 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     }
     // After the controller, so the lines are unmasked at the one that will deliver them.
     let console = if ok {
+        // The namespace's routes for PCI pins, before anything is wired to them.
+        let no_route = PinRoute {
+            gsi: 0,
+            active_low: false,
+            level: false,
+        };
+        let mut pins = [(Address::new(0, 0, 0), no_route); MAX_PIN_ROUTES];
+        let routed =
+            controller::pin_routes(c, &tables, config_space(&access), functions, &mut pins);
         // SAFETY: the caller's contract: once, masked, on the boot path.
         let messages = Messages {
             resources: &resources,
             cfg: config_space(&access),
+            pins: &pins[..routed],
         };
         let (wired, console) = unsafe { wire_all(c, &tree, &messages, &mut started) };
         ok &= wired;
@@ -974,6 +1008,11 @@ unsafe fn wire_all(
             Origin::Pci(f) => Some(f),
             _ => None,
         };
+        if drv.name() == virtio_blk::DRIVER.name() {
+            let msix = function.is_some_and(|f| msi::msix(f).is_some());
+            // SAFETY: once, on the single-threaded boot path.
+            let _ = unsafe { BLOCK_MSIX.set(msix) };
+        }
         match wire(c, chip, drv, s, function, Some(messages)) {
             Wired::Nothing => {}
             Wired::Failed => ok = false,
@@ -998,11 +1037,77 @@ unsafe fn wire_all(
     (ok, console)
 }
 
-/// What wiring a message-signalled interrupt needs beyond the device: the ledger, to find
-/// the window its MSI-X table is in, and configuration space, to turn the capability on.
+/// What wiring a PCI function's interrupt needs beyond the device: the ledger, to find the
+/// window its MSI-X table is in; configuration space, to turn the capability on; and the pin
+/// routes the ACPI namespace gave, for a function without one.
 struct Messages<'a, 's> {
     resources: &'a Resources<'s>,
     cfg: Option<&'a dyn ConfigSpace>,
+    pins: &'a [(Address, PinRoute)],
+}
+
+/// The first line past the ISA ones nothing is wired to, and its index in [`LINE_ROUTES`].
+fn free_line(routes: &[Option<LineRoute>; MAX_MSI_ROUTES]) -> Option<(usize, IrqNumber)> {
+    let slot = routes.iter().position(Option::is_none)?;
+    let line = controller::MSI_LINES
+        .start
+        .checked_add(u32::try_from(slot).ok()?)?;
+    controller::MSI_LINES
+        .contains(&line)
+        .then_some((slot, IrqNumber(line)))
+}
+
+/// Wire a PCI function's interrupt pin through the I/O APIC entry `_PRT` named for it, in a
+/// line's order: a free line, the handler registered and enabled, then the entry programmed
+/// unmasked, with the route's trigger and polarity, for the line's vector on the boot CPU.
+///
+/// The line comes from the range message-signalled interrupts use, past the ISA lines, so
+/// its vector is one no ISA IRQ is also routed to.
+fn wire_pin(
+    c: &dyn EarlyConsole,
+    drv: &dyn Driver,
+    started: &Started,
+    line: &IrqLine,
+    handler: fn(),
+    route: PinRoute,
+) -> Wired {
+    let failed = |why: &str| {
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" ");
+        c.write_str(why);
+        Wired::Failed
+    };
+    let mut routes = LINE_ROUTES.lock_irqsave();
+    let Some((slot, number)) = free_line(&routes) else {
+        return failed("FOUND NO FREE LINE FOR A PCI PIN");
+    };
+    let registered = {
+        let mut table = HANDLERS.lock_irqsave();
+        table
+            .register(started.bound(), line, number, handler)
+            .and_then(|()| table.enable(started, number))
+    };
+    if registered.is_err() {
+        return failed("HANDLER NOT REGISTERED");
+    }
+    if !controller::route_pin(number.0, &route, false) {
+        return failed("HAS A _PRT ROUTE NO I/O APIC ENTRY TAKES");
+    }
+    c.write_str("; ");
+    c.write_str(drv.name());
+    c.write_str(" receives its pin through _PRT on GSI ");
+    write_usize(c, route.gsi as usize);
+    c.write_str(if route.level { ", level" } else { ", edge" });
+    c.write_str(if route.active_low {
+        ", active low"
+    } else {
+        ", active high"
+    });
+    c.write_str(", line ");
+    write_usize(c, number.0 as usize);
+    routes[slot] = Some(LineRoute::Pin(route));
+    Wired::Line(number)
 }
 
 /// Configuration space as discovery reaches it, if it does.
@@ -1016,7 +1121,9 @@ fn config_space(access: &Access) -> Option<&dyn ConfigSpace> {
 
 /// Whether `line` is one of the message-signalled lines and something was wired to it.
 fn is_msi_line(line: u32) -> bool {
-    msi_slot(line).is_some_and(|slot| MSI_ROUTES.lock_irqsave()[slot].is_some())
+    msi_slot(line).is_some_and(|slot| {
+        matches!(LINE_ROUTES.lock_irqsave()[slot], Some(LineRoute::Message { .. }))
+    })
 }
 
 /// The index of `line` among the message-signalled lines.
@@ -1057,16 +1164,8 @@ fn wire_msi(
     let Some(cfg) = messages.cfg else {
         return failed("HAS A VECTOR BUT NO CONFIGURATION SPACE TO ENABLE IT IN");
     };
-    let mut routes = MSI_ROUTES.lock_irqsave();
-    let free = routes.iter().position(Option::is_none);
-    let Some((slot, number)) = free.and_then(|s| {
-        let line = controller::MSI_LINES
-            .start
-            .checked_add(u32::try_from(s).ok()?)?;
-        controller::MSI_LINES
-            .contains(&line)
-            .then_some((s, IrqNumber(line)))
-    }) else {
+    let mut routes = LINE_ROUTES.lock_irqsave();
+    let Some((slot, number)) = free_line(&routes) else {
         return failed("FOUND NO FREE LINE FOR A MESSAGE-SIGNALLED INTERRUPT");
     };
     let Some((address, data)) = controller::msi_message(number.0, 0) else {
@@ -1104,8 +1203,9 @@ fn wire_msi(
         c.write_str(drv.name());
         c.write_str(" receives MSI-X entry ");
         write_usize(c, usize::from(entry));
-        MsiRoute {
+        LineRoute::Message {
             entry: Some((table, entry)),
+            remapped: false,
         }
     } else if let Some(cap) = msi::msi(f) {
         let Ok(data) = u16::try_from(data) else {
@@ -1117,7 +1217,10 @@ fn wire_msi(
         c.write_str("; ");
         c.write_str(drv.name());
         c.write_str(" receives MSI");
-        MsiRoute { entry: None }
+        LineRoute::Message {
+            entry: None,
+            remapped: false,
+        }
     } else {
         return failed("CLAIMED A VECTOR ITS FUNCTION DOES NOT HAVE");
     };
@@ -1194,13 +1297,20 @@ fn wire(
     }
     // A PCI function's line is what firmware routed, which is the right answer only on the
     // controller firmware routed for; see `controller::PCI_LINE_TRUSTED`. Where it is not,
-    // the device is left unwired and its driver polls, rather than being handed a line its
-    // interrupts never reach — which would look wired and time out instead.
-    if function.is_some() && !controller::PCI_LINE_TRUSTED {
-        c.write_str("; ");
-        c.write_str(drv.name());
-        c.write_str(" polled: no PCI interrupt route on this controller");
-        return Wired::Nothing;
+    // the pin goes where `_PRT` routed it. With no route, the device is left unwired and its
+    // driver polls, rather than being handed a line its interrupts never reach — which would
+    // look wired and time out instead.
+    if let (Some(f), false) = (function, controller::PCI_LINE_TRUSTED) {
+        let route = messages.and_then(|m| m.pins.iter().find(|(at, _)| *at == f.address));
+        return match route {
+            Some(&(_, route)) => wire_pin(c, drv, started, line, handler, route),
+            None => {
+                c.write_str("; ");
+                c.write_str(drv.name());
+                c.write_str(" polled: no PCI interrupt route on this controller");
+                Wired::Nothing
+            }
+        };
     }
     // A declared device's specifier is the ISA line itself.
     let number = match line.specifier().cells() {
@@ -1280,11 +1390,17 @@ pub fn delivers_msi() -> bool {
 /// nothing else has to change for the handler to run there.
 pub fn route_interrupt(line: u32, cpu: usize) -> Result<(), &'static str> {
     let slot = msi_slot(line).ok_or("not a message-signalled line")?;
-    let routes = MSI_ROUTES.lock_irqsave();
+    let routes = LINE_ROUTES.lock_irqsave();
     let route = routes[slot]
         .as_ref()
         .ok_or("nothing is wired to that line")?;
-    let Some((table, entry)) = &route.entry else {
+    let LineRoute::Message { entry, remapped } = route else {
+        return Err("a PCI pin, whose I/O APIC entry delivers to the boot CPU");
+    };
+    if *remapped {
+        return Err("a remapped interrupt, whose CPU its IOMMU table entry names");
+    }
+    let Some((table, entry)) = entry else {
         return Err("an MSI route, which only discovery can program");
     };
     let (address, data) =
@@ -1293,6 +1409,67 @@ pub fn route_interrupt(line: u32, cpu: usize) -> Result<(), &'static str> {
         return Err("the MSI-X entry did not take the message");
     }
     Ok(())
+}
+
+/// The vector device line `line` is dispatched on, and the APIC ID of CPU `cpu`: what a
+/// message for the line names, and what an IOMMU remapping table entry names in its place.
+pub fn message_target(line: u32, cpu: usize) -> Option<(u8, u32)> {
+    controller::message_target(line, cpu)
+}
+
+/// Write `address` and `data` into message-signalled `line`'s MSI-X entry, masked while it
+/// is written, and keep them there: the message of an interrupt remapped through an IOMMU,
+/// which names a table entry rather than a CPU. [`route_interrupt`] refuses to move the line
+/// from then on, since the table entry is what says where it goes.
+pub fn set_line_message(line: u32, address: u64, data: u32) -> Result<(), &'static str> {
+    let slot = msi_slot(line).ok_or("not a message-signalled line")?;
+    let mut routes = LINE_ROUTES.lock_irqsave();
+    let Some(LineRoute::Message {
+        entry: Some((table, index)),
+        remapped,
+    }) = &mut routes[slot]
+    else {
+        return Err("not a line on an MSI-X entry");
+    };
+    if !table.retarget(*index, address, data) {
+        return Err("the MSI-X entry did not take the message");
+    }
+    *remapped = true;
+    Ok(())
+}
+
+/// The message message-signalled `line`'s MSI-X entry holds, read back from the table.
+pub fn line_message(line: u32) -> Option<(u64, u32)> {
+    let slot = msi_slot(line)?;
+    match &LINE_ROUTES.lock_irqsave()[slot] {
+        Some(LineRoute::Message {
+            entry: Some((table, index)),
+            ..
+        }) => table.message(*index),
+        _ => None,
+    }
+}
+
+/// The route of the PCI pin wired to `line`, if a pin is what is wired to it.
+pub fn pin_route(line: u32) -> Option<PinRoute> {
+    let slot = msi_slot(line)?;
+    match &LINE_ROUTES.lock_irqsave()[slot] {
+        Some(LineRoute::Pin(route)) => Some(*route),
+        _ => None,
+    }
+}
+
+/// The I/O APIC entry of the PCI pin wired to `line`, read back from the controller and
+/// checked against the pin's route: the line's vector, the boot CPU, unmasked, and the
+/// route's trigger and polarity. The route when all of it is as programmed.
+pub fn check_pin_entry(line: u32) -> Result<PinRoute, &'static str> {
+    let route = pin_route(line).ok_or("NOT A PCI PIN'S LINE")?;
+    controller::check_pin(line, &route).map(|()| route)
+}
+
+/// Whether the block device's PCI function has an MSI-X table, whatever it came up on.
+pub fn block_has_msix() -> bool {
+    BLOCK_MSIX.get().copied().unwrap_or(false)
 }
 
 /// The console UART's receive line, once its handler is wired.

@@ -25,3 +25,9 @@ pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
     c.write_str("skipped: needs MM_PAGED");
     Check::Skipped
 }
+
+/// Skipped: no device, so no interrupt to remap.
+pub fn remap_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("skipped: needs MM_PAGED");
+    Check::Skipped
+}

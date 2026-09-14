@@ -700,47 +700,90 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
       a refusal fails bring-up. On a PC with messages, `block irq` fails a test run whose
       disk came up on anything else, so a silent fallback cannot turn the interrupt checks
       into skips.
-    - **INTx is the fallback.** A function with neither capability, or one on a platform
-      without messages, keeps the line in its interrupt-line register. Firmware routed that
-      line *for the 8259A*. Where the 8259A is the controller — i686 — that is the answer, so
-      the platform wires it (`PCI_LINE_TRUSTED`), and `virtio-blk` takes its completions on
-      it. Under the I/O APIC — x86_64 — a PCI pin arrives on a different input altogether: on
-      q35, a global system interrupt from 16 up, level-triggered and active low, named only
-      by `_PRT` in the ACPI namespace, which is AML. Wiring the register there would program
-      an input nothing drives, and the device would look wired and time out. So on x86_64 a
-      PCI function with neither capability is left polled, and the boot says so.
-    - **What a minimal `_PRT` interpreter would need.** Enough AML to load the DSDT and SSDTs
-      into a namespace:
-      - `Scope`, `Device`, `Name`, `Method`, `Package`, integers, strings and buffers,
-        `_HID`, `_ADR`, `_UID` and `_STA`, and the control flow and arithmetic that real
-        `_PRT` and link methods use.
-      - Evaluate `\_PIC(1)` first, to tell firmware the I/O APIC is in use; many `_PRT`s
-        return different tables after it.
-      - Evaluate `_PRT` under each host bridge and bridge — on real firmware it is often a
-        method, not a package — into (address, pin, source, source index) entries.
-      - Where the source names a PCI interrupt link device, evaluate its `_CRS`, choose from
-        `_PRS` and commit the choice with `_SRS`.
-      - Apply the standard swizzle for a function behind a bridge with no `_PRT` of its own.
-      - Program the resulting GSI level-triggered and active low. The I/O APIC driver applies
-        polarity and trigger only to ISA source overrides today.
+    - **INTx, where there is neither capability.** A function with neither keeps an interrupt
+      pin, and where that arrives depends on the controller.
+      - *i686, on the 8259A*: the pin arrives at the line in the function's interrupt-line
+        register, which firmware routed for the 8259A. The platform wires that line
+        (`PCI_LINE_TRUSTED`), and `virtio-blk` takes its completions on it.
+      - *x86_64, on the I/O APIC*: the pin arrives at a global system interrupt that only the
+        ACPI namespace's `_PRT` names (16 to 23 on q35). The register's value would program
+        an input nothing drives.
 
-      Operation regions are reached through memory and I/O ports. Notifications, `_OSI`
-      beyond a fixed answer, and mutex semantics can wait for the full interpreter Phase 7
-      needs.
-    - **What an IOMMU's interrupt remapping needs from this.** Intel VT-d and AMD-Vi replace
-      the message programmed here with a *remappable* format: the address carries an index
-      into the IOMMU's interrupt remapping table. The table entry holds the destination,
-      vector and trigger, and is checked against the requesting function's
-      bus/device/function. For this code that means:
-      - `apic::msi::message` becomes one of two encoders, chosen by the platform.
-      - A route owns a remapping-table index as well as a line, allocated at wiring.
-      - `route_interrupt` rewrites that entry and flushes the IOMMU's interrupt entry cache;
-        the MSI-X entry, still behind the same claim, stops changing.
+        So discovery loads the DSDT and SSDTs into `boot/acpi::aml`, evaluates `\_PIC(1)`,
+        and asks `_PRT` about every function with a pin (`controller::pin_routes`). A pin
+        with a route is wired like a vector: a free line past the ISA lines, the handler
+        registered and enabled, and then the GSI's redirection entry programmed. The entry
+        gets the route's trigger and polarity and the line's vector on the boot CPU
+        (`apic::Controller::route_gsi`, which refuses a GSI an ISA IRQ owns). A pin with no
+        route is left polled, and the boot says so.
 
-      It is also the only way to name a CPU whose APIC ID is above 255, which `message`
-      refuses today rather than truncate.
+        `x86_64-bios` runs the disk with no MSI-X table to prove this, and `block irq` reads
+        the entry back.
+    - **The AML interpreter** (`boot/acpi::aml`) is what routing needs, and no more. It is
+      host-tested against the DSDTs in the q35 and pc captures, and fuzzed (`aml`).
+      - *Loading* records every named object and where it is defined: `Scope`, `Device`,
+        `Processor`, `PowerResource`, `ThermalZone`, `Name`, `Method`, `OperationRegion`
+        with constant bounds, `Field`, the names of `IndexField` and `BankField`, `Mutex`,
+        `Event`, `Alias`, `External` and `DataRegion`. Names resolve by ACPI's rules:
+        absolute, parent-prefixed, a path, or a single segment searched outward.
+      - *Evaluation* runs methods with arguments and locals. It covers:
+        - `If`/`Else`, `While`, `Return` and `Store`;
+        - integer arithmetic and comparisons, 32-bit in a revision 1 table;
+        - strings, buffers, and packages whose names are references;
+        - `Index` as a store target, and `Create*Field`.
+
+        Fields are read and written through a host trait. The kernel's host reaches PCI
+        configuration space, and refuses ports and memory.
+      - *Routing* (`route_pin`) asks the `_PRT` of the function's bus. Where a bridge has
+        none, it swizzles the pin onto the bridge above. An entry either names the GSI itself
+        (level-triggered, active low) or names a link device, whose `_CRS` gives the GSI. A
+        link with nothing assigned is given its first `_PRS` choice through `_SRS`.
+      - *Bounded.* Every evaluation has a step budget, nesting and calls are capped, and
+        storage is the caller's. An opcode it does not know is an error naming the table
+        offset. A loop is `Budget` and recursion is `TooDeep`, never a hang or a panic.
+      - *Not implemented*: notifications, `_OSI`, mutex semantics, and executable code at
+        table level. They belong to the full interpreter Phase 7 needs.
+    - **Interrupt remapping** (x86_64 with `IOMMU`). VT-d replaces the message with a
+      *remappable* one. Its address carries an index into the IOMMU's interrupt remapping
+      table. The table entry holds the destination, the vector and the trigger, and the one
+      requester it accepts (`drivers/iommu/vtd`, `remap.rs`).
+
+      After confining the disk's DMA, the kernel builds a table whose entry 0 delivers the
+      disk's line vector to the boot CPU and accepts only the disk. It turns remapping on with
+      extended interrupt mode. Then it rewrites the disk's MSI-X entry to name entry 0
+      (`platform::set_line_message`). From then on:
+      - The table entry, not the MSI-X entry, says where the interrupt goes.
+        `route_interrupt` therefore refuses a remapped line rather than rewrite a message the
+        IOMMU ignores. Moving one would mean rewriting its table entry.
+      - A destination is a 32-bit x2APIC ID, the only way to name a CPU whose ID is above 255.
+        `apic::msi::message` still refuses such an ID rather than truncate it.
+      - An interrupt whose entry is absent is blocked and recorded in the fault log with the
+        entry's index. So is one from a function the entry does not name.
+      - Other functions' MSI-X and the I/O APIC's entries stay in compatibility format. QEMU
+        still delivers those with remapping on (the network card does on `x86_64-iommu`).
+
+      The interrupt entry cache is not flushed when an entry changes. That needs queued
+      invalidation, which the driver does not implement. QEMU keeps no such cache for an
+      emulated device, so the `remap` check's changes apply at once there. Hardware needs the
+      flush first.
+
+      **The Phase 5 domain's forwarded interrupt.** A driver in a domain does not own its
+      vector. The kernel keeps the line, the handler and, with remapping, the table entry, and
+      forwards each interrupt to the domain as a message. Remapping does not change that path:
+      the kernel's handler runs on the line's vector either way. The interface a domain's
+      device relies on is:
+      - `platform::message_target(line, cpu)`: the vector and APIC ID an entry must name;
+      - `platform::set_line_message`: the one place the MSI-X entry is written;
+      - `iommu::remap_disk_interrupt`, to be generalised to a function per domain, which
+        allocates the entry and validates the requester.
+
+      A forwarded interrupt that is not remapped keeps its compatibility-format message and
+      works as before. Remapping it adds only kernel memory the device cannot write, which
+      names the CPU and refuses every other requester. The domain never touches the MSI-X
+      table or the remapping table.
 - **ACPI.** `boot/acpi` parses the RSDP, RSDT/XSDT, MADT, MCFG and the FADT's PM timer
-  and reset register. There is no `unsafe`: physical memory is read through a trait.
+  and reset register. It also loads the DSDT's and SSDTs' AML, as far as routing PCI pins
+  needs ("PCI interrupts", above). There is no `unsafe`: physical memory is read through a trait.
   Every table's length is capped and its checksum checked before any field is read. A
   malformed MADT entry ends the walk with an error naming its offset, and an unknown
   entry type is skipped. Host tests run against the complete table sets of q35 and pc
@@ -948,6 +991,14 @@ isolated DMA-capable driver's containment rests on, demonstrated in the kernel:
   driver is plain logic over three traits — registers, a frame source, physical memory — and is
   host-tested against models of each; the `unsafe` that turns a physical address into a load is
   the kernel's, in `kernel/main/src/iommu.rs`.
+- **Interrupt remapping** (`drivers/iommu/vtd`, `remap.rs`) puts the disk's MSI-X behind the
+  same unit. Its message names a table entry that delivers to the boot CPU and accepts only the
+  disk. The `remap` check proves three things:
+  - the entry decides delivery;
+  - an absent entry, or one naming another function, blocks and logs the interrupt;
+  - a destination above 255 is carried whole.
+
+  See "PCI interrupts" above.
 - **`kernel/main/src/block.rs`** builds a domain that maps *exactly* the disk's DMA grant and
   nothing else, attaches the disk, and turns translation on before the device does any DMA. The
   block check then runs with every DMA translated, proving an in-grant DMA still works; a

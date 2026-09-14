@@ -232,7 +232,7 @@ fn a_superpage_can_be_unmapped_and_split_regions_still_translate() {
 
 /// A helper for the tests to reach the internals the hardware would.
 impl<R: Regs, M: PhysMem> Unit<R, M> {
-    fn regs_for_test(&self) -> &R {
+    pub(crate) fn regs_for_test(&self) -> &R {
         &self.regs
     }
 

@@ -37,6 +37,7 @@
 mod fault;
 mod pagetable;
 mod regs;
+mod remap;
 
 #[cfg(test)]
 mod harness;
@@ -47,6 +48,7 @@ mod tests;
 pub use fault::Fault;
 pub use pagetable::{Domain, Perm};
 pub use regs::reg;
+pub use remap::{IRT_ENTRIES, InterruptTable, Irte, message_handle, remappable_message};
 
 /// The unit's memory-mapped registers, at offsets from its register base (VT-d §10.4).
 ///
@@ -104,6 +106,13 @@ pub enum Error {
     AddressWidth,
     /// A source id outside the 0..0x10000 a PCI segment holds.
     BadSource,
+    /// The unit cannot remap interrupts (`ECAP.IR` clear).
+    NoInterruptRemapping,
+    /// An interrupt remapping table index past the table.
+    BadHandle,
+    /// A destination the table's interrupt mode cannot hold: an APIC ID above 255 without
+    /// extended interrupt mode.
+    Destination,
 }
 
 /// Reads before a register bit is called stuck. Under QEMU each of these completes at once;

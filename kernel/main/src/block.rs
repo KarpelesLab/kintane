@@ -28,7 +28,7 @@ use mm::phys::FrameAllocator;
 use virtio_blk::VirtioBlk;
 use virtio_blk::mem::Dma;
 
-use crate::{Check, Live, Locks, iommu, write_usize};
+use crate::{Check, Live, Locks, intx, iommu, write_usize};
 
 /// Frames for the rings and for every request that may be in flight: each has its own
 /// header, status byte and bounce buffer, so the driver can have several outstanding.
@@ -171,6 +171,14 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
             return Check::Failed;
         }
         c.write_str("; ");
+        // On MSI-X, the disk's interrupt goes through the IOMMU as well: its table entry, not
+        // its message, then names the CPU, and only the disk may use it.
+        if let Some(line) = platform::block_line().filter(|&l| platform::interrupt_is_msi(l)) {
+            if !iommu::remap_disk_interrupt(c, frames, line) {
+                return Check::Failed;
+            }
+            c.write_str("; ");
+        }
         true
     } else {
         false
@@ -519,12 +527,21 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no block device");
         return Check::Skipped;
     };
-    // QEMU's virtio-blk-pci has an MSI-X table. On a platform that delivers messages, a test
-    // disk that came up on anything else fell back somewhere, and this check and the next
-    // would skip where they should have measured.
+    // QEMU's virtio-blk-pci has an MSI-X table unless it was started with `vectors=0`. On a
+    // platform that delivers messages, a test disk whose function has one and came up on
+    // anything else fell back somewhere; one whose function has none must be on its pin,
+    // routed through `_PRT`. Falling back to polling would turn this check and the next into
+    // skips where they should have measured.
+    let pin = platform::block_line().and_then(intx::pin_route);
     if kconfig::QEMU_BLOCK_TEST && platform::delivers_msi() && !blk.uses_msix() {
-        c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
-        return Check::Failed;
+        if intx::block_has_msix() {
+            c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
+            return Check::Failed;
+        }
+        if pin.is_none() {
+            c.write_str("THE DISK HAS NO MSI-X AND IS NOT ON ITS PIN THROUGH _PRT");
+            return Check::Failed;
+        }
     }
     let Some(line) = platform::block_line() else {
         c.write_str("skipped: the disk is polled, no interrupt route on this port");
@@ -534,6 +551,32 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
     write_usize(c, line as usize);
     if blk.uses_msix() {
         c.write_str(", MSI-X");
+    }
+    if let Some(route) = pin {
+        c.write_str(", INTx on GSI ");
+        write_usize(c, route.gsi as usize);
+        c.write_str(if route.level { " level" } else { " edge" });
+        c.write_str(if route.active_low {
+            " active low"
+        } else {
+            " active high"
+        });
+        // The entry as the I/O APIC holds it, read back: the line's vector, the boot CPU,
+        // unmasked, and the trigger and polarity the route gave.
+        if let Err(why) = intx::check_pin_entry(line) {
+            c.write_str(": ");
+            c.write_str(why);
+            return Check::Failed;
+        }
+        // What QEMU's q35 wires a PCI pin to: GSI 16 to 23, level-triggered, active high. A
+        // wrong polarity still delivers under QEMU, whose I/O APIC ignores it, so this is
+        // where an interpreter or route that got it wrong is caught. A wrong GSI in that range
+        // is caught by the reads below, which time out.
+        let qemu = (16..=23).contains(&route.gsi) && route.level && !route.active_low;
+        if kconfig::QEMU_BLOCK_TEST && !qemu {
+            c.write_str(": NOT THE ROUTE QEMU'S Q35 GIVES A PCI PIN");
+            return Check::Failed;
+        }
     }
 
     // SAFETY: the interrupt path is up (the interrupt selftest ran), the disk's handler is
@@ -545,6 +588,173 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
         Check::Passed
     } else {
         Check::Failed
+    }
+}
+
+/// Spins an interrupt that did not arrive is waited for, with interrupts enabled, after its
+/// request completed by polling. Far above what a delivered interrupt takes under QEMU.
+const BLOCKED_SPINS: u32 = 2_000_000;
+
+/// Interrupt remapping, proved on the disk, where an IOMMU remaps it (`IOMMU`, on MSI-X).
+///
+/// The disk's MSI-X entry must hold a remappable message naming its table entry, and the entry
+/// must be present, for the disk, on the line's vector, to the boot CPU. Then, with interrupts
+/// enabled:
+///
+/// 1. every read by interrupt completes: the remapped message is delivered;
+/// 2. with the entry not present, and then present for another function, a read completes by
+///    polling, its interrupt never arrives, and the fault log names the disk and the entry: an
+///    interrupt the table does not remap, and one from a function it does not name, are blocked and
+///    logged;
+/// 3. with the entry delivering to x2APIC ID 256, which no CPU here has, the interrupt does not
+///    arrive either. Cut to eight bits, the ID would be the boot CPU's 0, which would take it; so
+///    the destination is carried whole, as only a remapped interrupt can carry it;
+/// 4. restored, every read by interrupt completes again.
+pub fn remap_check(c: &dyn EarlyConsole) -> Check {
+    if !kconfig::IOMMU {
+        c.write_str("skipped: no IOMMU in this build");
+        return Check::Skipped;
+    }
+    let Some(blk) = disk() else {
+        c.write_str("skipped: no block device");
+        return Check::Skipped;
+    };
+    let Some(line) = platform::block_line().filter(|&l| platform::interrupt_is_msi(l)) else {
+        c.write_str("THE DISK IS NOT ON MSI-X, SO NOTHING IS REMAPPED");
+        return Check::Failed;
+    };
+    let extended = match iommu::check_disk_interrupt(line) {
+        Ok(extended) => extended,
+        Err(why) => {
+            c.write_str(why);
+            return Check::Failed;
+        }
+    };
+    c.write_str("remappable MSI-X through entry 0");
+    // SAFETY: as `interrupt_check`, which ran before this: the interrupt path is up, the disk's
+    // handler registered and its interrupt enabled, and the tick's hook not installed.
+    let delivered = unsafe { reads_by_interrupt(blk, true) };
+    if !delivered.report(c) {
+        return Check::Failed;
+    }
+    while iommu::take_fault().is_some() {}
+
+    let blocked = [
+        (iommu::Tamper::Absent, "; entry absent: "),
+        (iommu::Tamper::ForeignSource, "; entry for another function: "),
+    ];
+    for (how, what) in blocked {
+        c.write_str(what);
+        if !blocked_and_logged(c, blk, how) {
+            let _ = iommu::tamper_disk_interrupt(iommu::Tamper::Restore);
+            return Check::Failed;
+        }
+    }
+
+    c.write_str("; entry to x2APIC ID 256: ");
+    if !extended {
+        c.write_str("NO EXTENDED INTERRUPT MODE, SO NO DESTINATION ABOVE 255");
+        return Check::Failed;
+    }
+    if !iommu::tamper_disk_interrupt(iommu::Tamper::WideDestination) {
+        c.write_str("THE ENTRY DID NOT TAKE THE DESTINATION");
+        return Check::Failed;
+    }
+    // SAFETY: as above.
+    let taken = unsafe { interrupts_during_polled_read(blk) };
+    let _ = iommu::tamper_disk_interrupt(iommu::Tamper::Restore);
+    while iommu::take_fault().is_some() {}
+    match taken {
+        Ok(0) => c.write_str("not taken by the boot CPU"),
+        Ok(_) => {
+            c.write_str("DELIVERED TO THE BOOT CPU: THE DESTINATION WAS CUT TO EIGHT BITS");
+            return Check::Failed;
+        }
+        Err(why) => {
+            c.write_str(why);
+            return Check::Failed;
+        }
+    }
+
+    c.write_str("; restored");
+    // SAFETY: as above.
+    let restored = unsafe { reads_by_interrupt(blk, true) };
+    if restored.report(c) {
+        c.write_str(" ok");
+        Check::Passed
+    } else {
+        Check::Failed
+    }
+}
+
+/// With the disk's table entry changed as `how` says, a read that completes by polling must
+/// take no interrupt, and the fault log must hold an interrupt-remapping fault from the disk
+/// for entry 0. The entry is restored afterwards.
+fn blocked_and_logged(c: &dyn EarlyConsole, blk: &VirtioBlk<Locks>, how: iommu::Tamper) -> bool {
+    if !iommu::tamper_disk_interrupt(how) {
+        c.write_str("THE ENTRY COULD NOT BE CHANGED");
+        return false;
+    }
+    // SAFETY: as `remap_check`'s.
+    let taken = unsafe { interrupts_during_polled_read(blk) };
+    let fault = iommu::take_fault();
+    let restored = iommu::tamper_disk_interrupt(iommu::Tamper::Restore);
+    while iommu::take_fault().is_some() {}
+    match taken {
+        Ok(0) => c.write_str("blocked"),
+        Ok(_) => {
+            c.write_str("THE INTERRUPT WAS DELIVERED");
+            return false;
+        }
+        Err(why) => {
+            c.write_str(why);
+            return false;
+        }
+    }
+    match fault {
+        Some((f, disk)) if f.source_id == disk && f.interrupt_index() == Some(0) => {
+            c.write_str(", fault ");
+            write_hex(c, u64::from(f.reason));
+            c.write_str(" from ");
+            write_hex(c, u64::from(f.source_id));
+        }
+        Some((f, _)) => {
+            c.write_str(", A FAULT THAT IS NOT THE DISK'S ENTRY: REASON ");
+            write_hex(c, u64::from(f.reason));
+            return false;
+        }
+        None => {
+            c.write_str(", BUT NOT LOGGED");
+            return false;
+        }
+    }
+    if !restored {
+        c.write_str("; THE ENTRY COULD NOT BE RESTORED");
+    }
+    restored
+}
+
+/// One read that completes by polling, with interrupts enabled throughout and for
+/// [`BLOCKED_SPINS`] after, and how many disk interrupts were taken meanwhile.
+///
+/// # Safety
+/// As [`reads_by_interrupt`] with `enable`.
+unsafe fn interrupts_during_polled_read(blk: &VirtioBlk<Locks>) -> Result<u64, &'static str> {
+    let (before, _) = blk.interrupt_counts();
+    blk.set_interrupt_driven(false);
+    // SAFETY: the caller's contract.
+    unsafe { arch::tick::enable_interrupts() };
+    let mut sector = [0u8; testdisk::SECTOR];
+    let read = blk.read_blocks(1, &mut sector);
+    for _ in 0..BLOCKED_SPINS {
+        core::hint::spin_loop();
+    }
+    let _ = Cpu::irq_save();
+    let (after, _) = blk.interrupt_counts();
+    match read {
+        Ok(()) if testdisk::first_mismatch(1, &sector).is_none() => Ok(after - before),
+        Ok(()) => Err("A POLLED READ DID NOT HOLD THE PATTERN"),
+        Err(_) => Err("A POLLED READ FAILED"),
     }
 }
 

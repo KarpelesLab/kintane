@@ -11,10 +11,13 @@
 
 use crate::{Regs, reg};
 
-/// One recorded DMA fault.
+/// One recorded fault: a DMA the device's domain does not allow, or an interrupt the
+/// remapping table does not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fault {
-    /// The device address the device tried to reach.
+    /// The device address the device tried to reach. For an interrupt-remapping fault, the
+    /// fault information field instead, whose top 16 bits are the table index the blocked
+    /// message named; see [`Fault::interrupt_index`].
     pub address: u64,
     /// The faulting device's source id (`bus << 8 | dev << 3 | fn`).
     pub source_id: u16,
@@ -23,6 +26,20 @@ pub struct Fault {
     pub reason: u8,
     /// Whether the access was a write.
     pub write: bool,
+}
+
+impl Fault {
+    /// Whether this is an interrupt-remapping fault (VT-d §7.1, reasons 0x20 to 0x26): a
+    /// message blocked by the remapping table rather than a DMA blocked by a domain.
+    pub fn is_interrupt(&self) -> bool {
+        (0x20..=0x26).contains(&self.reason)
+    }
+
+    /// For an interrupt-remapping fault, the table index the blocked message named: bits
+    /// 63:48 of the fault information field (VT-d §10.4.14).
+    pub fn interrupt_index(&self) -> Option<u16> {
+        self.is_interrupt().then_some((self.address >> 48) as u16)
+    }
 }
 
 /// The fault-recording register block's offset: CAP.FRO (bits [33:24], in 16-byte units).

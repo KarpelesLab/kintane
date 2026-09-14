@@ -28,3 +28,31 @@ pub fn domain_maps(_iova: u64) -> bool {
 pub fn take_fault() -> Option<(Fault, u16)> {
     None
 }
+
+/// The changes the IOMMU build makes to the disk's remapping table entry; none apply here.
+#[derive(Clone, Copy)]
+pub enum Tamper {
+    Absent,
+    ForeignSource,
+    WideDestination,
+    Restore,
+}
+
+/// No IOMMU to remap through.
+pub fn remap_disk_interrupt(
+    _c: &dyn EarlyConsole,
+    _frames: &mut mm::phys::FrameAllocator<'_, arch::Cpu>,
+    _line: u32,
+) -> bool {
+    false
+}
+
+/// Nothing is remapped.
+pub fn check_disk_interrupt(_line: u32) -> Result<bool, &'static str> {
+    Err("NO IOMMU IN THIS BUILD")
+}
+
+/// No table entry to change.
+pub fn tamper_disk_interrupt(_how: Tamper) -> bool {
+    false
+}

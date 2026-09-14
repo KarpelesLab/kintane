@@ -19,7 +19,7 @@ use arch::Cpu;
 use hal::{EarlyConsole, PhysAddr};
 use mm::DirectMap;
 use mm::phys::FrameAllocator;
-use vtd::{Domain, Fault, Frames, Perm, PhysMem, Regs, Unit};
+use vtd::{Domain, Fault, Frames, InterruptTable, Irte, Perm, PhysMem, Regs, Unit};
 
 use crate::write_usize;
 
@@ -112,6 +112,9 @@ struct Confinement {
     unit: Unit<UnitRegs, Mem>,
     domain: Domain,
     source: u16,
+    /// The interrupt remapping table and the entry the disk's MSI-X interrupt was given,
+    /// once [`remap_disk_interrupt`] has put it there.
+    interrupts: Option<(InterruptTable, Irte)>,
 }
 
 /// SAFETY INVARIANT: written once by [`confine_disk`] on the boot path, read only after.
@@ -184,6 +187,7 @@ pub fn confine_disk(
             unit,
             domain,
             source: facts.block_source_id,
+            interrupts: None,
         });
     }
     true
@@ -205,6 +209,145 @@ pub fn take_fault() -> Option<(Fault, u16)> {
     // SAFETY: as `domain_maps`; the boot thread is the only reader and writer.
     let conf = unsafe { (*CONFINEMENT.get()).as_mut() }?;
     conf.unit.take_fault().map(|f| (f, conf.source))
+}
+
+/// The remapping table entry the disk's MSI-X interrupt is delivered through.
+const DISK_HANDLE: u16 = 0;
+
+/// How [`tamper_disk_interrupt`] changes the disk's table entry, for the checks that the entry
+/// is what decides whether and where the disk's interrupt is delivered.
+#[derive(Clone, Copy)]
+pub enum Tamper {
+    /// Not present: the disk's messages name an entry that does not exist.
+    Absent,
+    /// Present, but for another function: the disk is not the requester the entry accepts.
+    ForeignSource,
+    /// Present, for the disk, delivering to x2APIC ID 256, which no CPU here has. Cut to the
+    /// eight bits a compatibility-format message holds, it would be the boot CPU's ID 0.
+    WideDestination,
+    /// Back to what [`remap_disk_interrupt`] set.
+    Restore,
+}
+
+/// Remap the disk's MSI-X interrupt on `line` through the IOMMU confining it: a remapping
+/// table whose entry 0 delivers the line's vector to the boot CPU and accepts only the disk,
+/// remapping turned on, and the disk's MSI-X entry rewritten to a remappable message naming
+/// that entry. Returns whether it was done.
+///
+/// After [`confine_disk`], and before the device raises an interrupt: the device is not
+/// brought up yet. Compatibility-format interrupts — the I/O APIC's, and other functions'
+/// MSI-X — are left as the unit's reset state has them.
+pub fn remap_disk_interrupt(
+    c: &dyn EarlyConsole,
+    frames: &mut FrameAllocator<'_, Cpu>,
+    line: u32,
+) -> bool {
+    // SAFETY: after `confine_disk`'s one write; the boot thread is the only reader and writer.
+    let Some(conf) = (unsafe { (*CONFINEMENT.get()).as_mut() }) else {
+        c.write_str("no IOMMU to remap the disk's interrupt through");
+        return false;
+    };
+    let Some((vector, destination)) = platform::message_target(line, 0) else {
+        c.write_str("the disk's line names no vector on the boot CPU");
+        return false;
+    };
+    let mut pool = Pool { frames };
+    let table = match conf.unit.new_interrupt_table(&mut pool) {
+        Ok(t) => t,
+        Err(_) => {
+            c.write_str("the IOMMU cannot remap interrupts");
+            return false;
+        }
+    };
+    let entry = Irte {
+        vector,
+        destination,
+        level: false,
+        source: conf.source,
+    };
+    let enabled = conf.unit.set_irte(&table, DISK_HANDLE, Some(entry)).is_ok()
+        && conf.unit.enable_interrupt_remapping(&table).is_ok();
+    if !enabled {
+        c.write_str("interrupt remapping did not enable");
+        return false;
+    }
+    let (address, data) = vtd::remappable_message(DISK_HANDLE);
+    if let Err(why) = platform::set_line_message(line, address, data) {
+        c.write_str("the disk's MSI-X entry did not take its remappable message: ");
+        c.write_str(why);
+        return false;
+    }
+    c.write_str("interrupts remapped, ");
+    c.write_str(if table.extended() {
+        "32-bit destinations"
+    } else {
+        "8-bit destinations"
+    });
+    conf.interrupts = Some((table, entry));
+    true
+}
+
+/// Check the disk's interrupt as remapping delivers it: its MSI-X entry holds a
+/// remappable-format message naming entry 0, remapping is on, and the entry is present, for
+/// the disk, on the line's vector, to the boot CPU. Returns whether the table's destinations
+/// are 32 bits wide.
+pub fn check_disk_interrupt(line: u32) -> Result<bool, &'static str> {
+    // SAFETY: as `domain_maps`; the boot thread is the only reader and writer.
+    let conf = unsafe { (*CONFINEMENT.get()).as_ref() }.ok_or("NO IOMMU CONFINES THE DISK")?;
+    let (table, set) = conf
+        .interrupts
+        .as_ref()
+        .ok_or("THE DISK'S INTERRUPT IS NOT REMAPPED")?;
+    let (address, _) =
+        platform::line_message(line).ok_or("THE DISK'S MSI-X ENTRY IS UNREADABLE")?;
+    match vtd::message_handle(address) {
+        Some(DISK_HANDLE) => {}
+        Some(_) => return Err("THE DISK'S MESSAGE NAMES ANOTHER TABLE ENTRY"),
+        None => return Err("THE DISK'S MESSAGE IS NOT IN REMAPPABLE FORMAT"),
+    }
+    if !conf.unit.interrupt_remapping_enabled() {
+        return Err("INTERRUPT REMAPPING IS OFF");
+    }
+    if conf.unit.irte(table, DISK_HANDLE) != Some(*set) {
+        return Err("THE TABLE ENTRY IS NOT WHAT WAS SET");
+    }
+    let target = platform::message_target(line, 0).ok_or("THE LINE NAMES NO VECTOR")?;
+    if (set.vector, set.destination) != target || set.source != conf.source {
+        return Err("THE TABLE ENTRY IS NOT THE DISK'S, FOR ITS LINE ON THE BOOT CPU");
+    }
+    Ok(table.extended())
+}
+
+/// Change the disk's table entry as `how` says. `false` when there is no entry to change, or
+/// when the table's mode cannot hold the change.
+pub fn tamper_disk_interrupt(how: Tamper) -> bool {
+    // SAFETY: as `domain_maps`; the boot thread is the only reader and writer.
+    let Some(conf) = (unsafe { (*CONFINEMENT.get()).as_mut() }) else {
+        return false;
+    };
+    let Confinement {
+        unit,
+        source,
+        interrupts: Some((table, set)),
+        ..
+    } = conf
+    else {
+        return false;
+    };
+    let entry = match how {
+        Tamper::Absent => None,
+        // Function 1 of the disk's device, which does not exist.
+        Tamper::ForeignSource => Some(Irte {
+            source: *source ^ 1,
+            ..*set
+        }),
+        Tamper::WideDestination => Some(Irte {
+            destination: 0x100,
+            ..*set
+        }),
+        Tamper::Restore => Some(*set),
+    };
+    unit.set_irte(table, DISK_HANDLE, entry).is_ok()
 }
 
 fn write_source(c: &dyn EarlyConsole, source: u16) {
