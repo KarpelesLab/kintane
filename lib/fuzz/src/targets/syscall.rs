@@ -102,6 +102,65 @@ impl Handler for Mock {
         let _ = handle;
         Ok(0)
     }
+
+    // The construction calls the object layer added. Like the rest, each answers with a value
+    // or an error chosen by its arguments, so `dispatch` takes both paths for every one.
+
+    fn process_create(&mut self, image: Handle) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = image;
+        Ok(1)
+    }
+
+    fn process_transfer(&mut self, process: Handle, handle: Handle) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (process, handle);
+        Ok(2)
+    }
+
+    fn thread_create(&mut self, process: Handle, entry: u64, arg: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = arg;
+        let _ = process;
+        // A real kernel refuses an entry outside the process's user half.
+        if entry >= 0x0000_8000_0000_0000 {
+            Err(Error::InvalidArgument)
+        } else {
+            Ok(3)
+        }
+    }
+
+    fn process_wait(&mut self, process: Handle, queue: Handle, cookie: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = cookie;
+        let _ = (process, queue);
+        Ok(0)
+    }
+
+    fn completion_create(&mut self) -> Result<u64, Error> {
+        self.calls += 1;
+        Ok(4)
+    }
+
+    fn completion_poll(&mut self, queue: Handle, out: UserPtr) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (queue, out);
+        Err(Error::ShouldWait)
+    }
+
+    fn vm_region_create(&mut self, len: usize) -> Result<u64, Error> {
+        self.calls += 1;
+        len.checked_next_multiple_of(4096)
+            .filter(|&l| l != 0)
+            .map(|l| l as u64)
+            .ok_or(Error::InvalidArgument)
+    }
+
+    fn vm_map_in(&mut self, process: Handle, region: Handle) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (process, region);
+        Ok(0)
+    }
 }
 
 /// Each record is a number and six argument words: 8 bytes for the number, 48 for the
