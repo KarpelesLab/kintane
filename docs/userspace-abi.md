@@ -452,9 +452,9 @@ process, its descriptors or its mappings, and waits on the kernel's wait queues 
 so that another thread of the process can make the call that ends the wait.
 
 **The numbers and the tables.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 101 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
+`syscall_64.tbl`, in its format: 102 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
 the generic table arm64 numbers its calls by, in the format of Linux's `scripts/syscall.tbl`:
-94 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
+95 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
 each with its number under each `linux::Abi`; a host test pins every number to its name in
 that ABI's table, and the kernel reads a table at run time only to name a call it does not
 implement. The kernel picks the ABI from its port's ELF machine at compile time, and dispatches
