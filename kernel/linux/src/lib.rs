@@ -510,9 +510,15 @@ pub mod socket {
     pub const SO_SNDTIMEO: u64 = 21;
     pub const TCP_NODELAY: u64 = 1;
 
+    /// Copy what has arrived without taking it: the receive after a peek sees the same bytes,
+    /// or the same datagram.
+    pub const MSG_PEEK: u64 = 0x2;
     /// Answer with the length the datagram had, not the length that fit.
     pub const MSG_TRUNC: u64 = 0x20;
     pub const MSG_DONTWAIT: u64 = 0x40;
+    /// Wait for the whole count rather than for what has arrived so far. A datagram is taken
+    /// whole or not at all, so it means nothing on one.
+    pub const MSG_WAITALL: u64 = 0x100;
     pub const MSG_NOSIGNAL: u64 = 0x4000;
 
     pub const SHUT_RD: u64 = 0;

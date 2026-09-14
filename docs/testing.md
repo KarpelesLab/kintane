@@ -1797,6 +1797,37 @@ restored.
 | A wait runs out at once whatever timeout it was given | `readiness`: `init exited 0x710, WRONG` — the step that requires a timeout not to fire early — with `A REQUEST WAS NEVER ANSWERED, NOTHING REALLY BLOCKED OR WAS WOKEN` |
 | The second look after registering is removed from `WaitQueue::wait_once` | **`readiness` still passed**, 18 of 18 wakes delivered. The window it closes is not reached by this check; see above. |
 
+**`peek`, inside `linux net`**, is what a receive leaves behind, and what a message of several
+buffers carries. The mode runs against kbuild's datagram service and its TCP service:
+
+```
+  linux net  tcp client ok; server ok; poll ok (two connections, 4 announcements); udp ok; peek ok
+```
+
+It peeks a datagram twice and requires both to answer the same bytes, then receives and requires
+those bytes again, then requires nothing to be left — one datagram arrived, and two peeks took
+none of it. It peeks into a buffer shorter than the datagram, with and without `MSG_TRUNC`, and
+requires the datagram to survive both. It sends one datagram gathered from two buffers and
+requires the reply to arrive scattered across two more, in order, rather than crammed into the
+first. It requires more buffers than the personality carries to be refused with `EOPNOTSUPP`
+rather than half carried. On a stream it peeks with `MSG_WAITALL` for the whole reply, then reads
+the same bytes again, because a peek moves neither the ring's head nor the inbox's slot.
+
+A peek that finds fewer bytes than asked for waits rather than looping: it would otherwise see
+the same bytes it had already seen and spin. That was a real fault in the first version of this
+code, and it hung the boot at `linux net` until the wait itself was made to decide whether enough
+had arrived.
+
+| Mutation | Result |
+|---|---|
+| A peek takes the datagram (`datagram_peek` calling `udp_recv_from`) | `linux net`: `peek exited 0x00000000000000dd, WRONG` — step 221, where the second peek finds nothing |
+| A receive fills only the first buffer it was given (`scatter`) | `linux net`: `peek exited 0x00000000000000e2, WRONG` — step 226, where the reply must be spread over both |
+
+A step number is the exit status a failing step ends with, and a status is eight bits: a step
+above 255 comes back truncated. This mode's steps are 220 to 229 for that reason — the band first
+assigned, 310 to 329, would have reported step 315 as 59, which is the mode's own success code,
+and graded that failure a pass.
+
 Timing is measured on the native side only. This personality has no `clock_gettime`, so a Linux
 program here cannot read a clock to say its timeout ran out on time; `readiness` is where that is
 checked.

@@ -43,8 +43,17 @@
 //! as soon as nothing holds it, sends no keepalives, and never delays a segment — and
 //! `getsockopt` answers `SO_TYPE`, `SO_ERROR` and `TCP_NODELAY`. Refused, with Linux's errors:
 //! other families (`EAFNOSUPPORT`), raw sockets (`EPROTONOSUPPORT`), other options
-//! (`ENOPROTOOPT`), `MSG_PEEK` and the other message flags, and shutting down the receiving half
-//! (`EOPNOTSUPP`), and binding port zero (`EINVAL`: bind a port, or connect without binding).
+//! (`ENOPROTOOPT`), the message flags beyond `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITALL`,
+//! `MSG_DONTWAIT` and `MSG_NOSIGNAL`, and shutting down the receiving half (`EOPNOTSUPP`), and
+//! binding port zero (`EINVAL`: bind a port, or connect without binding).
+//!
+//! `MSG_PEEK` copies what has arrived and leaves it: the receive after a peek reads the same
+//! bytes, or takes the same datagram, because neither the ring's head nor the inbox's slot
+//! moves. `MSG_WAITALL` waits for the whole count on a stream and means nothing on a datagram,
+//! which is taken whole or not at all. `sendmsg` and `recvmsg` carry up to four buffers: a
+//! datagram is gathered into one message however many it was written from, and one receive is
+//! spread over them in order. More buffers than that is `EOPNOTSUPP` rather than a half-carried
+//! message.
 //! There is no `SIGPIPE`: a send after the connection closed fails with `EPIPE`, and that is all.
 
 use core::cell::SyncUnsafeCell;
@@ -55,8 +64,8 @@ use hal::EarlyConsole;
 use kobject::ObjectId;
 use linux::Failure;
 use linux::socket::{
-    AF_INET, IOVEC_LEN, IPPROTO_TCP, IPPROTO_UDP, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_TRUNC,
-    MSGHDR_FLAGS, MSGHDR_IOV, MSGHDR_IOVLEN, MSGHDR_LEN, MSGHDR_NAME, MSGHDR_NAMELEN, SHUT_RD,
+    AF_INET, IOVEC_LEN, IPPROTO_TCP, IPPROTO_UDP, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC,
+    MSG_WAITALL, MSGHDR_IOV, MSGHDR_IOVLEN, MSGHDR_LEN, MSGHDR_NAME, MSGHDR_NAMELEN, SHUT_RD,
     SHUT_RDWR, SHUT_WR, SO_BROADCAST, SO_ERROR, SO_KEEPALIVE, SO_RCVTIMEO, SO_REUSEADDR,
     SO_SNDTIMEO, SO_TYPE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SOCK_TYPE_MASK,
     SOCKADDR_IN_LEN, SOL_SOCKET, TCP_NODELAY, TIMEVAL_LEN, word,
@@ -477,10 +486,25 @@ pub(super) fn recv(
     buf: u64,
     count: usize,
 ) -> Result<u64, Failure> {
+    recv_with(slot, i, nonblock, buf, count, 0, 0, 0)
+}
+
+/// [`recv`], with the message flags, and where to write the sender's address for a datagram.
+#[allow(clippy::too_many_arguments)]
+fn recv_with(
+    slot: usize,
+    i: usize,
+    nonblock: bool,
+    buf: u64,
+    count: usize,
+    flags: u64,
+    addr: u64,
+    len_at: u64,
+) -> Result<u64, Failure> {
     let id = id_of(i)?;
     // A datagram socket takes one datagram, and says nothing about where it came from.
     if crate::sockets::is_datagram(id) {
-        return recv_datagram(slot, i, id, nonblock, buf, count, 0, 0, 0);
+        return recv_datagram(slot, i, id, nonblock, buf, count, flags, addr, len_at);
     }
     let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
     let n = count.min(CHUNK);
@@ -492,9 +516,35 @@ pub(super) fn recv(
     to_user(buf, &[0u8; CHUNK][..n])?;
     let mut bytes = [0u8; CHUNK];
     let (rcv, _) = timeouts(i);
-    let got = wait(slot, nonblock, rcv, || {
-        crate::sockets::recv(conn, &mut bytes[..n]).map_err(failure)
-    })?;
+    // `MSG_WAITALL` waits for the whole count; without it, for the first bytes to arrive.
+    let want = if flags & MSG_WAITALL != 0 { n } else { 1 };
+    // A peek reads the ring without taking from it, so it answers the same bytes every time:
+    // whether there are enough yet is decided inside the wait, which otherwise would never
+    // sleep and would spin on what it had already seen.
+    if flags & MSG_PEEK != 0 {
+        let got = wait(slot, nonblock, rcv, || {
+            match crate::sockets::peek(conn, &mut bytes[..n]).map_err(failure)? {
+                // Enough to answer with, or the end of the stream, which waiting cannot add to.
+                Some(k) if k >= want || k == 0 => Ok(Some(k)),
+                _ => Ok(None),
+            }
+        })?;
+        to_user(buf, &bytes[..got])?;
+        return Ok(got as u64);
+    }
+    let mut got = 0;
+    while got < want {
+        let taken = wait(slot, nonblock, rcv, || {
+            crate::sockets::recv(conn, &mut bytes[got..n]).map_err(failure)
+        });
+        match taken {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            // What has been taken is the answer; the error waits for the next call.
+            Err(e) if got == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
     to_user(buf, &bytes[..got])?;
     Ok(got as u64)
 }
@@ -547,11 +597,16 @@ fn recv_datagram(
     // is gone, and nothing can ask for it again.
     to_user(buf, &[0u8; CHUNK][..cap])?;
     let (rcv, _) = timeouts(i);
+    let peek = flags & MSG_PEEK != 0;
     let (from, copied, whole) = wait(slot, nonblock, rcv, || {
         let mut bytes = [0u8; CHUNK];
-        let Some((from, copied, whole)) =
-            crate::sockets::datagram_recv(id, &mut bytes[..cap]).map_err(failure)?
-        else {
+        // A peek leaves the datagram in the inbox, so the receive after it takes the same one.
+        let taken = if peek {
+            crate::sockets::datagram_peek(id, &mut bytes[..cap])
+        } else {
+            crate::sockets::datagram_recv(id, &mut bytes[..cap])
+        };
+        let Some((from, copied, whole)) = taken.map_err(failure)? else {
             return Ok(None);
         };
         to_user(buf, bytes.get(..copied).unwrap_or(&[]))?;
@@ -611,20 +666,21 @@ pub(super) fn recvfrom(
     len_at: u64,
 ) -> Result<u64, Failure> {
     let (i, nonblock) = socket_of(slot, fd)?;
-    if flags & !(MSG_DONTWAIT | MSG_TRUNC) != 0 {
+    if flags & !(MSG_DONTWAIT | MSG_TRUNC | MSG_PEEK | MSG_WAITALL) != 0 {
         return Err(Failure::OperationNotSupported);
     }
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let count = usize::try_from(count).unwrap_or(MAX_IO);
     let id = id_of(i)?;
     if crate::sockets::is_datagram(id) {
+        // `MSG_WAITALL` says nothing on a datagram: one is taken whole or not at all.
         return recv_datagram(slot, i, id, nonblock, buf, count, flags, addr, len_at);
     }
     if flags & MSG_TRUNC != 0 {
         // Nothing is truncated in a stream: the rest of it is still there to read.
         return Err(Failure::OperationNotSupported);
     }
-    let got = recv(slot, i, nonblock, buf, count)?;
+    let got = recv_with(slot, i, nonblock, buf, count, flags, 0, 0)?;
     // A stream names no sender: Linux reports an address of no bytes.
     if len_at != 0 {
         to_user(len_at, &0u32.to_le_bytes())?;
@@ -632,35 +688,253 @@ pub(super) fn recvfrom(
     Ok(got)
 }
 
-/// The one buffer, the address and the flags of the `struct msghdr` at `at`: what `sendmsg` and
-/// `recvmsg` carry. A message of several buffers is refused rather than half sent.
-fn one_message(at: u64) -> Result<(u64, u64, u64, u64, u64), Failure> {
+/// Buffers one message may be spread over. A message of more is refused rather than half
+/// carried, which is what `UIO_MAXIOV` bounds on Linux; this bound is the personality's own.
+const MAX_IOV: usize = 4;
+
+/// One buffer of a message: where it is in the program, and how long.
+#[derive(Clone, Copy)]
+struct Buffer {
+    base: u64,
+    len: u64,
+}
+
+/// The buffers, the address and the flags of the `struct msghdr` at `at`: what `sendmsg` and
+/// `recvmsg` carry. Each `iovec` is one buffer of the one message — a datagram goes whole,
+/// however many buffers it was gathered from, and arrives into as many as it fills.
+fn message(at: u64) -> Result<([Buffer; MAX_IOV], usize, u64, u64), Failure> {
     let mut header = [0u8; MSGHDR_LEN];
     from_user(at, &mut header)?;
     let (name, name_len) = (word(&header, MSGHDR_NAME), word(&header, MSGHDR_NAMELEN));
     let (iov, iov_len) = (word(&header, MSGHDR_IOV), word(&header, MSGHDR_IOVLEN));
-    if iov_len != 1 {
+    let count = usize::try_from(iov_len).unwrap_or(usize::MAX);
+    if count > MAX_IOV {
         return Err(Failure::OperationNotSupported);
     }
-    let mut vector = [0u8; IOVEC_LEN];
-    from_user(iov, &mut vector)?;
-    let (base, len) = (word(&vector, 0), word(&vector, 8));
-    Ok((base, len, name, name_len, word(&header, MSGHDR_FLAGS)))
+    let mut buffers = [Buffer { base: 0, len: 0 }; MAX_IOV];
+    for (i, b) in buffers.iter_mut().enumerate().take(count) {
+        let at = iov
+            .checked_add((i * IOVEC_LEN) as u64)
+            .ok_or(Failure::Fault)?;
+        let mut vector = [0u8; IOVEC_LEN];
+        from_user(at, &mut vector)?;
+        *b = Buffer {
+            base: word(&vector, 0),
+            len: word(&vector, 8),
+        };
+    }
+    Ok((buffers, count, name, name_len))
+}
+
+/// The bytes of `buffers`, copied out of the program into `into`: what a send gathers.
+fn gather(buffers: &[Buffer], into: &mut [u8]) -> Result<usize, Failure> {
+    let mut done = 0;
+    for b in buffers {
+        let n = usize::try_from(b.len)
+            .unwrap_or(usize::MAX)
+            .min(into.len() - done);
+        if n == 0 {
+            continue;
+        }
+        from_user(b.base, &mut into[done..done + n])?;
+        done += n;
+        if done == into.len() {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// `from`, copied into `buffers` in turn: what a receive scatters. Answers the bytes placed,
+/// which is all of them unless the buffers hold less than arrived.
+fn scatter(buffers: &[Buffer], from: &[u8]) -> Result<usize, Failure> {
+    let mut done = 0;
+    for b in buffers {
+        if done == from.len() {
+            break;
+        }
+        let n = usize::try_from(b.len)
+            .unwrap_or(usize::MAX)
+            .min(from.len() - done);
+        if n == 0 {
+            continue;
+        }
+        to_user(b.base, &from[done..done + n])?;
+        done += n;
+    }
+    Ok(done)
 }
 
 pub(super) fn sendmsg(slot: usize, fd: u64, at: u64, flags: u64) -> Result<u64, Failure> {
-    let (base, len, name, name_len, _) = one_message(at)?;
-    sendto(slot, fd, base, len, flags, name, name_len)
+    let (buffers, count, name, name_len) = message(at)?;
+    let buffers = &buffers[..count];
+    // One buffer goes straight from the program's memory, as `sendto` sends it.
+    if let [only] = buffers {
+        return sendto(slot, fd, only.base, only.len, flags, name, name_len);
+    }
+    // Several are gathered into one message first: a datagram is one datagram whatever it was
+    // written from, and a stream keeps the order the buffers are in.
+    let mut bytes = [0u8; CHUNK];
+    let n = gather(buffers, &mut bytes)?;
+    let (i, nonblock) = socket_of(slot, fd)?;
+    if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
+        return Err(Failure::OperationNotSupported);
+    }
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+    let id = id_of(i)?;
+    let to = if name == 0 {
+        0
+    } else {
+        let (ip, port) = read_sockaddr(name, name_len)?;
+        abi::socket::address(ip, port)
+    };
+    send_bytes(slot, i, id, nonblock, to, &bytes[..n])
 }
 
 pub(super) fn recvmsg(slot: usize, fd: u64, at: u64, flags: u64) -> Result<u64, Failure> {
-    let (base, len, name, _, _) = one_message(at)?;
+    let (buffers, count, name, _) = message(at)?;
+    let buffers = &buffers[..count];
     // The address's length goes back in the header, where `msg_namelen` is, rather than at a
     // pointer of its own as `recvfrom` takes it.
     let len_at = at
         .checked_add(MSGHDR_NAMELEN as u64)
         .ok_or(Failure::Fault)?;
-    recvfrom(slot, fd, base, len, flags, name, len_at)
+    if let [only] = buffers {
+        return recvfrom(slot, fd, only.base, only.len, flags, name, len_at);
+    }
+    // Several buffers take one receive between them: the message arrives once, into the
+    // personality's own buffer, and is spread over them in order.
+    let want = buffers
+        .iter()
+        .map(|b| usize::try_from(b.len).unwrap_or(usize::MAX))
+        .fold(0usize, |a, n| a.saturating_add(n))
+        .min(CHUNK);
+    let mut bytes = [0u8; CHUNK];
+    let (got, reported) = recv_into(slot, fd, &mut bytes[..want], flags, name, len_at)?;
+    scatter(buffers, &bytes[..got])?;
+    // What the call answers is what arrived, which `MSG_TRUNC` makes the whole datagram's
+    // length; what was placed is bounded by the buffers, and a short set loses the rest.
+    Ok(reported)
+}
+
+/// Send `bytes`, already out of the program's memory, on socket `i`: one datagram to `to`, or
+/// as much of a stream as it takes. What [`sendmsg`] gathers goes out through this.
+fn send_bytes(
+    slot: usize,
+    i: usize,
+    id: ObjectId,
+    nonblock: bool,
+    to: u64,
+    bytes: &[u8],
+) -> Result<u64, Failure> {
+    let (_, snd) = timeouts(i);
+    if crate::sockets::is_datagram(id) {
+        if bytes.len() > crate::sockets::MAX_DATAGRAM {
+            return Err(Failure::MessageTooLong);
+        }
+        return wait(slot, nonblock, snd, || match crate::sockets::datagram_send(id, to, bytes) {
+            Ok(n) => Ok(Some(n)),
+            Err(abi::Error::ShouldWait) => Ok(None),
+            Err(abi::Error::InvalidArgument) if to == 0 => Err(Failure::NotConnected),
+            Err(e) => Err(failure(e)),
+        });
+    }
+    let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
+    let mut done = 0;
+    while done < bytes.len() {
+        let sent = wait(slot, nonblock, snd, || {
+            crate::sockets::send(conn, &bytes[done..]).map_err(|e| match e {
+                abi::Error::InvalidArgument => Failure::BrokenPipe,
+                e => failure(e),
+            })
+        });
+        match sent {
+            Ok(k) => done += k as usize,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done as u64)
+}
+
+/// Receive one message into `into`, which is the personality's own memory rather than the
+/// program's: the bytes copied, and what the call answers with, which `MSG_TRUNC` makes the
+/// whole datagram's length. What [`recvmsg`] scatters comes in through this.
+fn recv_into(
+    slot: usize,
+    fd: u64,
+    into: &mut [u8],
+    flags: u64,
+    addr: u64,
+    len_at: u64,
+) -> Result<(usize, u64), Failure> {
+    let (i, nonblock) = socket_of(slot, fd)?;
+    if flags & !(MSG_DONTWAIT | MSG_TRUNC | MSG_PEEK | MSG_WAITALL) != 0 {
+        return Err(Failure::OperationNotSupported);
+    }
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+    let id = id_of(i)?;
+    let (rcv, _) = timeouts(i);
+    let peek = flags & MSG_PEEK != 0;
+    if crate::sockets::is_datagram(id) {
+        let (from, copied, whole) = wait(slot, nonblock, rcv, || {
+            let taken = if peek {
+                crate::sockets::datagram_peek(id, into)
+            } else {
+                crate::sockets::datagram_recv(id, into)
+            };
+            taken.map_err(failure)
+        })?;
+        if addr != 0 {
+            write_sockaddr(addr, len_at, abi::socket::ip(from), abi::socket::port(from))?;
+        } else if len_at != 0 {
+            to_user(len_at, &0u32.to_le_bytes())?;
+        }
+        let reported = if flags & MSG_TRUNC != 0 {
+            whole
+        } else {
+            copied
+        };
+        return Ok((copied, reported as u64));
+    }
+    if flags & MSG_TRUNC != 0 {
+        // Nothing is truncated in a stream: the rest of it is still there to read.
+        return Err(Failure::OperationNotSupported);
+    }
+    let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
+    let want = if flags & MSG_WAITALL != 0 {
+        into.len()
+    } else {
+        1
+    };
+    // As in `recv_with`: a peek sees the same bytes until they are taken, so the wait itself
+    // decides whether there are enough, rather than looping on them.
+    let mut got = 0;
+    if peek {
+        got = wait(slot, nonblock, rcv, || {
+            match crate::sockets::peek(conn, into).map_err(failure)? {
+                Some(k) if k >= want || k == 0 => Ok(Some(k)),
+                _ => Ok(None),
+            }
+        })?;
+    } else {
+        while got < want {
+            let taken = wait(slot, nonblock, rcv, || {
+                crate::sockets::recv(conn, &mut into[got..]).map_err(failure)
+            });
+            match taken {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(e) if got == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+    }
+    // A stream names no sender: Linux reports an address of no bytes.
+    if len_at != 0 {
+        to_user(len_at, &0u32.to_le_bytes())?;
+    }
+    Ok((got, got as u64))
 }
 
 pub(super) fn shutdown(slot: usize, fd: u64, how: u64) -> Result<u64, Failure> {
@@ -801,6 +1075,9 @@ const TCP_SUCCESS: u64 = 48;
 const SERVE_SUCCESS: u64 = 49;
 /// The `udp` mode's, which mirrors `UDP_SUCCESS` in `user/linux-hello/src/main.rs`.
 const UDP_SUCCESS: u64 = 52;
+
+/// The `peek` mode's, which mirrors `PEEK_SUCCESS` in `user/linux-hello/src/main.rs`.
+const PEEK_SUCCESS: u64 = 59;
 /// The port `serve` listens on, which kbuild forwards a loopback port to: `INBOUND_PORT` in
 /// the program and `NET_GUEST_TCP_PORT` in `kbuild/src/qemu.rs`.
 const INBOUND_PORT: u16 = 7777;
@@ -835,7 +1112,9 @@ static TCP_ARGV: SyncUnsafeCell<[&[u8]; 3]> = SyncUnsafeCell::new([b"hello", b"t
 /// The `udp` mode's one argument, `<service>,<quiet>`, and the `argv` naming it. Written and
 /// read under the same rule as `PORT_DIGITS`.
 static UDP_DIGITS: SyncUnsafeCell<[u8; 12]> = SyncUnsafeCell::new([0; 12]);
+static PEEK_DIGITS: SyncUnsafeCell<[u8; 12]> = SyncUnsafeCell::new([0; 12]);
 static UDP_ARGV: SyncUnsafeCell<[&[u8]; 3]> = SyncUnsafeCell::new([b"hello", b"udp", b""]);
+static PEEK_ARGV: SyncUnsafeCell<[&[u8]; 3]> = SyncUnsafeCell::new([b"hello", b"peek", b""]);
 
 /// `<service>,<quiet>` into `buf`, which is what the `udp` mode parses. Its length.
 fn two_ports(buf: &mut [u8; 12], service: u16, quiet: u16) -> usize {
@@ -1025,6 +1304,29 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
         None => !kconfig::QEMU_NET_TEST,
     };
 
+    // Then what a peek leaves behind, and messages of several buffers, against the same
+    // datagram service and kbuild's TCP service.
+    let peeked = match (crate::net::udp_service_port(), crate::net::tcp_port()) {
+        (Some(service), Some(tcp)) => {
+            // SAFETY: as the datagram mode's argv above: no Linux process runs, and the next
+            // is not built yet.
+            let argv: &'static [&'static [u8]] = unsafe {
+                let digits: &'static mut [u8; 12] = &mut *PEEK_DIGITS.get();
+                let n = two_ports(digits, service, tcp);
+                let written: &'static [u8] = &*PEEK_DIGITS.get();
+                let argv = &mut *PEEK_ARGV.get();
+                argv[2] = written.get(..n).unwrap_or(b"");
+                &*PEEK_ARGV.get()
+            };
+            Some(run_mode(&program, argv, || {}))
+        }
+        _ => None,
+    };
+    let peek_ok = match peeked {
+        Some(run) => run.code == Some(PEEK_SUCCESS) && run.ended,
+        None => !kconfig::QEMU_NET_TEST,
+    };
+
     let give_up = timekeeping::now().saturating_add(SETTLE);
     let settled = loop {
         let quiet = crate::net::with_stack(|s, _, _| s.tcp_rings_held() == 0 && s.balanced());
@@ -1058,6 +1360,11 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     match datagram {
         Some(run) => report(c, "udp", run, UDP_SUCCESS),
         None => c.write_str("udp skipped: kbuild announced no datagram service"),
+    }
+    c.write_str("; ");
+    match peeked {
+        Some(run) => report(c, "peek", run, PEEK_SUCCESS),
+        None => c.write_str("peek skipped: kbuild announced no datagram service"),
     }
     c.write_str(" (kbuild told of its listener ");
     write_usize(c, told as usize);
@@ -1098,6 +1405,7 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     });
     Check::from_ok(
         datagram_ok
+            && peek_ok
             && client.code == Some(TCP_SUCCESS)
             && server.code == Some(SERVE_SUCCESS)
             && polled.code == Some(POLL_SUCCESS)

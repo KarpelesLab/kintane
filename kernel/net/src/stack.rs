@@ -416,6 +416,14 @@ impl Stack {
         Ok(n)
     }
 
+    /// Read what has arrived without taking it: what `MSG_PEEK` answers with.
+    ///
+    /// No flush follows, unlike [`tcp_recv`](Self::tcp_recv): a peek acknowledges nothing and
+    /// opens no window, because the bytes are still in the ring for the next receive.
+    pub fn tcp_peek(&mut self, c: Conn, into: &mut [u8]) -> Result<usize, TcpError> {
+        self.st.tcp.peek(&mut self.pool, c, into)
+    }
+
     /// Send a FIN after what is queued; keep reading.
     pub fn tcp_shutdown<N: Nic>(&mut self, nic: &N, c: Conn, now: u64) -> Result<(), TcpError> {
         self.st.mac = nic.mac();
@@ -610,6 +618,27 @@ impl Stack {
             .iter_mut()
             .find(|d| d.is_some_and(|d| d.dst_port == port))?;
         let d = slot.take()?;
+        let n = d.len.min(into.len());
+        into[..n].copy_from_slice(&d.data[..n]);
+        Some((d.src_ip, d.src_port, n, d.len))
+    }
+
+    /// [`udp_recv_from`](Self::udp_recv_from), leaving the datagram where it is: what Linux's
+    /// `MSG_PEEK` answers with.
+    ///
+    /// `from`, when given, is the address a connected socket takes datagrams from, so a peek
+    /// reports the datagram that socket's next receive would take rather than the oldest one
+    /// for the port. Nothing is taken, so a peek and the receive after it see the same
+    /// datagram: the stack is behind one lock, and only a receive empties a slot.
+    pub fn udp_peek_from(
+        &self,
+        port: u16,
+        from: Option<(Ipv4Addr, u16)>,
+        into: &mut [u8],
+    ) -> Option<(Ipv4Addr, u16, usize, usize)> {
+        let d = self.st.inbox.iter().flatten().find(|d| {
+            d.dst_port == port && from.is_none_or(|(ip, src)| d.src_ip == ip && d.src_port == src)
+        })?;
         let n = d.len.min(into.len());
         into[..n].copy_from_slice(&d.data[..n]);
         Some((d.src_ip, d.src_port, n, d.len))
