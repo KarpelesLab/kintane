@@ -1161,12 +1161,15 @@ kept `/KINTANE/LINUX.ELF` runs twice more:
   by then, only the process's end can end that wait. Then it binds `0.0.0.0:7777`, listens and
   blocks in `accept4`. kbuild's QEMU
   command line forwards a loopback port to guest port 7777 (`hostfwd=tcp:…-:7777`). Once the
-  listener is up the check sends kbuild's datagram peer `kintane-tcp-listening 1`, repeated every
-  500 ms while the program runs, and kbuild connects in once per number, sends
-  `kintane-tcp-inbound 1`, and answers the reply with `kintane-tcp-inbound-verified 1` only if it
-  is `kintane-tcp-inbound-reply 1`, then closes. The program requires the peer's address to be the
-  gateway, the verification, and the end of the stream after it. kbuild answers and does not
-  judge: a wrong reply gets `kintane-tcp-inbound-wrong`, and the program fails.
+  listener is up the check sends kbuild's datagram peer `kintane-tcp-listening <n>`, repeated
+  every 500 ms while the program runs, and kbuild connects in once per number, sends
+  `kintane-tcp-inbound <n>`, and answers the reply with `kintane-tcp-inbound-verified <n>` only if
+  it is `kintane-tcp-inbound-reply <n>`, then closes. The program requires the peer's address to be
+  the gateway, the verification, and the end of the stream after it. kbuild answers and does not
+  judge: a wrong reply gets `kintane-tcp-inbound-wrong`, and the program fails. `<n>` is the
+  scheduler clock's nanoseconds when the check runs, so each boot's differs: the boot counter
+  test, which restarts one QEMU several times under the same kbuild, found that a fixed number was
+  served on the first boot only, and every later boot's server waited in `accept` for good.
 
 The check requires both exit codes, both processes' threads ended, the waits woken as above,
 every connection closed in order with every stack buffer back, every Linux socket let go of, and

@@ -507,8 +507,10 @@ const SERVE_SUCCESS: u64 = 47;
 /// the program and `NET_GUEST_TCP_PORT` in `kbuild/src/qemu.rs`.
 const INBOUND_PORT: u16 = 7777;
 /// What tells kbuild the listener is up, to kbuild's datagram peer: `NET_TCP_LISTENING` in
-/// `kbuild/src/qemu.rs`, and a number, so a repeat of the datagram is not a second request.
-const LISTENING: &[u8] = b"kintane-tcp-listening 1";
+/// `kbuild/src/qemu.rs`, then a number kbuild connects in once for. The number is this boot's
+/// ([`listening_message`]), so a repeat of the datagram is not a second request, and a machine
+/// that restarts under the same kbuild, as the boot counter test's does, is served again.
+const LISTENING: &[u8] = b"kintane-tcp-listening ";
 /// How often it is repeated while the listener is up, in case one is lost.
 const ANNOUNCE_EVERY: Duration = Duration::from_nanos(500_000_000);
 /// How long the connections the program let go of get to finish closing.
@@ -522,6 +524,34 @@ const SERVE_ARGV: [&[u8]; 2] = [b"hello", b"serve"];
 /// and never while a Linux process runs.
 static PORT_DIGITS: SyncUnsafeCell<[u8; 5]> = SyncUnsafeCell::new([0; 5]);
 static TCP_ARGV: SyncUnsafeCell<[&[u8]; 3]> = SyncUnsafeCell::new([b"hello", b"tcp", b""]);
+
+/// [`LISTENING`] and this boot's number into `buf`: the scheduler clock's nanoseconds when the
+/// check runs, which two boots of one machine do not share, cut to the sixteen digits kbuild
+/// takes. Its length.
+fn listening_message(buf: &mut [u8; 40]) -> usize {
+    let mut digits = [0u8; 16];
+    let mut first = digits.len();
+    let mut v = timekeeping::now().as_nanos() % 10_000_000_000_000_000;
+    loop {
+        first -= 1;
+        if let Some(d) = digits.get_mut(first) {
+            *d = b'0' + (v % 10) as u8;
+        }
+        v /= 10;
+        if v == 0 || first == 0 {
+            break;
+        }
+    }
+    let mut n = 0;
+    for (to, &from) in buf
+        .iter_mut()
+        .zip(LISTENING.iter().chain(digits.get(first..).unwrap_or(&[])))
+    {
+        *to = from;
+        n += 1;
+    }
+    n
+}
 
 /// Whether every entry of the table is free: what a moment with no Linux socket open shows.
 fn table_empty() -> bool {
@@ -578,6 +608,9 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     };
     let client = run_mode(&program, argv, || {});
 
+    let mut message = [0u8; 40];
+    let message_len = listening_message(&mut message);
+    let message = message.get(..message_len).unwrap_or(LISTENING);
     let mut last: Option<Instant> = None;
     let mut told = 0u32;
     let server = run_mode(&program, &SERVE_ARGV, || {
@@ -589,7 +622,7 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
         }
         last = Some(now);
         let sent = crate::net::with_stack(|s, card, t| {
-            s.udp_send(card, peer.0, crate::net::PORT, peer.1, LISTENING, t)
+            s.udp_send(card, peer.0, crate::net::PORT, peer.1, message, t)
                 .is_ok()
         });
         if sent == Some(true) {
