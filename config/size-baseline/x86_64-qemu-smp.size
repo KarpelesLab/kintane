@@ -19,13 +19,13 @@ crate bootinfo text 2574 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
 crate core text 16992 rodata 3002 data 0 bss 0
-crate device text 23765 rodata 0 data 0 bss 0
+crate device text 24260 rodata 0 data 0 bss 0
 crate elf text 2383 rodata 0 data 0 bss 0
 crate fat text 6210 rodata 0 data 0 bss 0
-crate hal text 531 rodata 0 data 0 bss 0
+crate hal text 558 rodata 0 data 0 bss 0
 crate ipc text 1215 rodata 16 data 0 bss 0
 crate kalloc text 13946 rodata 0 data 0 bss 0
-crate kintane text 121791 rodata 112 data 32996 bss 109967
+crate kintane text 121985 rodata 112 data 32996 bss 109967
 crate kobject text 3259 rodata 16 data 0 bss 0
 crate mm text 36453 rodata 0 data 0 bss 0
 crate module text 15694 rodata 0 data 0 bss 0
@@ -39,5 +39,5 @@ crate time text 2782 rodata 0 data 0 bss 0
 crate uart16550 text 2152 rodata 0 data 256 bss 88
 crate unwind text 3206 rodata 0 data 0 bss 0
 crate vfs text 2233 rodata 0 data 0 bss 0
-crate virtio_blk text 11578 rodata 16 data 136 bss 8
+crate virtio_blk text 11587 rodata 16 data 136 bss 8
 total 1452772
