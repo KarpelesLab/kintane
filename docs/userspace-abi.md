@@ -528,7 +528,11 @@ already holds rather than a second authority:
   within one directory, and on x86_64 `mkdir`, `unlink` and `rename`. A name that is
   eight-and-three is stored as one, keeping the case it was written in; anything longer, or mixed
   in case, is kept in long entries with a short alias of its own, and the file answers to either.
-  A forked child does not inherit an open file.
+  A name the driver will not write is refused as `ENAMETOOLONG` rather than shortened, so a
+  program is never handed back a name it did not ask for. **There is no `getdents` or
+  `getdents64`**, so a Linux program cannot list a directory at all: it can create, open, rename
+  and unlink a long name, and never enumerate one. A native program reads a directory through the
+  file server instead. A forked child does not inherit an open file.
 - `pipe2` makes two ends of one of 4 kernel pipes, each holding 512 bytes. A read of an empty
   pipe blocks on the pipe's wait queue until a writer puts bytes in, or until the last write end
   closes, which is end of file. A write to a full pipe blocks until a reader makes room, and
@@ -561,6 +565,7 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `read`, `write` | standard input reads end of file; the console takes writes; a file reads through the VFS; a pipe blocks as above, and a socket is `recv` and `send`. Up to 4096 bytes a call, 512 on a pipe or a socket's receive, a short count as Linux allows |
 | `openat` | `AT_FDCWD` or an absolute path; the working directory is `/`. Read-only (`O_ACCMODE` other than `O_RDONLY` is `EROFS`); `O_DIRECTORY`, in the architecture's own numbering, is honoured, and so is `O_CLOEXEC`; other flags are ignored. A relative path against any other descriptor is `ENOTDIR` |
 | `close`, `fstat` | `fstat` reports a regular file or directory with its size, a FIFO for a pipe end, a socket, or a character device for 0–2, in the architecture's own `struct stat`; `st_ino` is a hash of the path |
+| `statfs`, `fstatfs` | what filesystem a name is on, and what filesystem an open descriptor's file is on, in the architecture's own `struct statfs`. 137 and 138 on x86_64, 43 and 44 on aarch64 |
 | `pipe2`, `pipe` | `O_CLOEXEC` and `O_NONBLOCK`; any other flag is `EINVAL`. `pipe` is x86_64's only |
 | `socket` | `AF_INET` with `SOCK_STREAM` (protocol 0 or `IPPROTO_TCP`) or `SOCK_DGRAM` (protocol 0 or `IPPROTO_UDP`), with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`. Another family is `EAFNOSUPPORT`, another type or protocol `EPROTONOSUPPORT`, another flag `EINVAL`, and a machine with no started card `ENETDOWN` |
 | datagram sockets | `bind` gives the port received on; `connect` names the one address sent to and taken from, without a handshake, and may be made again; a socket with neither is given a port by its first send. `listen`, `accept` and `shutdown` are `EOPNOTSUPP`, and a datagram past 256 bytes is `EMSGSIZE`. A receive answers what fit, or, with `MSG_TRUNC`, the length the datagram had; either way the rest is gone. A connected socket passes over datagrams from anywhere else |
@@ -594,6 +599,28 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `kill` | a signal, or 0 to ask whether the process exists, to a Linux process by pid. A process group and -1 are `EINVAL`, and so is `SIGSTOP`, since nothing here stops a process |
 | `tgkill` | a signal to one thread of a process, by tid; a process's first thread, whose tid is the pid, before it has made a call, takes it as its process |
 | `rt_sigqueueinfo` | a signal to a Linux process carrying a value its handler reads as `si_value`. Only `SI_QUEUE` is accepted in the `siginfo` the sender writes, so no sender may claim the kernel raised the signal, nor that another process sent it. Real-time signals, 32 and up, queue eight deep per process; a ninth is `EAGAIN`. Below 32 a signal coalesces, keeping the first sender's value |
+
+**Asking what filesystem a file is on.** `statfs` takes a path and answers for the filesystem
+*covering that path*, not for the one mounted at the root: a name on the second volume answers for
+the second volume. `fstatfs` takes a descriptor and answers for the filesystem the open file is
+on, which is a different question rather than a convenience — a handle already records its mount,
+so it needs no path at all, and a program holding an open file may have no path to give, or may
+hold one whose name has since been renamed or removed out from under it. The kernel answers it by
+the descriptor's recorded mount (`vfs::Vfs::statfs_fd`) rather than by resolving a name again.
+Both fill in the filesystem's allocation unit, how many units it has, how many are free, and the
+longest name it will hold; `f_type` is `MSDOS_SUPER_MAGIC` (`0x4d44`), and `f_bavail` equals the
+free count, since this personality keeps no reservation a privileged writer could dip into. The
+free count is the driver's own, counted at mount and maintained as the table changes — on FAT32,
+what the volume's FSInfo sector claims is compared against it and never trusted.
+
+The two architectures disagree about the structure, so `linux::statfs_bytes` lays out each ABI's,
+beside `stat_bytes`:
+
+| | x86_64 | aarch64 (the generic layout) |
+|---|---|---|
+| size | 120 bytes | 88 bytes |
+| `f_bsize`, `f_namelen`, `f_frsize`, `f_flags` | 64-bit | **32-bit** |
+| everything else (`f_type`, `f_blocks`, `f_bfree`, `f_bavail`, `f_files`, `f_ffree`, `f_fsid`) | 64-bit | 64-bit |
 
 **The thread pointer** is part of a user thread's saved context on both ports. The context
 switch reads `FS` base (x86_64) or `TPIDR_EL0` (aarch64) back into the thread it switches away

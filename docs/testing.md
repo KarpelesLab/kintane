@@ -843,7 +843,7 @@ lists, the nightly job iterates, and the smoke run replays:
 | `aml` | DSDT and SSDT bytecode, loaded and run as the kernel routes pins | seeded: QEMU `q35` and `pc` DSDTs, body mutated, checksum always repaired; `\_PIC(1)`, pin routes, and every method under a 5000-step budget |
 | `elf` | static executables | built valid, then one deliberate mistake a third of the time |
 | `module` | relocatable modules and their bundle | seeded: a module kbuild built, sometimes bundled |
-| `fat` | FAT16 volumes, and every write the driver makes to one | seeded: a script that uses every operation; an image mounted, walked, read and written, which must walk clean after writes if it did before; or an operation script run against a model of every file, walked after each operation and replayed at every cut point |
+| `fat` | FAT16 **and FAT32** volumes, and every write the driver makes to one | seeded: a script that uses every operation; an image mounted, walked, read and written, which must walk clean after writes if it did before; or an operation script run against a model of every file, walked after each operation and replayed at every cut point. A bit of the input's mode byte picks the format, so both are reachable by mutation, and two of the four names the scripts use are long ones |
 | `bootproto` | the boot protocol's tag stream | built with the crate's own `Builder`, then corrupted |
 | `menu` | the boot menu's entry list, and the menu it drives | built valid, then one mistake a person makes |
 | `pci` | configuration space, as devices answer enumeration | a machine with bridges and buses laid out on purpose |
@@ -871,6 +871,29 @@ iteration and the message. `kbuild fuzz --target <t> --file <path>` runs that on
 Committing the file makes it a permanent regression test: `kbuild fuzz --smoke` replays
 the whole corpus, and CI runs it on every change. A panic is shrunk; a hang is saved as
 found, because every shrink attempt at a hang would wait out the whole budget.
+
+**The `fat` target's second format, over a sparse disk.** A volume is FAT32 by its cluster count
+and nothing else, and the specification's boundary is 65,525 clusters — so the smallest honest
+FAT32 volume is about 34 MiB, against the FAT16 one's 2.1 MiB, and the script mode clones the base
+image again at every cut point it replays, up to 48 of them. Held densely that is more memory than
+the whole campaign is worth. So the target's disk is sparse: a `BTreeMap` of only the sectors
+something has written, with an absent sector reading as zeros. The driver sees a full-size volume;
+the fuzzer stores a few dozen kilobytes. Two seeds keep both formats reachable without relying on
+a mutation to flip the mode bit — `seed-fat32-script.bin` (97 bytes) and `seed-fat32-image.bin`
+(16,897 bytes, trimmed from 542 KB).
+
+**Two ways this could have passed while testing nothing**, both closed:
+
+- A FAT32 volume built with the wrong geometry is **FAT16 to every reader**. Nothing would have
+  failed: every "FAT32" input would have quietly exercised FAT16 a second time and passed. The
+  host test `the_second_format_mounts_as_fat32` asserts the volume the generator builds really
+  mounts as FAT32, and falsifying it — pushing the cluster count just below the boundary — failed
+  both it and `a_script_runs_on_either_format`, which is what a real geometry mistake would look
+  like. This is the one failure a fuzz target cannot report about itself, since a target that
+  tests the wrong thing still answers every input.
+- The stress run's FAT32 half could have been skipped silently, since the boot line naming the
+  second volume is printed *before* the run and so proves nothing. What settles it is the image
+  afterwards ([2e](#2e-files)).
 
 **Why structure-aware, and not coverage-guided.** Coverage guidance needs the compiler to
 instrument every branch and a runtime to read the counters; kbuild drives `rustc`
@@ -951,9 +974,17 @@ The stress run adds a filesystem workload on the same presets. It reads random r
 whole cache every 64 iterations. The disk it reads is the one the block workload is writing at the
 same time. It also writes: `/SUB/STRESS.TMP` grows by appends of its own bytes, is read back
 against them, is cut short once it passes 24 KB, and is removed and made again, with a sync at the
-end of every iteration. The audit requires every handle closed, the cache's books balanced with no
-block left unwritten, and the volume's consistency walk to find no lost cluster and the two tables
-the same.
+end of every iteration. It writes the **second volume** too, `/FAT32/SUB32/STRESS.TMP` by the same
+appends, read-backs, truncation and removal, under the same lease, so the FAT32 driver is exercised
+by a workload racing the block workload rather than only by host tests. The audit requires every
+handle closed, the cache's books balanced with no block left unwritten, and the volume's
+consistency walk to find no lost cluster and the two tables the same — and, on the second volume,
+that its FSInfo free count is what its table says, since the workload syncs and a synced volume has
+no excuse for disagreeing.
+
+That the FAT32 half runs at all is checked by the image afterwards, not by the boot line naming the
+second volume, which is printed before the run and so proves nothing: the image holds four files
+where kbuild wrote three, and 13 fewer free clusters.
 
 `vfs`, `bcache` and `fat` are host-tested (20, 18 and 37 tests, the last of them against FAT32 volumes as well as FAT16). The FAT tests build their volumes
 with a writer of their own, independent of kbuild's, or format them empty and fill them through
@@ -1023,14 +1054,25 @@ until the test counted entries before the name was made and after it was removed
 
 In a boot, `linux-hello`'s files mode makes `/KINTANE/NOT.AN.83` — a name no short entry can hold
 — opens it again by the name it was made with, and removes it, before the step whose `fsync`
-makes all of that durable. What must still be refused is a component longer than the namespace
-holds, which creates nothing.
+makes all of that durable. Before that same `fsync` it carries a long name through a whole life:
+created with `openat`, renamed with `renameat` onto *another* long name, reopened by the new name,
+and removed with `unlinkat`. The ordering is not incidental — anything that writes must happen
+before the step that syncs, or the walk that follows finds the volume dirty and the boot fails;
+steps that only ask may follow it. What must still be refused is a component longer than the
+namespace holds, which creates nothing, and a name the driver will not write, which reaches the
+program as `ENAMETOOLONG` rather than as a shortened name.
+
+**A Linux program cannot list a long name**, because no `getdents` of any kind exists
+([userspace-abi.md](userspace-abi.md#as-built--static-programs-x86_64-and-aarch64)). Create, open,
+rename and unlink carry a long name end to end; enumeration is not available rather than working.
+Listing is checked through the file server and the `fat` host tests instead.
 
 | Mutation | What catches it |
 |---|---|
 | Deleting only the short entry, leaving the long ones | `removing_a_long_name_frees_every_entry_of_its_set`, by the entry count; nothing else |
 | An alias that ignores what the directory already holds | `an_alias_never_takes_a_name_something_else_answers_to` |
 | A name with a reserved character, or a trailing dot, written rather than refused | `a_name_this_driver_will_not_write_is_refused`, and the boot's step 96 |
+| `fstatfs` answers for the filesystem at the root instead of the one its descriptor's file is on | the `linux` check: files mode exited **`0xc6`**, step 198, and the boot failed `rc=1`; restored, it exits `0x32` and the boot passes |
 
 #### What the volumes say they are
 
@@ -1049,6 +1091,20 @@ holds, which creates nothing.
   be what the walk counts, which is what makes the answer worth anything — a program cannot count
   free clusters itself, so its half is that it asked and was answered coherently, and the kernel's
   half is that the answer was true.
+
+- **The `linux` check asks the same questions through Linux's calls**, in `linux-hello`'s files
+  mode: `statfs` on `/` and on `/FAT32`, each answer required to stand on its own, the two required
+  to differ in their block counts since one volume answered twice would look the same, and
+  `fstatfs` on an open file of the second volume required to agree with the `statfs` of its path on
+  the allocation unit, the unit count and the longest name. These steps only ask, so they run after
+  the step whose `fsync` makes the writing durable, leaving nothing in the cache for the walk that
+  follows.
+
+  **What is not built:** nothing holds a *Linux* program's `statfs` answers against the kernel's own
+  walk, as `files size` does for `init`. The Linux side proves the two calls are coherent with each
+  other and that the path decides which filesystem answers; it does not prove the numbers are true.
+  A `statfs` that answered plausible fabricated numbers would pass the Linux steps and be caught
+  only through the native path.
 
 ```
   files size init: asked the file service what the volumes are; both volumes answered for themselves; the same server thread; 0 objects left, 0 frames left ok
@@ -1082,6 +1138,21 @@ It must find no chain through a free cluster, no cluster claimed twice, no file 
 chain, and no byte below a `/CRASH` file's size that the workload did not write. Lost clusters and
 table copies apart are counted, since that is what the write order allows a cut to leave.
 
+**Both volumes are cut, not only the first.** The workload writes `/FAT32/CRASH` on the second
+volume as it writes `/CRASH` on the first, so a cut lands in FAT32's root cluster chain, its
+28-bit entries and its FSInfo sector; a rename between the two volumes is `EXDEV`, which the
+workload takes as an answer. kbuild walks the second volume after every cut too, and each cut line
+now ends with its counts — `FAT32: N lost, tables differ in N, N files, N bytes` — with the
+campaign summary counting a cut that damaged either volume. The FAT32 free count in **FSInfo is
+not required to match** after a cut: FSInfo is written at a sync, so a cut between a table change
+and the next sync leaves it stale by design. A synced volume whose FSInfo disagrees is a failure
+(the stress audit requires the match); a crashed one whose FSInfo disagrees is the ordering working
+([architecture.md](architecture.md#vfs-bcache-and-fat--files)).
+
+A campaign of 4 cuts at seed 23 left 0 inconsistent volumes with the second volume visibly damaged
+and tolerated: one cut left 1 lost cluster with the tables differing in 1 entry, another left 3
+lost clusters. The transcript below predates the FAT32 columns.
+
 ```
 $ kbuild crashtest --preset x86_64-qemu --count 30 --seed 20260914
   cut   1 after 2777 ms,  2400+ ops: consistent; 10 files, 0 lost clusters, tables differ in 0; 5 workload files, 19443 bytes checked
@@ -1105,6 +1176,8 @@ The write path was falsified like the read path:
 | Only the first table copy is written | 7 `fat` host tests; boot: `files write`'s tables differ, and the `linux` check's `THE VOLUME IS NOT CONSISTENT` |
 | The same, with both kernel checks made blind to differing tables | kbuild, after the guest exited 0: `the disk image after a clean exit lost 0 clusters, and its tables differ in 6 entries` |
 | A sync writes nothing back | 7 `fat` host tests; boot: `files write`'s `2 BLOCKS NEVER WRITTEN after the sync`, and the `linux` check's `THE VOLUME IS NOT CONSISTENT` |
+| The second volume's check after a cut swallows a failed walk | kbuild's `a_volume_the_walk_refuses_is_not_reported_clean`, which cross-links two table entries onto one cluster, **FAILED**; restored, 210 kbuild tests pass. Without it a cut could report a cross-linked FAT32 volume as consistent |
+| The FAT32 generator builds a volume below the 65,525-cluster boundary | `the_second_format_mounts_as_fat32` and `a_script_runs_on_either_format` **FAILED**; restored, 41 host units pass. The volume would otherwise be FAT16 to every reader and every FAT32 input would have passed while testing FAT16 twice |
 
 ### 2f. The Linux personality
 
