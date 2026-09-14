@@ -282,7 +282,7 @@ native process pays one indirect call for the Linux one existing. The Linux tabl
 `rax` (`SyscallFrame::set_return`). The native one still sets status and value.
 
 **The numbers and the table.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 78 calls. It is *not* turned into code. The calls the
+`syscall_64.tbl`, in its format: 70 calls. It is *not* turned into code. The calls the
 personality answers are constants in `linux::nr`, a host test pins each constant to its name
 in the table, and the kernel reads the table at run time only to name a call it does not
 implement. The dispatch is a `match` on those constants.
