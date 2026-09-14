@@ -57,9 +57,16 @@ endchoice
 config BOOT_STACK_KIB
     int "Size of the boot stack (KiB)"
     range 1 256
+    default 32 if BLOCK_DOMAIN
     default 16
     help
         The stack the first thread of execution runs on, with a guard below it.
+        A driver domain's boot check hands the disk back to the kernel from the
+        boot stack, under kmain's own frame: on x86_64 that path measured about
+        15.7 KiB of frames, past a 16 KiB stack once the object-layer checks grew
+        kmain, so a build with BLOCK_DOMAIN doubles it. x86_64 and ARMv7-M
+        reserve this much; aarch64, i686 and riscv32 still reserve a fixed
+        16 KiB in their boot assembly.
 
 config HANDLER_STACK_KIB
     int "Size of the exception stack (KiB)"

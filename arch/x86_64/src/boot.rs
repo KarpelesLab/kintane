@@ -272,13 +272,9 @@ pd:
 multiboot_info:
     .skip 8
 
-/* The boot stack. A section of its own, not part of .bss, because link.ld places it
- * first in the writable region with a guard page below it — see the layout comment
- * there. 16 KiB, a whole number of pages so that the guard page below is a whole page
- * too; the linker owns `__stack_bottom` and `__stack_top`. */
-.section .stack, "aw", @nobits
-.align 4096
-    .skip 16384
+/* The boot stack is not reserved here: link.ld reserves CONFIG_BOOT_STACK_KIB of it, first
+ * in the writable region with a guard page below it — see the layout comment there — and
+ * owns `__stack_bottom` and `__stack_top`. */
 "#,
     options(att_syntax)
 );
