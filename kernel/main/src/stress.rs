@@ -192,6 +192,11 @@ fn remember(w: usize, id: ThreadId) {
 
 /// The slices charged to workload `w`'s thread: `None` where it has none, or where it has
 /// ended and been reaped.
+pub(super) fn slices_of(w: Workload) -> Option<Slices> {
+    slices(w as usize)
+}
+
+/// As [`slices_of`], by index.
 fn slices(w: usize) -> Option<Slices> {
     match THREADS[w].load(Ordering::Acquire) {
         NO_THREAD => None,
@@ -758,7 +763,9 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
     write_usize(c, p(Workload::Sleep));
     c.write_str(" (latest +");
     write_usize(c, (sleep::worst_late().as_nanos() / 1_000) as usize);
-    c.write_str(" us), vm ");
+    c.write_str(" us, ");
+    write_usize(c, sleep::host_late() as usize);
+    c.write_str(" late with the CPU elsewhere), vm ");
     write_usize(c, p(Workload::Vm));
     c.write_str(" (faults ");
     write_usize(c, vm::faults() as usize);
