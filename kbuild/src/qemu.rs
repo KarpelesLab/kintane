@@ -916,7 +916,7 @@ fn downstream(
         };
         let mut state = Disturbance {
             tcp_port,
-            reordered: false,
+            split: std::collections::HashSet::new(),
         };
         let mut len = [0u8; 4];
         let mut frame = vec![0u8; 1 << 16];
@@ -943,8 +943,12 @@ fn downstream(
 /// What [`downstream`] has done so far.
 struct Disturbance {
     tcp_port: u16,
-    /// Whether a segment has been split and reversed already: one per run.
-    reordered: bool,
+    /// The guest ports whose first data segment has been split already: one disturbance per
+    /// connection, not per run. A run can be several boots of one machine — the boot counter
+    /// test resets the same QEMU four times under one kbuild — and with one per run, boots
+    /// two, three and four found the relay had already spent it and failed the check that
+    /// requires a segment held out of order.
+    split: std::collections::HashSet<u16>,
 }
 
 /// The frames to send the guest in place of `frame`: two for a datagram that is fragmented,
@@ -962,14 +966,24 @@ fn disturb(frame: &[u8], state: &mut Disturbance) -> Vec<Vec<u8>> {
     {
         return fragments;
     }
-    if !state.reordered
-        && tcp_data_from(frame, state.tcp_port)
+    if tcp_data_from(frame, state.tcp_port)
+        && let Some(port) = guest_port(frame)
+        && !state.split.contains(&port)
         && let Some(pieces) = split_reversed(frame)
     {
-        state.reordered = true;
+        state.split.insert(port);
         return pieces;
     }
     vec![frame.to_vec()]
+}
+
+/// The guest's own port, on a segment the service sent it.
+fn guest_port(frame: &[u8]) -> Option<u16> {
+    let (ihl, _) = ipv4_header(frame)?;
+    let tcp = 14 + ihl;
+    frame
+        .get(tcp + 2..tcp + 4)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
 }
 
 /// One data segment as two, the second half first and the first half twice: what a guest sees
@@ -1564,12 +1578,20 @@ mod tests {
     fn quiet(tcp_port: u16) -> super::Disturbance {
         super::Disturbance {
             tcp_port,
-            reordered: false,
+            split: std::collections::HashSet::new(),
         }
     }
 
     /// An Ethernet frame holding an IPv4 TCP segment carrying `payload` bytes of data, with
     /// addresses and a checksum, as the service's replies have.
+    fn reply_to(src_port: u16, dst_port: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = reply(src_port, seq, payload);
+        f[36..38].copy_from_slice(&dst_port.to_be_bytes());
+        let sum = super::tcp_checksum(&f, 20);
+        f[50..52].copy_from_slice(&sum.to_be_bytes());
+        f
+    }
+
     fn reply(src_port: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
         let total = 20 + 20 + payload.len();
         let mut f = vec![0u8; 14 + total];
@@ -1634,9 +1656,15 @@ mod tests {
         assert_eq!(piece(&out[0]), (104, b"efgh".to_vec()), "the second half first");
         assert_eq!(piece(&out[1]), (100, b"abcd".to_vec()), "then the first");
         assert_eq!(out[2], out[1], "and the first again, duplicated");
-        // One segment per run: everything after it passes straight through.
+        // One segment per connection: the rest of this one passes straight through.
         let next = reply(port, 108, b"ijkl");
         assert_eq!(super::disturb(&next, &mut state), vec![next.clone()]);
+        // A different guest port is a different connection, and gets its own disturbance —
+        // which is what every boot of a machine that reboots under one kbuild needs.
+        let other = reply_to(port, 50001, 300, b"mnop");
+        assert_eq!(super::disturb(&other, &mut state).len(), 3, "a second connection");
+        let after = reply_to(port, 50001, 304, b"qrst");
+        assert_eq!(super::disturb(&after, &mut state), vec![after.clone()]);
     }
 
     #[test]
