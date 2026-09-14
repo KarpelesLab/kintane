@@ -619,7 +619,9 @@ fn udp_peer(
         let announce = [NET_TCP_ANNOUNCE, tcp_port.to_string().as_bytes()].concat();
         // The datagram the downstream relay fragments, with a pattern the guest checks after
         // it has put the two fragments back together.
-        let pattern: Vec<u8> = (0..NET_FRAGMENT_PATTERN).map(|i| (i as u8) ^ 0x5a).collect();
+        let pattern: Vec<u8> = (0..NET_FRAGMENT_PATTERN)
+            .map(|i| (i as u8) ^ 0x5a)
+            .collect();
         let fragmented = [NET_UDP_FRAGMENTED, b"1 ", &pattern].concat();
         let mut listeners = std::collections::HashSet::new();
         while !stop.load(Ordering::Relaxed) {

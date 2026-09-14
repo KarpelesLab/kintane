@@ -15,8 +15,8 @@
 //! Three rules keep a sender from turning that memory into a denial of service:
 //!
 //! * a set that is not complete within [`TIMEOUT_NS`] is given up;
-//! * a datagram that arrives when every set is taken displaces the set closest to being given
-//!   up, so a sender that opens sets and never finishes them loses its own first;
+//! * a datagram that arrives when every set is taken displaces the set closest to being given up,
+//!   so a sender that opens sets and never finishes them loses its own first;
 //! * a fragment that would reach past [`MAX`], or that would need more than [`PIECES`] runs to
 //!   describe, gives up its whole set rather than growing anything.
 //!

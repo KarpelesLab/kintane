@@ -14,10 +14,10 @@
 //!   reset and reports [`TcpError::TimedOut`].
 //! * **A round-trip-time estimate, and the timeout computed from it** (RFC 6298). One segment is
 //!   timed at a time, and never a retransmitted one (Karn's rule), so a measurement always belongs
-//!   to the segment it is charged to. The smoothed estimate and its variation give
-//!   `RTO = srtt + max(G, 4 × rttvar)`, clamped to [`RTO_MIN_NS`]..=[`RTO_MAX_NS`]; a connection
-//!   with no sample yet uses [`RTO_INITIAL_NS`]. A timeout doubles the timeout in use and leaves
-//!   the estimate alone, and the next acknowledgement that is not for a retransmission restores it.
+//!   to the segment it is charged to. The smoothed estimate and its variation give `RTO = srtt +
+//!   max(G, 4 × rttvar)`, clamped to [`RTO_MIN_NS`]..=[`RTO_MAX_NS`]; a connection with no sample
+//!   yet uses [`RTO_INITIAL_NS`]. A timeout doubles the timeout in use and leaves the estimate
+//!   alone, and the next acknowledgement that is not for a retransmission restores it.
 //! * **Congestion control** (RFC 5681, with NewReno's fast recovery from RFC 6582):
 //!   * **Slow start** from an initial window of [`INITIAL_WINDOW`] segments, growing by a segment
 //!     per acknowledgement until the congestion window passes the slow-start threshold;
@@ -47,9 +47,9 @@
 //!
 //! # What is not, stated rather than discovered
 //!
-//! * **No selective acknowledgement.** A hole is still filled by the sender resending from it:
-//!   fast retransmit sends one segment, and what follows waits for its acknowledgement. Without
-//!   SACK a second loss in one window costs another round trip, which is what NewReno's partial
+//! * **No selective acknowledgement.** A hole is still filled by the sender resending from it: fast
+//!   retransmit sends one segment, and what follows waits for its acknowledgement. Without SACK a
+//!   second loss in one window costs another round trip, which is what NewReno's partial
 //!   acknowledgements handle one hole at a time.
 //! * **No Nagle, no delayed acknowledgements, no explicit congestion notification.** Every segment
 //!   that carries data or a FIN is acknowledged at once, and a small write is sent as it is.
@@ -607,10 +607,7 @@ impl Tcb {
         counters.rtt_samples += 1;
         let (srtt, rttvar) = match self.srtt {
             None => (rtt, rtt / 2),
-            Some((srtt, rttvar)) => (
-                (7 * srtt + rtt) / 8,
-                (3 * rttvar + srtt.abs_diff(rtt)) / 4,
-            ),
+            Some((srtt, rttvar)) => ((7 * srtt + rtt) / 8, (3 * rttvar + srtt.abs_diff(rtt)) / 4),
         };
         self.srtt = Some((srtt, rttvar));
         self.rto = srtt
@@ -626,7 +623,8 @@ impl Tcb {
             self.cwnd.saturating_add(acked.min(seg))
         } else {
             // Congestion avoidance: about one segment per round trip.
-            self.cwnd.saturating_add((seg * seg / self.cwnd.max(1)).max(1))
+            self.cwnd
+                .saturating_add((seg * seg / self.cwnd.max(1)).max(1))
         }
         // Past the ring there is nothing left to send anyway.
         .min(RING as u32);
