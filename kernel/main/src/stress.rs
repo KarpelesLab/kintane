@@ -656,6 +656,10 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         write_usize(c, retransmits as usize);
         c.write_str(", retries ");
         write_usize(c, retries as usize);
+        if let Some(why) = tcp::last_retry() {
+            c.write_str(", last: ");
+            c.write_str(why);
+        }
         c.write_str(")");
     }
     if mp::CPUS > 1 {

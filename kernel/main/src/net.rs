@@ -720,10 +720,17 @@ fn tcp_exchange(
         .ok_or("KBUILD NEVER CLOSED ITS END")??;
     }
     let t = now();
-    STACK
-        .lock_irqsave()
-        .tcp_close(card, conn, t)
-        .map_err(|_| "THE TCP CONNECTION COULD NOT BE CLOSED")?;
+    {
+        let mut s = STACK.lock_irqsave();
+        s.tcp_close(card, conn, t)
+            .map_err(|_| "THE TCP CONNECTION COULD NOT BE CLOSED")?;
+        // Seen under the same lock as the close, which sent the FIN: the peer's acknowledgement
+        // can arrive before the wait below first looks, and a connection closed and reaped by
+        // then would never have been seen in LAST-ACK.
+        if let Some(st) = s.tcp_status(conn) {
+            visited |= st.visited;
+        }
+    }
     let mut failed = false;
     let over = wait(card, timeout_ns, now, pause, |s, _| match s.tcp_status(conn) {
         Some(st) => {

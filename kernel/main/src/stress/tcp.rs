@@ -15,6 +15,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use arch::Cpu;
+use sync::{LockClass, SpinLock};
+
 use super::{Parked, Workload, after_ms, checkpoint, fail, park_requested, progress};
 use crate::preempt::{begin, sleep_until};
 
@@ -30,6 +33,17 @@ const ROUND_MS: u64 = 25;
 static ROUNDS: AtomicU64 = AtomicU64::new(0);
 static RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 static RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Why the latest round that had to be tried again failed, for the heartbeat: a retried round
+/// is allowed, and one whose reason goes unrecorded cannot be told from a flaw.
+static LAST_RETRY: SpinLock<Option<&'static str>, Cpu> =
+    SpinLock::with_class(None, &LAST_RETRY_CLASS);
+static LAST_RETRY_CLASS: LockClass = LockClass::new("stress.tcp.retry");
+
+/// Why the latest failed try failed, if one has.
+pub fn last_retry() -> Option<&'static str> {
+    *LAST_RETRY.lock_irqsave()
+}
 
 /// Whether the machine has the card and kbuild's TCP port this workload uses.
 pub fn present() -> bool {
@@ -92,17 +106,19 @@ pub extern "C" fn worker(_: usize) -> ! {
         for i in 0..TRIES {
             let result =
                 crate::net::tcp_round(card, port, guest_closes, round, TIMEOUT_NS, &mut clock, nap);
-            match result {
+            let why = match result {
                 Ok(r) if r.closed => {
                     ROUNDS.fetch_add(1, Ordering::Relaxed);
                     RETRANSMITS.fetch_add(r.retransmits, Ordering::Relaxed);
                     done = true;
                     break;
                 }
-                _ if i + 1 < TRIES => {
-                    RETRIES.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
+                Ok(_) => "a connection did not end where its close order leads",
+                Err(why) => why,
+            };
+            *LAST_RETRY.lock_irqsave() = Some(why);
+            if i + 1 < TRIES {
+                RETRIES.fetch_add(1, Ordering::Relaxed);
             }
         }
         if !done {

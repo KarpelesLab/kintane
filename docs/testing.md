@@ -904,6 +904,24 @@ with 1,536 echo replies, 1,536 round trips and 2 retries, beside 255,650 disk co
 interrupt and none polled. The 20-second runs pass on
 `x86_64-qemu`, `i686-qemu`, `aarch64-virt`, both SMP presets at four CPUs and both at eight.
 
+A `tcp` workload runs beside it, making TCP round trips with `tcp_service` through the same
+card and stack. Each round connects, sends a request, reads the reply and closes: the kernel
+closes first on odd rounds, and kbuild on even ones. The relay drops each connection's first
+data segment, so every round retransmits. Each step waits at most 2 s. A failed round is tried
+twice more and a third failure fails the run, and the heartbeat counts retries and names the
+reason for the latest. At every audit no connection may hold a ring, and the pool's books must
+agree with what connections hold. 60 s at four CPUs passed all 60 audits on both SMP presets,
+neither retrying a round: `aarch64-virt-smp` made 154 round trips with 154 data retransmits,
+and `x86_64-qemu-smp` 162 with 163.
+
+The first 60-second runs passed too, but retried 7 rounds on `x86_64-qemu-smp` (before the
+heartbeat named a reason) and 2 on `aarch64-virt-smp`. The recorded reason was `a connection
+did not end where its close order leads`, and the fault was in the round's bookkeeping, not in
+TCP. On a round kbuild closes first, the connection's states were read only by the wait after
+the kernel's close. QEMU's acknowledgement of the FIN could arrive, and the connection be closed
+and reaped, before that wait first looked, so LAST-ACK was never seen. The status is now read
+under the same lock as the close.
+
 The workload is paced: it sleeps 5 ms between polls for a reply and 25 ms between rounds.
 Unpaced, at one millisecond each, it passed 60 s at four CPUs with 8,547 round trips. On a
 single CPU, though, it took enough time from the user process below it that `x86_64-qemu` and
