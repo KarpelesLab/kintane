@@ -8,6 +8,16 @@ mitigation is to measure early with a prototype.
 This page is that prototype: what it builds, what it proves, what it costs, and — as
 plainly as the rest — what it does not prove.
 
+Two things run under this heading, and they are at different stages:
+
+- **The aarch64 register-driver prototype** (`DRIVER_ISOLATION`): the same driver body in the
+  kernel and in an unprivileged domain, over one register window. This is the "same source, either
+  way" claim, executed on every aarch64 boot. It does no DMA.
+- **DMA confinement with a VT-d IOMMU** (`IOMMU`, x86_64): the disk's DMA put behind an IOMMU that
+  maps exactly its grant, demonstrated **in the kernel**. This is the DMA-confinement piece the
+  prototype named as missing. It is not yet a separate driver *domain* on x86_64 — the stateful
+  driver runs in-kernel behind the IOMMU — and that remaining gap is stated plainly below.
+
 ## What runs
 
 On aarch64, with `DRIVER_ISOLATION` (on by default there), every boot runs one driver body
@@ -158,43 +168,90 @@ exists to catch.
 
 ### What is not measured
 
-The directive for this work named three operations to measure. One is measured here; two
-are not, and neither is estimated:
+The directive for this work named several operations to measure. The register-identification
+cost is measured above. The DMA-related ones are only partly measurable with what runs today,
+and nothing is estimated:
 
-- **Interrupt delivery**, in-kernel versus as a message to a domain. Not measured: the subject
-  device has no interrupt wired to it, and the prototype's `Irq` is `NoIrq`. Delivering an
-  interrupt to a domain needs a message path the kernel can post to from interrupt context,
-  and that path does not exist yet.
-- **A DMA round trip.** Not measured: the subject device does no DMA. See below for why that is
-  also the case isolation cannot yet protect.
+- **A block read end to end, in-kernel versus in a domain.** Not measured as a comparison: the
+  converted block driver runs in-kernel behind the IOMMU, but there is no x86_64 *domain* running
+  it, so there is no second number to compare against. The in-kernel read behind VT-d passes the
+  block check (see the IOMMU section), which shows it works, not what it costs relative to a domain.
+- **IOMMU map and unmap.** Attempted and deliberately **not published as a per-operation number**:
+  over 65 536 map+unmap+invalidate iterations the total came in below the boot clock's resolution
+  under QEMU TCG, so any per-op figure would round to zero and mean nothing. QEMU's `intel-iommu`
+  global invalidation is a cheap flag toggle rather than the pipeline drain hardware pays, so the
+  operation is exactly the kind QEMU makes meaningless — reported here as unmeasurable rather than
+  reported as a false small number.
+- **Interrupt delivery**, in-kernel versus as a message to a domain. Not measured, and not
+  implemented: x86_64 has no PCI interrupt route to the disk yet (`controller::PCI_LINE_TRUSTED` is
+  false; the disk is polled), and MSI-X is a separate fork's work. `hwproxy::Irq` remains defined
+  and unused on this path. Interrupt remapping (`intremap=on`) is enabled on the machine so that MSI
+  fork can build on it, but nothing here delivers an interrupt as a message.
+
+## Confining DMA with an IOMMU (x86_64)
+
+The aarch64 prototype above named DMA confinement as the piece it could not do: without an
+IOMMU, a driver that programs a DMA-capable device can point it at any physical address, and
+the device's own address space is irrelevant because the device does not use it. On x86_64 with
+`IOMMU` (the `x86_64-iommu` preset), that piece is built and demonstrated **in the kernel**.
+
+### What runs
+
+QEMU is started with `-device intel-iommu,intremap=on` behind a split irqchip, and the disk
+with `iommu_platform=on`. On boot:
+
+1. **`boot/acpi::dmar`** reads the DMA remapping table for the one hardware unit's register base —
+   no other table names it — its address width, and the interrupt-remapping flag.
+2. **`kernel/platform/acpi`** records that register window among the device windows the kernel maps,
+   and pairs it with the disk's PCI source id.
+3. **`drivers/iommu/vtd`** programs the unit: a root table, a per-bus context table, and a
+   four-level second-level page table for one translation domain. `kernel/main/src/block.rs` maps
+   *exactly* the disk's DMA grant into that domain — at an I/O virtual address equal to its physical
+   one, because the driver puts physical addresses in descriptors and the device treats them as
+   device addresses (`VIRTIO_F_ACCESS_PLATFORM`) — attaches the disk, and turns translation on
+   before the device does any DMA.
+
+The driver source does not change between this and a plain boot. `virtio_blk_core` already accepts
+`VIRTIO_F_ACCESS_PLATFORM` and already keeps the device's address and the CPU's apart
+(`mem::Dma`); behind the IOMMU, `phys()` is an I/O virtual address the grant maps, and nothing
+above the transport knows the difference. That is the payoff of having kept the two addresses
+distinct in the type since before it bit.
+
+### What the check requires
+
+The `block` line shows the disk brought up behind the IOMMU and passes every functional check
+with its DMA translated — the in-grant DMA working end to end. The `iommu` line then gates on:
+
+- **Exact grant.** The domain maps the grant and does *not* map the canary frame beside it.
+- **Out-of-grant DMA stopped and logged.** A deliberate read into the canary (a descriptor pointing
+  outside the grant, which a driver never does and an isolated one must not be able to get away
+  with) is stopped by the hardware. The unit's fault log names the canary's address and the disk's
+  own source id, `00:03.0`, and the canary still holds its sentinel.
+- **Restart.** The faulted device is reset and brought up again over the same grant, and serves a
+  read — so the host survives a device fault and the stress run still has a disk.
+
+Each was falsified; see [testing.md](testing.md#2c-bis-dma-confinement-with-the-iommu).
 
 ## What it does not prove
 
-- **DMA is not confined.** Nothing here confines a device that writes memory on a driver's
-  behalf. Without an IOMMU, a domain granted a DMA-capable device can program it to read or
-  write *any* physical address. The domain's own address space is irrelevant to that, because
-  the device does not use it.
-- **What an IOMMU has to add.** Phase 5's IOMMU work has to make DMA confinement real:
-  - a translation domain per device: SMMUv3 on aarch64, VT-d or AMD-Vi on x86;
-  - `hwproxy::Dma::phys` becoming an I/O virtual address in that domain rather than a physical
-    address;
-  - a grant of DMA memory becoming a mapping in the device's domain;
-  - a device naming memory outside its grant faulting in the IOMMU, instead of corrupting the
-    kernel.
-
-  The `Dma` trait already keeps the device's address and the CPU's apart, so that change is
-  confined to the host's implementation of it. The driver body would not change.
-- **No domain on x86_64.** A domain is granted a *mapping*, and the PCs have no memory-mapped
-  device to grant today:
-  - COM1 is in the port space, which cannot be mapped into an address space. A port range
-    could be granted through the TSS I/O permission bitmap instead, which would be a real
-    mechanism with a different shape.
-  - virtio-blk reaches x86 only over PCI, and its PCI transport is separate work.
-- **The driver is small on purpose.** Identification is read-only and has no state. That is
-  right for testing the boundary and says nothing about the protocol a stateful isolated
-  driver needs: start, stop, fault recovery mid-request, and restarting a device the domain
-  left half-programmed.
-- **Restart is a new domain, not a recovered one.** Every run builds a fresh domain on the same
-  slot after the previous one is torn down, including after the rogue domain is killed. That
-  demonstrates the host survives and can grant the window again. It does not demonstrate
-  resuming a device that failed partway through real work.
+- **The stateful driver is confined in the kernel, not in a domain, on x86_64.** The block driver
+  runs in-kernel behind the IOMMU; it is not the separate unprivileged *domain* the aarch64
+  register prototype is. The two halves — a driver body in a domain (aarch64, no DMA) and a
+  DMA-capable driver confined by an IOMMU (x86_64, in-kernel) — are not yet joined into one
+  isolated DMA-capable driver domain on x86_64. Joining them needs the domain to run
+  `virtio_blk_core` in ring 3 and to receive completions, which is the interrupt-as-a-message path
+  that does not exist yet (see below).
+- **Interrupts do not reach a domain as messages.** x86_64 has no PCI interrupt route to the disk
+  (it is polled), and MSI-X is a separate fork's work. Until then a driver domain would poll, which
+  is why the domain half is not wired on x86_64 yet.
+- **The numbers are QEMU's.** The map/unmap cost is below the boot clock under TCG (above), and
+  QEMU's IOMMU invalidation is far cheaper than silicon's. What survives the emulator is the
+  *shape*: the grant is mapped once at setup, and per DMA the MMU-equivalent does the work, so the
+  cost is at the edges, as with the register prototype.
+- **One unit, the first DRHD.** The kernel programs the first remapping unit the DMAR lists, which
+  is all QEMU presents. A machine with several units, each covering part of the PCI topology, would
+  need each programmed and the device matched to the unit whose scope covers it.
+- **The aarch64 register prototype's own limits still hold:** its driver is small and stateless, and
+  its "restart" is a fresh domain rather than a recovered one. The x86_64 restart above *is* a
+  recovered device — reset and brought up again over the same grant after a real fault — which is
+  the stronger of the two.
