@@ -640,7 +640,7 @@ fn on_kill(trap: UserTrap) -> ! {
             // A fault before the program set an exit code is the process being killed: as a
             // Linux parent is told, by SIGSEGV. If it had already exited, `record_exit` keeps
             // that.
-            record_exit(p, crate::personality::killed_by(p.personality));
+            record_exit(p, crate::personality::killed_by(slot, p.personality));
             (leave(slot), p.exit)
         }
         None => (leave(slot), Some(KILLED)),
@@ -668,6 +668,30 @@ fn on_user_interrupt() {
         None => (leave(slot), Some(KILLED)),
     };
     finish_thread(slot, last, exit)
+}
+
+/// Deliver a signal to the user thread an interrupt is about to return to, with the
+/// registers it was interrupted with. `true` when `regs` is a handler's now and the port must
+/// return to that instead.
+///
+/// The other half of [`on_user_interrupt`]: that one ends a thread whose process has gone,
+/// this one runs a handler for a thread whose process is very much alive. A thread spinning in
+/// user mode makes no system call, so without this its signals would wait forever.
+fn on_user_deliver(regs: &mut [u64; hal::user::REGISTER_WORDS]) -> bool {
+    let Some(slot) = current_slot() else {
+        return false;
+    };
+    crate::personality::deliver_on_interrupt(slot, regs)
+}
+
+/// Hand a trap taken in user mode to the process that took it, as the signal it raises.
+/// `true` when the process has a handler and `regs` is now that handler's; `false` when the
+/// port must end the thread, as every trap did before signals.
+fn on_user_trap(trap: UserTrap, regs: &mut [u64; hal::user::REGISTER_WORDS]) -> bool {
+    let Some(slot) = current_slot() else {
+        return false;
+    };
+    crate::personality::trap_signal(slot, trap, regs)
 }
 
 /// Threads [`on_user_interrupt`] has ended since boot.
@@ -1962,6 +1986,8 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
                 fault: on_user_fault,
                 kill: on_kill,
                 interrupted: on_user_interrupt,
+                deliver: on_user_deliver,
+                trap: on_user_trap,
             },
             kernel_root,
         );

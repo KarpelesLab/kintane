@@ -269,13 +269,68 @@ pub(crate) fn kill(trap: UserTrap) -> ! {
     }
 }
 
-/// On the way out of an interrupt handler: if the interrupt arrived in ring 3, give the
-/// kernel the chance to end the thread instead of returning to it. Called after the
-/// handler's EOI and scheduler hook, with `GS` still the kernel's.
-pub(crate) fn interrupted(from_user: bool) {
-    if from_user && let Some(h) = hooks() {
-        (h.interrupted)();
+/// Every register of a trap from ring 3, in the order `hal::user::UserRegisters` gives them:
+/// `rax, rbx, rcx, rdx, rsi, rdi, rbp, r8`–`r15, rip, rflags, rsp`, as [`Registers`] does.
+fn words_of(f: &crate::idt::TrapFrame) -> [u64; hal::user::REGISTER_WORDS] {
+    let mut w = [0u64; hal::user::REGISTER_WORDS];
+    w[..18].copy_from_slice(&[
+        f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp, f.r8, f.r9, f.r10, f.r11, f.r12,
+        f.r13, f.r14, f.r15, f.rip, f.rflags, f.rsp,
+    ]);
+    w
+}
+
+/// Return to `w` rather than to what the trap interrupted. The address and the flags are
+/// sanitised exactly as [`X86_64::set_registers`] sanitises them: the words came out of a
+/// signal frame, which is the program's own memory to write.
+fn set_words(f: &mut crate::idt::TrapFrame, w: &[u64; hal::user::REGISTER_WORDS]) {
+    let [rax, rbx, rcx, rdx, rsi, rdi, rbp] = [w[0], w[1], w[2], w[3], w[4], w[5], w[6]];
+    (f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp) = (rax, rbx, rcx, rdx, rsi, rdi, rbp);
+    (f.r8, f.r9, f.r10, f.r11) = (w[7], w[8], w[9], w[10]);
+    (f.r12, f.r13, f.r14, f.r15) = (w[11], w[12], w[13], w[14]);
+    f.rip = user_rip(w[15]);
+    f.rflags = user_flags(w[16]);
+    f.rsp = w[17];
+}
+
+/// On the way back to ring 3 from a scheduler interrupt, with the registers it took: end the
+/// thread if its process has gone, then deliver a signal to it if one is waiting.
+///
+/// A thread spinning in user mode never makes a system call, so this is the only place a
+/// handler can be entered for it.
+///
+/// # Safety
+/// `frame` is the live trap frame of an interrupt taken from ring 3, with `GS` the kernel's.
+pub(crate) unsafe fn interrupted_frame(frame: *mut crate::idt::TrapFrame) {
+    let Some(h) = hooks() else {
+        return;
+    };
+    (h.interrupted)();
+    // SAFETY: the caller's promise: the frame is live and nothing else refers to it.
+    let f = unsafe { &mut *frame };
+    let mut regs = words_of(f);
+    if (h.deliver)(&mut regs) {
+        set_words(f, &regs);
     }
+}
+
+/// Hand a trap taken in ring 3 to the kernel as the signal it raises. `true` when the process
+/// has a handler and `frame` now returns to it; `false` when the caller must kill.
+///
+/// # Safety
+/// `frame` is the live trap frame of a trap taken from ring 3.
+pub(crate) unsafe fn trap_handled(trap: UserTrap, frame: *mut crate::idt::TrapFrame) -> bool {
+    let Some(h) = hooks() else {
+        return false;
+    };
+    // SAFETY: the caller's promise.
+    let f = unsafe { &mut *frame };
+    let mut regs = words_of(f);
+    if !(h.trap)(trap, &mut regs) {
+        return false;
+    }
+    set_words(f, &regs);
+    true
 }
 
 /// The Rust side of the `syscall` entry: run the installed handler on `frame`.

@@ -85,6 +85,13 @@ struct ThreadSignals {
     tid: AtomicU64,
     mask: AtomicU64,
     pending: AtomicU64,
+    /// The address the last fault on this thread took, which `si_addr` reports.
+    fault: AtomicU64,
+    /// The instruction that fault was taken at, and how many faults in a row have been taken
+    /// there. A handler that returns without fixing what it was sent for returns to the same
+    /// instruction, which faults again at once; see [`REFAULTS`].
+    fault_pc: AtomicU64,
+    refaults: AtomicU32,
 }
 
 static THREAD_SIGNALS: [ThreadSignals; THREADS] = [const {
@@ -94,8 +101,20 @@ static THREAD_SIGNALS: [ThreadSignals; THREADS] = [const {
         tid: AtomicU64::new(0),
         mask: AtomicU64::new(0),
         pending: AtomicU64::new(0),
+        fault: AtomicU64::new(0),
+        fault_pc: AtomicU64::new(0),
+        refaults: AtomicU32::new(0),
     }
 }; THREADS];
+
+/// How many times a thread may fault at one instruction with a handler for it before the
+/// kernel stops running that handler and lets the signal end the process.
+///
+/// Linux leaves this to the program: a handler that returns without fixing the fault faults
+/// again, forever. A kernel whose boot checks must finish cannot spin like that, so the
+/// process ends instead, reported as ended by the signal — and the count is per instruction,
+/// so a handler that fixes one fault and meets another somewhere else starts over.
+const REFAULTS: u32 = 16;
 
 static ACTION_CLASS: LockClass = LockClass::new("linux.sigaction");
 /// Each process's dispositions. Held only to read or write them, and nothing is taken inside.
@@ -315,13 +334,20 @@ pub(super) fn raise_self(slot: usize, signo: u64) {
     }
 }
 
+/// The calling thread's entry if it already has one, without making it one. What the paths
+/// that must not claim an entry — a thread of a process that is not Linux at all — look
+/// through.
+fn existing(slot: usize) -> Option<&'static ThreadSignals> {
+    let k = key(slot);
+    THREAD_SIGNALS
+        .iter()
+        .find(|t| t.key.load(Ordering::Acquire) == k && t.slot.load(Ordering::Acquire) == slot)
+}
+
 /// Whether the calling thread of `slot` has a signal to act on: pending, not masked, not
 /// ignored. What a blocking call looks at when it wakes.
 pub(super) fn interrupting(slot: usize) -> bool {
-    let k = key(slot);
-    let (mask, pending) = THREAD_SIGNALS
-        .iter()
-        .find(|t| t.key.load(Ordering::Acquire) == k && t.slot.load(Ordering::Acquire) == slot)
+    let (mask, pending) = existing(slot)
         .map_or((FIRST_MASK[slot].load(Ordering::Acquire), 0), |t| {
             (t.mask.load(Ordering::Acquire), t.pending.load(Ordering::Acquire))
         });
@@ -389,28 +415,52 @@ fn restarted(entry: &Words) -> Words {
     ctx
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle(
+/// Handlers entered on the way out of an interrupt rather than a system call, and handlers
+/// entered for a fault the thread took.
+static ASYNC: AtomicU64 = AtomicU64::new(0);
+static FAULTED: AtomicU64 = AtomicU64::new(0);
+
+/// The exit code the last fault decided for each process, for [`fault_exit_code`]. Zero until
+/// a fault raises a signal nothing handles.
+static LAST_FAULT: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
+
+/// The code a trap that ended `slot` is recorded with, when a fault chose one: `SIGFPE` for a
+/// division by zero rather than the `SIGSEGV` every trap used to report.
+pub(super) fn fault_exit_code(slot: usize) -> Option<u64> {
+    let code = LAST_FAULT[slot].load(Ordering::Acquire);
+    (code != 0).then_some(code)
+}
+
+/// The address `si_addr` reports for `signo`: the one the thread's last fault took, and
+/// nothing for a signal a fault did not raise, whose bytes hold the sender's pid instead.
+fn fault_addr(slot: usize, signo: u64) -> Option<u64> {
+    if !sig::from_fault(signo) {
+        return None;
+    }
+    existing(slot).map(|t| t.fault.load(Ordering::Acquire))
+}
+
+/// Put the thread of `slot`, whose registers are `ctx`, into `action`'s handler for `signo`:
+/// the frame on its stack and the registers it starts the handler with, or `None` when the
+/// frame could not be written.
+///
+/// Every delivery goes through here, from a system call, an interrupt or a fault alike; what
+/// differs between them is only which registers `ctx` holds.
+fn enter_handler(
     slot: usize,
     me: &ThreadSignals,
-    frame: &mut <Cpu as HasUserMode>::SyscallFrame,
-    entry: &Words,
-    interrupted: bool,
+    ctx: &Words,
     signo: u64,
     action: Action,
     mask: u64,
-) {
-    use sig::flags::{SA_NODEFER, SA_RESETHAND, SA_RESTART};
-    // What the handler returns to: the call again, or its answer.
-    let ctx = if interrupted && action.flags & SA_RESTART != 0 {
-        restarted(entry)
-    } else {
-        Cpu::registers(frame).to_words()
-    };
+) -> Option<Words> {
+    use sig::flags::{SA_NODEFER, SA_RESETHAND};
     let from = SENDER[slot][(signo - 1) as usize].load(Ordering::Acquire);
     let code = if signo == sig::SIGCHLD {
         // CLD_EXITED: the only change a child reports here.
         1
+    } else if sig::from_fault(signo) {
+        sig::SI_KERNEL
     } else if from != 0 {
         sig::SI_USER
     } else {
@@ -422,16 +472,11 @@ fn handle(
         old_mask: mask,
         code,
         pid: from,
+        addr: fault_addr(slot, signo),
     };
-    let built = sig::build(ABI, &ctx, &d, USER_START, USER_END)
+    let built = sig::build(ABI, ctx, &d, USER_START, USER_END)
         .ok()
-        .filter(write_frame);
-    let Some(built) = built else {
-        // No room below the stack for the frame, or not memory the thread can write: Linux's
-        // answer is SIGSEGV, which ends the process.
-        SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
-        super::exit_group(slot, sig::exit_code(sig::SIGSEGV))
-    };
+        .filter(write_frame)?;
     let mut blocked = mask | action.mask;
     if action.flags & SA_NODEFER == 0 {
         blocked |= sig::bit(signo);
@@ -441,8 +486,121 @@ fn handle(
     if action.flags & SA_RESETHAND != 0 {
         ACTIONS.lock_irqsave()[slot][(signo - 1) as usize] = Action::DEFAULT;
     }
-    Cpu::set_registers(frame, &UserRegisters::from_words(&built.regs));
     HANDLED.fetch_add(1, Ordering::Relaxed);
+    Some(built.regs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle(
+    slot: usize,
+    me: &ThreadSignals,
+    frame: &mut <Cpu as HasUserMode>::SyscallFrame,
+    entry: &Words,
+    interrupted: bool,
+    signo: u64,
+    action: Action,
+    mask: u64,
+) {
+    use sig::flags::SA_RESTART;
+    // What the handler returns to: the call again, or its answer.
+    let ctx = if interrupted && action.flags & SA_RESTART != 0 {
+        restarted(entry)
+    } else {
+        Cpu::registers(frame).to_words()
+    };
+    let Some(regs) = enter_handler(slot, me, &ctx, signo, action, mask) else {
+        // No room below the stack for the frame, or not memory the thread can write: Linux's
+        // answer is SIGSEGV, which ends the process.
+        SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
+        super::exit_group(slot, sig::exit_code(sig::SIGSEGV))
+    };
+    Cpu::set_registers(frame, &UserRegisters::from_words(&regs));
+}
+
+/// Deliver what the thread of `slot` has pending to the registers an interrupt took it out of
+/// user mode with. `true` when `regs` is a handler's now.
+///
+/// This is the path a thread spinning in user mode is reached by: it calls nothing, so nothing
+/// else ever returns to it with its registers in the kernel's hands. Called on the way back to
+/// user code, so the context it changes is the program's own and no lock taken here can be one
+/// that context held.
+pub(super) fn deliver_interrupted(slot: usize, regs: &mut Words) -> bool {
+    // Lock-free and cheap first: most interrupts of most threads have nothing to deliver, and
+    // a thread of a process that is not Linux at all never has an entry to look at.
+    let entry = existing(slot);
+    let pending = entry.map_or(0, |t| t.pending.load(Ordering::Acquire))
+        | PROCESS_PENDING[slot].load(Ordering::Acquire);
+    if pending == 0 {
+        return false;
+    }
+    let Some(me) = entry.or_else(|| mine(slot)) else {
+        return false;
+    };
+    loop {
+        let mask = me.mask.load(Ordering::Acquire);
+        let Some(signo) = take(&me.pending, !mask).or_else(|| take(&PROCESS_PENDING[slot], !mask))
+        else {
+            return false;
+        };
+        let action = action_of(slot, signo);
+        match sig::effect(signo, &action) {
+            Effect::Ignore => {}
+            Effect::Terminate => {
+                SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
+                super::exit_group(slot, sig::exit_code(signo))
+            }
+            Effect::Handle => {
+                let Some(next) = enter_handler(slot, me, regs, signo, action, mask) else {
+                    SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
+                    super::exit_group(slot, sig::exit_code(sig::SIGSEGV))
+                };
+                *regs = next;
+                ASYNC.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+}
+
+/// A trap the thread of `slot` took raised `signo`, at `addr`. `true` when a handler runs and
+/// `regs` is now that handler's; `false` when the trap must end the process, which is what the
+/// port does with it.
+///
+/// A fault's signal cannot be held off the way a sent one can: the instruction that raised it
+/// runs again the moment the thread does. A masked or ignored one therefore ends the process,
+/// as it does on Linux, and so does a handler that has returned to the same instruction
+/// [`REFAULTS`] times without fixing what it was sent for.
+pub(super) fn on_fault(slot: usize, signo: u64, addr: u64, regs: &mut Words) -> bool {
+    LAST_FAULT[slot].store(sig::exit_code(signo), Ordering::Release);
+    let action = action_of(slot, signo);
+    if sig::effect(signo, &action) != Effect::Handle {
+        return false;
+    }
+    let Some(me) = mine(slot) else {
+        return false;
+    };
+    let mask = me.mask.load(Ordering::Acquire);
+    if mask & sig::bit(signo) != 0 {
+        return false;
+    }
+    let pc = regs[ABI.pc_word()];
+    let again = me.fault_pc.swap(pc, Ordering::AcqRel) == pc;
+    let refaults = if again {
+        me.refaults.fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        me.refaults.store(0, Ordering::Release);
+        0
+    };
+    if refaults >= REFAULTS {
+        return false;
+    }
+    me.fault.store(addr, Ordering::Release);
+    let Some(next) = enter_handler(slot, me, regs, signo, action, mask) else {
+        return false;
+    };
+    *regs = next;
+    FAULTED.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// Write a frame to the calling thread's stack. `false` if any of it could not be.
@@ -687,6 +845,61 @@ const ENDS: u64 = 3;
 
 fn counters() -> [u64; 4] {
     [&HANDLED, &RETURNED, &INTERRUPTED, &SIGNAL_ENDS].map(|n| n.load(Ordering::Relaxed))
+}
+
+/// `argv` for the program's faults mode, and its exit code when every step behaved; mirror
+/// `user/linux-hello/src/main.rs`.
+const FAULTS_ARGV: [&[u8]; 2] = [b"hello", b"faults"];
+const FAULTS_SUCCESS: u64 = 54;
+/// What that mode does at least: one handler entered from an interrupt, for a thread that only
+/// spins, and two from faults it raised itself — the store with no mapping and the
+/// architecture's arithmetic trap.
+const ASYNC_HANDLERS: u64 = 1;
+const FAULT_HANDLERS: u64 = 2;
+
+/// Run the program in its faults mode and grade it: a handler entered for a thread that makes
+/// no system call, and handlers for the faults the program raises itself. On the boot thread,
+/// after the signals run, whose slot and stacks it reuses.
+pub(super) fn faults_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux flt  ");
+    let before = [&ASYNC, &FAULTED, &HANDLED, &RETURNED].map(|n| n.load(Ordering::Relaxed));
+    let run = match super::run_mode(&FAULTS_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
+    let after = [&ASYNC, &FAULTED, &HANDLED, &RETURNED].map(|n| n.load(Ordering::Relaxed));
+    let [asynchronous, faulted, handled, returned] = [0, 1, 2, 3].map(|i| after[i] - before[i]);
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(FAULTS_SUCCESS)) => c.write_str(
+            "a spinning thread took its handler, SIGSEGV was fixed from si_addr, the arithmetic trap stepped over",
+        ),
+        (true, Some(code)) => {
+            c.write_str("the program exited ");
+            write_hex(c, code);
+            c.write_str(", WRONG");
+        }
+    }
+    c.write_str("; ");
+    write_usize(c, asynchronous as usize);
+    c.write_str(" from an interrupt, ");
+    write_usize(c, faulted as usize);
+    c.write_str(" from a fault, ");
+    write_usize(c, returned as usize);
+    c.write_str(" of ");
+    write_usize(c, handled as usize);
+    c.write_str(" returned");
+    let counted =
+        asynchronous >= ASYNC_HANDLERS && faulted >= FAULT_HANDLERS && returned == handled;
+    if !counted {
+        c.write_str("; NOT WHAT THE MODE DOES");
+    }
+    let clean = super::report_run(c, &run);
+    Check::from_ok(run.code == Some(FAULTS_SUCCESS) && counted && clean)
 }
 
 /// Run the program in its signals mode with the scheduler, and grade it. On the boot thread,

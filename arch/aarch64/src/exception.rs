@@ -267,16 +267,24 @@ unsafe fn try_user_sync(_index: u64, _frame: *mut TrapFrame) -> bool {
 }
 
 /// The last thing an IRQ taken from EL0 does before it returns: the kernel may end the thread
-/// there instead (`hal::user::UserHooks::interrupted`). The two definitions keep the `cfg` at
-/// item level.
+/// there instead, or deliver a signal to it, for which it is given the registers the interrupt
+/// took (`hal::user::UserHooks::interrupted` and `deliver`). The two definitions keep the
+/// `cfg` at item level.
+///
+/// # Safety
+/// `frame` is the live exception frame of an IRQ taken from EL0.
 #[cfg(CONFIG_USERSPACE)]
-fn returning_to_user() {
-    crate::user::interrupted();
+unsafe fn returning_to_user(frame: *mut TrapFrame) {
+    // SAFETY: forwarded; the frame is live and nothing else holds a reference to it.
+    unsafe { crate::user::interrupted(frame) };
 }
 
 /// No userspace port: nothing at EL0 to return to.
+///
+/// # Safety
+/// None; matches the userspace form's signature.
 #[cfg(not(CONFIG_USERSPACE))]
-fn returning_to_user() {}
+unsafe fn returning_to_user(_frame: *mut TrapFrame) {}
 
 /// Install the vector table in `VBAR_EL1`.
 ///
@@ -319,7 +327,9 @@ extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
     if index == VEC_CURRENT_SPX_IRQ || index == VEC_LOWER_A64_IRQ {
         crate::irq::dispatch();
         if index == VEC_LOWER_A64_IRQ {
-            returning_to_user();
+            // SAFETY: `frame` is the live exception frame of this IRQ, taken from EL0, and
+            // nothing else holds a reference to it here.
+            unsafe { returning_to_user(frame) };
         }
         return;
     }

@@ -43,8 +43,30 @@ pub(crate) fn wake_all_waiters() {}
     not(CONFIG_USERSPACE),
     expect(dead_code, reason = "only userspace traps processes")
 )]
-pub(crate) fn killed_by<P>(_personality: P) -> u64 {
+pub(crate) fn killed_by<P>(_slot: usize, _personality: P) -> u64 {
     u64::MAX
+}
+
+/// No Linux thread to deliver to on the way out of an interrupt.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "only userspace returns to user code")
+)]
+pub(crate) fn deliver_on_interrupt(_slot: usize, _regs: &mut [u64; hal::user::REGISTER_WORDS]) -> bool {
+    false
+}
+
+/// No Linux process to hand a fault to: every trap kills, as it did before signals.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "only userspace traps processes")
+)]
+pub(crate) fn trap_signal(
+    _slot: usize,
+    _trap: hal::user::UserTrap,
+    _regs: &mut [u64; hal::user::REGISTER_WORDS],
+) -> bool {
+    false
 }
 
 /// No Linux parent to tell.

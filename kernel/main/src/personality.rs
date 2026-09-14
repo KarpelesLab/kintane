@@ -344,14 +344,67 @@ fn unimplemented(slot: usize, number: u64) -> Result<u64, Failure> {
     Err(Failure::NotImplemented)
 }
 
-/// The exit code a process a trap ends is recorded with: a Linux process is reported to its
-/// parent as ended by `SIGSEGV`, whatever the trap was, since the trap hook has no registers to
-/// run a handler with; a native process as killed.
-pub(crate) fn killed_by(personality: Personality) -> u64 {
+/// The exit code a process a trap ends is recorded with: a Linux process by the signal the
+/// trap raised, which is `SIGSEGV` unless a fault said otherwise and nothing handled it; a
+/// native process as killed.
+pub(crate) fn killed_by(slot: usize, personality: Personality) -> u64 {
     match personality {
-        Personality::Linux => linux::signal::exit_code(linux::signal::SIGSEGV),
+        Personality::Linux => signals::fault_exit_code(slot)
+            .unwrap_or(linux::signal::exit_code(linux::signal::SIGSEGV)),
         Personality::Native => userproc::KILLED,
     }
+}
+
+/// Deliver a signal to the thread of `slot` an interrupt took out of user mode, with the
+/// registers it was taken with. `true` when `regs` is now a handler's and the port must return
+/// to it. This is what runs a handler for a thread that makes no system call at all.
+///
+/// On the way back to user code, so the interrupted context was the program's: it cannot have
+/// held any lock this takes.
+pub(crate) fn deliver_on_interrupt(slot: usize, regs: &mut [u64; hal::user::REGISTER_WORDS]) -> bool {
+    signals::deliver_interrupted(slot, regs)
+}
+
+/// Hand `trap` to the process of `slot` as the signal it raises: `true` when it has a handler
+/// and `regs` is now that handler's, `false` when the port must end the thread as before.
+///
+/// The signal a trap raises is the port's own vector or exception class read through this
+/// build's ABI, and `si_addr` is the address that faulted for a page fault, or the instruction
+/// for everything else, as Linux reports them.
+pub(crate) fn trap_signal(
+    slot: usize,
+    trap: hal::user::UserTrap,
+    regs: &mut [u64; hal::user::REGISTER_WORDS],
+) -> bool {
+    use linux::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV};
+    let (signo, addr) = match trap {
+        // A page the process may not touch, or one no mapping covers. Linux tells the two
+        // apart with `si_code`; this kernel does not, and reports the address either way.
+        hal::user::UserTrap::Page { fault, .. } => (SIGSEGV, fault.addr as u64),
+        hal::user::UserTrap::BadReturn { pc } => (SIGSEGV, pc as u64),
+        hal::user::UserTrap::Exception { code, pc } => {
+            let signo = match ABI {
+                // x86_64 vectors: #DE, #UD, #GP and #AC are the ones a program raises.
+                linux::Abi::X86_64 => match code {
+                    0 => SIGFPE,
+                    6 => SIGILL,
+                    17 => SIGBUS,
+                    _ => SIGSEGV,
+                },
+                // aarch64 exception classes: an unknown reason is an undefined instruction,
+                // 0x18 a system register it may not touch, 0x2c a floating-point exception,
+                // and 0x0e an illegal execution state.
+                linux::Abi::Aarch64 => match code {
+                    0x00 | 0x0e | 0x18 => SIGILL,
+                    0x2c => SIGFPE,
+                    0x22 => SIGBUS,
+                    _ => SIGSEGV,
+                },
+            };
+            (signo, pc as u64)
+        }
+    };
+    signals::on_fault(slot, signo, addr, regs)
 }
 
 fn pid(slot: usize) -> u64 {
@@ -2124,7 +2177,7 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("\n  linux sig  NOT RUN: the run before it left its processes in place");
         return Check::Failed;
     }
-    rich.and(signals::check(c))
+    rich.and(signals::check(c)).and(signals::faults_check(c))
 }
 
 fn free_frames() -> usize {

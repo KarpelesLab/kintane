@@ -213,13 +213,26 @@ pub(crate) unsafe fn on_lower_sync(esr: u64, far: u64, frame: *mut TrapFrame) {
             }
             // SAFETY: `elr` is the faulting instruction; the frame is live.
             let pc = unsafe { (*frame).elr } as usize;
-            kill(UserTrap::Page { fault, pc });
+            let trap = UserTrap::Page { fault, pc };
+            // A process may handle its own fault: `SIGSEGV` with the address in `si_addr`.
+            // SAFETY: forwarded; the frame is live.
+            if unsafe { trap_handled(trap, frame) } {
+                return;
+            }
+            kill(trap);
         }
         // Any other exception from EL0 is the process's problem.
         _ => {
             // SAFETY: the frame is live.
             let pc = unsafe { (*frame).elr } as usize;
-            kill(UserTrap::Exception { code: ec, pc });
+            let trap = UserTrap::Exception { code: ec, pc };
+            // As above: an undefined instruction or a floating-point exception is a signal
+            // the process may have a handler for.
+            // SAFETY: forwarded; the frame is live.
+            if unsafe { trap_handled(trap, frame) } {
+                return;
+            }
+            kill(trap);
         }
     }
 }
@@ -237,13 +250,65 @@ fn kill(trap: UserTrap) -> ! {
     }
 }
 
+/// Every register of a trap from EL0, in the order `hal::user::UserRegisters` gives them.
+fn words_of(f: &TrapFrame) -> [u64; hal::user::REGISTER_WORDS] {
+    let mut w = [0u64; hal::user::REGISTER_WORDS];
+    w[..31].copy_from_slice(&f.x);
+    w[31] = f.sp_el0;
+    w[32] = f.elr;
+    w[33] = f.spsr;
+    w
+}
+
+/// Return to `w` instead of what the trap interrupted. The address and the processor state
+/// are sanitised exactly as `set_registers` sanitises them: the frame is the kernel's, but
+/// what goes in it came from a program's signal frame.
+fn set_words(f: &mut TrapFrame, w: &[u64; hal::user::REGISTER_WORDS]) {
+    f.x.copy_from_slice(&w[..31]);
+    f.sp_el0 = w[31];
+    f.elr = user_pc(w[32]);
+    f.spsr = w[33] & USER_PSTATE;
+}
+
 /// On the way out of an IRQ taken from EL0: give the kernel the chance to end the thread
-/// instead of returning to it. Called after dispatch, so after every EOI and the scheduler's
-/// hook.
-pub(crate) fn interrupted() {
-    if let Some(h) = hooks() {
-        (h.interrupted)();
+/// instead of returning to it, and then to deliver a signal to it. Called after dispatch, so
+/// after every EOI and the scheduler's hook.
+///
+/// The frame holds every register the interrupt took from EL0, which is what a signal frame
+/// has to save: a thread spinning in user mode is reached here and nowhere else.
+///
+/// # Safety
+/// `frame` is the live exception frame of an IRQ taken from EL0.
+pub(crate) unsafe fn interrupted(frame: *mut TrapFrame) {
+    let Some(h) = hooks() else {
+        return;
+    };
+    (h.interrupted)();
+    // SAFETY: the caller's promise: the frame is live, and this is the only reference to it.
+    let f = unsafe { &mut *frame };
+    let mut regs = words_of(f);
+    if (h.deliver)(&mut regs) {
+        set_words(f, &regs);
     }
+}
+
+/// Hand a trap taken at EL0 to the kernel as a signal for the process. `true` when the process
+/// has a handler and `frame` now returns to it; `false` when the caller must kill.
+///
+/// # Safety
+/// `frame` is the live exception frame of a trap taken from EL0.
+unsafe fn trap_handled(trap: UserTrap, frame: *mut TrapFrame) -> bool {
+    let Some(h) = hooks() else {
+        return false;
+    };
+    // SAFETY: the caller's promise.
+    let f = unsafe { &mut *frame };
+    let mut regs = words_of(f);
+    if !(h.trap)(trap, &mut regs) {
+        return false;
+    }
+    set_words(f, &regs);
+    true
 }
 
 impl hal::HasUserMode for Aarch64 {
