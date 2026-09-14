@@ -13,9 +13,91 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | **exit criterion met** on x86_64: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
-| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b's second slice on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve` and `wait4`. Signals and Linux sockets are not started |
-| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, a read-only FAT16 filesystem, virtio-net with IPv4 and TCP, sockets over handles, an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
+| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals with their own frames, TCP sockets, and file writes. Stopping signals, `poll`/`epoll` and datagram sockets are not built |
+| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, a FAT16 filesystem written as well as read and checked after every run, virtio-net with IPv4 and TCP, sockets over handles and through Linux calls, an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The ninth round of landings
+
+Eighteen presets now build and boot, with `x86_64-isolated-smp` new. Six branches ran in
+parallel, and all six landed.
+
+- **The SMP deadlock the eighth round recorded is fixed.** A thread faulting on one CPU while
+  another installed a program, unmapped or forked could stop both: the frame lock's wait spun
+  with interrupts masked and never answered the holder's TLB shootdown. The wait now answers
+  shootdowns on every spin, as the process locks already did. A churning-pair stress cycle hung
+  all eight runs with the old lock on both SMP presets at 4 and 8 CPUs, and passes with the fix;
+  the Linux pair's workaround is gone. Every lock held across a shootdown is now written down
+  with how it is waited for.
+- **Signals** (Phase 6b), on x86_64 and aarch64. Processes have dispositions and a pending set,
+  threads have masks and pending sets of their own, and delivery happens on the way out of every
+  system call through Linux's own signal frames. `rt_sigreturn` validates the frame the program
+  hands back, and a fuzz target holds it to that. Blocked pipe, futex and `wait4` calls return
+  `EINTR` or restart under `SA_RESTART`; children send `SIGCHLD`, readerless writes raise
+  `SIGPIPE`, and default actions end processes with the signal `wait4` reports. Stopping,
+  alternate stacks, queued real-time signals, handlers from interrupts or traps, and
+  floating-point state in the frame are not built.
+- **Networking serves real programs** (Phase 7). The virtio-net interrupt handler runs the stack
+  and wakes socket waiters, which otherwise look again only at TCP timers: the checks require
+  wakes from the card and zero polls. The Linux personality answers the IPv4 TCP socket calls on
+  both architectures, blocking and non-blocking, over the kernel's socket objects. A static
+  program that knows nothing of KinTane is both a client of kbuild's service and a server kbuild
+  connects into through a QEMU port forward. No `poll`, `select`, `epoll`, datagram sockets or
+  congestion control.
+- **Driver isolation past its exit criterion** (Phase 5). On `x86_64-isolated-smp` the disk is
+  served from a ring-3 domain with its client, its interrupt and the domain each on a different
+  CPU; the interrupt handler hands work to a forwarder thread without taking a lock, and every
+  interrupt of the run is accounted as forwarded. VT-d changes the unit may have cached are
+  flushed through the invalidation queue, and every IOMMU boot proves it: a translation taken
+  away while the device runs cannot be reached through QEMU's IOTLB. Delivery to a CPU with an
+  x2APIC ID above 255 stays blocked, because the kernel's ACPI discovery cannot describe the 257
+  or more CPUs QEMU needs for such a topology. The branch also fixed a seventh-round overrun that
+  zeroed the page after every VT-d table frame.
+- **KinTane writes files** (Phase 7). The block cache holds writes back and releases them in the
+  order FAT16 needs, so a crash can leave lost clusters or table copies one step apart, but never
+  a cross-linked chain or a directory entry pointing at free clusters. Native programs write
+  through the standing file server, where writing is a right the kernel grants per connection;
+  Linux programs use their own calls on both architectures. After every run kbuild reads the disk
+  image back with its own FAT reader, which shares no code with the kernel, and `kbuild crashtest`
+  killed QEMU 30 times mid-write without producing an inconsistent volume. FAT32, long names and
+  renames across directories are not built.
+- **The boot stack is the configured size on every port, and measured.** aarch64, i686 and riscv32
+  reserved a fixed 16 KiB and ignored `BOOT_STACK_KIB`; all five ports now take it from `sizes.ld`
+  and assert it, and kbuild refuses a linked kernel whose stack symbols disagree. Every boot paints
+  the stack and reports how deep it went, failing past 75%: that found `x86_64-iommu`'s test image
+  at 93% of 16 KiB, so IOMMU, SMP and stress builds join driver-domain builds at 32 KiB, while
+  `armv7m-tiny` keeps 14 KiB at 66%, because there the RAM is real. The boot `preempt` check is now
+  judged in interrupts, preemptions and slices rather than wall-clock windows: beside six busy
+  guests the old check failed 4 of 20 runs and the new one none of 20.
+
+**A real bug, found because branches compared notes.** Three branches reported the same thing
+under load — the `preempt` check saying "thread table INCONSISTENT", once followed by a fault at
+instruction address 5. It was not a timing artefact. When the check's fixed window ended before a
+worker had exited, its slot was never reaped, and the checks that follow spawned on stack slots 1
+to 3 regardless: two live threads shared one stack, and the older one returned into whatever the
+newer had written. Nothing had ever checked that a slot's previous thread was gone. `spawn` and
+`spawn_prepared` now refuse such a slot, an unreaped thread fails the check outright, and the bug
+reproduces on the eighth round's last commit with no load at all.
+
+**What merging six branches taught this round:**
+
+- **Three branches, three helpers, one name.** `join`, `write_all` and a mode's success code each
+  arrived twice in the one test program, from branches that never saw each other. Git merged the
+  files without complaint and the compiler caught two of them; the third, four modes sharing exit
+  codes 46 and 47, no compiler could catch. The modes are numbered 42 to 50 now, each distinct.
+- **A loaded host is not a verdict, and not an excuse either.** Every branch reported failures in
+  the boot `preempt` check at load averages above 20, including on ports that carry none of the
+  code under test. The gate held — nothing was pushed until a quiet host agreed — and the same
+  reports, taken together, are what uncovered the shared-stack bug above.
+- **Size budgets moved again**, this time on aarch64: signals, Linux sockets and writable FAT16
+  together took `aarch64-virt` and `aarch64-virt-gicv3` to 101% of 1536 KiB and `aarch64-virt-smp`
+  to 100% of 1792 KiB. Raised to 2048 and 2304 KiB, matching what the eighth round did to x86_64.
+
+**Still open.** `poll`/`epoll` and datagram sockets; congestion control; signals delivered from
+interrupts and traps; FAT32, long names and renames across directories; VT-d queued invalidation's
+recovery from a rejected descriptor; an x2APIC ID above 255 on hardware that can have one; the
+guest-time bounds that remain in the stress audit; and, as before, the 24-hour soak, real hardware,
+and Secure Boot with a TPM.
 
 ### The eighth round of landings
 
