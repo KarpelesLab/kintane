@@ -368,6 +368,50 @@ endpoint object is destroyed rather than its last gives that same line and fails
 The interleaving is forced, not raced: at boot only the boot CPU schedules, so this proves
 that a held lookup keeps its channel, not that two CPUs happen to collide.
 
+**A wait for a process runs out on time.** In the `waits` line, `init` waits for its own
+process with `process_wait` and no completion queue. That process cannot end while it waits,
+so a zero timeout must answer `ShouldWait`, arming a queue with a timeout must be refused, and
+a 30 ms wait must end in `TimedOut` no earlier than 30 ms and not long after. `spawn` joins its
+child with a timeout. Falsified: a kernel that ignores the timeout fails `waits` within its
+patience, as `init NEVER EXITED`, rather than hanging the boot.
+
+**A thread spinning in user mode is stopped when its process ends.** The `sibling` line
+(`kernel/main/src/sibling.rs`) runs after `waits` on the same presets. The kernel starts two
+threads of `init` in one process. The second signals an event and then spins in user mode for
+ever, with no system call; the first waits for the signal, waits 20 ms more, and exits. A
+thread that neither calls nor waits can only be reached by interrupt. An exit sends a
+reschedule IPI to every other CPU, and every scheduler interrupt that arrived in user mode
+ends its thread on the way back if the thread's process has ended
+(`hal::user::UserHooks::interrupted`, on x86_64 after the timer's and the reschedule IPI's
+hook, on aarch64 after an IRQ from EL0). The check requires the success code, both threads
+ended within 5 s, at least one thread ended from an interrupt, and every object and frame
+back:
+
+```
+  sibling    a process ended under a thread spinning in user mode, and it stopped; 1 stopped from an interrupt; 0 objects left, 0 frames left ok
+```
+
+At boot only the boot CPU schedules, so there the spinner is reached when the scheduler
+resumes it inside the timer interrupt that preempted it. In the stress run, every other audit
+interval runs the same process with its two threads pinned to two CPUs, so the exit on one
+must reach a thread spinning on the other. That cycle fails the run as `spinning sibling` if
+the spinner is not stopped, if it ended other than by interrupt, or if a frame or object is
+left.
+
+Falsified (applied, booted on `x86_64-qemu`, restored): with the interrupt hook never ending
+a thread, the line fails by the clock rather than hanging the boot:
+
+```
+  sibling    THE SPINNING THREAD WAS NEVER STOPPED; 0 stopped from an interrupt, NONE; A THREAD NEVER ENDED, its process left in place; 1 OBJECTS LEAKED, 14 FRAMES LEAKED
+```
+
+Over 20 s of stress on `x86_64-qemu-smp` and `aarch64-virt-smp`, ten spinning processes each
+had their spinner, pinned to a CPU other than the exiting thread's, stopped from an interrupt.
+One falsification did **not** fail. With the exit sending no reschedule IPI at all, the same
+stress run still passed with ten spinners stopped. The stress run keeps every CPU busy, so the
+spinner's CPU takes slice ticks, and the next tick stops it. The IPI is what reaches a spinner
+on an otherwise idle CPU, and nothing here isolates that case yet.
+
 ### 2b. Block storage
 
 With `QEMU_BLOCK_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild

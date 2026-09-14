@@ -608,6 +608,35 @@ fn on_kill(trap: UserTrap) -> ! {
     finish_thread(slot, last, exit)
 }
 
+/// The way back to user code from an interrupt that arrived while it ran. A thread whose
+/// process has ended in the meantime ends here instead of returning.
+///
+/// A thread spinning in user mode makes no system call and waits on nothing, so this is the
+/// one place it can be stopped: at the next timer interrupt on its CPU, at the reschedule IPI
+/// [`record_exit`] sends to every other CPU, or, on the exiting thread's own CPU, when the
+/// scheduler resumes it inside the interrupt that preempted it. See `crate::sibling`.
+fn on_user_interrupt() {
+    let Some(slot) = current_slot() else {
+        return;
+    };
+    if !EXITING[slot].load(Ordering::Acquire) {
+        return;
+    }
+    INTERRUPT_KILLS.fetch_add(1, Ordering::Relaxed);
+    let (last, exit) = match lock(slot) {
+        Some(mut held) => (leave(slot), held.process().exit),
+        None => (leave(slot), Some(KILLED)),
+    };
+    finish_thread(slot, last, exit)
+}
+
+/// Threads [`on_user_interrupt`] has ended since boot.
+static INTERRUPT_KILLS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn interrupt_kills() -> u64 {
+    INTERRUPT_KILLS.load(Ordering::Relaxed)
+}
+
 /// Count one thread of process `slot` as ended, and say whether it was the last.
 ///
 /// A process whose threads were never counted — the boot-time slice starts its one thread
@@ -659,6 +688,11 @@ fn record_exit(p: &mut Process, code: u64) {
     // wait again.
     objects::wake_all_waiters();
     wake_all_channel_waiters();
+    // A thread of it running user code on another CPU neither calls nor waits; an interrupt
+    // is what reaches it ([`on_user_interrupt`]).
+    if threads_live(p.slot) > 1 {
+        preempt::interrupt_other_cpus();
+    }
 }
 
 /// End the running process with `code`, from its own system call. Never returns.
@@ -1516,6 +1550,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
                 syscall: on_syscall,
                 fault: on_user_fault,
                 kill: on_kill,
+                interrupted: on_user_interrupt,
             },
             kernel_root,
         );

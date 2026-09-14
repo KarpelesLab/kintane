@@ -147,7 +147,10 @@ user stack of its own, up to three beyond the first over the process's life. Two
 one process may be in the kernel on two CPUs at once, so a system call takes its process's
 lock and releases it around anything that blocks. A process ends when any thread calls
 `process_exit` or faults. Its other threads end at their next system call, or at once if
-they are waiting, because the exit wakes every wait. Its exit is posted to `process_wait`'s
+they are waiting, because the exit wakes every wait. A thread running user code, which does
+neither, is ended by interrupt: the exit sends a reschedule IPI to every other CPU, and a
+scheduler interrupt that arrived in user mode ends its thread on the way back if that thread's
+process has ended. Nothing of the process is freed until every thread is gone. Its exit is posted to `process_wait`'s
 queue when the last thread has gone.
 
 **A file service.** `lib/vfsproto` is a channel protocol (open, read, close, one 64-byte

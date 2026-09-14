@@ -372,6 +372,12 @@ pub fn stress_cycles() -> u64 {
     PAIRS.load(Ordering::Relaxed)
 }
 
+/// The second stack, for the stress run's other two-threaded process (`crate::sibling`), which
+/// runs after this one's cycle has reaped its threads.
+pub fn stress_stack() -> usize {
+    STRESS_STACK.load(Ordering::Relaxed)
+}
+
 /// Build, run and destroy one two-threaded waiting process; see the section comment. On the
 /// auditor's thread, after the process cycle.
 pub fn stress_cycle(round: u64) -> Result<(), &'static str> {

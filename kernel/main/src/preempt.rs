@@ -295,6 +295,26 @@ fn send_reschedules(mask: u64) {
     }
 }
 
+/// Interrupt every other CPU the scheduler runs on with a reschedule IPI.
+///
+/// For a process that has ended while another of its threads may be running user code
+/// elsewhere: an interrupt is the one thing that reaches a thread that makes no system call,
+/// and `userproc` ends it on the way back to user mode.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only to end user threads, which need USERSPACE"
+    )
+)]
+pub fn interrupt_other_cpus() {
+    let here = Cpu::cpu_index();
+    let others = (0..mp::CPUS.min(64))
+        .filter(|&cpu| cpu != here && joined(cpu))
+        .fold(0u64, |mask, cpu| mask | 1 << cpu);
+    send_reschedules(others);
+}
+
 /// Give CPU `cpu`, the caller's, to a ready thread there that should run, if one should.
 ///
 /// # Safety

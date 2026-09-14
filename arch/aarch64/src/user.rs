@@ -154,6 +154,15 @@ fn kill(trap: UserTrap) -> ! {
     }
 }
 
+/// On the way out of an IRQ taken from EL0: give the kernel the chance to end the thread
+/// instead of returning to it. Called after dispatch, so after every EOI and the scheduler's
+/// hook.
+pub(crate) fn interrupted() {
+    if let Some(h) = hooks() {
+        (h.interrupted)();
+    }
+}
+
 impl hal::HasUserMode for Aarch64 {
     const USER_START: usize = USER_START;
     const USER_END: usize = USER_END;

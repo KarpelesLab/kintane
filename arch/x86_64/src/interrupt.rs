@@ -218,6 +218,7 @@ extern "x86-interrupt" fn irq_entry<const LINE: u8>(frame: idt::InterruptFrame) 
     // acknowledged before the interrupted thread is suspended. See `tick`.
     if irq == TIMER_IRQ {
         tick::run_hook();
+        returning(from_user);
     }
     smp::gs_leave(from_user);
 }
@@ -244,6 +245,7 @@ extern "x86-interrupt" fn timer_entry(frame: idt::InterruptFrame) {
             tick::run_hook();
         }
     }
+    returning(from_user);
     smp::gs_leave(from_user);
 }
 
@@ -263,8 +265,21 @@ extern "x86-interrupt" fn ipi_reschedule_entry(frame: idt::InterruptFrame) {
     if run_hook {
         tick::run_hook();
     }
+    returning(from_user);
     smp::gs_leave(from_user);
 }
+
+/// The last thing a scheduler interrupt does before it returns: one that arrived in user mode
+/// may end the thread there instead (`hal::user::UserHooks::interrupted`). The two definitions
+/// keep the `cfg` at item level.
+#[cfg(CONFIG_USERSPACE)]
+fn returning(from_user: bool) {
+    crate::user::interrupted(from_user);
+}
+
+/// No userspace port: nothing runs in ring 3 to return to.
+#[cfg(not(CONFIG_USERSPACE))]
+fn returning(_from_user: bool) {}
 
 /// A TLB shootdown IPI: the kernel's handler flushes and acknowledges, and never switches.
 extern "x86-interrupt" fn ipi_tlb_entry(frame: idt::InterruptFrame) {

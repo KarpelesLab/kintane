@@ -24,6 +24,8 @@
 //!   kernel's file service; see [`waits`].
 //! * [`MODE_PAIR`] and [`MODE_PAIR_PEER`] are two threads of one process passing a counter back and
 //!   forth, each blocking for the other; the stress run pins them to two CPUs. See [`pair`].
+//! * [`MODE_SPIN`] and [`MODE_SPINNER`] are two threads of one process: the second spins in user
+//!   mode for ever, and the first ends the process under it. See [`spin`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -50,6 +52,10 @@ const MODE_WAITS: usize = 5;
 const MODE_PAIR: usize = 6;
 /// The second thread of [`MODE_PAIR`]; see [`peer`].
 const MODE_PAIR_PEER: usize = 7;
+/// End the process under a thread spinning in user mode; see [`spin`].
+const MODE_SPIN: usize = 8;
+/// Spin in user mode for ever; see [`spinner`].
+const MODE_SPINNER: usize = 9;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -91,6 +97,8 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_WAITS => waits(handle(a), handle(b), handle(c)),
         MODE_PAIR => pair(handle(a)),
         MODE_PAIR_PEER => peer(handle(a)),
+        MODE_SPIN => spin(handle(a)),
+        MODE_SPINNER => spinner(handle(a)),
         _ => 0xbad0,
     };
     exit(code)
@@ -370,6 +378,10 @@ const SPAWN_SUCCESS: u64 = 0x5a;
 const WAITS_SUCCESS: u64 = 0x6b;
 /// [`MODE_PAIR`]'s.
 const PAIR_SUCCESS: u64 = 0x6c;
+/// [`MODE_SPIN`]'s. Mirrors `kernel/main/src/sibling.rs`.
+const SPIN_SUCCESS: u64 = 0x6d;
+/// How long [`spin`] lets the spinner spin before ending the process under it.
+const SPIN_SETTLE_NS: u64 = 20_000_000;
 
 /// The timeout the timing steps use.
 const TIMEOUT_NS: u64 = 30_000_000;
@@ -698,6 +710,31 @@ fn ask<'a>(service: Handle, request: &[u8], buf: &'a mut [u8]) -> Option<vfsprot
     rt::send(service, request).ok()?;
     let n = rt::recv_timeout(service, buf, WAKE_NS).ok()?;
     vfsproto::parse_reply(buf.get(..n)?)
+}
+
+/// Wait for [`spinner`] to start, let it spin, and end the process under it. Returns
+/// [`SPIN_SUCCESS`], or `0x80x` for a step that did not behave. Whether the spinner ended too
+/// is for the kernel to see: nothing here could tell.
+fn spin(started: Handle) -> u64 {
+    let started = rt::Event { handle: started };
+    if !wait_promptly(&started) {
+        return 0x801;
+    }
+    // Long enough for the spinner to be deep in its loop, preempted here or running elsewhere.
+    if started.wait(SPIN_SETTLE_NS) != Err(Error::TimedOut) {
+        return 0x802;
+    }
+    SPIN_SUCCESS
+}
+
+/// Say this thread has started, then spin in user mode for ever without entering the kernel
+/// again. Only the kernel can end it.
+fn spinner(started: Handle) -> ! {
+    let _ = call::event_signal(started);
+    let mut spins = 0u64;
+    loop {
+        spins = core::hint::black_box(spins.wrapping_add(1));
+    }
 }
 
 /// Pass a counter to [`peer`] and back until a tenth of a second has gone, blocking in the

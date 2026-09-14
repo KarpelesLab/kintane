@@ -70,6 +70,12 @@ pub struct UserHooks<F> {
     /// End the current user thread for `trap`. Called from the trap handler, on the
     /// thread's kernel stack, with interrupts masked; it must not return.
     pub kill: fn(UserTrap) -> !,
+    /// Called on the way back to user code from an interrupt that arrived while it ran —
+    /// after the interrupt's own handling, its acknowledgement and the scheduler's hook — on
+    /// the thread's kernel stack, with interrupts masked. It may end the thread rather than
+    /// return: that is how a thread spinning in user mode, which makes no system call, is
+    /// stopped when its process ends.
+    pub interrupted: fn(),
 }
 
 /// A user address could not be copied from or to.

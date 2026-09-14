@@ -145,6 +145,15 @@ pub(crate) fn kill(trap: UserTrap) -> ! {
     }
 }
 
+/// On the way out of an interrupt handler: if the interrupt arrived in ring 3, give the
+/// kernel the chance to end the thread instead of returning to it. Called after the
+/// handler's EOI and scheduler hook, with `GS` still the kernel's.
+pub(crate) fn interrupted(from_user: bool) {
+    if from_user && let Some(h) = hooks() {
+        (h.interrupted)();
+    }
+}
+
 /// The Rust side of the `syscall` entry: run the installed handler on `frame`.
 #[unsafe(no_mangle)]
 extern "C" fn x86_64_syscall(frame: *mut SyscallFrame) {
