@@ -430,6 +430,96 @@ impl TcpStream {
     }
 }
 
+/// A datagram socket: no connection, and no delivery owed.
+pub struct UdpSocket {
+    handle: Handle,
+}
+
+impl UdpSocket {
+    /// A datagram socket bound to `port`, or, with `port` zero, one the kernel gives a port of
+    /// its own at the first send.
+    pub fn bind(port: u16) -> Result<UdpSocket, Error> {
+        let handle = Handle(call::socket_create(abi::socket::DATAGRAM)? as u32);
+        if port != 0
+            && let Err(e) = call::socket_bind(handle, abi::socket::address([0; 4], port))
+        {
+            let _ = call::handle_close(handle);
+            return Err(e);
+        }
+        Ok(UdpSocket { handle })
+    }
+
+    pub fn handle(&self) -> Handle {
+        self.handle
+    }
+
+    /// Send to the one address this socket sends to and takes datagrams from, without naming
+    /// it on every call.
+    pub fn connect(&self, ip: [u8; 4], port: u16) -> Result<(), Error> {
+        call::socket_connect(self.handle, abi::socket::address(ip, port), 0).map(|_| ())
+    }
+
+    /// Send `bytes` to `ip`:`port` as one datagram, waiting up to `timeout_ns` for the next
+    /// hop's hardware address.
+    pub fn send_to(
+        &self,
+        ip: [u8; 4],
+        port: u16,
+        bytes: &[u8],
+        timeout_ns: u64,
+    ) -> Result<usize, Error> {
+        let address = abi::socket::address(ip, port);
+        call::socket_send_to(
+            self.handle,
+            address,
+            UserPtr(bytes.as_ptr() as u64),
+            bytes.len(),
+            timeout_ns,
+        )
+        .map(|n| n as usize)
+    }
+
+    /// Send to the address [`UdpSocket::connect`] named.
+    pub fn send(&self, bytes: &[u8], timeout_ns: u64) -> Result<usize, Error> {
+        call::socket_send_to(
+            self.handle,
+            0,
+            UserPtr(bytes.as_ptr() as u64),
+            bytes.len(),
+            timeout_ns,
+        )
+        .map(|n| n as usize)
+    }
+
+    /// Take the oldest datagram into `buf`, waiting up to `timeout_ns` for one. Returns the
+    /// length it had and where it came from; a length past `buf` is one that did not fit, and
+    /// the rest of it is gone.
+    pub fn recv_from(
+        &self,
+        buf: &mut [u8],
+        timeout_ns: u64,
+    ) -> Result<(usize, [u8; 4], u16), Error> {
+        let mut from = 0u64;
+        let whole = call::socket_recv_from(
+            self.handle,
+            UserPtr(buf.as_mut_ptr() as u64),
+            buf.len(),
+            UserPtr(&raw mut from as u64),
+            timeout_ns,
+        )?;
+        Ok((whole as usize, abi::socket::ip(from), abi::socket::port(from)))
+    }
+
+    /// Take a datagram, without asking where it came from.
+    pub fn recv(&self, buf: &mut [u8], timeout_ns: u64) -> Result<usize, Error> {
+        self.recv_from(buf, timeout_ns).map(|(whole, _, _)| whole)
+    }
+
+    pub fn close(self) -> Result<(), Error> {
+        call::handle_close(self.handle).map(|_| ())
+    }
+}
+
 impl TcpListener {
     /// Listen on `port`.
     pub fn bind(port: u16) -> Result<TcpListener, Error> {

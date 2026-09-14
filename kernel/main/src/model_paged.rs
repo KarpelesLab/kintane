@@ -149,6 +149,41 @@ pub fn network_changed() {
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn network_changed() {}
 
+/// Whether this kernel has socket objects to exercise: a datagram round trip through one is
+/// not a thing a kernel without userspace can make.
+#[cfg(CONFIG_USERSPACE)]
+pub fn datagram_sockets() -> bool {
+    true
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn datagram_sockets() -> bool {
+    false
+}
+
+/// Make the socket the stress run's datagram rounds use, before any workload runs.
+#[cfg(CONFIG_USERSPACE)]
+pub fn datagram_setup() -> bool {
+    crate::sockets::datagram_setup()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn datagram_setup() -> bool {
+    false
+}
+
+/// One datagram round trip with kbuild's service, through a socket object.
+#[cfg(CONFIG_USERSPACE)]
+pub fn datagram_round(service: u16, n: u32, timeout_ns: u64) -> bool {
+    crate::sockets::datagram_round(service, n, timeout_ns)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn datagram_round(service: u16, n: u32, timeout_ns: u64) -> bool {
+    let _ = (service, n, timeout_ns);
+    false
+}
+
 /// Wait for the network to change, or for the stack's next TCP timer, as a socket call does.
 /// `false`, having waited for nothing, where nothing would wake the wait.
 #[cfg(CONFIG_USERSPACE)]

@@ -175,6 +175,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"signals" => signals(),
         b"tcp" => tcp(s.arg),
         b"serve" => serve(),
+        b"udp" => udp(s.arg),
         b"files" => files(),
         _ => hello(&s),
     }
@@ -915,6 +916,211 @@ fn decimal(digits: &[u8]) -> u16 {
         n = n * 10 + u32::from(d - b'0');
     }
     u16::try_from(n).unwrap_or(0)
+}
+
+// ---- udp: datagram sockets -----------------------------------------------------------------
+
+const UDP_SUCCESS: u64 = 52;
+
+const SOCK_DGRAM: u64 = 2;
+const IPPROTO_UDP: u64 = 17;
+const SO_BROADCAST: u64 = 6;
+const SO_RCVTIMEO: u64 = 20;
+const MSG_TRUNC: u64 = 0x20;
+const EMSGSIZE: i64 = 90;
+const ENOPROTOOPT: i64 = 92;
+const EPROTONOSUPPORT: i64 = 93;
+
+/// kbuild's datagram protocol, in `kbuild/src/qemu.rs`. The tag is this program's, so a reply
+/// to it is not one to `user/udp-client`'s request.
+const UDP_REQUEST: &[u8] = b"kintane-udp-request linux";
+const UDP_REPLY: &[u8] = b"kintane-udp-reply linux";
+/// The largest datagram the kernel carries; one byte more is `EMSGSIZE`. Mirrors
+/// `sockets::MAX_DATAGRAM`.
+const MAX_DATAGRAM: usize = 256;
+
+/// Send `bytes` on `fd`, to `to` or to whatever it connected to.
+fn send_to(fd: u64, bytes: &[u8], to: Option<([u8; 4], u16)>, flags: u64) -> i64 {
+    let (at, len) = match to {
+        Some((ip, port)) => (sockaddr(ip, port), 16u64),
+        None => ([0u8; 16], 0),
+    };
+    let address = if len == 0 { 0 } else { at.as_ptr() as u64 };
+    sys::call(
+        sys::SENDTO,
+        [fd, bytes.as_ptr() as u64, bytes.len() as u64, flags, address, len],
+    )
+}
+
+/// Take a datagram on `fd`, and where it came from.
+fn recv_from(fd: u64, buf: &mut [u8], flags: u64) -> (i64, Option<([u8; 4], u16)>) {
+    let mut a = [0u8; 16];
+    let mut len = a.len() as u32;
+    let n = sys::call(
+        sys::RECVFROM,
+        [
+            fd,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            flags,
+            a.as_mut_ptr() as u64,
+            &raw mut len as u64,
+        ],
+    );
+    let from = (len == 16 && a[0] == AF_INET as u8)
+        .then_some(([a[4], a[5], a[6], a[7]], u16::from_be_bytes([a[2], a[3]])));
+    (n, from)
+}
+
+/// A `struct msghdr` naming one buffer, and `to` when it names an address.
+fn msghdr(
+    address: &[u8; 16],
+    to: bool,
+    vector: &[u8; 16],
+) -> [u8; 56] {
+    let mut h = [0u8; 56];
+    let name = if to { address.as_ptr() as u64 } else { 0 };
+    let name_len: u64 = if to { 16 } else { 0 };
+    h[0..8].copy_from_slice(&name.to_le_bytes());
+    h[8..16].copy_from_slice(&name_len.to_le_bytes());
+    h[16..24].copy_from_slice(&(vector.as_ptr() as u64).to_le_bytes());
+    h[24..32].copy_from_slice(&1u64.to_le_bytes());
+    h
+}
+
+/// A `struct iovec` over `bytes`.
+fn iovec(base: u64, len: u64) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[0..8].copy_from_slice(&base.to_le_bytes());
+    v[8..16].copy_from_slice(&len.to_le_bytes());
+    v
+}
+
+/// How long a receive waits before `EAGAIN`, as a `struct timeval`.
+fn set_timeout(fd: u64, option: u64, micros: u64) -> i64 {
+    let mut tv = [0u8; 16];
+    tv[0..8].copy_from_slice(&(micros / 1_000_000).to_le_bytes());
+    tv[8..16].copy_from_slice(&(micros % 1_000_000).to_le_bytes());
+    sys::call(sys::SETSOCKOPT, [fd, SOL_SOCKET, option, tv.as_ptr() as u64, 16, 0])
+}
+
+/// The two ports the kernel passes as `<service>,<quiet>`.
+fn two_ports(arg: &[u8]) -> (u16, u16) {
+    let mut at = 0;
+    while at < arg.len() && arg.get(at) != Some(&b',') {
+        at += 1;
+    }
+    let service = decimal(arg.get(..at).unwrap_or(&[]));
+    let quiet = decimal(arg.get(at + 1..).unwrap_or(&[]));
+    (service, quiet)
+}
+
+fn udp(ports: &[u8]) -> ! {
+    let (service, quiet) = two_ports(ports);
+    // 170: the ports the kernel passed, and a datagram socket of the type asked for.
+    expect(service != 0 && quiet != 0, 170);
+    let fd = socket(SOCK_DGRAM | SOCK_CLOEXEC);
+    expect(fd >= 3, 170);
+    let fd = fd as u64;
+    expect(get_opt(fd, SOL_SOCKET, SO_TYPE) == Some(SOCK_DGRAM as u32), 170);
+    // UDP named outright is the same socket as protocol 0; another protocol is not.
+    let named = sys::call(sys::SOCKET, [AF_INET, SOCK_DGRAM, IPPROTO_UDP, 0, 0, 0]);
+    expect(named >= 3, 170);
+    expect(call1(sys::CLOSE, named as u64) == 0, 170);
+    expect(
+        sys::call(sys::SOCKET, [AF_INET, SOCK_DGRAM, IPPROTO_TCP, 0, 0, 0]) == -EPROTONOSUPPORT,
+        170,
+    );
+
+    // 171: with nowhere to send and no address given, there is nothing to do but refuse.
+    expect(send_to(fd, UDP_REQUEST, None, 0) == -ENOTCONN, 171);
+
+    // 172: a request to kbuild's service, and the reply, which names where it came from.
+    let mut buf = [0u8; 128];
+    expect(
+        send_to(fd, UDP_REQUEST, Some((GATEWAY, service)), 0) == UDP_REQUEST.len() as i64,
+        172,
+    );
+    let (n, from) = recv_from(fd, &mut buf, 0);
+    expect(n == UDP_REPLY.len() as i64, 172);
+    expect(buf.get(..n as usize) == Some(UDP_REPLY), 172);
+    expect(from == Some((GATEWAY, service)), 172);
+
+    // 173: into four bytes, what is answered is what fit; with MSG_TRUNC, what the datagram had.
+    let mut small = [0u8; 4];
+    expect(
+        send_to(fd, UDP_REQUEST, Some((GATEWAY, service)), 0) == UDP_REQUEST.len() as i64,
+        173,
+    );
+    let (fit, _) = recv_from(fd, &mut small, 0);
+    expect(fit == small.len() as i64, 173);
+    expect(
+        send_to(fd, UDP_REQUEST, Some((GATEWAY, service)), 0) == UDP_REQUEST.len() as i64,
+        173,
+    );
+    let (whole, _) = recv_from(fd, &mut small, MSG_TRUNC);
+    expect(whole == UDP_REPLY.len() as i64, 173);
+
+    // 174: a datagram past what the stack carries is EMSGSIZE, not a short send.
+    let big = [b'x'; MAX_DATAGRAM + 1];
+    expect(send_to(fd, &big, Some((GATEWAY, service)), 0) == -EMSGSIZE, 174);
+
+    // 175: a receive with nothing to take waits its timeout and then answers EAGAIN.
+    expect(set_timeout(fd, SO_RCVTIMEO, 200_000) == 0, 175);
+    let (waited, _) = recv_from(fd, &mut buf, 0);
+    expect(waited == -EAGAIN, 175);
+
+    // 176: broadcasting is not offered, and a program that asks is told so.
+    expect(set_opt(fd, SOL_SOCKET, SO_BROADCAST, 1) == -ENOPROTOOPT, 176);
+
+    // 177: nothing connects to a datagram socket, and it has no half to shut.
+    expect(sys::call(sys::LISTEN, [fd, 1, 0, 0, 0, 0]) == -EOPNOTSUPP, 177);
+    expect(sys::call(sys::SHUTDOWN, [fd, SHUT_RD, 0, 0, 0, 0]) == -EOPNOTSUPP, 177);
+    expect(call1(sys::CLOSE, fd) == 0, 177);
+
+    // 178: a connected datagram socket sends and receives without naming an address, and both
+    //      names agree with what it connected to.
+    let c = socket(SOCK_DGRAM);
+    expect(c >= 3, 178);
+    let c = c as u64;
+    expect(connect(c, GATEWAY, service) == 0, 178);
+    expect(name(sys::GETPEERNAME, c) == Some((GATEWAY, service)), 178);
+    expect(matches!(name(sys::GETSOCKNAME, c), Some((OURS, p)) if p != 0), 178);
+    expect(send_to(c, UDP_REQUEST, None, 0) == UDP_REQUEST.len() as i64, 178);
+    let (n, _) = recv_from(c, &mut buf, 0);
+    expect(buf.get(..n.max(0) as usize) == Some(UDP_REPLY), 178);
+
+    // 179: the same round trip through sendmsg and recvmsg, one buffer each.
+    let address = sockaddr(GATEWAY, service);
+    let out = iovec(UDP_REQUEST.as_ptr() as u64, UDP_REQUEST.len() as u64);
+    let header = msghdr(&address, false, &out);
+    expect(
+        sys::call(sys::SENDMSG, [c, header.as_ptr() as u64, 0, 0, 0, 0]) == UDP_REQUEST.len() as i64,
+        179,
+    );
+    let mut got = [0u8; 128];
+    let back = iovec(got.as_mut_ptr() as u64, got.len() as u64);
+    let mut in_header = msghdr(&address, true, &back);
+    let n = sys::call(sys::RECVMSG, [c, in_header.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    expect(n == UDP_REPLY.len() as i64, 179);
+    expect(got.get(..n.max(0) as usize) == Some(UDP_REPLY), 179);
+
+    // 180: connected to the port nobody listens on, a reply from the service is not this
+    //      socket's to take: it waits its timeout and answers EAGAIN.
+    let elsewhere = socket(SOCK_DGRAM);
+    expect(elsewhere >= 3, 180);
+    let elsewhere = elsewhere as u64;
+    expect(connect(elsewhere, GATEWAY, quiet) == 0, 180);
+    expect(set_timeout(elsewhere, SO_RCVTIMEO, 500_000) == 0, 180);
+    expect(
+        send_to(elsewhere, UDP_REQUEST, Some((GATEWAY, service)), 0) == UDP_REQUEST.len() as i64,
+        180,
+    );
+    let (refused, _) = recv_from(elsewhere, &mut buf, 0);
+    expect(refused == -EAGAIN, 180);
+    expect(call1(sys::CLOSE, elsewhere) == 0, 180);
+    expect(call1(sys::CLOSE, c) == 0, 180);
+    exit(UDP_SUCCESS)
 }
 
 /// Write all of `bytes` to `fd`.

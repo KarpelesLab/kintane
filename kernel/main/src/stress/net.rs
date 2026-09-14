@@ -57,6 +57,13 @@ pub fn setup() -> Result<(), &'static str> {
     if !present() {
         return Ok(());
     }
+    // The socket the datagram rounds use is made here, before any workload runs and before
+    // anything audits: one made inside a round would change the number of live objects while
+    // another workload's audit was comparing it, and that audit is right to call an object
+    // that appeared from nowhere a leak.
+    if crate::model::datagram_sockets() && !crate::model::datagram_setup() {
+        return Err("no socket for the datagram rounds");
+    }
     crate::net::audit().map_err(|_| "the network's books do not balance before the run")
 }
 
@@ -107,6 +114,16 @@ pub extern "C" fn worker(_: usize) -> ! {
             ROUNDS.fetch_add(1, Ordering::Relaxed);
         } else {
             fail(w, "a datagram round trip with kbuild failed three times");
+        }
+
+        // And the same exchange through a datagram socket object, where this kernel has them:
+        // the socket layer under the audit the stack below it already answers to. The socket
+        // is made and retired inside the round, so at a checkpoint nothing holds a port.
+        if crate::model::datagram_sockets()
+            && let Some(service) = crate::net::udp_service_port()
+            && !retried(|| crate::model::datagram_round(service, round, TIMEOUT_NS))
+        {
+            fail(w, "a datagram round trip through a socket failed three times");
         }
 
         progress(w);

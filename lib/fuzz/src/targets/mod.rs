@@ -13,6 +13,7 @@ use crate::Target;
 pub mod acpi;
 pub mod aml;
 pub mod bootproto;
+pub mod dgram;
 pub mod elf;
 pub mod fat;
 pub mod fdt;
@@ -134,6 +135,14 @@ pub const TARGETS: &[Target] = &[
         generate: net::generate,
         run: net::run,
         accepts: Some(net::accepts),
+    },
+    Target {
+        name: "dgram",
+        what: "datagrams taken out of the stack's inbox, and the addresses programs hand the socket calls",
+        needs_seeds: true,
+        generate: dgram::generate,
+        run: dgram::run,
+        accepts: Some(dgram::accepts),
     },
     Target {
         name: "sigframe",

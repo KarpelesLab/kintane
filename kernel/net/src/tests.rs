@@ -399,13 +399,50 @@ fn a_full_inbox_counts_what_it_could_not_keep() {
     let link = Link::new();
     let mut s = stack();
     resolved(&mut s, &link);
-    for _ in 0..6 {
+    for _ in 0..10 {
         s.udp_send(&link, GATEWAY, 5000, 7, b"fill", 3 * MS)
             .unwrap();
     }
     s.poll(&link, 4 * MS);
     let c = s.counters();
-    assert_eq!((c.udp_received, c.inbox_full), (4, 2));
+    assert_eq!((c.udp_received, c.inbox_full), (8, 2));
+}
+
+#[test]
+fn a_truncated_datagram_reports_the_length_it_had() {
+    let link = Link::new();
+    let mut s = stack();
+    resolved(&mut s, &link);
+    s.udp_send(&link, GATEWAY, 40000, 7, b"0123456789", 3 * MS)
+        .unwrap();
+    s.poll(&link, 4 * MS);
+    let mut small = [0u8; 4];
+    let got = s.udp_recv_from(40000, &mut small);
+    assert_eq!(got, Some((GATEWAY, 7, 4, 10)), "four copied, ten arrived");
+    assert_eq!(&small, b"0123");
+    // The rest went with it: a datagram is taken whole or not at all.
+    assert_eq!(s.udp_recv_from(40000, &mut small), None);
+    assert!(s.balanced());
+}
+
+#[test]
+fn a_datagram_is_taken_by_the_port_it_was_sent_to() {
+    let link = Link::new();
+    let mut s = stack();
+    resolved(&mut s, &link);
+    // The link echoes each datagram back to the port it came from, so these land on two.
+    s.udp_send(&link, GATEWAY, 40000, 7, b"first", 3 * MS)
+        .unwrap();
+    s.udp_send(&link, GATEWAY, 40001, 7, b"second", 3 * MS)
+        .unwrap();
+    s.poll(&link, 4 * MS);
+    let mut buf = [0u8; 64];
+    let (_, _, n, _) = s.udp_recv_from(40001, &mut buf).expect("the second arrived");
+    assert_eq!(&buf[..n], b"second", "a port takes its own datagram, not the other's");
+    let (_, _, n, _) = s.udp_recv_from(40000, &mut buf).expect("the first waited");
+    assert_eq!(&buf[..n], b"first");
+    assert_eq!(s.udp_recv_from(40002, &mut buf), None, "and no port takes another's");
+    assert!(s.balanced());
 }
 
 #[test]

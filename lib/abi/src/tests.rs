@@ -238,6 +238,34 @@ impl Handler for Recorder {
             .push(("socket_shutdown", vec![u64::from(socket.0), timeout_ns]));
         Ok(0)
     }
+    fn socket_send_to(
+        &mut self,
+        socket: Handle,
+        address: u64,
+        bytes: UserPtr,
+        len: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls.push((
+            "socket_send_to",
+            vec![u64::from(socket.0), address, bytes.0, len as u64, timeout_ns],
+        ));
+        Ok(len as u64)
+    }
+    fn socket_recv_from(
+        &mut self,
+        socket: Handle,
+        buf: UserPtr,
+        cap: usize,
+        from: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls.push((
+            "socket_recv_from",
+            vec![u64::from(socket.0), buf.0, cap as u64, from.0, timeout_ns],
+        ));
+        Err(Error::TimedOut)
+    }
 }
 
 #[test]

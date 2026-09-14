@@ -1,0 +1,30 @@
+# A native program that talks datagrams: the test of the datagram socket calls.
+#
+# Embedded in the image like `user/tcp-client`, and run by the kernel's sockets check once the
+# scheduler is up (`kernel/main/src/sockets.rs`). It exchanges a request and a reply with
+# kbuild's datagram service through QEMU's user network, checks what a truncated datagram
+# reports and what a connected socket refuses, sends one to a port nobody listens on, and exits
+# with a code the kernel grades. It carries the KinTane ABI note, from the shared linker script,
+# so the loader tags it native.
+#
+# `userudp` is a provider name: with USERSPACE off, `user/udp-client-none` provides it as an
+# empty library, so the kernel image depends on the name in every configuration.
+[unit]
+name = "userudp"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+# As `user/tcp-client`: position-independent code at a static link address, the same linker
+# script, and no debug info, because it is embedded with `include_bytes!`.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-T$ROOT/user/init/link.ld",
+    "-C", "link-arg=--no-warnings",
+    "-C", "strip=debuginfo",
+]
+
+[deps]
+units = ["abi", "rt"]
+
+[config]
+requires = "USERSPACE"

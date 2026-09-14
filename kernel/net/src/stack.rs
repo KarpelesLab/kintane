@@ -76,8 +76,15 @@ pub struct Counters {
 
 /// Echo replies remembered for a caller to collect.
 const REPLIES: usize = 8;
-/// Datagrams held for a caller to collect.
-const INBOX: usize = 4;
+/// Datagrams held for a caller to collect, across every port.
+///
+/// Four was enough while the kernel's own check was the only reader. A datagram socket shares
+/// the inbox with it, and kbuild probes the guest four times a second whether anything is
+/// reading or not, so four slots are full of probes within a second of the check that drains
+/// them ending, and a socket's reply arrives to no room. Eight is headroom for that, not a
+/// queue: a datagram that finds the inbox full is counted in `inbox_full` and dropped, as UDP
+/// allows and this stack says.
+const INBOX: usize = 8;
 /// The largest UDP payload the inbox keeps.
 pub const UDP_MAX: usize = 256;
 /// Frames one poll handles at most, so a flood cannot hold the caller's lock for ever.
@@ -539,6 +546,23 @@ impl Stack {
     /// The oldest datagram received for `port`, copied into `into`: its source address,
     /// source port and length. Taking it forgets it.
     pub fn udp_recv(&mut self, port: u16, into: &mut [u8]) -> Option<(Ipv4Addr, u16, usize)> {
+        self.udp_recv_from(port, into)
+            .map(|(ip, src, copied, _)| (ip, src, copied))
+    }
+
+    /// [`udp_recv`](Self::udp_recv), reporting what the datagram held as well as what was
+    /// copied: its source address, source port, the bytes copied into `into`, and its whole
+    /// length.
+    ///
+    /// The two differ when `into` is smaller than the datagram, and the rest is lost with it:
+    /// a datagram is taken or it is not, and there is no second half to come back for. A
+    /// caller that must tell a short read from a truncated one — Linux's `MSG_TRUNC` answers
+    /// the whole length — needs both numbers, which is why this exists.
+    pub fn udp_recv_from(
+        &mut self,
+        port: u16,
+        into: &mut [u8],
+    ) -> Option<(Ipv4Addr, u16, usize, usize)> {
         let slot = self
             .st
             .inbox
@@ -547,7 +571,7 @@ impl Stack {
         let d = slot.take()?;
         let n = d.len.min(into.len());
         into[..n].copy_from_slice(&d.data[..n]);
-        Some((d.src_ip, d.src_port, n))
+        Some((d.src_ip, d.src_port, n, d.len))
     }
 }
 

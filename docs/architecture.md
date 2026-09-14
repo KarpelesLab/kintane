@@ -1180,7 +1180,7 @@ outstanding together at least once in a run.
 One network card driver and enough IPv4 to prove it. `kernel/net` is Ethernet, ARP, IPv4,
 ICMP echo, UDP and TCP, host-tested against a simulated gateway and a scripted TCP peer.
 `drivers/net/virtio-net` is the card. The boot's `net` check drives both against QEMU's
-user-mode network, and sockets put TCP behind handles. What it is not:
+user-mode network, and sockets put TCP and UDP behind handles. What it is not:
 
 - **No fragment reassembly.** A fragment is refused and counted (`WireError::Fragmented`),
   and a datagram that does not fit one 1500-byte frame is not sent.
@@ -1224,8 +1224,11 @@ the card has a route.
   `books_consistent` (everything held is a connection's ring) is what the fuzzer requires with
   connections open.
 - **No allocation on receive.** A frame is copied from the card into a pool buffer and handled
-  there. A datagram's payload, up to 256 bytes, is copied into a four-slot inbox, and a full
-  inbox drops and counts. Echo replies go into an eight-entry ring that the sender matches by
+  there. A datagram's payload, up to 256 bytes, is copied into an eight-slot inbox shared by
+  every port, and a full inbox drops and counts. Eight because a datagram socket reads that
+  inbox alongside the kernel's own checks, and kbuild probes the check's port four times a
+  second whether anything is reading or not; `udp_recv_from` reports what a datagram held as
+  well as what was copied, which is what lets a socket answer Linux's `MSG_TRUNC` honestly. Echo replies go into an eight-entry ring that the sender matches by
   identifier and sequence number.
 - **Bounded work.** One `poll` handles at most sixteen frames, so a flood cannot hold its caller.
 - **`Nic`:** `mac`, `send` and `recv`, all `&self`. virtio-net implements it, and so do the host

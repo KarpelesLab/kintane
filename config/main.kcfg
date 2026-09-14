@@ -62,6 +62,7 @@ config BOOT_STACK_KIB
     default 32 if SMP
     default 32 if STRESS_TEST
     default 32 if INKERNEL_TESTS
+    default 32 if QEMU_NET_TEST
     default 16
     help
         The stack the first thread of execution runs on, with a guard below it.
@@ -84,6 +85,15 @@ config BOOT_STACK_KIB
         and aarch64 at 66%, are raised with them: a test image is not what a
         small machine ships, and a preset that knows its RAM says so itself,
         as armv7m-tiny does with 14 KiB.
+
+        A run with a network card takes 32 KiB for the same reason. Its socket
+        checks run user programs from the boot stack — a stream client, then a
+        datagram client, and the Linux program in three modes — and each is
+        built, started and graded under kmain's own frame, which the compiler
+        gives every check at once. On x86_64 that reached 14,800 bytes of
+        16 KiB, 90%, where the same image without the datagram client sat at
+        11,824, 72%. The depth is in the checks, not in the network: a kernel
+        that ships without them does not pay for them.
 
 config HANDLER_STACK_KIB
     int "Size of the exception stack (KiB)"

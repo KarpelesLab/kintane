@@ -23,14 +23,26 @@
 //!
 //! # What there is, and what is refused
 //!
-//! IPv4 TCP byte streams: `socket(AF_INET, SOCK_STREAM)` with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`,
+//! IPv4, in byte streams and in datagrams.
+//!
+//! A datagram socket — `socket(AF_INET, SOCK_DGRAM)` — holds no connection: `bind` gives it the
+//! port it receives on, `connect` names the one address it sends to and takes datagrams from
+//! without a handshake, and a socket that has neither is given a port by its first send.
+//! `sendto`, `send`, `write`, `sendmsg`, `recvfrom`, `recv`, `read` and `recvmsg` carry the
+//! datagrams, one to a call. A receive answers the length that fit, or, with `MSG_TRUNC`, the
+//! length the datagram had; either way the rest is gone, because a datagram is taken whole or
+//! not at all. `listen`, `accept` and `shutdown` refuse one (`EOPNOTSUPP`), and a datagram past
+//! what the stack keeps is `EMSGSIZE`. `SO_RCVTIMEO` and `SO_SNDTIMEO` bound a wait on either
+//! kind, and a wait that runs out is `EAGAIN`.
+//!
+//! For streams: `socket(AF_INET, SOCK_STREAM)` with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`,
 //! `bind` to a port of this machine's, `listen`, `accept` and `accept4`, `connect`, `send`,
 //! `sendto` and `write`, `recv`, `recvfrom` and `read`, `shutdown` of the sending half,
 //! `getsockname`, `getpeername`, and the options a simple client sets: `SO_REUSEADDR`,
 //! `SO_KEEPALIVE` and `TCP_NODELAY` are accepted and change nothing — the stack reuses a port
 //! as soon as nothing holds it, sends no keepalives, and never delays a segment — and
 //! `getsockopt` answers `SO_TYPE`, `SO_ERROR` and `TCP_NODELAY`. Refused, with Linux's errors:
-//! other families (`EAFNOSUPPORT`), datagram and raw sockets (`EPROTONOSUPPORT`), other options
+//! other families (`EAFNOSUPPORT`), raw sockets (`EPROTONOSUPPORT`), other options
 //! (`ENOPROTOOPT`), `MSG_PEEK` and the other message flags, and shutting down the receiving half
 //! (`EOPNOTSUPP`), and binding port zero (`EINVAL`: bind a port, or connect without binding).
 //! There is no `SIGPIPE`: a send after the connection closed fails with `EPIPE`, and that is all.
@@ -43,9 +55,11 @@ use hal::EarlyConsole;
 use kobject::ObjectId;
 use linux::Failure;
 use linux::socket::{
-    AF_INET, IPPROTO_TCP, MSG_DONTWAIT, MSG_NOSIGNAL, SHUT_RD, SHUT_RDWR, SHUT_WR, SO_ERROR,
-    SO_KEEPALIVE, SO_REUSEADDR, SO_TYPE, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM, SOCK_TYPE_MASK,
-    SOCKADDR_IN_LEN, SOL_SOCKET, TCP_NODELAY,
+    AF_INET, IOVEC_LEN, IPPROTO_TCP, IPPROTO_UDP, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_TRUNC,
+    MSGHDR_FLAGS, MSGHDR_IOV, MSGHDR_IOVLEN, MSGHDR_LEN, MSGHDR_NAME, MSGHDR_NAMELEN, SHUT_RD,
+    SHUT_RDWR, SHUT_WR, SO_BROADCAST, SO_ERROR, SO_KEEPALIVE, SO_RCVTIMEO, SO_REUSEADDR,
+    SO_SNDTIMEO, SO_TYPE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SOCK_TYPE_MASK,
+    SOCKADDR_IN_LEN, SOL_SOCKET, TCP_NODELAY, TIMEVAL_LEN, word,
 };
 use sync::SpinLock;
 use sync::lockdep::LockClass;
@@ -66,13 +80,35 @@ struct Entry {
     id: Option<ObjectId>,
     /// Descriptors naming it, in every process.
     refs: u32,
+    /// How long a receive and a send wait before giving up, in nanoseconds; zero waits until
+    /// it has an answer. `SO_RCVTIMEO` and `SO_SNDTIMEO` set them, and an expiry is `EAGAIN`,
+    /// as Linux reports one.
+    rcv_ns: u64,
+    snd_ns: u64,
+}
+
+impl Entry {
+    const FREE: Entry = Entry {
+        id: None,
+        refs: 0,
+        rcv_ns: 0,
+        snd_ns: 0,
+    };
+}
+
+/// How long socket `i`'s receives and sends wait.
+fn timeouts(i: usize) -> (u64, u64) {
+    TABLE
+        .lock_irqsave()
+        .get(i)
+        .map_or((0, 0), |e| (e.rcv_ns, e.snd_ns))
 }
 
 static TABLE_CLASS: LockClass = LockClass::new("linux.sockets");
 /// Every Linux socket. Held only to look at or change an entry: never while waiting, and
 /// nothing is taken inside it.
 static TABLE: SpinLock<[Entry; SOCKETS], Cpu> =
-    SpinLock::with_class([Entry { id: None, refs: 0 }; SOCKETS], &TABLE_CLASS);
+    SpinLock::with_class([Entry::FREE; SOCKETS], &TABLE_CLASS);
 
 /// Give the new socket object `id` an entry with one descriptor's count. Retires the object if
 /// no entry is free.
@@ -84,6 +120,7 @@ fn adopt(id: ObjectId) -> Result<usize, Failure> {
             table[i] = Entry {
                 id: Some(id),
                 refs: 1,
+                ..Entry::FREE
             };
         }
         free
@@ -140,9 +177,14 @@ fn interrupted(slot: usize) -> Option<Failure> {
 
 /// Run `attempt` until it has an answer, waiting on the network between tries; see the module
 /// documentation. With `nonblock`, one try, and `EAGAIN` for no answer.
+///
+/// `timeout_ns` is what `SO_RCVTIMEO` or `SO_SNDTIMEO` set, or zero to wait until there is an
+/// answer. A wait that runs out answers `EAGAIN`, which is what Linux gives a socket whose
+/// timeout expired.
 fn wait<R>(
     slot: usize,
     nonblock: bool,
+    timeout_ns: u64,
     mut attempt: impl FnMut() -> Result<Option<R>, Failure>,
 ) -> Result<R, Failure> {
     if let Some(r) = attempt()? {
@@ -151,9 +193,14 @@ fn wait<R>(
     if nonblock {
         return Err(Failure::TryAgain);
     }
+    let until = (timeout_ns != 0)
+        .then(|| timekeeping::now().saturating_add(Duration::from_nanos(timeout_ns)));
     let queue = crate::sockets::waits();
     loop {
-        let due = crate::sockets::next_look().map(Instant::from_nanos);
+        let due = match (crate::sockets::next_look().map(Instant::from_nanos), until) {
+            (Some(look), Some(until)) => Some(look.min(until)),
+            (look, until) => look.or(until),
+        };
         let got = queue.wait_once(due, || {
             if userproc::exiting(slot) {
                 return Some(Err(Failure::Io));
@@ -165,6 +212,9 @@ fn wait<R>(
         });
         if let Some(result) = got {
             return result;
+        }
+        if until.is_some_and(|until| timekeeping::now() >= until) {
+            return Err(Failure::TryAgain);
         }
         // Before the scheduler runs nothing moves the network, and a wait cannot block.
         if !preempt::scheduled() {
@@ -229,18 +279,24 @@ pub(super) fn socket(slot: usize, domain: u64, kind: u64, protocol: u64) -> Resu
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(Failure::InvalidArgument);
     }
-    if kind & SOCK_TYPE_MASK != SOCK_STREAM || !(protocol == 0 || protocol == IPPROTO_TCP) {
-        return Err(Failure::ProtocolNotSupported);
-    }
+    let datagram = match (kind & SOCK_TYPE_MASK, protocol) {
+        (SOCK_STREAM, 0) | (SOCK_STREAM, IPPROTO_TCP) => false,
+        (SOCK_DGRAM, 0) | (SOCK_DGRAM, IPPROTO_UDP) => true,
+        _ => return Err(Failure::ProtocolNotSupported),
+    };
     if !crate::sockets::available() {
         return Err(Failure::NetworkDown);
     }
-    let socket = Object::Socket {
-        port: 0,
-        conn: None,
-        listening: false,
+    let id = if datagram {
+        crate::sockets::datagram_create().map_err(failure)?
+    } else {
+        objects::create(Object::Socket {
+            port: 0,
+            conn: None,
+            listening: false,
+        })
+        .ok_or(Failure::TooManyOpen)?
     };
-    let id = objects::create(socket).ok_or(Failure::TooManyOpen)?;
     let i = adopt(id)?;
     let placed = locked(slot, |_, s| s.place(Descriptor::Socket(i), flags));
     if placed.is_err() {
@@ -253,6 +309,12 @@ pub(super) fn connect(slot: usize, fd: u64, addr: u64, len: u64) -> Result<u64, 
     let (i, nonblock) = socket_of(slot, fd)?;
     let (ip, port) = read_sockaddr(addr, len)?;
     let id = id_of(i)?;
+    // A datagram socket's connect is a note of where it sends: there is no handshake to wait
+    // for, and it can be made again to point the socket somewhere else.
+    if crate::sockets::is_datagram(id) {
+        return crate::sockets::datagram_connect(id, abi::socket::address(ip, port))
+            .map_err(failure);
+    }
     let earlier = crate::sockets::connection(id).ok();
     let conn = match earlier {
         Some(conn) => conn,
@@ -268,7 +330,10 @@ pub(super) fn connect(slot: usize, fd: u64, addr: u64, len: u64) -> Result<u64, 
         (_, Some(_)) => return Ok(0),
         (_, None) => {}
     }
-    wait(slot, false, || crate::sockets::connected(conn).map_err(connect_failure)).map(|_| 0)
+    wait(slot, false, 0, || {
+        crate::sockets::connected(conn).map_err(connect_failure)
+    })
+    .map(|_| 0)
 }
 
 pub(super) fn bind(slot: usize, fd: u64, addr: u64, len: u64) -> Result<u64, Failure> {
@@ -277,12 +342,22 @@ pub(super) fn bind(slot: usize, fd: u64, addr: u64, len: u64) -> Result<u64, Fai
     if ip != [0; 4] && ip != crate::net::CONFIG.ip {
         return Err(Failure::AddressNotAvailable);
     }
-    crate::sockets::bind(id_of(i)?, abi::socket::address(ip, port)).map_err(failure)
+    let id = id_of(i)?;
+    let address = abi::socket::address(ip, port);
+    if crate::sockets::is_datagram(id) {
+        return crate::sockets::datagram_bind(id, address).map_err(failure);
+    }
+    crate::sockets::bind(id, address).map_err(failure)
 }
 
 pub(super) fn listen(slot: usize, fd: u64, _backlog: u64) -> Result<u64, Failure> {
     let (i, _) = socket_of(slot, fd)?;
-    crate::sockets::listen(id_of(i)?).map_err(failure)
+    let id = id_of(i)?;
+    // Nothing connects to a datagram socket, so nothing can be listened for on one.
+    if crate::sockets::is_datagram(id) {
+        return Err(Failure::OperationNotSupported);
+    }
+    crate::sockets::listen(id).map_err(failure)
 }
 
 pub(super) fn accept4(
@@ -302,8 +377,9 @@ pub(super) fn accept4(
     if addr != 0 {
         write_sockaddr(addr, len_at, [0; 4], 0)?;
     }
-    let accepted =
-        wait(slot, nonblock, || crate::sockets::accept(listener, port).map_err(failure))?;
+    let accepted = wait(slot, nonblock, 0, || {
+        crate::sockets::accept(listener, port).map_err(failure)
+    })?;
     let j = adopt(accepted)?;
     let placed = match locked(slot, |_, s| s.place(Descriptor::Socket(j), flags)) {
         Ok(fd) => fd,
@@ -329,14 +405,20 @@ pub(super) fn send(
     buf: u64,
     count: usize,
 ) -> Result<u64, Failure> {
-    let conn = crate::sockets::connection(id_of(i)?).map_err(|_| Failure::NotConnected)?;
+    let id = id_of(i)?;
+    // A datagram socket sends one datagram, to the address it connected to.
+    if crate::sockets::is_datagram(id) {
+        return send_datagram(slot, i, id, nonblock, 0, buf, count);
+    }
+    let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
     let count = count.min(MAX_IO);
+    let (_, snd) = timeouts(i);
     let mut done = 0;
     while done < count {
         let n = (count - done).min(CHUNK);
         let mut chunk = [0u8; CHUNK];
         from_user(buf.checked_add(done as u64).ok_or(Failure::Fault)?, &mut chunk[..n])?;
-        let sent = wait(slot, nonblock, || {
+        let sent = wait(slot, nonblock, snd, || {
             crate::sockets::send(conn, &chunk[..n]).map_err(|e| match e {
                 // Closed for sending: this end shut down or closed, or the connection ended.
                 abi::Error::InvalidArgument => Failure::BrokenPipe,
@@ -362,7 +444,12 @@ pub(super) fn recv(
     buf: u64,
     count: usize,
 ) -> Result<u64, Failure> {
-    let conn = crate::sockets::connection(id_of(i)?).map_err(|_| Failure::NotConnected)?;
+    let id = id_of(i)?;
+    // A datagram socket takes one datagram, and says nothing about where it came from.
+    if crate::sockets::is_datagram(id) {
+        return recv_datagram(slot, i, id, nonblock, buf, count, 0, 0, 0);
+    }
+    let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
     let n = count.min(CHUNK);
     if n == 0 {
         return Ok(0);
@@ -371,47 +458,176 @@ pub(super) fn recv(
     // refused their copy would be lost.
     to_user(buf, &[0u8; CHUNK][..n])?;
     let mut bytes = [0u8; CHUNK];
-    let got =
-        wait(slot, nonblock, || crate::sockets::recv(conn, &mut bytes[..n]).map_err(failure))?;
+    let (rcv, _) = timeouts(i);
+    let got = wait(slot, nonblock, rcv, || {
+        crate::sockets::recv(conn, &mut bytes[..n]).map_err(failure)
+    })?;
     to_user(buf, &bytes[..got])?;
     Ok(got as u64)
 }
 
+/// Send one datagram from socket `i` to `to`, or to the address it connected to when `to` is
+/// zero.
+fn send_datagram(
+    slot: usize,
+    i: usize,
+    id: ObjectId,
+    nonblock: bool,
+    to: u64,
+    buf: u64,
+    count: usize,
+) -> Result<u64, Failure> {
+    if count > crate::sockets::MAX_DATAGRAM {
+        return Err(Failure::MessageTooLong);
+    }
+    let mut bytes = [0u8; CHUNK];
+    from_user(buf, &mut bytes[..count])?;
+    let (_, snd) = timeouts(i);
+    wait(slot, nonblock, snd, || {
+        match crate::sockets::datagram_send(id, to, &bytes[..count]) {
+            Ok(n) => Ok(Some(n)),
+            // The next hop is being resolved, or every buffer is held: both pass with a poll.
+            Err(abi::Error::ShouldWait) => Ok(None),
+            // Nowhere to send it: no address given, and none connected to.
+            Err(abi::Error::InvalidArgument) if to == 0 => Err(Failure::NotConnected),
+            Err(e) => Err(failure(e)),
+        }
+    })
+}
+
+/// Take one datagram for socket `i` into `buf`, writing where it came from to `addr` unless
+/// that is null. Answers the length that fit, or the length the datagram had under `MSG_TRUNC`.
+#[allow(clippy::too_many_arguments)]
+fn recv_datagram(
+    slot: usize,
+    i: usize,
+    id: ObjectId,
+    nonblock: bool,
+    buf: u64,
+    count: usize,
+    flags: u64,
+    addr: u64,
+    len_at: u64,
+) -> Result<u64, Failure> {
+    let cap = count.min(CHUNK);
+    // Written first, for the reason `recv` gives: a datagram taken and then refused its copy
+    // is gone, and nothing can ask for it again.
+    to_user(buf, &[0u8; CHUNK][..cap])?;
+    let (rcv, _) = timeouts(i);
+    let (from, copied, whole) = wait(slot, nonblock, rcv, || {
+        let mut bytes = [0u8; CHUNK];
+        let Some((from, copied, whole)) =
+            crate::sockets::datagram_recv(id, &mut bytes[..cap]).map_err(failure)?
+        else {
+            return Ok(None);
+        };
+        to_user(buf, bytes.get(..copied).unwrap_or(&[]))?;
+        Ok(Some((from, copied, whole)))
+    })?;
+    if addr != 0 {
+        write_sockaddr(addr, len_at, abi::socket::ip(from), abi::socket::port(from))?;
+    } else if len_at != 0 {
+        to_user(len_at, &0u32.to_le_bytes())?;
+    }
+    Ok(if flags & MSG_TRUNC != 0 {
+        whole as u64
+    } else {
+        copied as u64
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn sendto(
     slot: usize,
     fd: u64,
     buf: u64,
     count: u64,
     flags: u64,
+    addr: u64,
+    addr_len: u64,
 ) -> Result<u64, Failure> {
     let (i, nonblock) = socket_of(slot, fd)?;
     if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
         return Err(Failure::OperationNotSupported);
     }
-    // The address, if any, is ignored, as Linux ignores it on a connected stream.
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let count = usize::try_from(count).unwrap_or(MAX_IO);
-    send(slot, i, nonblock || flags & MSG_DONTWAIT != 0, buf, count)
+    let id = id_of(i)?;
+    if crate::sockets::is_datagram(id) {
+        // Where it goes: the address this call names, or the one the socket connected to.
+        let to = if addr == 0 {
+            0
+        } else {
+            let (ip, port) = read_sockaddr(addr, addr_len)?;
+            abi::socket::address(ip, port)
+        };
+        return send_datagram(slot, i, id, nonblock, to, buf, count);
+    }
+    // On a connected stream the address is ignored, as it is on Linux.
+    send(slot, i, nonblock, buf, count)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recvfrom(
     slot: usize,
     fd: u64,
     buf: u64,
     count: u64,
     flags: u64,
+    addr: u64,
     len_at: u64,
 ) -> Result<u64, Failure> {
     let (i, nonblock) = socket_of(slot, fd)?;
-    if flags & !MSG_DONTWAIT != 0 {
+    if flags & !(MSG_DONTWAIT | MSG_TRUNC) != 0 {
         return Err(Failure::OperationNotSupported);
     }
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let count = usize::try_from(count).unwrap_or(MAX_IO);
-    let got = recv(slot, i, nonblock || flags & MSG_DONTWAIT != 0, buf, count)?;
+    let id = id_of(i)?;
+    if crate::sockets::is_datagram(id) {
+        return recv_datagram(slot, i, id, nonblock, buf, count, flags, addr, len_at);
+    }
+    if flags & MSG_TRUNC != 0 {
+        // Nothing is truncated in a stream: the rest of it is still there to read.
+        return Err(Failure::OperationNotSupported);
+    }
+    let got = recv(slot, i, nonblock, buf, count)?;
     // A stream names no sender: Linux reports an address of no bytes.
     if len_at != 0 {
         to_user(len_at, &0u32.to_le_bytes())?;
     }
     Ok(got)
+}
+
+/// The one buffer, the address and the flags of the `struct msghdr` at `at`: what `sendmsg` and
+/// `recvmsg` carry. A message of several buffers is refused rather than half sent.
+fn one_message(at: u64) -> Result<(u64, u64, u64, u64, u64), Failure> {
+    let mut header = [0u8; MSGHDR_LEN];
+    from_user(at, &mut header)?;
+    let (name, name_len) = (word(&header, MSGHDR_NAME), word(&header, MSGHDR_NAMELEN));
+    let (iov, iov_len) = (word(&header, MSGHDR_IOV), word(&header, MSGHDR_IOVLEN));
+    if iov_len != 1 {
+        return Err(Failure::OperationNotSupported);
+    }
+    let mut vector = [0u8; IOVEC_LEN];
+    from_user(iov, &mut vector)?;
+    let (base, len) = (word(&vector, 0), word(&vector, 8));
+    Ok((base, len, name, name_len, word(&header, MSGHDR_FLAGS)))
+}
+
+pub(super) fn sendmsg(slot: usize, fd: u64, at: u64, flags: u64) -> Result<u64, Failure> {
+    let (base, len, name, name_len, _) = one_message(at)?;
+    sendto(slot, fd, base, len, flags, name, name_len)
+}
+
+pub(super) fn recvmsg(slot: usize, fd: u64, at: u64, flags: u64) -> Result<u64, Failure> {
+    let (base, len, name, _, _) = one_message(at)?;
+    // The address's length goes back in the header, where `msg_namelen` is, rather than at a
+    // pointer of its own as `recvfrom` takes it.
+    let len_at = at
+        .checked_add(MSGHDR_NAMELEN as u64)
+        .ok_or(Failure::Fault)?;
+    recvfrom(slot, fd, base, len, flags, name, len_at)
 }
 
 pub(super) fn shutdown(slot: usize, fd: u64, how: u64) -> Result<u64, Failure> {
@@ -421,7 +637,12 @@ pub(super) fn shutdown(slot: usize, fd: u64, how: u64) -> Result<u64, Failure> {
         SHUT_RD => return Err(Failure::OperationNotSupported),
         _ => return Err(Failure::InvalidArgument),
     }
-    let conn = crate::sockets::connection(id_of(i)?).map_err(|_| Failure::NotConnected)?;
+    let id = id_of(i)?;
+    // A datagram socket has no half to shut: nothing is owed to a peer it never agreed with.
+    if crate::sockets::is_datagram(id) {
+        return Err(Failure::OperationNotSupported);
+    }
+    let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
     crate::sockets::shutdown(conn).map_err(failure)?;
     Ok(0)
 }
@@ -435,7 +656,19 @@ pub(super) fn name(
     peer: bool,
 ) -> Result<u64, Failure> {
     let (i, _) = socket_of(slot, fd)?;
-    let (local, remote) = crate::sockets::endpoints(id_of(i)?).map_err(failure)?;
+    let id = id_of(i)?;
+    if crate::sockets::is_datagram(id) {
+        let (port, connected) = crate::sockets::datagram_endpoints(id).map_err(failure)?;
+        let (ip, port) = match (peer, connected) {
+            (true, Some(peer)) => (abi::socket::ip(peer), abi::socket::port(peer)),
+            (true, None) => return Err(Failure::NotConnected),
+            (false, _) if port != 0 => (crate::net::CONFIG.ip, port),
+            (false, _) => ([0; 4], 0),
+        };
+        write_sockaddr(addr, len_at, ip, port)?;
+        return Ok(0);
+    }
+    let (local, remote) = crate::sockets::endpoints(id).map_err(failure)?;
     let (ip, port) = match (peer, remote) {
         (true, Some(remote)) => remote,
         (true, None) => return Err(Failure::NotConnected),
@@ -455,9 +688,35 @@ pub(super) fn setsockopt(
     value: u64,
     len: u64,
 ) -> Result<u64, Failure> {
-    socket_of(slot, fd)?;
+    let (i, _) = socket_of(slot, fd)?;
+    // The two that do something: how long a receive and a send wait.
+    if level == SOL_SOCKET && (option == SO_RCVTIMEO || option == SO_SNDTIMEO) {
+        if len < TIMEVAL_LEN as u64 {
+            return Err(Failure::InvalidArgument);
+        }
+        let mut timeval = [0u8; TIMEVAL_LEN];
+        from_user(value, &mut timeval)?;
+        let (seconds, micros) = (word(&timeval, 0), word(&timeval, 8));
+        if micros >= 1_000_000 {
+            return Err(Failure::InvalidArgument);
+        }
+        let ns = seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(micros.saturating_mul(1_000));
+        let mut table = TABLE.lock_irqsave();
+        let entry = table.get_mut(i).ok_or(Failure::BadDescriptor)?;
+        if option == SO_RCVTIMEO {
+            entry.rcv_ns = ns;
+        } else {
+            entry.snd_ns = ns;
+        }
+        return Ok(0);
+    }
     match (level, option) {
         (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE) | (IPPROTO_TCP, TCP_NODELAY) => {}
+        // Nothing here sends to a broadcast address, and a program that asked to should hear
+        // so rather than find its datagrams going to one host.
+        (SOL_SOCKET, SO_BROADCAST) => return Err(Failure::NoProtocolOption),
         _ => return Err(Failure::NoProtocolOption),
     }
     if len < 4 {
@@ -480,6 +739,7 @@ pub(super) fn getsockopt(
 ) -> Result<u64, Failure> {
     let (i, _) = socket_of(slot, fd)?;
     let answer: i32 = match (level, option) {
+        (SOL_SOCKET, SO_TYPE) if crate::sockets::is_datagram(id_of(i)?) => SOCK_DGRAM as i32,
         (SOL_SOCKET, SO_TYPE) => SOCK_STREAM as i32,
         // Never delayed: the stack sends each segment when it can.
         (IPPROTO_TCP, TCP_NODELAY) => 1,
@@ -506,6 +766,8 @@ pub(super) fn getsockopt(
 /// `TCP_SUCCESS` and `SERVE_SUCCESS` in `user/linux-hello/src/main.rs`.
 const TCP_SUCCESS: u64 = 48;
 const SERVE_SUCCESS: u64 = 49;
+/// The `udp` mode's, which mirrors `UDP_SUCCESS` in `user/linux-hello/src/main.rs`.
+const UDP_SUCCESS: u64 = 52;
 /// The port `serve` listens on, which kbuild forwards a loopback port to: `INBOUND_PORT` in
 /// the program and `NET_GUEST_TCP_PORT` in `kbuild/src/qemu.rs`.
 const INBOUND_PORT: u16 = 7777;
@@ -527,6 +789,36 @@ const SERVE_ARGV: [&[u8]; 2] = [b"hello", b"serve"];
 /// and never while a Linux process runs.
 static PORT_DIGITS: SyncUnsafeCell<[u8; 5]> = SyncUnsafeCell::new([0; 5]);
 static TCP_ARGV: SyncUnsafeCell<[&[u8]; 3]> = SyncUnsafeCell::new([b"hello", b"tcp", b""]);
+
+/// The `udp` mode's one argument, `<service>,<quiet>`, and the `argv` naming it. Written and
+/// read under the same rule as `PORT_DIGITS`.
+static UDP_DIGITS: SyncUnsafeCell<[u8; 12]> = SyncUnsafeCell::new([0; 12]);
+static UDP_ARGV: SyncUnsafeCell<[&[u8]; 3]> = SyncUnsafeCell::new([b"hello", b"udp", b""]);
+
+/// `<service>,<quiet>` into `buf`, which is what the `udp` mode parses. Its length.
+fn two_ports(buf: &mut [u8; 12], service: u16, quiet: u16) -> usize {
+    let mut n = 0;
+    let mut put = |b: u8, n: &mut usize| {
+        if let Some(slot) = buf.get_mut(*n) {
+            *slot = b;
+            *n += 1;
+        }
+    };
+    for (i, port) in [service, quiet].into_iter().enumerate() {
+        if i == 1 {
+            put(b',', &mut n);
+        }
+        let mut started = false;
+        for d in [10_000u16, 1_000, 100, 10, 1] {
+            let digit = (port / d) % 10;
+            if digit != 0 || started || d == 1 {
+                started = true;
+                put(b'0' + digit as u8, &mut n);
+            }
+        }
+    }
+    n
+}
 
 /// [`LISTENING`] and this boot's number into `buf`: the scheduler clock's nanoseconds when the
 /// check runs, which two boots of one machine do not share, cut to the sixteen digits kbuild
@@ -633,6 +925,30 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
         }
     });
 
+    // Then datagrams: the same program against kbuild's datagram service and the port it leaves
+    // unbound.
+    let datagram = match (crate::net::udp_service_port(), crate::net::quiet_port()) {
+        (Some(service), Some(quiet)) => {
+            // SAFETY: see `PORT_DIGITS`: no Linux process runs, and the next is not built yet.
+            let argv: &'static [&'static [u8]] = unsafe {
+                let digits: &'static mut [u8; 12] = &mut *UDP_DIGITS.get();
+                let n = two_ports(digits, service, quiet);
+                let written: &'static [u8] = &*UDP_DIGITS.get();
+                let argv = &mut *UDP_ARGV.get();
+                argv[2] = written.get(..n).unwrap_or(b"");
+                &*UDP_ARGV.get()
+            };
+            Some(run_mode(&program, argv, || {}))
+        }
+        // kbuild announces its datagram service beside its TCP service, so a run that heard one
+        // and not the other heard half of what it was told.
+        _ => None,
+    };
+    let datagram_ok = match datagram {
+        Some(run) => run.code == Some(UDP_SUCCESS) && run.ended,
+        None => !kconfig::QEMU_NET_TEST,
+    };
+
     let give_up = timekeeping::now().saturating_add(SETTLE);
     let settled = loop {
         let quiet = crate::net::with_stack(|s, _, _| s.tcp_rings_held() == 0 && s.balanced());
@@ -657,6 +973,11 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     report(c, "tcp client", client, TCP_SUCCESS);
     c.write_str("; ");
     report(c, "server", server, SERVE_SUCCESS);
+    c.write_str("; ");
+    match datagram {
+        Some(run) => report(c, "udp", run, UDP_SUCCESS),
+        None => c.write_str("udp skipped: kbuild announced no datagram service"),
+    }
     c.write_str(" (kbuild told of its listener ");
     write_usize(c, told as usize);
     c.write_str(if told == 1 { " time)" } else { " times)" });
@@ -695,7 +1016,8 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
         " FRAMES LEAKED"
     });
     Check::from_ok(
-        client.code == Some(TCP_SUCCESS)
+        datagram_ok
+            && client.code == Some(TCP_SUCCESS)
             && server.code == Some(SERVE_SUCCESS)
             && client.ended
             && server.ended

@@ -352,6 +352,38 @@ impl Handler for Mock {
         self.last = timeout_ns;
         Ok(0)
     }
+
+    fn socket_send_to(
+        &mut self,
+        socket: Handle,
+        address: u64,
+        bytes: UserPtr,
+        len: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (socket, bytes, timeout_ns);
+        self.last = address;
+        if abi::socket::well_formed(address) {
+            Ok(len.min(256) as u64)
+        } else {
+            Err(Error::InvalidArgument)
+        }
+    }
+
+    fn socket_recv_from(
+        &mut self,
+        socket: Handle,
+        buf: UserPtr,
+        cap: usize,
+        from: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (socket, buf, from, timeout_ns);
+        self.last = cap as u64;
+        Err(Error::TimedOut)
+    }
 }
 
 /// Each record is a number and six argument words: 8 bytes for the number, 48 for the

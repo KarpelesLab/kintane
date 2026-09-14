@@ -1645,23 +1645,27 @@ impl abi::Handler for Syscalls {
     // ---- sockets: see `crate::sockets` -------------------------------------------------------
 
     fn socket_create(&mut self, kind: u64) -> Result<u64, Error> {
-        if kind != abi::socket::STREAM {
-            return Err(Error::InvalidArgument);
-        }
         if !sockets::available() {
             return Err(Error::Unsupported);
         }
-        let socket = Object::Socket {
-            port: 0,
-            conn: None,
-            listening: false,
+        let id = match kind {
+            abi::socket::STREAM => objects::create(Object::Socket {
+                port: 0,
+                conn: None,
+                listening: false,
+            })
+            .ok_or(Error::Full)?,
+            abi::socket::DATAGRAM => sockets::datagram_create()?,
+            _ => return Err(Error::InvalidArgument),
         };
-        let id = objects::create(socket).ok_or(Error::Full)?;
         self.insert_new(id, ObjectType::Socket)
     }
 
     fn socket_bind(&mut self, socket: AbiHandle, address: u64) -> Result<u64, Error> {
         let id = self.socket(socket, Rights::WRITE)?;
+        if sockets::is_datagram(id) {
+            return sockets::datagram_bind(id, address);
+        }
         sockets::bind(id, address)
     }
 
@@ -1672,6 +1676,11 @@ impl abi::Handler for Syscalls {
         timeout_ns: u64,
     ) -> Result<u64, Error> {
         let id = self.socket(socket, Rights::WRITE)?;
+        // A datagram socket's connect names where it sends and takes datagrams from. There is
+        // no handshake, so there is nothing for `timeout_ns` to bound.
+        if sockets::is_datagram(id) {
+            return sockets::datagram_connect(id, address);
+        }
         let conn = sockets::connect(id, address)?;
         self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
             sockets::connected(conn)
@@ -1754,6 +1763,65 @@ impl abi::Handler for Syscalls {
         sockets::shutdown(conn)?;
         self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
             sockets::shut(conn)
+        })
+    }
+
+    fn socket_send_to(
+        &mut self,
+        socket: AbiHandle,
+        address: u64,
+        bytes: UserPtr,
+        len: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let id = self.socket(socket, Rights::WRITE)?;
+        let len = len.min(sockets::CHUNK);
+        let mut buf = [0u8; sockets::CHUNK];
+        // SAFETY: as `socket_send`.
+        unsafe { Cpu::copy_from_user(&mut buf[..len], user(bytes)) }.map_err(|_| Error::Fault)?;
+        self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
+            match sockets::datagram_send(id, address, &buf[..len]) {
+                // Waiting on a hardware address or a buffer, both of which a poll moves.
+                Err(Error::ShouldWait) => Ok(None),
+                other => other.map(Some),
+            }
+        })
+    }
+
+    fn socket_recv_from(
+        &mut self,
+        socket: AbiHandle,
+        buf: UserPtr,
+        cap: usize,
+        from: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let id = self.socket(socket, Rights::READ)?;
+        let cap = cap.min(sockets::CHUNK);
+        // Both written before anything is taken, so their pages are present: a datagram taken
+        // and then refused its copy would be lost, as `socket_recv` says of a stream's bytes.
+        // SAFETY: as `socket_recv`.
+        unsafe { Cpu::copy_to_user(user(buf), &[0u8; sockets::CHUNK][..cap]) }
+            .map_err(|_| Error::Fault)?;
+        if from.0 != 0 {
+            // SAFETY: as above.
+            unsafe { Cpu::copy_to_user(user(from), &0u64.to_le_bytes()) }
+                .map_err(|_| Error::Fault)?;
+        }
+        self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
+            let mut bytes = [0u8; sockets::CHUNK];
+            let Some((address, copied, whole)) = sockets::datagram_recv(id, &mut bytes[..cap])?
+            else {
+                return Ok(None);
+            };
+            // SAFETY: as above; both ranges were written before the wait began.
+            unsafe { Cpu::copy_to_user(user(buf), &bytes[..copied]) }.map_err(|_| Error::Fault)?;
+            if from.0 != 0 {
+                // SAFETY: as above.
+                unsafe { Cpu::copy_to_user(user(from), &address.to_le_bytes()) }
+                    .map_err(|_| Error::Fault)?;
+            }
+            Ok(Some(whole as u64))
         })
     }
 }
