@@ -494,7 +494,7 @@ const POLL: Duration = Duration::from_nanos(5_000_000);
 
 /// How a wait by [`await_slices`] ended.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Waited {
+pub(crate) enum Waited {
     Done,
     /// It ran [`RAN_SLICES`] without making progress.
     Ran,
@@ -513,7 +513,7 @@ enum Waited {
 /// Wait until `done`, judging thread `id` meanwhile by the slices it is charged. `moving`
 /// says whether it is making progress, which suspends that judgement: a thread that is
 /// advancing, but has not yet done what is waited for, has only [`STARVE_WAIT`] to meet.
-fn await_slices(
+pub(crate) fn await_slices(
     id: ThreadId,
     mut done: impl FnMut() -> bool,
     mut moving: impl FnMut() -> bool,

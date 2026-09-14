@@ -76,11 +76,9 @@ const STACKS: [usize; 3] = [1, 2, 3];
 /// Priority of process threads: below boot, so boot's wake-ups preempt them.
 const PRIORITY: u8 = 4;
 
-/// The longest this check waits for `init` to finish the whole sequence, and the longest a
-/// thread waits for its process's program to be installed.
+/// The longest a thread waits for its process's program to be installed. The wait for a
+/// thread to *exit* is judged in slices instead; see [`wait_exit`].
 const PATIENCE: Duration = Duration::from_nanos(3_000_000_000);
-/// How often it looks.
-const POLL: Duration = Duration::from_nanos(5_000_000);
 
 // ---- starting threads in processes ------------------------------------------------------
 
@@ -368,16 +366,17 @@ fn run(c: &dyn EarlyConsole, program: &elf::Program) -> Option<u64> {
     userproc::slot(PARENT).and_then(|p| p.exit)
 }
 
-/// Wait up to [`PATIENCE`] for `id` to exit.
+/// Wait for `id` to exit, judging it by what the scheduler gave it rather than by a window of
+/// wall time.
+///
+/// This was three seconds of wall clock, and under an emulator that measured the host: a soak
+/// lost a run at 141 s to a vCPU the host had not scheduled, reported as "a thread did not
+/// end". The tenth round replaced nine bounds of that kind with the slices a thread is charged
+/// ([`crate::procs::await_slices`]); this is the tenth, and it shares that helper rather than
+/// keeping a second rule for the same question. A thread that truly never ends still fails,
+/// having run its slices without exiting.
 fn wait_exit(id: ThreadId) -> bool {
-    let give_up = timekeeping::now().saturating_add(PATIENCE);
-    while preempt::alive(id) {
-        if timekeeping::now() >= give_up {
-            return false;
-        }
-        sleep_until(timekeeping::now().saturating_add(POLL));
-    }
-    true
+    crate::procs::await_slices(id, || !preempt::alive(id), || false) == crate::procs::Waited::Done
 }
 
 fn free_frames() -> usize {

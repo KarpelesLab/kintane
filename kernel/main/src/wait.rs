@@ -193,6 +193,10 @@ impl WaitQueue {
             return None;
         }
         let me = preempt::current_thread()?;
+        // The window this opens is what `crate::waitrace` parks in: everything a waker
+        // does from here until the look below finds nobody registered, and is seen only
+        // by that look. Nothing without WAIT_RACE_TEST; see `waitrace_off.rs`.
+        crate::waitrace::stall();
         let Some(slot) = self.register(me) else {
             // No room to block in. Poll rather than wait for a wake nobody can deliver.
             OVERFLOWS.fetch_add(1, Ordering::Relaxed);

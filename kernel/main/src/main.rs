@@ -110,6 +110,13 @@ mod spawn;
 mod userproc;
 #[cfg(CONFIG_USERSPACE)]
 mod wait;
+// A stall point inside a wait, so the window before registering can be raced; without
+// WAIT_RACE_TEST, an empty inline function and a check that passes silently.
+#[cfg(CONFIG_WAIT_RACE_TEST)]
+mod waitrace;
+#[cfg(not(CONFIG_WAIT_RACE_TEST))]
+#[path = "waitrace_off.rs"]
+mod waitrace;
 #[cfg(CONFIG_USERSPACE)]
 mod waits;
 // ABI_LINUX depends on USERSPACE, so the personality is only ever built on a process.
