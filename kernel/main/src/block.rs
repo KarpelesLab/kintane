@@ -289,6 +289,33 @@ fn iommu_checks(
         unsafe { cp.add(i).write_volatile(SENTINEL) };
     }
 
+    // A translation the device has used, taken away while it runs. The canary is mapped into the
+    // domain and the device reads a sector into it; then it is unmapped with the flush the unit
+    // needs. The unit caches what the device translated, so without that flush the rogue DMA
+    // below would reach the canary through the translation it used a moment ago.
+    if !iommu::grant_page(frames, cphys) {
+        c.write_str("\n  iommu      THE CANARY COULD NOT BE MAPPED FOR THE DEVICE");
+        return false;
+    }
+    let used = blk.dma_probe(0, cphys, testdisk::SECTOR as u32, ROGUE_POLLS);
+    let mut arrived = [0u8; testdisk::SECTOR];
+    for (i, b) in arrived.iter_mut().enumerate() {
+        // SAFETY: as the fill above.
+        *b = unsafe { cp.add(i).read_volatile() };
+    }
+    if !used || testdisk::header(&arrived) != Some(testdisk::SECTORS) {
+        c.write_str("\n  iommu      A READ INTO A PAGE MAPPED FOR THE DEVICE DID NOT ARRIVE");
+        return false;
+    }
+    if !iommu::revoke_page(cphys) {
+        c.write_str("\n  iommu      THE CANARY COULD NOT BE UNMAPPED AND FLUSHED");
+        return false;
+    }
+    for i in 0..testdisk::SECTOR {
+        // SAFETY: as the fill above.
+        unsafe { cp.add(i).write_volatile(SENTINEL) };
+    }
+
     // The grant must translate and the canary must not: the domain maps exactly the grant.
     if !iommu::domain_maps(phys) || iommu::domain_maps(cphys) {
         c.write_str("\n  iommu      THE DOMAIN DOES NOT MAP EXACTLY THE GRANT");
@@ -307,7 +334,7 @@ fn iommu_checks(
         }
     }
 
-    c.write_str("\n  iommu      in-grant DMA served behind VT-d");
+    c.write_str("\n  iommu      in-grant DMA served behind VT-d; a page the device used was unmapped and flushed");
     let stopped = match fault {
         Some((f, source)) if f.address == cphys && f.write => {
             c.write_str("; out-of-grant DMA stopped at ");
@@ -610,6 +637,10 @@ const BLOCKED_SPINS: u32 = 2_000_000;
 ///    arrive either. Cut to eight bits, the ID would be the boot CPU's 0, which would take it; so
 ///    the destination is carried whole, as only a remapped interrupt can carry it;
 /// 4. restored, every read by interrupt completes again.
+/// Changes [`remap_check`] makes to the disk's entry while remapping is on: absent, another
+/// function's and a wide destination, each followed by a restore.
+const ENTRY_CHANGES: u64 = 6;
+
 pub fn remap_check(c: &dyn EarlyConsole) -> Check {
     if !kconfig::IOMMU {
         c.write_str("skipped: no IOMMU in this build");
@@ -631,6 +662,7 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
         }
     };
     c.write_str("remappable MSI-X through entry 0");
+    let queue_before = iommu::invalidation_stats();
     // SAFETY: as `interrupt_check`, which ran before this: the interrupt path is up, the disk's
     // handler registered and its interrupt enabled, and the tick's hook not installed.
     let delivered = unsafe { reads_by_interrupt(blk, true) };
@@ -672,6 +704,29 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
         }
         Err(why) => {
             c.write_str(why);
+            return Check::Failed;
+        }
+    }
+
+    // Each tamper and each restore changed the entry in use, and the unit must have completed a
+    // flush for every one. QEMU keeps no entry cache that would show a missed flush stale, so
+    // what a guest can check is that each was queued and the unit wrote its wait's status; the
+    // host tests' model shows the stale entry itself.
+    let flushed = iommu::invalidation_stats()
+        .zip(queue_before)
+        .map(|(after, before)| {
+            (after.invalidations - before.invalidations, after.waits - before.waits)
+        });
+    match flushed {
+        Some((flushes, waits)) if flushes >= ENTRY_CHANGES && waits >= ENTRY_CHANGES => {
+            c.write_str("; ");
+            write_usize(c, flushes as usize);
+            c.write_str(" entry-cache flushes completed in ");
+            write_usize(c, waits as usize);
+            c.write_str(" waits");
+        }
+        _ => {
+            c.write_str("; AN ENTRY CHANGED IN USE WAS NOT FLUSHED");
             return Check::Failed;
         }
     }
@@ -789,14 +844,28 @@ pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no second CPU online");
         return Check::Skipped;
     }
-    if let Err(why) = platform::route_interrupt(line, ROUTED_CPU) {
+    // A remapped interrupt goes where its table entry says, so the entry is changed, with its cache
+    // flushed; any other message-signalled interrupt is moved in its MSI-X entry.
+    let remapped = iommu::disk_interrupt_remapped();
+    let route = |cpu| {
+        if remapped {
+            iommu::route_disk_interrupt(line, cpu)
+        } else {
+            platform::route_interrupt(line, cpu)
+        }
+    };
+    if let Err(why) = route(ROUTED_CPU) {
         c.write_str("LINE NOT ROUTED TO CPU 1: ");
         c.write_str(why);
         return Check::Failed;
     }
     c.write_str("line ");
     write_usize(c, line as usize);
-    c.write_str(" to CPU 1");
+    c.write_str(if remapped {
+        " to CPU 1 through its remapping entry"
+    } else {
+        " to CPU 1"
+    });
 
     let taken = |cpu| platform::interrupts_on_cpu(line, cpu);
     let (boot_before, routed_before) = (taken(0), taken(ROUTED_CPU));
@@ -804,7 +873,7 @@ pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
     // on the one the line was routed to.
     let run = unsafe { reads_by_interrupt(blk, false) };
     let (boot, routed) = (taken(0) - boot_before, taken(ROUTED_CPU) - routed_before);
-    let back = platform::route_interrupt(line, 0);
+    let back = route(0);
 
     let mut ok = run.report(c);
     c.write_str("; taken on CPU 1: ");
