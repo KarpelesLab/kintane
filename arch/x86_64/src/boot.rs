@@ -66,6 +66,14 @@
 //! identity-mapped by the firmware's tables while the kernel's are built, and both lie
 //! below 1 GiB, well inside the kernel's bootstrap map.
 
+// The boot tables alias their identity map at `hal::paging::DEVICE_WINDOW_BASE` through PML4
+// entry 2 (`pml4+16` below), so drivers that start during discovery reach registers where
+// the kernel's own space later maps them. Another base needs another entry.
+const _: () = assert!(
+    hal::paging::DEVICE_WINDOW_BASE == 2 << 39,
+    "x86_64's boot tables alias the device window through PML4 entry 2"
+);
+
 core::arch::global_asm!(
     r#"
 .section .multiboot_header, "a"
@@ -123,6 +131,9 @@ _start:
     movl $pdpt, %eax
     orl $0x03, %eax
     movl %eax, pml4
+    /* The device window: the same 4 GiB again at DEVICE_WINDOW_BASE (1 TiB, PML4 entry 2),
+     * where every driver reaches its registers. */
+    movl %eax, pml4+16
 
     movl $pml4, %eax
     movl %eax, %cr3
@@ -206,6 +217,8 @@ kinboot_entry:
     movq $pdpt, %rax
     orq $0x03, %rax
     movq %rax, pml4
+    /* The device window, as on the multiboot path. */
+    movq %rax, pml4+16
 
     movq $pml4, %rax
     movq %rax, %cr3

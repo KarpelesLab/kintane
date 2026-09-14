@@ -509,14 +509,15 @@ pub fn has_irq() -> bool {
 /// The transport for the bound device, of whichever kind its bus is.
 ///
 /// # Safety
-/// The claimed window must be mapped, as device memory, at its physical address — the
-/// kernel's address space maps every claimed window — and this must be called once,
+/// The claimed window must be mapped, as device memory, at
+/// [`hal::paging::DEVICE_WINDOW_BASE`] above its physical address — the kernel's address
+/// space maps every claimed window there — and this must be called once,
 /// because two transports for one device would be two drivers for one device.
 #[allow(unsafe_code)]
 pub unsafe fn transport() -> Option<AnyTransport> {
     let claims = CLAIMS.get()?;
     let (phys, len) = window()?;
-    let base = usize::try_from(phys).ok()?;
+    let base = hal::paging::device_virt(phys)?;
     let len = usize::try_from(len).ok()?;
     // SAFETY: the caller's contract; the window is the one the probe claimed.
     let window = unsafe { Direct::new(base, len) };
