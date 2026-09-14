@@ -1549,6 +1549,23 @@ walks a volume for exactly those properties, into a bitmap its caller lends, so 
 the boot checks and the stress audit — as well as on a host; kbuild's own reader walks the disk image
 the same way after every run (see [testing](testing.md#2e-files)).
 
+**Both volumes are crashed and stressed, not only the first.** The crash workload writes `/CRASH`
+on the FAT16 volume and `/FAT32/CRASH` on the second, so a cut lands in FAT32's root — a cluster
+chain that grows like any directory — in its 28-bit entries and in its FSInfo sector as often as
+it lands in FAT16's fixed root and 16-bit ones. Both are mounted in one namespace before the
+workload starts, since it never returns; a rename between the two is `Error::CrossDevice`, an
+answer rather than a fault. The stress run's filesystem workload writes a scratch file on the
+second volume beside the first's, under the same lease, and its audit walks both. kbuild's reader
+checks both after every cut.
+
+After a cut, the second volume's FSInfo free count is deliberately **not** required to match what
+its table says. FSInfo is written at a sync, so a cut between a table change and the next sync
+leaves it stale *by design* — the driver's own count is the authority and FSInfo is only ever
+compared against it. That is exactly the asymmetry the two checks encode: a clean, synced volume
+whose FSInfo disagrees is a failure, and a crashed one whose FSInfo disagrees is the write
+ordering working as intended. Requiring the match after a cut would have made the crash test fail
+on correct behaviour; not requiring it on a synced volume would have let a real disagreement pass.
+
 **The VFS as a service.** `kernel/main/src/fileserver.rs` answers `lib/vfsproto` over channels for
 every process the kernel has connected, holding the volume one request at a time through
 `fs::lease`. Whether a connection may write is decided when the kernel makes it: a request that would
@@ -1563,6 +1580,14 @@ regions: the pattern sectors the block check verifies, the scratch area tests ma
 block check and the block workload read is still the pattern exactly as it was. kbuild places
 `/HELLO.TXT`, the 200-cluster `/BIG.BIN`, `/SUB/NESTED.TXT`, and — when the configuration links a
 user program — that program at `/KINTANE/INIT.ELF`.
+
+A **second volume** follows the first from `FS32_START`, 66,600 sectors of it, and it is FAT32 for
+the only reason anything is: a volume's format is its cluster count and nothing else, the
+specification's boundary is 65,525 clusters, so the smallest honest FAT32 volume is about 34 MiB.
+It is what gives the second format a reader, a writer and a crash to survive rather than only host
+tests. kbuild writes files into it as it does the first, and both the file server and the crash
+workload mount it at `/FAT32`, each through a constant of its own, since the crash workload is
+built on configurations that have no file server.
 
 **Loading a program from a disk.** The boot `fs` check reads `/KINTANE/INIT.ELF` from the volume
 into frames it keeps, runs it once, and only after it exits with the success code makes it the
