@@ -48,6 +48,17 @@ pub const SETSOCKOPT: u64 = 208;
 pub const GETSOCKOPT: u64 = 209;
 pub const SHUTDOWN: u64 = 210;
 pub const ACCEPT4: u64 = 242;
+/// arm64 has no plain `poll` or `select`: only the forms that take a signal mask.
+pub const POLL: Option<u64> = None;
+pub const SELECT: Option<u64> = None;
+pub const PPOLL: u64 = 73;
+pub const PSELECT6: u64 = 72;
+pub const EPOLL_CREATE1: u64 = 20;
+pub const EPOLL_CTL: u64 = 21;
+pub const EPOLL_PWAIT: u64 = 22;
+/// `struct epoll_event` is aligned here: the data word sits at eight.
+pub const EPOLL_EVENT_BYTES: usize = 16;
+pub const EPOLL_DATA_AT: usize = 8;
 
 const SIGCHLD: u64 = 17;
 

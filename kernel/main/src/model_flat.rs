@@ -79,6 +79,10 @@ pub fn linux_check(_c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+pub fn readiness_check(_c: &dyn EarlyConsole) -> Check {
+    Check::Passed
+}
+
 pub fn sockets_check(_c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }

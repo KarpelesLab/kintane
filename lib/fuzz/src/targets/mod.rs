@@ -20,6 +20,7 @@ pub mod menu;
 pub mod module;
 pub mod net;
 pub mod pci;
+pub mod pollset;
 pub mod sigframe;
 pub mod syscall;
 pub mod virtio_ring;
@@ -142,6 +143,14 @@ pub const TARGETS: &[Target] = &[
         generate: sigframe::generate,
         run: sigframe::run,
         accepts: Some(sigframe::accepts),
+    },
+    Target {
+        name: "pollset",
+        what: "the descriptor sets poll, select and epoll take, and the timeouts with them",
+        needs_seeds: false,
+        generate: pollset::generate,
+        run: pollset::run,
+        accepts: Some(pollset::accepts),
     },
     Target {
         name: "syscall",

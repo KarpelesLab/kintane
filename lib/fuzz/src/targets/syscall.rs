@@ -346,6 +346,24 @@ impl Handler for Mock {
         Ok(cap.min(512) as u64 / 2)
     }
 
+    fn object_wait_any(
+        &mut self,
+        entries: UserPtr,
+        count: usize,
+        ready: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = count as u64;
+        if count == 0 || count > 8 || entries.0 == 0 || ready.0 == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if timeout_ns == 0 {
+            return Err(Error::ShouldWait);
+        }
+        Ok(1)
+    }
+
     fn socket_shutdown(&mut self, socket: Handle, timeout_ns: u64) -> Result<u64, Error> {
         self.calls += 1;
         let _ = socket;

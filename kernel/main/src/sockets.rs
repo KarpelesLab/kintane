@@ -106,6 +106,7 @@ pub fn next_look() -> Option<u64> {
 
 /// The card's handler has run the stack over what arrived: wake every waiting call.
 pub fn wake_from_interrupt() {
+    crate::readiness::wake();
     let woke = WAITS.wake_all();
     WOKEN.fetch_add(woke as u64, Ordering::Relaxed);
 }
@@ -377,6 +378,37 @@ pub fn shut(conn: Conn) -> Result<Option<u64>, Error> {
         return Err(error(e));
     }
     Ok((status.fin_acknowledged && status.unacknowledged == 0).then_some(0))
+}
+
+/// Whether `listener` has a connection an accept would take, without taking it: what a wait
+/// over a set asks about a listening socket (`crate::readiness`).
+pub fn pending(listener: Conn) -> bool {
+    crate::net::with_stack(|s, _, _| s.tcp_pending(listener)).unwrap_or(false)
+}
+
+/// A connected socket's readiness, taking nothing: bytes waiting — or the peer's close, which
+/// a receive answers at once with the end of the stream — room in the send ring, and a
+/// connection that has failed.
+pub fn readiness(conn: Conn) -> u32 {
+    use abi::ready;
+    let Some(Some(status)) = crate::net::with_stack(|s, _, _| s.tcp_status(conn)) else {
+        // The stack has let the connection go: every call on it now answers rather than waits.
+        return ready::ERROR | ready::CLOSED;
+    };
+    let mut bits = 0;
+    if status.error.is_some() {
+        bits |= ready::ERROR;
+    }
+    if status.readable > 0 || status.peer_closed {
+        bits |= ready::READ;
+    }
+    if status.peer_closed {
+        bits |= ready::CLOSED;
+    }
+    if status.writable > 0 {
+        bits |= ready::WRITE;
+    }
+    bits
 }
 
 /// Let go of a destroyed socket's connection: closed in order, and freed once it is over.

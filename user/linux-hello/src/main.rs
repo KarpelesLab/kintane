@@ -20,6 +20,8 @@
 //! * `signals`: [`signals`], handlers, masks, `EINTR`, `SIGCHLD`, `SIGPIPE` and default actions.
 //! * `tcp <port>`: [`tcp`], a TCP client of kbuild's service on `<port>`, blocking and not;
 //! * `serve`: [`serve`], a TCP server kbuild connects to through a port QEMU forwards.
+//! * `poll`: [`poll_mode`], two connections kbuild makes into the guest, served in the order they
+//!   arrive through `ppoll`, `select` and `epoll`;
 //! * `files`: [`files`], writing the test disk: create, write, append, truncate, directories,
 //!   rename and remove, and a file left for kbuild to read after the guest exits.
 //!
@@ -176,6 +178,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"tcp" => tcp(s.arg),
         b"serve" => serve(),
         b"files" => files(),
+        b"poll" => poll_mode(),
         _ => hello(&s),
     }
 }
@@ -1168,6 +1171,287 @@ fn serve() -> ! {
     expect(call1(sys::CLOSE, l) == 0, 140);
     // The second thread is still waiting in `accept`: the process's end has to end it.
     exit(SERVE_SUCCESS)
+}
+
+// ---- poll: waiting on several descriptors at once -------------------------------------------
+
+const POLL_SUCCESS: u64 = 51;
+
+/// `poll` events, as Linux numbers them.
+const POLLIN: u16 = 0x001;
+const POLLERR: u16 = 0x008;
+const POLLHUP: u16 = 0x010;
+const EPOLLIN: u32 = 0x001;
+/// Edge-triggered, which this kernel refuses rather than pretending to offer.
+const EPOLLET: u32 = 1 << 31;
+const EPOLL_CTL_ADD: u64 = 1;
+
+/// The port `poll_mode` listens on: the same one `serve` uses, which kbuild forwards to.
+const POLL_PORT: u16 = INBOUND_PORT;
+/// How long the wait that must run out is given.
+const POLL_TIMEOUT_NS: u64 = 50_000_000;
+/// Connections kbuild makes into this listener, one per number the kernel's check announces.
+const POLL_CONNECTIONS: usize = 2;
+/// Connections this mode holds at once, so an empty one QEMU made can be let go of and another
+/// accepted in its place.
+const POLL_SLOTS: usize = 4;
+/// Empty connections tolerated before this is a failure rather than QEMU's port forward.
+const POLL_EMPTY_MAX: usize = 8;
+
+/// One `struct pollfd`, as the kernel reads it.
+fn pollfd(buf: &mut [u8], at: usize, fd: u64, events: u16) {
+    let fd = (fd as u32).to_le_bytes();
+    let events = events.to_le_bytes();
+    for (i, b) in fd.into_iter().chain(events).chain([0, 0]).enumerate() {
+        if let Some(slot) = buf.get_mut(at * 8 + i) {
+            *slot = b;
+        }
+    }
+}
+
+/// What an entry of a `pollfd` array was answered with.
+fn revents(buf: &[u8], at: usize) -> u16 {
+    let (lo, hi) = (buf.get(at * 8 + 6), buf.get(at * 8 + 7));
+    match (lo, hi) {
+        (Some(lo), Some(hi)) => u16::from_le_bytes([*lo, *hi]),
+        _ => 0,
+    }
+}
+
+/// Name `fd` in a `select` bitmap: least significant bit of the first byte is descriptor 0.
+fn fd_set_bit(set: &mut [u8; 8], fd: u64) {
+    if let Some(byte) = set.get_mut((fd / 8) as usize) {
+        *byte |= 1 << (fd % 8);
+    }
+}
+
+/// `pselect6`, and where the architecture has it `select`: wait for `fd` to be readable, with a
+/// timeout. Both answer zero when nothing is ready, which is what this asks of them.
+fn select_idle(fd: u64, timeout_ns: u64) -> (i64, Option<i64>) {
+    let mut read = [0u8; 8];
+    fd_set_bit(&mut read, fd);
+    let nfds = fd + 1;
+    // `pselect6` takes a `timespec` and a pointer to (mask, size), which is null here.
+    let spec = [(timeout_ns / 1_000_000_000) as i64, (timeout_ns % 1_000_000_000) as i64];
+    let mut copy = read;
+    let p = sys::call(
+        sys::PSELECT6,
+        [
+            nfds,
+            copy.as_mut_ptr() as u64,
+            0,
+            0,
+            spec.as_ptr() as u64,
+            0,
+        ],
+    );
+    // `select` takes a `timeval`: seconds and microseconds.
+    let plain = sys::SELECT.map(|nr| {
+        let tv = [(timeout_ns / 1_000_000_000) as i64, ((timeout_ns % 1_000_000_000) / 1_000) as i64];
+        let mut copy = read;
+        sys::call(nr, [nfds, copy.as_mut_ptr() as u64, 0, 0, tv.as_ptr() as u64, 0])
+    });
+    (p, plain)
+}
+
+/// `ppoll`: the form both architectures have. `timeout_ns` of `None` waits as long as it takes.
+fn ppoll(fds: &mut [u8], n: usize, timeout_ns: Option<u64>) -> i64 {
+    let spec = match timeout_ns {
+        Some(ns) => [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64],
+        None => [0, 0],
+    };
+    let at = match timeout_ns {
+        Some(_) => spec.as_ptr() as u64,
+        None => 0,
+    };
+    sys::call(sys::PPOLL, [fds.as_mut_ptr() as u64, n as u64, at, 0, 8, 0])
+}
+
+/// Serve one connection kbuild made: read its request, reply, and read its verdict.
+fn poll_serve(c: u64, step: u64) -> bool {
+    let mut line = [0u8; 64];
+    let n = read_line(c, &mut line);
+    if n == 0 {
+        return false;
+    }
+    let Some(tag) = line.get(..n).and_then(|l| l.strip_prefix(INBOUND)) else {
+        exit(step)
+    };
+    let mut tag_buf = [0u8; 32];
+    let tag_len = concat(&mut tag_buf, tag, b"");
+    let tag = tag_buf.get(..tag_len).unwrap_or(&[]);
+    let mut reply = [0u8; 64];
+    let r = concat(&mut reply, INBOUND_REPLY, tag);
+    expect(write_all(c, reply.get(..r).unwrap_or(&[])), step);
+    let n = read_line(c, &mut line);
+    let mut verified = [0u8; 64];
+    let v = concat(&mut verified, INBOUND_VERIFIED, tag);
+    expect(line.get(..n) == verified.get(..v), step + 1);
+    true
+}
+
+/// Wait on a listener and its connections at once, serving whichever is ready, and then on
+/// nothing that will ever be ready, which must run out. The kernel's check tells kbuild about
+/// this listener twice, with a different number each time, so two connections come in.
+fn poll_mode() -> ! {
+    // 150: a listener at the port kbuild forwards to.
+    let l = socket(SOCK_STREAM);
+    expect(l >= 3, 150);
+    let l = l as u64;
+    expect(set_opt(l, SOL_SOCKET, SO_REUSEADDR, 1) == 0, 150);
+    let any = sockaddr([0; 4], POLL_PORT);
+    expect(
+        sys::call(sys::BIND, [l, any.as_ptr() as u64, any.len() as u64, 0, 0, 0]) == 0
+            && sys::call(sys::LISTEN, [l, 2, 0, 0, 0, 0]) == 0,
+        151,
+    );
+
+    // 152-155: the listener and whatever has been accepted, all in one wait. Each pass serves
+    // whichever is ready: a connection to accept, or a request to answer.
+    let mut conns = [0u64; POLL_SLOTS];
+    let mut done = [false; POLL_SLOTS];
+    let mut accepted = 0;
+    let mut served = 0;
+    let mut empty = 0;
+    while served < POLL_CONNECTIONS {
+        let mut fds = [0u8; 8 * (POLL_SLOTS + 1)];
+        pollfd(&mut fds, 0, l, POLLIN);
+        let mut watched = 1;
+        let mut i = 0;
+        while i < accepted {
+            if let Some(&c) = conns.get(i) {
+                pollfd(&mut fds, watched, c, POLLIN);
+                watched += 1;
+            }
+            i += 1;
+        }
+        let ready = ppoll(&mut fds, watched, None);
+        expect(ready >= 1, 152);
+        // The listener first: a connection waiting is one to accept.
+        if revents(&fds, 0) & POLLIN != 0 && accepted < POLL_SLOTS {
+            let c = sys::call(sys::ACCEPT4, [l, 0, 0, SOCK_CLOEXEC, 0, 0]);
+            expect(c >= 3, 153);
+            if let Some(slot) = conns.get_mut(accepted) {
+                *slot = c as u64;
+            }
+            accepted += 1;
+        }
+        // Then every connection the wait says has a request, in the order they arrived.
+        let mut i = 0;
+        while i < accepted {
+            let ready = revents(&fds, 1 + i) & (POLLIN | POLLHUP | POLLERR) != 0;
+            let fresh = done.get(i) == Some(&false);
+            if ready && fresh && let Some(&c) = conns.get(i) {
+                if poll_serve(c, 154) {
+                    served += 1;
+                } else {
+                    // Nothing on it: QEMU's port forward accepted before kbuild was there.
+                    expect(call1(sys::CLOSE, c) == 0, 155);
+                    empty += 1;
+                    expect(empty <= POLL_EMPTY_MAX, 155);
+                    if let Some(slot) = conns.get_mut(i) {
+                        *slot = 0;
+                    }
+                }
+                if let Some(slot) = done.get_mut(i) {
+                    *slot = true;
+                }
+            }
+            i += 1;
+        }
+    }
+    expect(served == POLL_CONNECTIONS, 156);
+
+    // 157: a wait for something that will not happen runs out, and not before its timeout.
+    let mut idle = [0u8; 8];
+    pollfd(&mut idle, 0, l, POLLIN);
+    // How long it took is not measured here: this personality has no `clock_gettime`, so the
+    // program cannot read a clock. That a timeout runs out on time, and not before, is what the
+    // native check measures (`kernel/main/src/readiness/check.rs`).
+    let ran_out = ppoll(&mut idle, 1, Some(POLL_TIMEOUT_NS));
+    expect(ran_out == 0, 157);
+
+    // 158: `pselect6`, and `select` where the architecture has it, over the same idle listener.
+    let (pselect, select) = select_idle(l, POLL_TIMEOUT_NS);
+    expect(pselect == 0, 158);
+    expect(select.is_none_or(|n| n == 0), 158);
+
+    // 159: `poll` itself, where the architecture has it: the listener is not ready either.
+    if let Some(nr) = sys::POLL {
+        let mut fds = [0u8; 8];
+        pollfd(&mut fds, 0, l, POLLIN);
+        expect(sys::call(nr, [fds.as_mut_ptr() as u64, 1, 0, 0, 0, 0]) == 0, 159);
+    }
+
+    // 160-163: `epoll`, over the two connections kbuild is closing, which must come back as
+    // readable or hung up; and the flags this kernel refuses.
+    let ep = sys::call(sys::EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+    expect(ep >= 3, 160);
+    let ep = ep as u64;
+    let mut event = [0u8; 16];
+    for (i, b) in EPOLLIN.to_le_bytes().into_iter().enumerate() {
+        if let Some(slot) = event.get_mut(i) {
+            *slot = b;
+        }
+    }
+    let mut i = 0;
+    while i < accepted {
+        if let Some(&c) = conns.get(i)
+            && c != 0
+        {
+            for (k, b) in (c as u64).to_le_bytes().into_iter().enumerate() {
+                if let Some(slot) = event.get_mut(sys::EPOLL_DATA_AT + k) {
+                    *slot = b;
+                }
+            }
+            expect(
+                sys::call(sys::EPOLL_CTL, [ep, EPOLL_CTL_ADD, c, event.as_ptr() as u64, 0, 0])
+                    == 0,
+                161,
+            );
+        }
+        i += 1;
+    }
+    // 162: an edge-triggered interest is refused, rather than quietly made level-triggered.
+    let mut edge = event;
+    for (i, b) in (EPOLLIN | EPOLLET).to_le_bytes().into_iter().enumerate() {
+        if let Some(slot) = edge.get_mut(i) {
+            *slot = b;
+        }
+    }
+    expect(
+        sys::call(sys::EPOLL_CTL, [ep, EPOLL_CTL_ADD, l, edge.as_ptr() as u64, 0, 0]) == -EINVAL,
+        162,
+    );
+    // 163: the connections kbuild closed are ready, and `epoll` says which.
+    let mut out = [0u8; 16 * POLL_CONNECTIONS];
+    // What `epoll_wait` writes per entry differs between the two ABIs; the buffer holds either.
+    expect(sys::EPOLL_EVENT_BYTES <= 16, 163);
+    let got = sys::call(
+        sys::EPOLL_PWAIT,
+        [
+            ep,
+            out.as_mut_ptr() as u64,
+            POLL_CONNECTIONS as u64,
+            5_000,
+            0,
+            0,
+        ],
+    );
+    expect(got >= 1, 163);
+
+    // 164: everything closes.
+    let mut i = 0;
+    while i < accepted {
+        if let Some(&c) = conns.get(i)
+            && c != 0
+        {
+            expect(call1(sys::CLOSE, c) == 0, 164);
+        }
+        i += 1;
+    }
+    expect(call1(sys::CLOSE, ep) == 0 && call1(sys::CLOSE, l) == 0, 164);
+    exit(POLL_SUCCESS)
 }
 
 #[panic_handler]

@@ -535,6 +535,9 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     let linux = crate::model::linux_check(c);
     // After `linux`, which has torn its processes down by now, reusing the same process slot;
     // and long after the net check, which learned kbuild's TCP port.
+    // After `linux`, whose process slot and stacks it reuses: one process waiting on a
+    // channel, an event and a timer at once.
+    let readiness = crate::model::readiness_check(c);
     let sockets = crate::model::sockets_check(c);
     // After `sockets`, which has torn its process down by now, reusing the same process slot:
     // the Linux program as a TCP client, and as a server kbuild connects to.
@@ -565,6 +568,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(files)
         .and(files_write)
         .and(linux)
+        .and(readiness)
         .and(sockets)
         .and(linux_net)
         .and(isolation)

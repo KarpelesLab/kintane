@@ -177,6 +177,19 @@ pub fn network_wakes() -> Option<(u64, u64, u64)> {
     None
 }
 
+/// A native program waiting on a channel, an event and a timer at once. Passed, silently, when
+/// USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn readiness_check(c: &dyn EarlyConsole) -> Check {
+    crate::readiness::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn readiness_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// A native program talking TCP through the socket calls. Passed when USERSPACE is off.
 #[cfg(CONFIG_USERSPACE)]
 pub fn sockets_check(c: &dyn EarlyConsole) -> Check {

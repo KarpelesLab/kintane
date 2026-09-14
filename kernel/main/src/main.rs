@@ -99,6 +99,8 @@ mod objects;
 #[cfg(CONFIG_USERSPACE)]
 mod procs;
 #[cfg(CONFIG_USERSPACE)]
+mod readiness;
+#[cfg(CONFIG_USERSPACE)]
 mod sibling;
 #[cfg(CONFIG_USERSPACE)]
 mod sockets;

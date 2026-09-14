@@ -427,6 +427,25 @@ impl<L: LockFamily, const D: usize, const B: usize, const H: usize> Channel<L, D
         })
     }
 
+    /// Observe the endpoint `object` names, without a handle to it.
+    ///
+    /// [`Channel::status`] is how a program observes its own endpoint, and checks the `WAIT`
+    /// right on the handle it named. This is for a kernel that already holds the endpoint —
+    /// a wait over a set of objects, which checked the rights on every handle before it began
+    /// (`kernel/main/src/readiness.rs`) — and so names the endpoint by its object.
+    /// `None` if `object` is not an endpoint of this channel.
+    pub fn status_of(&self, object: ObjectId) -> Option<Status> {
+        let side = self.side_of(object)?;
+        Some(L::with(&self.state, |st| {
+            let (mine, peer) = st.ends(side);
+            Status {
+                queued: mine.inbox.len(),
+                writable: peer.open && !peer.inbox.is_full(),
+                peer_closed: !peer.open,
+            }
+        }))
+    }
+
     /// Observe an endpoint. Requires `WAIT`.
     pub fn status<const N: usize>(
         &self,

@@ -11,6 +11,9 @@
 #
 # <number> <abi> <name> <entry point>
 17	common	getcwd			sys_getcwd
+20	common	epoll_create1		sys_epoll_create1
+21	common	epoll_ctl		sys_epoll_ctl
+22	common	epoll_pwait		sys_epoll_pwait
 23	common	dup			sys_dup
 24	common	dup3			sys_dup3
 25	common	fcntl			sys_fcntl

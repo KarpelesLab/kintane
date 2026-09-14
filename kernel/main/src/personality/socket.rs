@@ -221,6 +221,43 @@ fn write_sockaddr(at: u64, len_at: u64, ip: [u8; 4], port: u16) -> Result<(), Fa
     to_user(len_at, &(SOCKADDR_IN_LEN as u32).to_le_bytes())
 }
 
+/// What socket `i` is ready for, as `poll` events, taking nothing: a listener with a
+/// connection to accept is readable, as are queued bytes and the peer's close; room in the send
+/// ring is writable. A socket whose object is gone reports an error rather than waiting.
+pub(super) fn ready(i: usize) -> u16 {
+    use abi::ready;
+    use linux::poll;
+    let Ok(id) = id_of(i) else {
+        return poll::POLLNVAL;
+    };
+    if let Ok((listener, _)) = crate::sockets::listener(id) {
+        return if crate::sockets::pending(listener) {
+            poll::POLLIN
+        } else {
+            0
+        };
+    }
+    let Ok(conn) = crate::sockets::connection(id) else {
+        // Made but neither connected nor listening: nothing changes until the program acts.
+        return 0;
+    };
+    let bits = crate::sockets::readiness(conn);
+    let mut events = 0;
+    if bits & ready::READ != 0 {
+        events |= poll::POLLIN;
+    }
+    if bits & ready::WRITE != 0 {
+        events |= poll::POLLOUT;
+    }
+    if bits & ready::CLOSED != 0 {
+        events |= poll::POLLRDHUP;
+    }
+    if bits & ready::ERROR != 0 {
+        events |= poll::POLLERR;
+    }
+    events
+}
+
 pub(super) fn socket(slot: usize, domain: u64, kind: u64, protocol: u64) -> Result<u64, Failure> {
     if domain != AF_INET {
         return Err(Failure::AddressFamilyNotSupported);
@@ -520,6 +557,15 @@ const ANNOUNCE_EVERY: Duration = Duration::from_nanos(500_000_000);
 const SETTLE: Duration = Duration::from_nanos(10_000_000_000);
 
 const SERVE_ARGV: [&[u8]; 2] = [b"hello", b"serve"];
+const POLL_ARGV: [&[u8]; 2] = [b"hello", b"poll"];
+
+/// What the program's `poll` mode exits with when every step behaved; mirrors `POLL_SUCCESS`
+/// in `user/linux-hello/src/main.rs`.
+const POLL_SUCCESS: u64 = 51;
+
+/// How long into the poll run the second listener number is announced, so kbuild makes its
+/// two connections one after the other rather than at once.
+const SECOND_CONNECTION_AFTER: Duration = Duration::from_nanos(1_000_000_000);
 
 /// kbuild's TCP port in decimal, and the `tcp` mode's `argv` naming it.
 ///
@@ -633,6 +679,41 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
         }
     });
 
+    // The same listener, announced under two numbers: kbuild connects once per number it has
+    // not seen, so the program's `poll` mode has two connections to serve and a listener to
+    // watch at the same time.
+    let mut first = [0u8; 40];
+    let first_len = listening_message(&mut first);
+    let first = first.get(..first_len).unwrap_or(LISTENING);
+    let mut second = [0u8; 40];
+    let second_len = listening_message(&mut second);
+    let second = second.get(..second_len).unwrap_or(LISTENING);
+    let started_at = timekeeping::now();
+    let mut last_poll: Option<Instant> = None;
+    let mut poll_told = 0u32;
+    let polled = run_mode(&program, &POLL_ARGV, || {
+        let now = timekeeping::now();
+        if last_poll.is_some_and(|t| now < t.saturating_add(ANNOUNCE_EVERY))
+            || !crate::sockets::listening_on(INBOUND_PORT)
+        {
+            return;
+        }
+        last_poll = Some(now);
+        let mut announce = |message: &[u8]| {
+            let sent = crate::net::with_stack(|s, card, t| {
+                s.udp_send(card, peer.0, crate::net::PORT, peer.1, message, t)
+                    .is_ok()
+            });
+            if sent == Some(true) {
+                poll_told += 1;
+            }
+        };
+        announce(first);
+        if now >= started_at.saturating_add(SECOND_CONNECTION_AFTER) && first != second {
+            announce(second);
+        }
+    });
+
     let give_up = timekeeping::now().saturating_add(SETTLE);
     let settled = loop {
         let quiet = crate::net::with_stack(|s, _, _| s.tcp_rings_held() == 0 && s.balanced());
@@ -652,11 +733,16 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     );
     let frames = frames_before.saturating_sub(super::free_frames());
     let leaked = objects::live().saturating_sub(objects_before);
-    let emptied = table_empty();
+    let emptied = table_empty() && super::poll::table_empty();
 
     report(c, "tcp client", client, TCP_SUCCESS);
     c.write_str("; ");
     report(c, "server", server, SERVE_SUCCESS);
+    c.write_str("; ");
+    report(c, "poll", polled, POLL_SUCCESS);
+    c.write_str(" (two connections, ");
+    write_usize(c, poll_told as usize);
+    c.write_str(" announcements)");
     c.write_str(" (kbuild told of its listener ");
     write_usize(c, told as usize);
     c.write_str(if told == 1 { " time)" } else { " times)" });
@@ -678,7 +764,7 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
         "; A CONNECTION NEVER FINISHED CLOSING, OR A BUFFER IS MISSING"
     });
     if !emptied {
-        c.write_str("; A LINUX SOCKET WAS NEVER LET GO OF");
+        c.write_str("; A LINUX SOCKET OR EPOLL SET WAS NEVER LET GO OF");
     }
     c.write_str("; ");
     write_usize(c, leaked);
@@ -697,8 +783,10 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     Check::from_ok(
         client.code == Some(TCP_SUCCESS)
             && server.code == Some(SERVE_SUCCESS)
+            && polled.code == Some(POLL_SUCCESS)
             && client.ended
             && server.ended
+            && polled.ended
             && woken_ok
             && settled
             && emptied
