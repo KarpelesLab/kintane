@@ -30,7 +30,53 @@ use hal::EarlyConsole;
 use hal::paging::DeviceWindow;
 
 /// Every driver this image carries, in the order ties between equally specific matches go.
+///
+/// The interrupt-controller drivers are the configuration's, not the architecture's: an
+/// image built for one kind of machine can leave the other out, which is what lets
+/// `IRQCHIP_STATIC` know there is only one possible answer. Leaving one out also means a
+/// tree describing it binds nothing and the boot fails saying so, rather than the image
+/// quietly dispatching through the wrong driver.
+#[cfg(all(CONFIG_GIC_V2, CONFIG_GIC_V3))]
 const DRIVERS: &[&dyn Driver] = &[&gic::v2::DRIVER, &gic::v3::DRIVER, &pl011::DRIVER];
+#[cfg(all(CONFIG_GIC_V2, not(CONFIG_GIC_V3)))]
+const DRIVERS: &[&dyn Driver] = &[&gic::v2::DRIVER, &pl011::DRIVER];
+#[cfg(all(CONFIG_GIC_V3, not(CONFIG_GIC_V2)))]
+const DRIVERS: &[&dyn Driver] = &[&gic::v3::DRIVER, &pl011::DRIVER];
+
+/// The controller one of those drivers started, whichever kinds this image has.
+#[cfg(all(CONFIG_GIC_V2, CONFIG_GIC_V3))]
+fn started_chip() -> Option<&'static dyn hal::IrqChip> {
+    gic::v2::chip().or_else(gic::v3::chip)
+}
+#[cfg(all(CONFIG_GIC_V2, not(CONFIG_GIC_V3)))]
+fn started_chip() -> Option<&'static dyn hal::IrqChip> {
+    gic::v2::chip()
+}
+#[cfg(all(CONFIG_GIC_V3, not(CONFIG_GIC_V2)))]
+fn started_chip() -> Option<&'static dyn hal::IrqChip> {
+    gic::v3::chip()
+}
+
+/// The IRQ vector's dispatch, instantiated for the one controller this image can have.
+///
+/// `arch` declares this symbol and calls it from the vector; see `arch/aarch64/src/irq.rs`.
+/// This is the only place that can write it, because it is the only place that may name a
+/// driver's type. A controller that was never started leaves the interrupt unacknowledged,
+/// exactly as the dynamic path does with an empty slot.
+#[cfg(all(CONFIG_IRQCHIP_STATIC, CONFIG_GIC_V3))]
+#[unsafe(no_mangle)]
+extern "C" fn kintane_irq_dispatch() {
+    if let Some(chip) = gic::v3::chip_concrete() {
+        arch::irq::dispatch_with(chip);
+    }
+}
+#[cfg(all(CONFIG_IRQCHIP_STATIC, CONFIG_GIC_V2))]
+#[unsafe(no_mangle)]
+extern "C" fn kintane_irq_dispatch() {
+    if let Some(chip) = gic::v2::chip_concrete() {
+        arch::irq::dispatch_with(chip);
+    }
+}
 
 /// Nodes in the tree. QEMU `virt` has 48; a large SoC tree a few hundred. Running out is
 /// an error, never a partly-read tree.
@@ -158,8 +204,7 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     }
 
     // One interrupt controller, started.
-    let chip = gic::v2::chip().or_else(gic::v3::chip);
-    match chip {
+    match started_chip() {
         // SAFETY: once, from `discover`'s single call, with interrupts masked, and the
         // controller was initialised by its driver's start — `set_chip`'s contract.
         Some(chip) => unsafe { arch::irq::set_chip(chip) },

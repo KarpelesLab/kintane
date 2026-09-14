@@ -120,7 +120,8 @@ built-in `thumbv7m-none-eabi`):
   - code memory read-only and executable;
   - RAM and PSRAM read-write and never executable;
   - no access to the page below the boot stack;
-  - no access to an 8 KiB guard at the bottom of each thread-stack slot, using subregions.
+  - no access to a guard at the bottom of each thread-stack slot, a quarter of the slot
+    (8 KiB at the default 32 KiB), using subregions.
 
   The interrupt selftest proves each guard faults and `.rodata` refuses a write. A real
   overflow of the boot stack, run as a mutation, is reported with the guard named even
@@ -134,31 +135,47 @@ built-in `thumbv7m-none-eabi`):
 
   The MMU checks report Skipped.
 
-**Size**, against the roadmap's 64 KiB, from `kbuild size` (flash is `.text`, `.rodata`
-and `.data`'s load copy, each page-aligned by `link.ld`):
+**Size**, against the roadmap's 64 KiB, from `kbuild size`. Flash is `.text`, `.rodata` and
+`.data`'s load copy; RAM is `.data`, `.bss`, both stacks, the boot-stack guard and the thread
+stacks.
 
-| Configuration | `.text` | `.rodata` | `.data` | Flash | RAM (`.bss` + stacks) |
-|---|---|---|---|---|---|
-| `armv7m-mps2` preset (debug, test channel) | 92 KiB | 12 KiB | 3.7 KiB | 108 KiB | 324 KiB |
-| release (`DEBUG_BUILD=n`, `QEMU_EXIT=n`), opt-level 2 | 80 KiB | 12 KiB | 2.9 KiB | 95 KiB | 324 KiB |
-| release, `OPTIMIZE_FOR_SIZE=y` (opt-level `z`) | 48 KiB | 12 KiB | 2.9 KiB | 63 KiB | 324 KiB |
+| Configuration | `.text` | `.rodata` | Flash | `.bss` | stacks + guard | RAM |
+|---|---|---|---|---|---|---|
+| first port: `armv7m-mps2`, before this round | 100.0 KiB | 12.0 KiB | 116.0 KiB | 41.0 KiB | 284.0 KiB | 329.0 KiB |
+| `armv7m-mps2` (debug, test channel) | 99.4 KiB | 10.7 KiB | 114.1 KiB | 11.0 KiB | 284.0 KiB | 298.9 KiB |
+| `armv7m-tiny` (release, opt-level `z`, test channel) | 51.3 KiB | 10.6 KiB | 65.0 KiB | 10.8 KiB | 42.0 KiB | **55.9 KiB** |
+| `armv7m-tiny`, `QEMU_EXIT=n` (the product image) | 50.8 KiB | 10.6 KiB | 64.6 KiB | 10.8 KiB | 42.0 KiB | **55.9 KiB** |
 
-So a release image optimised for size fits 64 KiB of flash, with 1 KiB to spare, and
-5 KiB of it is page padding: `.text` uses 45.7 KiB of its 48 and `.rodata` 9.7 of its 12. A release image with the test exit channel also boots and passes every banner
-check at opt-level `z`. RAM is not in the budget yet and is the real problem:
-`.thread_stacks` is 256 KiB, eight 32 KiB slots, and `.bss` is 40 KiB, most of it the
-frame allocator's 32 KiB bitmap store (`FRAME_BITMAP_KIB`). Concrete paths to a
-64 KiB machine, not taken this round:
+**RAM fits a 64 KiB machine; flash is 0.6 KiB over.** The product image boots, reaches
+`kmain`, hands the CPU to the scheduler and keeps printing its uptime. The test image
+passes the whole boot banner. What moved, each by configuration and none by changing the
+kernel:
 
-- **Thread stacks** sized for a small target: fewer and smaller slots from configuration
-  rather than `link.ld` constants.
-- **The bitmap store** sized from the board's memory: 20 MiB at 4 KiB pages needs 1.3 KiB,
-  not 32.
-- **Section padding.** No page alignment of `.text`/`.rodata` on a target whose MPU
-  regions are not page-granular: 5 KiB.
-- **The boot checks.** `kernel/main` is 12 KiB of `.text` at opt-level `z`, and most of it
-  is the boot banner's demonstrations: preemption, sleep, the heap under threads, the flat
-  allocator. They are compiled into every image, test channel or not.
+- **Thread stacks.** `THREAD_STACK_SLOTS` and `THREAD_STACK_KIB` reach `link.ld` through
+  kbuild's generated `sizes.ld`. `armv7m-tiny` has six 4 KiB slots, 24 KiB, where the
+  first port had eight 32 KiB ones, 256 KiB. A slot's MPU guard stays a quarter of it, and
+  the MPU programs one region per two slots, however many there are.
+- **The bitmap store.** `FRAME_BITMAP_KIB` now goes down to 1. The board needs 2 KiB, and
+  the kernel names the shortfall if a preset asks for less: 1 KiB boots to "need 2048 bytes
+  of bitmap, have 1024".
+- **Section padding.** `.text`, `.rodata` and `.data` are word-aligned, not page-aligned,
+  since the MPU's flash and RAM regions are whole memories. Only the boot-stack guard, a
+  region of its own, stays on a page.
+- **The boot and handler stacks.** `BOOT_STACK_KIB` and `HANDLER_STACK_KIB`. The boot stack
+  cannot go below 12 KiB with the boot checks in: at 4 KiB the guard caught an overflow in
+  the interrupt selftest, and at 8 KiB one in `Threads::new`, which builds the whole thread
+  table on the stack before it is stored.
+
+What remains, in the order it would pay:
+
+- **The boot demonstrations.** `kernel/main` is 13.6 KiB of `.text` in the product image
+  (`kbuild size`'s `kintane` row), and most of it is the banner's checks — clock,
+  preemption, sleep, the heap under threads — which are in every image, product or test.
+  The flash overrun is 0.6 KiB, so leaving even the clock check out of a product image
+  would bring flash inside 64 KiB. That needs a configuration symbol that restructures
+  `kernel/main`, which other work is editing, so it was not taken this round.
+- **`Threads::new` building on the stack**, which sets the boot stack's floor at 12 KiB.
+  Constructing the table in place would let it drop to 8 or lower.
 - **Formatting.** `core`'s formatting reached through `panic!` messages is most of the 5 KiB
   of `core`.
 

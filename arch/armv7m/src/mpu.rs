@@ -14,7 +14,7 @@
 //! | 1 | SSRAM2/3, 4 MiB | read and write, never execute |
 //! | 2 | PSRAM, 16 MiB | read and write, never execute |
 //! | 3 | the page below the boot stack | nothing |
-//! | 4–7 | two thread-stack slots each | nothing in the two 8 KiB guard subregions; the rest falls through to region 1 |
+//! | 4.. | two thread-stack slots each | nothing in the two guard subregions, a quarter of a slot each; the rest falls through to region 1 |
 //!
 //! That is W^X over the whole image, and a guard under every stack, on a core with no
 //! page tables. Regions 0–2 come from the board's memory, which this port knows as the
@@ -47,7 +47,8 @@ const FLASH: (u32, u32) = (0x0000_0000, 4 << 20);
 const SRAM: (u32, u32) = (0x2000_0000, 4 << 20);
 const PSRAM: (u32, u32) = (0x2100_0000, 16 << 20);
 
-/// The guard subregions of a two-slot region: the bottom eighth of each 32 KiB slot.
+/// The guard subregions of a two-slot region: the bottom eighth of the region, which is
+/// the bottom quarter of each slot.
 /// `SRD` disables subregions whose bit is set, so every bit but 0 and 4.
 const SRD_TWO_GUARDS: u32 = 0b1110_1110 << 8;
 
@@ -83,6 +84,15 @@ unsafe fn set(n: u32, base: u32, len: u32, attrs: u32) -> Result<(), Error> {
     Ok(())
 }
 
+/// The first region number the thread-stack pairs use; 0..4 are the fixed ones.
+const FIRST_STACK_REGION: u32 = 4;
+
+/// How many regions the thread-stack slots need: one per two slots.
+pub fn stack_regions() -> u32 {
+    let slots = crate::image_sections().thread_stacks.count() as u32;
+    slots.div_ceil(2)
+}
+
 /// How many data regions the MPU has.
 pub fn regions() -> u32 {
     // SAFETY: MPU_TYPE is read-only and present on every PMSAv7 core; DREGION is 15:8.
@@ -96,7 +106,7 @@ pub fn regions() -> u32 {
 /// execute RAM.
 pub unsafe fn enable() -> Result<(), Error> {
     let have = regions();
-    if have < 8 {
+    if have < FIRST_STACK_REGION + stack_regions() {
         return Err(Error::TooFewRegions(have));
     }
     let s = crate::image_sections();
@@ -114,8 +124,11 @@ pub unsafe fn enable() -> Result<(), Error> {
             (s.stack_guard.1 - s.stack_guard.0) as u32,
             AP_NONE | RASR_XN,
         )?;
+        // One region per two slots, however many the configuration reserved. A slot
+        // count that needs more regions than the MPU has is a configuration error, and
+        // `regions()` above has already refused it.
         let pair = 2 * stacks.slot as u32;
-        for (i, region) in (4..8).enumerate() {
+        for (i, region) in (FIRST_STACK_REGION..FIRST_STACK_REGION + stack_regions()).enumerate() {
             let base = stacks.start as u32 + i as u32 * pair;
             set(region, base, pair, AP_NONE | RASR_XN | SRD_TWO_GUARDS)?;
         }
@@ -223,7 +236,8 @@ pub fn selftest(c: &dyn EarlyConsole) -> bool {
         Err(Error::TooFewRegions(n)) => {
             c.write_str("mpu has ");
             write_hex(c, u64::from(n));
-            c.write_str(" regions, needs 8");
+            c.write_str(" regions, needs ");
+            write_hex(c, u64::from(FIRST_STACK_REGION + stack_regions()));
             return false;
         }
         Err(Error::BadRegion(n)) => {
@@ -233,7 +247,9 @@ pub fn selftest(c: &dyn EarlyConsole) -> bool {
             return false;
         }
     }
-    c.write_str("mpu 8 regions");
+    c.write_str("mpu ");
+    write_hex(c, u64::from(FIRST_STACK_REGION + stack_regions()));
+    c.write_str(" regions");
 
     let s = crate::image_sections();
     let boot_guard = s.stack_guard.0 as usize;

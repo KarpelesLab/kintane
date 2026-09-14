@@ -29,11 +29,16 @@ ENTRY(__reset)
 
 PAGE_SIZE = 4K;
 
-/* See `.thread_stacks` below, and THREAD_STACK_SLOT and THREAD_STACK_GUARD in
- * src/lib.rs, which must agree. */
-THREAD_STACK_SLOT = 32K;
-THREAD_STACK_GUARD = 8K;
-THREAD_STACK_SLOTS = 8;
+/* The configuration's numbers, which is how a board too small for the defaults shrinks
+ * what the image reserves. `src/lib.rs` reads the same symbols through kconfig, and the
+ * assertions at the end of this file check the two agree. */
+INCLUDE sizes.ld
+
+/* See `.thread_stacks` below. A slot's guard is a quarter of it, because an MPU region
+ * covers two slots and its subregions are eighths of the region. */
+THREAD_STACK_SLOT = CONFIG_THREAD_STACK_KIB * 1K;
+THREAD_STACK_GUARD = THREAD_STACK_SLOT / 4;
+THREAD_STACK_SLOTS = CONFIG_THREAD_STACK_SLOTS;
 
 SECTIONS {
     __kernel_start = ORIGIN(FLASH);
@@ -42,20 +47,25 @@ SECTIONS {
         __text_start = .;
         KEEP(*(.vectors))
         *(.text .text.*)
-        . = ALIGN(PAGE_SIZE);
+        . = ALIGN(4);
         __text_end = .;
     } > FLASH
 
-    .rodata : ALIGN(PAGE_SIZE) {
+    /* Word-aligned, not page-aligned. This core has no pages: the MPU's flash region is
+     * the whole of flash and its RAM region the whole of RAM, so a section boundary
+     * rounded to 4 KiB protects nothing and costs up to a page of flash per section —
+     * 5 KiB of a 64 KiB image. The guard below the boot stack does stay page-aligned,
+     * because it is an MPU region of its own. */
+    .rodata : ALIGN(4) {
         __rodata_start = .;
         /* The build ID kbuild stamps after linking; see lib/buildid. */
         KEEP(*(.kintane_build_id))
         *(.rodata .rodata.*)
-        . = ALIGN(PAGE_SIZE);
+        . = ALIGN(4);
         __rodata_end = .;
     } > FLASH
 
-    .data : ALIGN(PAGE_SIZE) {
+    .data : ALIGN(4) {
         __data_start = .;
         *(.data .data.*)
         /* The copy loop moves a word at a time and stops on `>=`. */
@@ -76,7 +86,7 @@ SECTIONS {
      * of this one is not caught; handlers here are small and do not nest deeply. */
     .handler_stack (NOLOAD) : ALIGN(8) {
         __handler_stack_bottom = .;
-        . += 8K;
+        . += CONFIG_HANDLER_STACK_KIB * 1K;
         __handler_stack_top = .;
     } > RAM
 
@@ -90,7 +100,7 @@ SECTIONS {
 
     .stack (NOLOAD) : {
         __stack_bottom = .;
-        . += 16K;
+        . += CONFIG_BOOT_STACK_KIB * 1K;
         __stack_top = .;
     } > RAM
 
@@ -98,9 +108,9 @@ SECTIONS {
      * with THREAD_STACK_GUARD bytes at its bottom that the MPU forbids. The array starts
      * on a 64 KiB boundary because each MPU region covers two slots, 64 KiB, with the
      * two guards as its enabled subregions — eight regions would not stretch to one
-     * per slot. That is also why a guard is 8 KiB here, not a page: a subregion is an
-     * eighth of its region. */
-    .thread_stacks (NOLOAD) : ALIGN(64K) {
+     * per slot. That is also why a guard is a quarter of a slot rather than a page: a
+     * subregion is an eighth of its region. */
+    .thread_stacks (NOLOAD) : ALIGN(2 * THREAD_STACK_SLOT) {
         __thread_stacks_start = .;
         . += THREAD_STACK_SLOTS * THREAD_STACK_SLOT;
         __thread_stacks_end = .;
@@ -125,7 +135,7 @@ ASSERT(__text_end <= __rodata_start, ".text and .rodata overlap")
 ASSERT(__data_load >= __rodata_end, ".data's load copy overlaps .rodata")
 ASSERT(__bss_end <= __handler_stack_bottom, ".bss runs into the handler stack")
 ASSERT(__stack_guard_end <= __stack_bottom, "the stack guard overlaps the stack")
-ASSERT(__thread_stacks_start % 64K == 0, "thread stacks do not start on an MPU region boundary")
-ASSERT(THREAD_STACK_SLOT == 32K, "THREAD_STACK_SLOT disagrees with src/lib.rs")
-ASSERT(THREAD_STACK_GUARD == 8K, "THREAD_STACK_GUARD disagrees with src/lib.rs")
+ASSERT(__thread_stacks_start % (2 * THREAD_STACK_SLOT) == 0, "thread stacks do not start on an MPU region boundary")
+ASSERT(THREAD_STACK_SLOT >= 1K, "a thread stack slot must be at least 1 KiB")
+ASSERT(THREAD_STACK_GUARD * 4 == THREAD_STACK_SLOT, "a guard is a quarter of its slot")
 ASSERT(THREAD_STACK_SLOTS % 2 == 0, "an MPU region covers two thread-stack slots")

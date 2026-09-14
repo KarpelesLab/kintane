@@ -134,9 +134,12 @@ first such pool, and the live tables are walked again after it runs. On x86 an o
 entry goes unnoticed while the TLB still holds the old translation, so without that second
 walk the corruption would surface much later, somewhere else.
 
-**Kernel thread stacks.** Each port's `link.ld` reserves a run of 32 KiB slots after the
-boot stack, and `hal::StackArray` describes them: a guard page at the bottom of each slot,
-then a 28 KiB stack. Threads take their stacks from `arch::kspace::claim_thread_stack`,
+**Kernel thread stacks.** Each paged port's `link.ld` reserves a run of 32 KiB slots after
+the boot stack, and `hal::StackArray` describes them: a guard page at the bottom of each
+slot, then a 28 KiB stack. ARMv7-M sizes its run from the configuration instead
+(`THREAD_STACK_SLOTS`, `THREAD_STACK_KIB`, read through kbuild's `sizes.ld`), with an MPU
+guard of a quarter of each slot rather than a page, because a microcontroller cannot spend
+256 KiB on stacks. Threads take their stacks from `arch::kspace::claim_thread_stack`,
 which records who each slot is for, so an overflow report names the thread. Without this, a
 thread that overflowed wrote into the stack of the thread whose slot was below, which
 corrupts a suspended thread and fails later, somewhere else. The slot size is a power of
@@ -482,6 +485,15 @@ more than a wide margin, or if the counter steps backwards.
   dereferences itself. This is what makes the isolation domains possible.
 - **Power and lifecycle** — suspend, resume, and driver removal are part of the
   interface from the start, not retrofitted.
+- **Interrupt dispatch** crosses from `arch` to a driver in one of two modes, from one
+  source. `arch::irq::dispatch_with` is generic over `IrqChip`. An image with several
+  controller drivers calls it through the installed `&'static dyn IrqChip`, a vtable
+  call per claim, identify and acknowledge. An image the configuration left with exactly
+  one (`IRQCHIP_STATIC`, today aarch64 with `GIC_V2=n`) has the platform provider
+  instantiate it for the concrete driver and export it as `kintane_irq_dispatch`, which
+  the vector calls by name: no indirect call on the path, and a GICv3 acknowledgement
+  that compiles to one instruction. See
+  [portability.md](portability.md#buying-the-indirection-back-on-small-targets).
 
 #### What exists today
 

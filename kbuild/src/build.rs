@@ -299,6 +299,10 @@ impl Build {
                 .ok_or("this configuration selects no linker script (LINKER_SCRIPT is empty)")?;
             args.push("-C".into());
             args.push(format!("link-arg=-T{}", script.display()));
+            // Where `INCLUDE sizes.ld` finds the configuration's numbers; see
+            // `codegen::sizes_ld`. A script that includes nothing is unaffected.
+            args.push("-C".into());
+            args.push(format!("link-arg=-L{}", self.gen_dir.display()));
             // Without this the linker emits a warning and picks its own entry point,
             // which for a multiboot image is silently the wrong address.
             args.push("-C".into());
@@ -331,6 +335,13 @@ impl Build {
         if unit.kind == Kind::Bin {
             if let Some(script) = &self.link_script {
                 kb.file(script)?;
+                // The sizes a script may `INCLUDE`. Covered already by `kconfig`'s key,
+                // since every value is also a constant in `config.rs`, but named here
+                // too: the day a script reads something that is not, the key is right.
+                let sizes = self.gen_dir.join("sizes.ld");
+                if sizes.is_file() {
+                    kb.file(&sizes)?;
+                }
             }
         }
         kb.source_tree(&unit.src_dir())?;

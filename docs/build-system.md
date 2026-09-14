@@ -206,12 +206,20 @@ configures a kernel from zero: `x86_64-server`, `x86_64-qemu`, `aarch64-virt`,
 2. **`--cfg` flags** — only for crate- and module-level selection, per the rule in
    [portability.md](portability.md#where-cfg-is-still-allowed).
 
-3. **Provider aliases** — when a subsystem is pinned to one implementation:
-   ```rust
-   pub type SystemIrqChip = drivers::irqchip::nvic::Nvic;
-   ```
-   This is the only place `kbuild` emits type definitions, and it does so from a
-   fixed template.
+3. **`sizes.ld`** — every `int` and `hex` symbol as a linker-script assignment
+   (`CONFIG_THREAD_STACK_KIB = 4;`), because a linker script cannot read `.config` and a
+   section's size is not something the compiler can pass it. A port's script picks what
+   it needs with `INCLUDE sizes.ld`; kbuild puts the directory on the linker's search path
+   for `bin` units, and the file is part of the unit's cache key. This is how
+   `arch/armv7m/link.ld` sizes its stacks from the configuration rather than from literals.
+
+   **Provider aliases were planned here and are not built.** The plan was a generated
+   `pub type SystemIrqChip = ...;` for a subsystem pinned to one implementation. It cannot
+   work for the case it was meant for: the interrupt path is in `arch`, which may not
+   name a driver's type. Single-provider mode is a generic dispatch loop in `arch` plus a
+   linker symbol the one provider defines; see
+   [portability.md](portability.md#buying-the-indirection-back-on-small-targets). kbuild
+   generates no type definitions at all.
 
 4. **The registry tables** — driver match tables, initcall ordering, syscall dispatch.
    Built from `#[driver]` / `#[syscall]` attributes collected across the tree, so

@@ -181,6 +181,33 @@ jobs:
           done
           exit $fail
 
+      # docs/portability.md, "Buying the indirection back": a single-provider image must
+      # reach its interrupt controller without an indirect call, and a multi-driver image
+      # must still go through the vtable. Checking both halves is what stops this passing
+      # because the disassembly could not see an indirect branch at all.
+      - name: Interrupt dispatch is static where it should be
+        run: |
+          set -euo pipefail
+          sysroot=$(rustup run "${{ steps.pin.outputs.channel }}" rustc --print sysroot)
+          host=$(rustup run "${{ steps.pin.outputs.channel }}" rustc -vV | sed -n 's/^host: //p')
+          objdump="$sysroot/lib/rustlib/$host/bin/llvm-objdump"
+          ./kbuild/target/release/kbuild build --preset aarch64-virt-gicv3
+          static=$("$objdump" -d --disassemble-symbols=kintane_irq_dispatch \
+            build/aarch64-kintane/out/kintane.elf)
+          if ! grep -q 'kintane_irq_dispatch>:' <<<"$static"; then
+            echo "::error title=no static dispatch::kintane_irq_dispatch is missing"; exit 1
+          fi
+          if grep -qE '\bblr\b' <<<"$static"; then
+            echo "::error title=indirect call::the single-provider dispatch has a blr"; exit 1
+          fi
+          ./kbuild/target/release/kbuild build --preset aarch64-virt
+          dynamic=$("$objdump" -d --disassemble-symbols=aarch64_exception \
+            build/aarch64-kintane/out/kintane.elf)
+          if ! grep -qE '\bblr\b' <<<"$dynamic"; then
+            echo "::error title=check blind::the dynamic dispatch shows no blr either"; exit 1
+          fi
+          echo "static dispatch: no indirect call; dynamic dispatch: through the vtable"
+
       - name: Boot every preset under QEMU
         run: |
           set -euo pipefail

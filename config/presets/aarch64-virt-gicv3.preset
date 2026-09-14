@@ -1,0 +1,16 @@
+# aarch64 on QEMU's `virt` with the GICv3 driver alone: the single-provider image.
+#
+# The default aarch64 presets carry both GIC drivers and pick one from the device tree,
+# which is the demonstration docs/portability.md is built on. This one is the other half
+# of that argument: a board-specific image, where the configuration already knows the
+# answer, dispatches interrupts without a vtable (IRQCHIP_STATIC follows from GIC_V2=n).
+#
+# It boots only on a GICv3. A `gic-version=2` machine binds nothing and the boot fails
+# saying so, which is the intended behaviour, not a regression.
+ARCH_AARCH64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+GIC_V2=n
+SIZE_BUDGET_KIB=1280

@@ -9,4 +9,8 @@ ARCH_ARMV7M=y
 EARLY_CONSOLE=y
 DEBUG_BUILD=y
 QEMU_EXIT=y
+# The board's 20 MiB at 4 KiB pages needs 2 KiB of bitmap; the default 32 KiB is sized
+# for a PC and was most of this image's .bss. The kernel refuses too small a value by
+# name ("raise FRAME_BITMAP_KIB"), so this cannot quietly truncate the pool.
+FRAME_BITMAP_KIB=2
 SIZE_BUDGET_KIB=560

@@ -194,13 +194,13 @@ pub fn image_range() -> (u64, u64) {
     (start, end)
 }
 
-/// Bytes per kernel thread stack slot. `link.ld` reserves whole slots and asserts it
-/// agrees with this value.
-pub const THREAD_STACK_SLOT: u64 = 32 * 1024;
+/// Bytes per kernel thread stack slot, from `THREAD_STACK_KIB`. `link.ld` reserves whole
+/// slots from the same symbol, so the two cannot drift.
+pub const THREAD_STACK_SLOT: u64 = kconfig::THREAD_STACK_KIB as u64 * 1024;
 
 /// Bytes of MPU guard at the bottom of each slot: an eighth of the two-slot region that
-/// covers it; see `link.ld`.
-pub const THREAD_STACK_GUARD: u64 = 8 * 1024;
+/// covers it, which is a quarter of a slot; see `link.ld`.
+pub const THREAD_STACK_GUARD: u64 = THREAD_STACK_SLOT / 4;
 
 /// The kernel image's sections, from the symbols `link.ld` places around them.
 ///

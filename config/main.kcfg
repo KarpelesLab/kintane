@@ -46,6 +46,87 @@ choice MM_MODEL
             selectable on MMU targets for minimal-overhead builds.
 endchoice
 
+# --- memory the image reserves -----------------------------------------------
+#
+# Sizes a linker script reserves, rather than anything the allocator hands out. They are
+# the difference between an image that fits a microcontroller and one that does not: on
+# ARMv7-M these four sections were 90% of the RAM the image claimed. kbuild writes every
+# int symbol into `sizes.ld` for a script to INCLUDE; see docs/build-system.md.
+
+config THREAD_STACK_SLOTS
+    int "Guarded kernel thread stacks"
+    range 2 64
+    default 8
+    help
+        How many kernel threads can exist at once, since a slot is never
+        returned when its thread exits. Each slot costs THREAD_STACK_KIB of RAM
+        whether or not a thread is using it, and carries a guard region below it
+        that faults on overflow.
+
+config THREAD_STACK_KIB
+    int "Size of each kernel thread stack (KiB)"
+    range 1 256
+    default 32
+    help
+        Deep enough for an interrupt frame, the handler's Rust frames and the
+        scheduler on top of the thread's own. 32 KiB is generous because the
+        machines that boot first have RAM to spare; a Cortex-M does not.
+
+config BOOT_STACK_KIB
+    int "Size of the boot stack (KiB)"
+    range 1 256
+    default 16
+    help
+        The stack the first thread of execution runs on, with a guard below it.
+
+config HANDLER_STACK_KIB
+    int "Size of the exception stack (KiB)"
+    range 1 64
+    default 8
+    help
+        Ports that run handlers on a stack of their own — ARMv7-M's main stack —
+        size it with this. Nothing is below it but .bss, so an overflow of this
+        one is not caught; handlers here are small and do not nest.
+
+# --- interrupt controller drivers --------------------------------------------
+#
+# Which drivers an aarch64 image carries. Both, the default, is the configuration
+# `docs/portability.md` argues for: one image drives a GICv2 on one board and a GICv3 on
+# another, decided by the device tree. A board-specific image can leave one out, and then
+# the question the vtable answers has only one answer, which is what IRQCHIP_STATIC is.
+
+config GIC_V2
+    bool "Arm GICv2 driver"
+    depends on ARCH_AARCH64
+    default y if ARCH_AARCH64
+    help
+        Bind `arm,cortex-a15-gic` and `arm,gic-400` controllers. Leaving it out
+        of an image that meets one is not a fallback but a failed boot: the
+        controller node binds nothing and discovery says so.
+
+config GIC_V3
+    bool "Arm GICv3 driver"
+    depends on ARCH_AARCH64
+    default y if ARCH_AARCH64
+    help
+        Bind `arm,gic-v3` controllers.
+
+config IRQCHIP_STATIC
+    bool "Dispatch interrupts without a vtable"
+    depends on ARCH_AARCH64 && !(GIC_V2 && GIC_V3)
+    default y if ARCH_AARCH64
+    help
+        With exactly one interrupt-controller driver in the image, the platform
+        provider instantiates the architecture's dispatch loop for that driver's
+        own type and exports it as `kintane_irq_dispatch`; the IRQ vector calls
+        it directly. Every claim, ID and EOI on the interrupt path is then a
+        direct, inlinable call instead of a vtable call.
+
+        It cannot be selected while two drivers are enabled, because then only
+        the running machine knows which one answers. Other ports do not have the
+        symbol: ARMv7-M's NVIC is part of the architecture and was always a
+        direct call, and x86 carries both the 8259A and the APIC.
+
 # --- kernel ------------------------------------------------------------------
 
 config SMP
@@ -443,13 +524,15 @@ endchoice
 
 config FRAME_BITMAP_KIB
     int "Boot-time frame bitmap reserve (KiB)"
-    range 4 4096
+    range 1 4096
     default 32
     help
         Static reserve the boot path builds its frame allocator bitmap in.
         Two bits per frame of usable span, so 32 KiB covers about 512 MiB at
-        a 4 KiB page. A machine with more memory than this reports the
-        shortfall and skips the report rather than truncating the pool.
+        a 4 KiB page, and 1 KiB covers 16 MiB — which is why the floor is 1:
+        on a microcontroller the default is most of the RAM the image claims.
+        A machine with more memory than this reports the shortfall and skips
+        the report rather than truncating the pool.
 
         This is a bootstrap shortcut. The bitmap should be carved out of the
         memory it describes and this symbol should disappear; until then a

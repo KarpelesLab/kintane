@@ -1,0 +1,36 @@
+# kbuild size report for preset armv7m-tiny. Rewrite with `kbuild size --preset armv7m-tiny --update-baseline`.
+section .bss 11016
+section .data 3248
+section .handler_stack 2048
+section .rodata 10840
+section .stack 12288
+section .stack_guard 4096
+section .text 52488
+section .thread_stacks 24576
+crate (anonymous) text 0 rodata 1897 data 0 bss 0
+crate (unmangled) text 3350 rodata 0 data 0 bss 1
+crate __rustc text 112 rodata 0 data 0 bss 0
+crate align_to text 52 rodata 0 data 0 bss 0
+crate arch text 3584 rodata 0 data 64 bss 4213
+crate boot_protocol text 20 rodata 0 data 0 bss 0
+crate bootinfo text 276 rodata 0 data 0 bss 0
+crate buildid text 140 rodata 32 data 0 bss 0
+crate cmdline text 826 rodata 0 data 0 bss 0
+crate compiler_builtins text 238 rodata 0 data 0 bss 0
+crate copy_within text 72 rodata 0 data 0 bss 0
+crate core text 4944 rodata 256 data 0 bss 0
+crate ends_with text 34 rodata 0 data 0 bss 0
+crate hal text 518 rodata 0 data 0 bss 0
+crate kalloc text 6694 rodata 0 data 0 bss 0
+crate kintane text 16900 rodata 0 data 3180 bss 6776
+crate map text 48 rodata 0 data 0 bss 0
+crate mm text 4400 rodata 0 data 0 bss 0
+crate platform text 40 rodata 0 data 0 bss 0
+crate sched text 1372 rodata 0 data 0 bss 0
+crate sort_unstable_by_key text 46 rodata 0 data 0 bss 0
+crate sync text 2144 rodata 0 data 0 bss 0
+crate thread text 2164 rodata 0 data 0 bss 0
+crate time text 2698 rodata 0 data 0 bss 0
+crate trim_matches text 250 rodata 0 data 0 bss 0
+crate unwind text 1432 rodata 0 data 0 bss 0
+total 120600

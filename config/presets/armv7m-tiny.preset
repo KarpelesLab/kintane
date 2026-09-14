@@ -1,0 +1,21 @@
+# armv7m on `mps2-an385` with the memory a microcontroller actually has.
+#
+# Same kernel as armv7m-mps2, sized for the machine the roadmap's Phase 4 aims at rather
+# than for a comfortable development board. Everything the image reserves is turned down:
+# two-and-a-few thread stacks instead of eight 32 KiB ones, a frame bitmap sized for 4 MiB
+# rather than 4 GiB, and the smallest boot and handler stacks the checks still fit in.
+#
+# Built for size (OPTIMIZE_FOR_SIZE) and without DEBUG_BUILD, so the lock-order validator
+# and the poisoning allocator are out. QEMU_EXIT stays on so the harness can run it; a
+# shipping image has it off, as every other preset's comment says.
+ARCH_ARMV7M=y
+EARLY_CONSOLE=y
+DEBUG_BUILD=n
+OPTIMIZE_FOR_SIZE=y
+QEMU_EXIT=y
+THREAD_STACK_SLOTS=6
+THREAD_STACK_KIB=4
+BOOT_STACK_KIB=12
+HANDLER_STACK_KIB=2
+FRAME_BITMAP_KIB=2
+SIZE_BUDGET_KIB=160

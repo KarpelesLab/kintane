@@ -72,6 +72,12 @@ pub fn chip() -> Option<&'static dyn IrqChip> {
     CHIP.get().map(|c| c as &'static dyn IrqChip)
 }
 
+/// The started controller as itself, for a single-provider image's dispatch path, which
+/// instantiates the architecture's loop for this type rather than calling a vtable.
+pub fn chip_concrete() -> Option<&'static Gicv3> {
+    CHIP.get()
+}
+
 impl Driver for Gicv3Driver {
     fn name(&self) -> &'static str {
         "GICv3"
