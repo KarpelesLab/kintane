@@ -20,11 +20,28 @@ pub mod reg {
     pub const FSTS: usize = 0x34;
     /// Fault event control (32-bit).
     pub const FECTL: usize = 0x38;
+    /// Invalidation queue head (64-bit): the offset of the next descriptor the hardware reads.
+    pub const IQH: usize = 0x80;
+    /// Invalidation queue tail (64-bit): the offset software writes the next descriptor at.
+    pub const IQT: usize = 0x88;
+    /// Invalidation queue address (64-bit): the queue's base, size and descriptor width.
+    pub const IQA: usize = 0x90;
     /// Interrupt remapping table address (64-bit).
     pub const IRTA: usize = 0xb8;
 
+    /// Capability bits (VT-d §10.4.2).
+    pub mod cap {
+        /// Caching mode: the hardware may cache not-present entries too, so a new mapping needs
+        /// a flush as well as a removed one. Emulators that shadow the tables report it.
+        pub const CM: u64 = 1 << 7;
+        /// Page-selective invalidation.
+        pub const PSI: u64 = 1 << 39;
+    }
+
     /// Extended capability bits (VT-d §10.4.3).
     pub mod ecap {
+        /// Queued invalidation is supported.
+        pub const QI: u64 = 1 << 1;
         /// Interrupt remapping is supported.
         pub const IR: u64 = 1 << 3;
         /// Extended interrupt mode: 32-bit destinations, for x2APIC IDs.
@@ -42,6 +59,8 @@ pub mod reg {
         pub const SIRTP: u32 = 1 << 24;
         /// Interrupt remapping enable.
         pub const IRE: u32 = 1 << 25;
+        /// Queued invalidation enable.
+        pub const QIE: u32 = 1 << 26;
     }
 
     /// Global status bits (VT-d §10.4.5).
@@ -67,5 +86,7 @@ pub mod reg {
         pub const PPF: u32 = 1 << 1;
         /// Primary fault overflow: a fault was dropped because the log was full.
         pub const PFO: u32 = 1 << 0;
+        /// Invalidation queue error: the hardware rejected the descriptor at the head.
+        pub const IQE: u32 = 1 << 4;
     }
 }
