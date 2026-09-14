@@ -128,7 +128,7 @@ pub fn restart_in_kernel(c: &dyn EarlyConsole) -> bool {
 /// Bring the disk up and check it.
 pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: Live) -> Check {
     c.write_str("\n  block      ");
-    if virtio_blk::window().is_none() {
+    if virtio_blk::window(0).is_none() {
         if kconfig::QEMU_BLOCK_TEST {
             c.write_str("NO VIRTIO-BLK DEVICE, though the run attached a disk");
             return Check::Failed;
@@ -186,13 +186,13 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
 
     // SAFETY: the claimed window is mapped by the kernel's address space, which maps
     // every window a bound driver claimed, and this is the one transport made for it.
-    let Some(transport) = (unsafe { virtio_blk::transport() }) else {
+    let Some(transport) = (unsafe { virtio_blk::transport(0) }) else {
         c.write_str("the device's window is outside the address space");
         return Check::Failed;
     };
     // The queue on its MSI-X entry when that is how the platform wired the disk's interrupt;
     // on a line, or polled, bring-up needs to know nothing.
-    let vector = virtio_blk::msix_entry()
+    let vector = virtio_blk::msix_entry(0)
         .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi));
     let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(b) => b,
@@ -228,7 +228,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
     STARTED.store(true, Ordering::Release);
     // SAFETY: once, on the boot path, before any interrupt can be delivered for the line:
     // interrupts are masked here, and the first request is submitted below.
-    let _ = unsafe { virtio_blk::set_handler(on_disk_interrupt) };
+    let _ = unsafe { virtio_blk::set_handler(0, on_disk_interrupt) };
     let Some(blk) = disk() else {
         c.write_str("; the disk could not be read back after it was stored");
         return Check::Failed;
@@ -375,14 +375,14 @@ fn restart(c: &dyn EarlyConsole, virt: usize, phys: u64, len: usize, buf: &mut [
     unsafe { *DISK.get() = None };
     STARTED.store(false, Ordering::Release);
     let dma = unsafe { Dma::new(virt, phys, len) };
-    let Some(transport) = (unsafe { virtio_blk::transport() }) else {
+    let Some(transport) = (unsafe { virtio_blk::transport(0) }) else {
         c.write_str("; NO TRANSPORT ON RESTART");
         return false;
     };
     // Keep the disk on its MSI-X vector across the restart: the device reset forgot the queue
     // vector, but the platform's MSI-X table entry still stands, so bring-up sets the vector
     // again. Otherwise the restarted disk would drop to polling and the block-irq check fail.
-    let vector = virtio_blk::msix_entry()
+    let vector = virtio_blk::msix_entry(0)
         .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi));
     let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(b) => b,
