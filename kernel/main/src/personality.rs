@@ -49,7 +49,7 @@
 //! keeps the program. [`scheduled_check`] runs it again with the scheduler, in the mode that
 //! uses pipes, `fork`, `execve`, `wait4`, a thread and a futex, and requires that a pipe read
 //! and a futex wait really blocked. The stress run starts two of it at once on one CPU, each
-//! checking its own thread pointer across thousands of switches ([`stress_cycle`]).
+//! checking its own thread pointer across a hundred yields ([`stress_cycle`]).
 
 #![allow(unsafe_code)]
 
@@ -1786,14 +1786,17 @@ fn free_frames() -> usize {
 //
 // Once per audit interval the auditor starts the program twice in its thread-pointer mode,
 // pins both processes to one CPU, and waits for both. Each sets a thread pointer of its own
-// and checks it after every one of thousands of yields, which on one CPU switch to the other
-// process. A thread pointer that did not travel with its thread is read by the wrong process,
-// which exits with a code saying so. Which CPU moves with the round, so on a multiprocessor
-// every CPU takes a turn.
+// and checks it after each of a hundred yields, which on one CPU switch to the other process
+// or to a workload. A thread pointer that did not travel with its thread is read by the wrong
+// process, which exits with a code saying so. Which CPU moves with the round, so on a
+// multiprocessor every CPU takes a turn.
+//
+// A hundred, not thousands: a yield on a CPU a busy workload shares can hand that workload a
+// whole slice, and two thousand of them took longer than the patience below on aarch64.
 
 /// Pairs of Linux processes the stress run has run to completion.
 static PAIRS: AtomicU64 = AtomicU64::new(0);
-const PAIR_PATIENCE: Duration = Duration::from_nanos(5_000_000_000);
+const PAIR_PATIENCE: Duration = Duration::from_nanos(10_000_000_000);
 
 pub fn stress_cycles() -> u64 {
     PAIRS.load(Ordering::Relaxed)

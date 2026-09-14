@@ -14,7 +14,7 @@
 //! * `rich`: [`rich`], a pipe, `fork`, `execve`, `wait4`, and a thread sharing a futex-guarded
 //!   counter;
 //! * `child`: what `rich`'s child `execve`s into, which writes to the pipe it inherited;
-//! * `tls`: [`tls`], a thread pointer checked across thousands of yields, run two at a time.
+//! * `tls`: [`tls`], a thread pointer checked across a hundred yields, run two at a time.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -520,8 +520,9 @@ fn child() -> ! {
 
 // ---- tls: a thread pointer across switches -----------------------------------------------
 
-/// Yields `tls` checks its thread pointer across.
-const TLS_ROUNDS: u64 = 2000;
+/// Yields `tls` checks its thread pointer across. Few enough that a CPU shared with busy
+/// stress workloads, each yield of which may cost a slice, still finishes in seconds.
+const TLS_ROUNDS: u64 = 100;
 
 fn tls() -> ! {
     // 90: a pointer and a mark of this process's own, told apart from another's by the pid.

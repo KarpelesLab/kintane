@@ -295,14 +295,18 @@ generated from one source.
 
 ## The Linux personality
 
-### As built — one static program, x86_64
+### As built — static programs, x86_64 and aarch64
 
-A static Linux program runs unmodified from the filesystem on x86_64. `user/linux-hello` knows
-nothing of KinTane. It makes system calls by Linux's x86_64 numbers through `syscall`, reads a
-value or a negated errno back from `rax`, and reads Linux's start-up stack (`argc`, `argv`,
-`envp`, the auxiliary vector) at its entry. kbuild puts it on the test disk as
-`/KINTANE/LINUX.ELF`. At every boot of a configuration with `ABI_LINUX`, the kernel reads it
-from there, runs it, and grades it ([testing.md](testing.md#2f-the-linux-personality)).
+Static Linux programs run unmodified from the filesystem on x86_64 and aarch64.
+`user/linux-hello` knows nothing of KinTane. It makes system calls by Linux's numbers for the
+architecture it is built for, through `syscall` or `svc #0`, reads a value or a negated errno
+back from the one return register, and reads Linux's start-up stack (`argc`, `argv`, `envp`,
+the auxiliary vector) at its entry. One source builds for both, with the numbers and the few
+instructions that differ in a module per architecture. kbuild puts it on the test disk as
+`/KINTANE/LINUX.ELF`. Every boot of a configuration with `ABI_LINUX` runs it twice: once alone
+in the boot-time slice, and once with the scheduler, where it pipes, forks, `execve`s, waits
+and starts a thread ([testing.md](testing.md#2f-the-linux-personality)). The stress run starts
+two at a time on one CPU.
 
 It is built in-tree with the pinned Rust toolchain, not with a C one, so it is a Linux binary
 in every way the kernel can tell but is not musl or glibc output. The first corpus tier below,
@@ -330,13 +334,19 @@ after it starts. A native process's `process_create` refuses a Linux image with
 it is built. The system call entry finds the process by the loaded address space, as it always
 has, and calls through the pointer. Nothing on the path branches on the personality, and a
 native process pays one indirect call for the Linux one existing. The Linux table sets only
-`rax` (`SyscallFrame::set_return`). The native one still sets status and value.
+the one return register (`SyscallFrame::set_return`). The native one still sets status and
+value. The Linux table takes its process's lock only for the pieces of a call that touch the
+process, its descriptors or its mappings, and waits on the kernel's wait queues holding nothing,
+so that another thread of the process can make the call that ends the wait.
 
-**The numbers and the table.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 70 calls. It is *not* turned into code. The calls the
-personality answers are constants in `linux::nr`, a host test pins each constant to its name
-in the table, and the kernel reads the table at run time only to name a call it does not
-implement. The dispatch is a `match` on those constants.
+**The numbers and the tables.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
+`syscall_64.tbl`, in its format: 71 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
+the generic table arm64 numbers its calls by, in the format of Linux's `scripts/syscall.tbl`:
+76 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
+each with its number under each `linux::Abi`; a host test pins every number to its name in
+that ABI's table, and the kernel reads a table at run time only to name a call it does not
+implement. The kernel picks the ABI from its port's ELF machine at compile time, and dispatches
+with a `match` on the `Call`.
 
 **Errors.** The personality's calls fail with a `linux::Failure`, and `linux::errno` is a
 single exhaustive `match` from `Failure` to Linux's number, so a new failure does not compile
@@ -351,39 +361,91 @@ until someone decides what Linux calls it. Filesystem errors map onto `Failure` 
 | an executable mapping | `EACCES` | W^X is never granted, and Linux uses `EACCES` for protections the object refuses |
 | a volume or mount table full | `ENOSPC` | |
 | a corrupt volume or a device failure | `EIO` | |
+| a futex whose value has changed, a non-blocking pipe with nothing to give, or no free process slot or thread for `fork` or `clone` | `EAGAIN` | Linux's own answer to a `fork` past its process limit |
+| a write to a pipe with no reader | `EPIPE` | Linux also raises `SIGPIPE`; there are no signals |
+| `execve` of a file that is not a Linux program for this machine | `ENOEXEC` | |
+| a futex wait whose timeout ran out | `ETIMEDOUT` | |
+| `wait4` with no child to report | `ECHILD` | |
 
 **Descriptors.** Each Linux process has a table of 16 descriptors, a view over what the process
 already holds rather than a second authority:
 
-- 0 is standard input. Nothing feeds it yet, so it reads as end of file.
+- 0 is standard input. It reads as end of file. The kernel has no console input path, since no
+  driver reads the serial port's receive side, so there is nothing for a read to wait for.
 - 1 and 2 are two console handles in the process's own handle table. A write through either is
   checked against the handle's rights exactly as the native `debug_write` is, and `close`
   closes the handle.
 - `openat` opens a file in the filesystem namespace the process was started with, at the
   lowest free number.
+- `pipe2` makes two ends of one of 4 kernel pipes, each holding 512 bytes. A read of an empty
+  pipe blocks on the pipe's wait queue until a writer puts bytes in, or until the last write end
+  closes, which is end of file. A write to a full pipe blocks until a reader makes room, and
+  fails with `EPIPE` once no read end is left. `O_NONBLOCK` makes both answer `EAGAIN` instead,
+  and `O_CLOEXEC` closes the end at `execve`.
 
-The file descriptors are open files in the VFS, not kernel objects yet. That falls short of the
-table below, where every descriptor is a view over a `KObject`. Every operation answers at once.
-A descriptor that can have nothing to give yet (a pipe, a socket, a console with input) is where
-the native ABI's blocking calls and wait queues come in: its thread parks on that mechanism at
-the point where `read` answers today. It adds a variant to the descriptor, and the table does
-not change shape.
+The file descriptors are open files in the VFS and pipes in the personality, not kernel objects
+yet. That falls short of the table below, where every descriptor is a view over a `KObject`. A
+process's descriptors close when its last thread ends, as Linux closes them at exit: a pipe's
+reader sees end of file once the last writer's process has ended, not once its parent reaps it.
+
+A socket is the next variant of `Descriptor` in `kernel/main/src/personality.rs`. Its `read`
+and `write` go where a pipe's do, blocking on the socket's own queue, and the table does not
+change shape.
 
 **The calls.**
 
 | Call | As built |
 |---|---|
-| `read`, `write` | standard input reads end of file; the console takes writes; a file reads through the VFS. Up to 4096 bytes a call, a short count as Linux allows |
-| `openat` | `AT_FDCWD` or an absolute path; the working directory is `/`. Read-only (`O_ACCMODE` other than `O_RDONLY` is `EROFS`); `O_DIRECTORY` is honoured; other flags are ignored. A relative path against any other descriptor is `ENOTDIR` |
-| `close`, `fstat` | `fstat` reports a regular file or directory with its size, or a character device for 0–2; `st_ino` is a hash of the path |
+| `read`, `write` | standard input reads end of file; the console takes writes; a file reads through the VFS; a pipe blocks as above. Up to 4096 bytes a call, 512 on a pipe, a short count as Linux allows |
+| `openat` | `AT_FDCWD` or an absolute path; the working directory is `/`. Read-only (`O_ACCMODE` other than `O_RDONLY` is `EROFS`); `O_DIRECTORY`, in the architecture's own numbering, is honoured, and so is `O_CLOEXEC`; other flags are ignored. A relative path against any other descriptor is `ENOTDIR` |
+| `close`, `fstat` | `fstat` reports a regular file or directory with its size, a FIFO for a pipe end, or a character device for 0–2, in the architecture's own `struct stat`; `st_ino` is a hash of the path |
+| `pipe2`, `pipe` | `O_CLOEXEC` and `O_NONBLOCK`; any other flag is `EINVAL`. `pipe` is x86_64's only |
 | `brk` | moves within a reservation of 64 pages made at start; the answer is the break as it now is, which is the old one when the request cannot be met |
 | `mmap`, `munmap` | anonymous private mappings, readable or read-write, where the kernel chooses. File-backed, shared, `MAP_FIXED` and `PROT_NONE` are `EINVAL`, `PROT_EXEC` is `EACCES`. `munmap` releases exactly one earlier mapping; part of one is `EINVAL` |
-| `arch_prctl` | `ARCH_SET_FS` only, below the top of the user half; everything else is `EINVAL` |
-| `uname` | `Linux`, `kintane`, `6.1.0-kintane`, `#1 KinTane`, `x86_64` |
-| `getpid`, `gettid`, `set_tid_address` | the slot number plus one: one thread per process, so the thread id is the process id |
-| `exit`, `exit_group` | the low 8 bits of the code, as Linux reports a status |
+| `arch_prctl` | x86_64 only. `ARCH_SET_FS` only, below the top of the user half; everything else is `EINVAL`. aarch64 has no such call: a program writes `TPIDR_EL0` itself |
+| `uname` | `Linux`, `kintane`, `6.1.0-kintane`, `#1 KinTane`, and `x86_64` or `aarch64` |
+| `getpid` | the slot number plus one |
+| `gettid`, `set_tid_address` | a process's first thread's tid is its pid; a thread `clone` starts is given one above every pid. `set_tid_address` records the address the calling thread zeroes and wakes when it exits, and answers its tid |
+| `sched_yield` | gives the CPU to a ready thread of the same or higher priority |
+| `clone` | with `CLONE_THREAD`: a thread in the same process, on the stack given, which requires `CLONE_VM` and `CLONE_SIGHAND`. `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured, and `CLONE_FS`, `CLONE_FILES` and `CLONE_SYSVSEM` accepted, since the process has one of each. Without `CLONE_THREAD`: a fork, allowed only with nothing but the exit signal in the flags and no stack, which is how an aarch64 C library forks. Anything else, `CLONE_VFORK` included, is `EINVAL` |
+| `fork` | x86_64 only, since aarch64 has no such call: a copy-on-write child whose one thread resumes with the parent's registers and thread pointer, returning 0; the parent is answered the child's pid |
+| `execve` | an absolute path read whole from the namespace, at most 128 KiB, with up to 8 arguments and 8 environment strings. Refused with `EAGAIN` while the process has another thread. Once the old memory is released, a failure ends the process, as Linux's does. The thread pointer starts at zero, and close-on-exec descriptors close |
+| `wait4` | a child by pid, or any child with -1, once its last thread has gone; `WNOHANG`. The status is the exit code's low 8 bits shifted up 8, or 9, `SIGKILL`'s, for a child the kernel killed. A process group is `EINVAL`; `rusage` is not written |
+| `futex` | `FUTEX_WAIT` with an optional relative timeout, and `FUTEX_WAKE`, private or not; any other operation is `ENOSYS` |
+| `exit` | ends the calling thread, and its process with it when it was the last |
+| `exit_group` | ends every thread of the process; the low 8 bits of the code, as Linux reports a status |
 
-**Start-up.** `argv` is `["hello"]` and `envp` is `["HOME=/"]`. The auxiliary vector carries:
+**The thread pointer** is part of a user thread's saved context on both ports. The context
+switch reads `FS` base (x86_64) or `TPIDR_EL0` (aarch64) back into the thread it switches away
+from and loads the one it switches to, for threads bound to a process; a switch between kernel
+threads touches neither. aarch64's EL1 exception entry, which used `TPIDR_EL0` and
+`TPIDRRO_EL0` as scratch, now uses `SP_EL0`, whose value the frame of the trap from EL0 already
+holds, and `TPIDRRO_EL0`, zeroed before it returns.
+
+**`fork`** builds the child's address space with `mm::vm::Vm::fork_into`. Every region is
+reserved at the same address, every mapped page is mapped to the same frame read-only in both
+spaces, and every Linux process counts its shares in one store, so whichever side writes a page
+first copies it and the other keeps the original. The parent's pages made read-only are
+invalidated as every replaced leaf is, with a shootdown on a multiprocessor. The child's thread
+comes from the kernel's pool of process threads and resumes with the parent's full registers
+(`hal::HasUserMode::resume_user`); x86_64's system call frame carries the callee-saved
+registers for this. The child inherits console and pipe descriptors. It does not inherit open
+files, because the namespace has no way to share one open file between two descriptors, so the
+child's copies are closed.
+
+**Futexes** hash an address and its address space to one of 8 buckets, each a wait queue with a
+count of wakes. A waiter checks the futex's value and reads the count under one lock, and a
+waker counts under that lock before it wakes, so a wake between the check and the block shows
+as a changed count rather than being lost. A wake wakes the bucket, and every waiter looks
+again, as a futex waiter must.
+
+**Limits, all of them fixed sizes:** 4 process slots, and a pool of 3 process threads per check,
+enough for a program, one thread and one child; 8 thread records; 4 pipes; 128 shared-page
+counts across every Linux process. A child's process slot is freed when whatever started the
+process tree tears it down, not by `wait4`.
+
+**Start-up.** `argv` is `["hello"]`, or `["hello", <mode>]` for the modes the scheduled check
+and the stress run start, and `envp` is `["HOME=/"]`. The auxiliary vector carries:
 
 - `AT_PHDR`, by Linux's rule for a static executable;
 - `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ` and `AT_ENTRY`;
@@ -400,17 +462,16 @@ no corpus yet for a gap to fail.
 
 **What it does not do yet:**
 
-- **The thread pointer is not saved with a thread.** `arch_prctl` writes `FS` base on the CPU
-  the process runs on, and teardown resets it. That is safe only while one Linux process runs
-  at a time on a CPU no other process relies on it for, which is the boot check's case and no
-  other.
+- **No signals.** A child's exit sends no `SIGCHLD`, a write to a pipe with no reader is `EPIPE`
+  with no `SIGPIPE`, and nothing interrupts a blocked call. A thread spinning in user mode, in a
+  process another thread has ended, is not stopped until its next system call.
+- **No sockets.** `socket` and the calls after it are logged as unimplemented.
 - **`AT_RANDOM`'s bytes are not secret.** They are a SplitMix64 stream seeded from the
   process's page-table root and entry point. A C library seeds its stack protector from them.
-- **Only the boot check has a filesystem namespace.** A Linux process started any other way
-  would find `openat` failing with `EIO`.
-- **No signals, `clone`, `fork`, `execve`, threads, pipes or `/proc`.**
-- **x86_64 only.** The table and `uname`'s machine are x86_64's; aarch64 has the port hooks
-  (`set_return`, `set_tls`) but no table.
+- **Only the checks have a filesystem namespace.** A Linux process started any other way, the
+  stress run's included, would find `openat` and `execve` failing with `EIO`.
+- **`execve` does not end a process's other threads**, and refuses instead.
+- **No `dup`, `mprotect`, `/proc`, or console input.**
 
 ### The tag
 
@@ -424,8 +485,8 @@ pub enum Personality {
 ```
 
 The design put the tag in the thread control block as a pointer to a syscall dispatch table.
-As built, it is on the `Process`, because every process has exactly one thread. It moves to
-the thread when threads share a process. Either way, there is no branch on personality in the
+As built, it is on the `Process`, and every thread of a process speaks its process's ABI:
+a thread `clone` starts is a Linux thread because its process is a Linux one. Either way, there is no branch on personality in the
 syscall path and no cost to a native process for the compat layer existing.
 
 A process is tagged `Linux` when its ELF carries no KinTane ABI note and declares
@@ -532,7 +593,7 @@ config ABI_LINUX
         the flat memory model cannot provide.
 ```
 
-As built, `ABI_LINUX` is a `bool` that depends on `USERSPACE && ARCH_X86_64`, defaults to `y`,
+As built, `ABI_LINUX` is a `bool` that depends on `USERSPACE && (ARCH_X86_64 || ARCH_AARCH64)`, defaults to `y`,
 and is compiled in. `LINUX_ENOSYS_FATAL` (default `n`) turns an unimplemented call into the
 process's end. Both live in `config/main.kcfg`. The design is tristate, and `m` by default: the
 personality is a loadable module in a general-purpose build, compiled in for appliance builds,
