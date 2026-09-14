@@ -77,8 +77,7 @@ pub const DEVICE_TRANSITIONAL_BLOCK: u16 = 0x1001;
 
 /// Whether a function is a virtio block device of either kind.
 pub fn is_block_device(f: &Function) -> bool {
-    f.vendor == VENDOR
-        && (f.device == DEVICE_MODERN_BLOCK || f.device == DEVICE_TRANSITIONAL_BLOCK)
+    f.vendor == VENDOR && (f.device == DEVICE_MODERN_BLOCK || f.device == DEVICE_TRANSITIONAL_BLOCK)
 }
 
 /// One structure's place: which BAR, how far into it, and how long.

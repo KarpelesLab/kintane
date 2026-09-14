@@ -82,20 +82,23 @@ pub enum Workload {
     Pages,
     /// Present only on a machine with the test disk.
     Block,
+    /// A second block thread, so the disk has requests outstanding together: one thread
+    /// cannot overlap with itself, and the driver's concurrency would go unexercised.
+    BlockB,
 }
 
-const WORKLOADS: usize = 8;
+const WORKLOADS: usize = 9;
 
 const NAMES: [&str; WORKLOADS] = [
-    "heap A", "heap B", "ping", "pong", "sleep", "vm", "pages", "block",
+    "heap A", "heap B", "ping", "pong", "sleep", "vm", "pages", "block", "block B",
 ];
 
 /// Guarded stacks the run claims beyond the ones the scheduler's own check left behind.
 /// `preempt` asserts at compile time that `KERNEL_THREAD_SLOTS` covers both.
 pub const EXTRA_STACKS: usize = if kconfig::STRESS_TEST {
-    // The four named workloads, the block workload's when the disk is attached, and the
+    // The four named workloads, the two block workloads' when the disk is attached, and the
     // user process the auditor drives when there is userspace.
-    EXTRA_NAMES.len() + kconfig::QEMU_BLOCK_TEST as usize + kconfig::USERSPACE as usize
+    EXTRA_NAMES.len() + 2 * kconfig::QEMU_BLOCK_TEST as usize + kconfig::USERSPACE as usize
 } else {
     0
 };
@@ -348,6 +351,17 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
 
         heartbeat(c, seconds, audits);
         if now >= end {
+            // Observed, not assumed: two block threads were running the whole time, and
+            // a driver whose requests never actually overlapped proved nothing about the
+            // concurrency it claims.
+            if block::present() && block::peak_in_flight() < 2 {
+                audit_failed(
+                    c,
+                    seconds,
+                    "block",
+                    "the disk never had two requests outstanding at once",
+                );
+            }
             c.write_str("stress passed: ");
             write_usize(c, audits as usize);
             c.write_str(" audits over ");
@@ -372,8 +386,8 @@ fn start() -> Result<(), &'static str> {
     // After the workloads' own, so their slot numbers are what they were: the stack the
     // user process the auditor drives runs on, in an image with userspace.
     crate::model::process_stress_setup()?;
-    // Every workload but the block one, which is spawned below only if the disk exists.
-    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 1] = [
+    // Every workload but the two block ones, which are spawned below only if the disk exists.
+    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 2] = [
         (heap::worker, 0, 4, 1),
         (heap::worker, 1, 4, extra),
         (ipc::ping, 0, 4, 2),
@@ -397,17 +411,22 @@ fn start() -> Result<(), &'static str> {
     // neither waits for it nor asks it for progress.
     if !block::present() {
         PARKED[Workload::Block as usize].store(Parked::Empty as u8, Ordering::Release);
+        PARKED[Workload::BlockB as usize].store(Parked::Empty as u8, Ordering::Release);
         return Ok(());
     }
-    let stack = preempt::claim_stacks(&["block"]).ok_or("not enough guarded thread stacks")?;
+    // Two threads, each on its own half of the scratch area, so their requests overlap at
+    // the device without either overwriting what the other reads back.
+    let stack =
+        preempt::claim_stacks(&["block", "block B"]).ok_or("not enough guarded thread stacks")?;
     let irq = Cpu::irq_save();
-    let spawned = preempt::spawn(stack, block::worker, 0, 5).is_some();
+    let spawned = preempt::spawn(stack, block::worker, 0, 5).is_some()
+        && preempt::spawn(stack + 1, block::worker, 1, 5).is_some();
     // SAFETY: pairs with the `irq_save` above.
     unsafe { Cpu::irq_restore(irq) };
     if spawned {
         Ok(())
     } else {
-        Err("the block workload's thread was refused")
+        Err("a block workload's thread was refused")
     }
 }
 
@@ -420,7 +439,8 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
             audit_failed(c, seconds, "a workload found something wrong", what);
         }
         let now = PROGRESS[w].load(Ordering::Acquire);
-        if w == Workload::Block as usize && !block::present() {
+        let is_block = w == Workload::Block as usize || w == Workload::BlockB as usize;
+        if is_block && !block::present() {
             continue;
         }
         if now == last[w] {
@@ -511,8 +531,12 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
     if block::present() {
         c.write_str(", block ");
         write_usize(c, p(Workload::Block));
+        c.write_str("+");
+        write_usize(c, p(Workload::BlockB));
         c.write_str(" (requests ");
         write_usize(c, block::requests() as usize);
+        c.write_str(", peak in flight ");
+        write_usize(c, block::peak_in_flight());
         c.write_str(")");
     }
     if mp::CPUS > 1 {

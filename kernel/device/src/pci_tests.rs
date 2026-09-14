@@ -145,7 +145,8 @@ impl Model {
                     f.config[base + w] = *value;
                 }
             }
-            f.config[base] = (f.config[base] & 0xffff_0000) | u32::from(id) | (u32::from(next) << 8);
+            f.config[base] =
+                (f.config[base] & 0xffff_0000) | u32::from(id) | (u32::from(next) << 8);
         }
     }
 
@@ -561,12 +562,17 @@ fn functions_become_nodes_under_their_bridges_and_bind_by_compatible() {
     assert!(matches!(tree.node(behind).origin(), Origin::Pci(f) if f.device == 0x0005));
     assert_eq!(tree.mmio_count(behind), 1, "the I/O BAR is not a window");
     assert_eq!(tree.mmio(behind, 0), Ok((0xfea0_0000, 0x1000)));
+    // Its interrupt is the line firmware programmed: pin INTA#, routed to 11. Whether that
+    // line means anything is the platform's decision, not the model's.
+    let spec = tree.interrupt(behind, 0).unwrap();
+    assert_eq!(spec.cells(), &[11]);
     assert_eq!(
-        tree.interrupt(behind, 0),
+        tree.interrupt(behind, 1),
         Err(Error::NoSuchEntry {
             node: behind,
-            index: 0
-        })
+            index: 1
+        }),
+        "a function has one interrupt pin"
     );
     assert_eq!(tree.stdout(), None, "no device tree, no chosen console");
 
@@ -661,12 +667,54 @@ fn the_builder_refuses_unknown_parents_and_full_storage() {
 }
 
 #[test]
+fn a_pci_node_has_an_interrupt_only_when_firmware_routed_its_pin() {
+    let m = Model::default();
+    m.endpoint(Address::new(0, 0, 0), (0x8086, 0x29c0), HOST, &[]);
+    // `add` gives every function pin INTA# routed to line 11. Three variations on it.
+    m.endpoint(Address::new(0, 1, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.endpoint(Address::new(0, 2, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.endpoint(Address::new(0, 3, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    {
+        let mut fns = m.functions.borrow_mut();
+        // No interrupt pin at all: the function raises nothing.
+        fns[2].config[15] = 0x0000_000b;
+        // A pin, but firmware left the line unassigned.
+        fns[3].config[15] = 0x0000_01ff;
+    }
+    let fns = enumerate(&m);
+    let mut storage = vec![Node::EMPTY; 16];
+    let mut b = Builder::new(&mut storage).unwrap();
+    let ids: Vec<NodeId> = fns
+        .iter()
+        .map(|f| {
+            b.add(NodeId::ROOT, f.name(), f.compatible(), Origin::Pci(f))
+                .unwrap()
+        })
+        .collect();
+    let tree = b.finish();
+    let routed = ids[1];
+    assert_eq!(tree.interrupt(routed, 0).unwrap().cells(), &[11]);
+    for &id in &ids[2..] {
+        assert_eq!(
+            tree.interrupt(id, 0),
+            Err(Error::NoSuchEntry { node: id, index: 0 }),
+            "no pin, or a line firmware did not assign, is no interrupt"
+        );
+    }
+}
+
+#[test]
 fn a_capability_list_is_walked_in_order() {
     let m = Model::default();
     m.endpoint(Address::new(0, 5, 0), (0x1af4, 0x1042), ETHERNET, &[]);
     // A virtio device's vendor capabilities, with a PCI Express and an MSI-X capability
     // among them that a reader must walk past rather than stop at.
-    m.capabilities(&[(0x09, 0x40, 0), (0x10, 0x50, 0), (0x09, 0x60, 0), (0x11, 0x70, 0)]);
+    m.capabilities(&[
+        (0x09, 0x40, 0),
+        (0x10, 0x50, 0),
+        (0x09, 0x60, 0),
+        (0x11, 0x70, 0),
+    ]);
     let mut caps = [pci::Capability::EMPTY; 8];
     let n = pci::capabilities(&m, Address::new(0, 5, 0), &mut caps);
     assert_eq!(n, 4);

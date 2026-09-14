@@ -827,6 +827,20 @@ impl<'a, 's> DeviceTree<'a, 's> {
     /// interpret, so its specifier is that one number, and its controller is the root:
     /// the platform has exactly one, and no table names it as a node.
     pub fn interrupt(&self, id: NodeId, index: usize) -> Result<Specifier, Error> {
+        // A PCI function's interrupt, as firmware routed it: the line it programmed into the
+        // function's interrupt-line register, as one cell. Meaningful only on the controller
+        // firmware routed for, which this model cannot know — the platform decides whether
+        // it trusts the line (an 8259A machine does, since that is the controller firmware
+        // routed for; one with an I/O APIC does not, since PCI interrupts reach it elsewhere).
+        // A function with no pin, or a line firmware left unassigned, has no interrupt.
+        if let Origin::Pci(f) = self.node(id).origin {
+            let line = u32::from(f.interrupt_line);
+            if index != 0 || f.interrupt_pin == 0 || !(1..=15).contains(&line) {
+                return Err(Error::NoSuchEntry { node: id, index });
+            }
+            return Specifier::new(NodeId::ROOT, &[line])
+                .ok_or(Error::NoSuchEntry { node: id, index });
+        }
         if let Origin::Table(d) = self.node(id).origin {
             let line = d
                 .interrupt()

@@ -122,6 +122,8 @@ static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
 
 /// The console UART's receive line, once its handler is wired.
 static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
+/// The block device's interrupt line, once its handler is wired.
+static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
 
 /// Where this platform's devices come from, for the banner.
 pub const SOURCE: &str = "device tree";
@@ -385,6 +387,10 @@ fn wire(
         // SAFETY: once, on the single-threaded boot path.
         let _ = unsafe { CONSOLE_LINE.set(number) };
     }
+    if drv.name() == virtio_blk::DRIVER.name() {
+        // SAFETY: once, on the single-threaded boot path.
+        let _ = unsafe { BLOCK_LINE.set(number) };
+    }
     c.write_str("; ");
     c.write_str(drv.name());
     c.write_str(" receives on IRQ ");
@@ -395,6 +401,12 @@ fn wire(
 /// The console UART's receive line, once its handler is wired.
 pub fn console_line() -> Option<u32> {
     CONSOLE_LINE.get().map(|n| n.0)
+}
+
+/// The block device's interrupt line, once its handler is wired. `None` when the device
+/// is polled.
+pub fn block_line() -> Option<u32> {
+    BLOCK_LINE.get().map(|n| n.0)
 }
 
 /// Receive interrupts the console driver has taken, and the bytes they carried.

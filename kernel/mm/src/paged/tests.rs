@@ -134,6 +134,23 @@ fn nothing_is_mapped_until_it_is() {
 }
 
 #[test]
+fn a_top_level_range_is_mapped_only_under_an_entry_something_uses() {
+    // The question a process asks of the kernel's root before mirroring it: one page mapped
+    // makes every range its top-level entry covers mapped, and no range beside it. `V` and
+    // address 0 are under different top-level entries, which the `(0, PAGE)` case needs.
+    let (mut mem, mut space) = setup(64);
+    assert!(matches!(space.top_level_mapped(0, V + PAGE), Ok(false)));
+
+    space
+        .map(V, PhysAddr::new(0x9_0000), PAGE, PageFlags::KERNEL_DATA, &mut mem)
+        .unwrap();
+    assert!(matches!(space.top_level_mapped(V, V + PAGE), Ok(true)));
+    assert!(matches!(space.top_level_mapped(0, V + PAGE), Ok(true)));
+    assert!(matches!(space.top_level_mapped(0, PAGE), Ok(false)));
+    assert!(matches!(space.top_level_mapped(V, V), Ok(false)));
+}
+
+#[test]
 fn misaligned_requests_are_refused() {
     let (mut mem, mut space) = setup(64);
     let p = PhysAddr::new(0x9_0000);

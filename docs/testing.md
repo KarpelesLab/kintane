@@ -295,10 +295,12 @@ loader against fuzzed and truncated files.
 
 ### 2b. Block storage
 
-With `QEMU_BLOCK_TEST`, on by default on aarch64 test builds, kbuild writes
-`testdisk.img` beside the image. It is 2 MiB, and every byte is a function of its sector
-and offset, with a header in sector 0. QEMU attaches it to a `virtio-blk-device` with
-`snapshot=on`, so a run's writes never reach the file. The format is written twice, in
+With `QEMU_BLOCK_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild
+writes `testdisk.img` beside the image. It is 2 MiB, and every byte is a function of its
+sector and offset, with a header in sector 0. QEMU attaches it with `snapshot=on`, so a
+run's writes never reach the file: to a `virtio-blk-device` in a memory-mapped slot on
+aarch64, and to a modern-only `virtio-blk-pci` function on the PCs, through every boot
+path they have (`-kernel`, BIOS and UEFI). The format is written twice, in
 `kernel/block/src/testdisk.rs` and `kbuild/src/testdisk.rs`, and a pinned set of bytes
 that both sides' tests assert keeps the two in step.
 
@@ -310,6 +312,21 @@ The boot gates on the `block` line ([architecture.md](architecture.md#block--the
              refusal was an error; 64 more requests, 0 in flight ok
 ```
 
+After the serial check, the boot also gates on the `block irq` line, which proves the
+disk's completions arrive by interrupt. The driver is put in interrupt-driven mode, where
+a waiting caller never drains the ring itself, interrupts are enabled, and 32 reads must
+each return the pattern with every completion collected in the handler and none polled:
+
+```
+  block irq  line 79; 32 requests, 32 completions in 32 interrupts, 0 polled ok
+```
+
+On i686 the line is the one firmware programmed into the PCI function (11 under QEMU's
+`pc`), wired through the 8259A. On x86_64 the check reports the disk as polled and skips:
+the I/O APIC is reached only through `_PRT` or MSI-X, neither of which the kernel has
+([architecture.md](architecture.md#device--the-device-framework)). A lost interrupt is a
+request that times out, which fails the check rather than hanging it.
+
 The driver's protocol is host-tested without QEMU:
 
 - `test_support::FakeDevice` walks the rings from the device's side, at a different memory
@@ -317,9 +334,40 @@ The driver's protocol is host-tested without QEMU:
 - The tests cover the handshake and every refusal in it, reads, writes, splits, a device
   error, a device that never answers, and a thousand requests with no descriptor lost.
 
-In a stress run the `block` workload writes random runs of the scratch area and reads them
-back, reads the untouched part against the pattern, and flushes. At every audit the driver
-must report nothing in flight and every descriptor on the ring.
+In a stress run two block workloads, `block` and `block B`, each write random runs of their
+own half of the scratch area and read them back, read the untouched part against the
+pattern, and flush. At every audit the driver must report nothing in flight and every
+descriptor on the ring, and a run with a disk fails if the two were never outstanding at
+once: the heartbeat's `peak in flight` must reach 2.
+
+Letting a request wait with the lock released, rather than polling to completion under
+it, roughly doubled what the disk serves under the same load. Requests in 20 s of guest
+time in a stress run, all other workloads running, before (one request at a time, polled
+under the lock) and after:
+
+| Preset | Before | After | |
+| --- | --- | --- | --- |
+| aarch64-virt-smp, 4 CPUs, by interrupt | 27,501 (1,375/s) | 55,790 (2,790/s) | 2.0× |
+| x86_64-qemu-smp, 8 CPUs, polled | 24,118 (1,206/s) | 35,917 (1,796/s) | 1.5× |
+
+These are QEMU under TCG on one host, not a disk benchmark: they say the lock stopped
+being the bottleneck, not how fast a disk is.
+
+Falsified, each mutation confirmed applied, then restored:
+
+| Mutation | Caught by |
+| --- | --- |
+| The PCI node's interrupt is its line plus one | i686: `virtio-blk receives on IRQ 12`, then `block irq` fails with a request timed out, its interrupt never arrived |
+| `on_interrupt` never reads the clear-on-read ISR register | aarch64: the level-triggered line storms once interrupts are unmasked, and the boot times out at `interrupts` |
+| `drain` marks the first request in flight, not the one the device named | the host test `a_completion_marks_the_request_it_names_not_the_first_one_in_flight` |
+| The ring returns a chain's descriptors only when no other chain is outstanding | aarch64-virt-smp stress fails at 1 s: the ring fills and a block workload's read fails |
+| A waiter drains the ring even in interrupt-driven mode | aarch64: `block irq` fails, 30 of 32 completions polled |
+| x86_64-efi without `phys-bits=36`, so OVMF places the virtio BAR at 768 GiB | `userspace` fails: `REFUSED: the kernel maps something in the user half`. Before the guard the same run passed `userspace` and failed `processes` with a worker reading another's memory |
+
+**Not observable on i686:** the last mutation passes there. On QEMU's `pc` the device
+completes and interrupts before the waiter first looks, so the handler always wins. The
+check is sound, and aarch64 proves it catches polling, but on i686 it cannot distinguish
+the two.
 
 ### 3. Boot and integration tests
 

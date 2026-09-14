@@ -21,9 +21,22 @@ static IO_APIC: Reserve = Reserve {
     what: "I/O APIC",
 };
 
+/// Whether a PCI function's interrupt-line register can be wired as its interrupt.
+///
+/// Yes, here. That register holds the line firmware routed the function's pin to, and it
+/// routed it for the interrupt controller a PC has before any APIC is programmed: the
+/// 8259A, which is the controller this port keeps. So the answer firmware wrote is the
+/// answer, and no interpreter for the ACPI namespace's `_PRT` is needed to find it.
+pub(crate) const PCI_LINE_TRUSTED: bool = true;
+
 /// Every driver this image carries.
-pub(crate) const DRIVERS: &[&dyn Driver] =
-    &[&LOCAL_APIC, &IO_APIC, &ECAM, &uart16550::DRIVER, &virtio_blk::DRIVER];
+pub(crate) const DRIVERS: &[&dyn Driver] = &[
+    &LOCAL_APIC,
+    &IO_APIC,
+    &ECAM,
+    &uart16550::DRIVER,
+    &virtio_blk::DRIVER,
+];
 
 /// Nothing to install: the 8259A stays.
 ///

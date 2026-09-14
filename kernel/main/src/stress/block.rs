@@ -24,12 +24,17 @@ use crate::preempt::{begin, sleep_until};
 /// split is exercised under load too.
 const MAX_RUN: usize = 32;
 
-/// SAFETY INVARIANT: touched only by [`worker`]'s thread, of which there is one.
-static WRITE_BUF: SyncUnsafeCell<[u8; MAX_RUN * SECTOR]> =
-    SyncUnsafeCell::new([0; MAX_RUN * SECTOR]);
+/// How many block threads the run has, each with its own buffers and half of the scratch
+/// area.
+const THREADS: usize = 2;
+
+/// SAFETY INVARIANT: element `i` is touched only by the [`worker`] thread started with
+/// argument `i`, and there is one such thread per element.
+static WRITE_BUF: [SyncUnsafeCell<[u8; MAX_RUN * SECTOR]>; THREADS] =
+    [const { SyncUnsafeCell::new([0; MAX_RUN * SECTOR]) }; THREADS];
 /// SAFETY INVARIANT: as [`WRITE_BUF`].
-static READ_BUF: SyncUnsafeCell<[u8; MAX_RUN * SECTOR]> =
-    SyncUnsafeCell::new([0; MAX_RUN * SECTOR]);
+static READ_BUF: [SyncUnsafeCell<[u8; MAX_RUN * SECTOR]>; THREADS] =
+    [const { SyncUnsafeCell::new([0; MAX_RUN * SECTOR]) }; THREADS];
 
 /// Requests the workload has made, for the heartbeat.
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -37,6 +42,11 @@ static REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// Whether the machine has the disk this workload uses.
 pub fn present() -> bool {
     crate::block::disk().is_some()
+}
+
+/// The most requests the disk has had outstanding at once.
+pub fn peak_in_flight() -> usize {
+    crate::block::disk().map_or(0, |d| d.peak_in_flight())
 }
 
 pub fn requests() -> u64 {
@@ -76,18 +86,27 @@ fn written(tag: u8, lba: u64, i: usize) -> u8 {
     (i as u8).wrapping_mul(29) ^ tag ^ (lba as u8).rotate_left(3)
 }
 
-pub extern "C" fn worker(_: usize) -> ! {
+pub extern "C" fn worker(which: usize) -> ! {
     begin();
-    let w = Workload::Block;
-    let mut rng = Rng::new(0x800);
+    let which = which.min(THREADS - 1);
+    let w = if which == 0 {
+        Workload::Block
+    } else {
+        Workload::BlockB
+    };
+    let mut rng = Rng::new(0x800 + which as u64);
+    // This thread's half of the scratch area. The two halves do not overlap, so each
+    // thread's read-back sees only its own writes however the requests interleave.
+    let half = SCRATCH_SECTORS / THREADS as u64;
+    let base = SCRATCH_START + which as u64 * half;
     let Some(disk) = crate::block::disk() else {
         fail(w, "spawned without a disk");
         loop {
             sleep_until(after_ms(1000));
         }
     };
-    // SAFETY: this thread is the only one that touches the buffers; see their invariant.
-    let (out, back) = unsafe { (&mut *WRITE_BUF.get(), &mut *READ_BUF.get()) };
+    // SAFETY: this thread is the only one that touches element `which`; see the invariant.
+    let (out, back) = unsafe { (&mut *WRITE_BUF[which].get(), &mut *READ_BUF[which].get()) };
     let mut iterations = 0u64;
     loop {
         if park_requested() {
@@ -98,7 +117,7 @@ pub extern "C" fn worker(_: usize) -> ! {
 
         // A run inside the scratch area, written and read back.
         let run = 1 + rng.below(MAX_RUN as u64) as usize;
-        let lba = SCRATCH_START + rng.below(SCRATCH_SECTORS - run as u64 + 1);
+        let lba = base + rng.below(half - run as u64 + 1);
         let tag = rng.next() as u8;
         let bytes = run * SECTOR;
         for (i, b) in out[..bytes].iter_mut().enumerate() {

@@ -556,15 +556,23 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
   - A function's `compatible` list follows the Open Firmware PCI binding, most specific
     first: `pciVVVV,DDDD`, `pciclass,CCSSPP`, `pciclass,CCSS`. A chip driver and a class
     driver bind by the same rule as a device-tree driver.
-  - Not yet: resource assignment (BARs are read as firmware left them), capabilities and
-    MSI, segments other than 0, and **INTx routing**. That last one is a named gap, not an
-    oversight: which I/O APIC input a PCI function's interrupt pin reaches is described
-    only by the `_PRT` objects in the ACPI namespace, which is AML. Reading it needs an AML
-    interpreter (or, on a legacy-only machine, the PCI BIOS routing table), and the
-    kernel has neither. The interrupt line register a function reports is what firmware
-    wrote for the 8259A, and is wrong under an I/O APIC often enough that using it would
-    be guessing. So no PCI function's interrupt is wired today, and the first PCI driver
-    that needs one needs `_PRT` first.
+  - Capabilities are walked during enumeration and recorded on each `Function`, bounded so
+    a looping list is read once. A driver is handed the node and never the bus, so what it
+    reads from its own capabilities has to survive enumeration; virtio uses them to say
+    where in its BARs each register structure lives.
+  - Not yet: resource assignment (BARs are read as firmware left them), MSI and MSI-X, and
+    segments other than 0.
+  - **INTx routing, decided per port.** A function's interrupt-line register holds the line
+    firmware routed its pin to, and firmware routed it *for the 8259A*. Where the 8259A is
+    the controller — i686 — that is the answer, so the platform wires it
+    (`PCI_LINE_TRUSTED`), and `virtio-blk` takes its completions on it. Under the I/O APIC —
+    x86_64 — a PCI pin arrives on a different input altogether: on q35 a global system
+    interrupt from 16 up, level-triggered and active low, named only by `_PRT` in the ACPI
+    namespace, which is AML. Wiring the register there would program an input nothing
+    drives, and the device would look wired and time out. So PCI devices on x86_64 are
+    left polled, and the boot says so. The two ways past that are an AML interpreter for
+    `_PRT`, which Phase 7 needs for ACPI anyway, or MSI-X, which delivers straight to a
+    local APIC and needs no routing table at all.
 - **ACPI.** `boot/acpi` parses the RSDP, RSDT/XSDT, MADT, MCFG and the FADT's PM timer
   and reset register. There is no `unsafe`: physical memory is read through a trait.
   Every table's length is capped and its checksum checked before any field is read. A
@@ -725,8 +733,10 @@ It is host-tested against a RAM disk that fails on request.
 
 #### virtio-blk (`drivers/block/virtio-blk`)
 
-virtio 1.x over the memory-mapped transport, bound from the device tree on aarch64. It is
-the first driver that hands a device *addresses*:
+virtio 1.x over two transports: memory-mapped, bound from the device tree on aarch64, and
+PCI, bound from enumeration on the PCs. The device's protocol is written once against the
+`Transport` trait, and each transport is only where its registers are. It is the first
+driver that hands a device *addresses*:
 
 - **`mem::Dma`** carries a region's physical and virtual addresses and keeps them apart. A
   descriptor takes `Dma::phys`, and the CPU dereferences `Dma::virt`. Host tests place the fake
@@ -748,10 +758,21 @@ the first driver that hands a device *addresses*:
   handshake ends by handing the device queue addresses. So the driver's `start` does nothing,
   and the kernel calls `VirtioBlk::bring_up` once it has a DMA region to give. An untouched
   virtio device is quiescent.
-- **Completion is polled.** The interrupt line is claimed and `on_interrupt` acknowledges it,
-  but nothing dispatches device interrupts yet. The request path polls the used ring to a
-  bounded limit, and a device that stops answering is `Error::Timeout`, not a hang. Moving to
-  interrupts means registering `on_interrupt` and waiting instead of spinning.
+- **Completion by interrupt, and several requests at once.** Each request owns a slot: its own
+  header, status byte and bounce buffer, so requests in flight cannot overwrite each other.
+  A request is submitted under the device's lock and waited for *without* it, because the
+  lock is what the interrupt handler takes to collect a completion; held across the wait,
+  it would mask the device's interrupt and every completion would be polled. Completions
+  are matched to slots by the head descriptor the used element names, since the device
+  answers in whatever order it likes. Where a line is wired, the handler acknowledges the
+  device and drains the ring; where none is, the waiter drains it itself, to a bounded
+  limit, and a device that stops answering is `Error::Timeout`, not a hang. A request that
+  timed out keeps its slot, because a late completion would write into its buffers.
+  `IN_FLIGHT` is four, and a build-time assertion holds `QUEUE_SIZE` to three descriptors
+  for each: a queue of eight, which this was, fits only two full chains, and nothing short
+  of three requests outstanding together would show it. Waiting with the lock released
+  doubled the disk's throughput under stress on aarch64 (the numbers are in
+  [testing.md](testing.md#2b-block-storage)).
 - **A bounce buffer.** Data is copied through a buffer inside the DMA region, so a caller's
   buffer need not be physically contiguous. That costs a copy, and bounds a request by the
   buffer, which is what `max_transfer_blocks` reports and `block::read` splits around.
@@ -759,11 +780,30 @@ the first driver that hands a device *addresses*:
   register layout by default, so test runs pass `virtio-mmio.force-legacy=false`. A legacy
   slot is reported as one during discovery.
 
-The PCI transport, for x86, is not written yet. The memory-mapped one is what the device
-tree machines have.
+**The PCI transport** (`pci::Pci`). A PCI virtio device does not have its registers at a
+fixed layout: vendor-specific capabilities name a BAR, an offset and a length for each of
+the common, notification, interrupt-status and device-configuration structures. Those
+capabilities are read from the `Function` enumeration recorded, since a driver cannot
+reach configuration space, and every structure is required to sit in one BAR, because one
+window is what a probe claims and the kernel maps. A capability names a BAR by its own
+number while `claim_mmio` counts only memory BARs; they differ on a transitional device,
+whose BAR 0 decodes I/O, and `Function::memory_bar_index` is the translation. Test runs
+attach the device with `disable-legacy=on`, for the same reason the memory-mapped transport
+needs `force-legacy=false`.
+
+**A BAR in the user half.** The kernel maps every claimed window at its physical address,
+and OVMF puts a 64-bit BAR near the top of the CPU's address width — at 768 GiB under TCG,
+which is inside x86_64's user half, `[512 GiB, 1 TiB)`. A process root mirrors every
+top-level entry of the kernel's, so that entry became one table all processes built their
+pages into, and two workers read each other's memory. `userproc::user_half_clear` now
+refuses to build a process while the kernel maps anything there, and the boot says so. The
+EFI test machine runs with `phys-bits=36`, which puts OVMF's window below 64 GiB. The fix
+this stands in for is mapping device windows outside the user half rather than at their
+physical address, which every driver's "mapped at its physical address" contract assumes
+today; a real machine with a BAR there gets the refusal, not a shared page.
 
 **The check** (`kernel/main/src/block.rs`, on presets with `QEMU_BLOCK_TEST`) brings the
-device up on three frames and gates the boot on the following:
+device up on eight frames and gates the boot on the following:
 
 - the disk's header naming the geometry the device reported;
 - 32 sectors reading back kbuild's pattern through a split read;
@@ -773,7 +813,14 @@ device up on three frames and gates the boot on the following:
   an error;
 - nothing in flight and every descriptor back on the ring after 64 more requests.
 
-The started device lives on for the stress run's block workload.
+A second check, `block irq`, runs once interrupts are enabled, where the port wires the
+disk's line (aarch64 and i686). It puts the driver in interrupt-driven mode, in which a
+waiter never drains the ring, and requires 32 reads to return the pattern with every
+completion collected by the handler and none polled. On x86_64 it is skipped, and says the
+disk is polled.
+
+The started device lives on for the stress run's two block workloads, which must be seen
+outstanding together at least once in a run.
 
 ### `sched` — scheduling
 
@@ -1221,8 +1268,8 @@ Also not yet:
 - a shootdown targets every online CPU, including ones that cannot have cached the
   translation, and flushes one page per request. `mm::vm` operations on many pages pay
   one round of IPIs per page.
-- every device interrupt is routed to the boot CPU, and only ISA IRQs are routed at all:
-  PCI interrupts need `_PRT` from the ACPI namespace;
+- every device interrupt is routed to the boot CPU, and only ISA IRQs are routed through the
+  I/O APIC: a PCI interrupt there needs `_PRT` or MSI-X, so x86_64's PCI devices poll;
 - i686 starts no second CPU and keeps `HasSmp::MAX_CPUS = 1`;
 - the I/O APIC's select-then-access registers assume one CPU programs them, which holds
   while only the boot CPU enables lines.

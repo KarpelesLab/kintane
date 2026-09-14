@@ -127,6 +127,8 @@ static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
 
 /// The console UART's receive line, once wired. It does not change across a rebind.
 static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
+/// The block device's interrupt line, once its handler is wired.
+static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
 
 /// The console's binding, kept after discovery so the serial check can take the device
 /// away and bind it again: the tree it was bound from, the ledger its claims are in, its
@@ -448,7 +450,7 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     // After the controller, so the lines are unmasked at the one that will deliver them.
     let console = if ok {
         // SAFETY: the caller's contract: once, masked, on the boot path.
-        let (wired, console) = unsafe { wire_all(c, &mut started) };
+        let (wired, console) = unsafe { wire_all(c, &tree, &mut started) };
         ok &= wired;
         console
     } else {
@@ -888,6 +890,7 @@ enum Wired {
 /// Once, from `discover`, with interrupts masked, after the controller is installed.
 unsafe fn wire_all(
     c: &dyn EarlyConsole,
+    tree: &DeviceTree<'_, '_>,
     started: &mut [Option<(usize, Started)>; MAX_BOUND],
 ) -> (bool, Option<(NodeId, Started)>) {
     // Before any line is unmasked: the first `init` remaps and masks the 8259A, and on
@@ -906,10 +909,15 @@ unsafe fn wire_all(
         let Some(&drv) = controller::DRIVERS.get(*d) else {
             continue;
         };
-        match wire(c, chip, drv, s) {
+        let pci = matches!(tree.node(s.bound().node()).origin(), Origin::Pci(_));
+        match wire(c, chip, drv, s, pci) {
             Wired::Nothing => {}
             Wired::Failed => ok = false,
             Wired::Line(line) => {
+                if drv.name() == virtio_blk::DRIVER.name() {
+                    // SAFETY: once, on the single-threaded boot path.
+                    let _ = unsafe { BLOCK_LINE.set(line) };
+                }
                 if drv.name() == uart16550::DRIVER.name() && console.is_none() {
                     // SAFETY: once, on the single-threaded boot path.
                     let _ = unsafe { CONSOLE_LINE.set(line) };
@@ -930,10 +938,22 @@ fn wire(
     chip: &'static dyn IrqChip,
     drv: &dyn Driver,
     started: &Started,
+    pci: bool,
 ) -> Wired {
     let Some((line, handler)) = drv.interrupt() else {
         return Wired::Nothing;
     };
+    // A PCI function's line is what firmware routed, which is the right answer only on the
+    // controller firmware routed for; see `controller::PCI_LINE_TRUSTED`. Where it is not,
+    // the device is left unwired and its driver polls, rather than being handed a line its
+    // interrupts never reach — which would look wired and time out instead. `pci` says
+    // which kind of node the device is, because only the caller holds the tree.
+    if pci && !controller::PCI_LINE_TRUSTED {
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" polled: no PCI interrupt route on this controller");
+        return Wired::Nothing;
+    }
     // A declared device's specifier is the ISA line itself.
     let number = match line.specifier().cells() {
         [isa] if *isa < ISA_LINES => IrqNumber(*isa),
@@ -980,6 +1000,12 @@ fn dispatch(number: IrqNumber) -> bool {
 /// The console UART's receive line, once its handler is wired.
 pub fn console_line() -> Option<u32> {
     CONSOLE_LINE.get().map(|n| n.0)
+}
+
+/// The block device's interrupt line, once its handler is wired. `None` when the device
+/// is polled, including on a port whose controller no PCI interrupt route reaches.
+pub fn block_line() -> Option<u32> {
+    BLOCK_LINE.get().map(|n| n.0)
 }
 
 /// Receive interrupts the console driver has taken, and the bytes they carried.
@@ -1073,7 +1099,8 @@ pub unsafe fn rebind_console(c: &dyn EarlyConsole) -> Option<bool> {
     };
     c.write_str("binding ");
     write_usize(c, uart16550::bindings());
-    let rewired = match wire(c, chip, drv, &started) {
+    // The console is the 16550 a firmware table declares, never a PCI function.
+    let rewired = match wire(c, chip, drv, &started, false) {
         Wired::Line(again) if again == line => true,
         Wired::Line(_) => {
             c.write_str(", ON A DIFFERENT LINE");
