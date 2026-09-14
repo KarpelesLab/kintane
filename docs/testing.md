@@ -2422,12 +2422,40 @@ two things a long run needs.
 to `build/<target>/soak-<len>.trail`, whatever the outcome, because a run that failed at the
 ninth hour is exactly the one whose trail is worth reading after the scrollback is gone.
 
-**The drift.** The trail is compared with itself: every counter's rate over the first window
-against the same counter's rate over the last, where the window is a sixth of the run between
-ten seconds and ten minutes. A run can pass every audit and still be leaking, and a rate that
-climbs or falls away is what a long run is for. Counters whose rate moved by more than a
-quarter are marked. The comparison is arithmetic on the guest's own numbers; nothing in it
-decides whether the run passed.
+**The drift.** The trail is compared with itself: the first window of the run against the last,
+where the window is a sixth of the run between ten seconds and ten minutes. A run can pass every
+audit and still be leaking, and that is what a long run is for. The comparison is arithmetic on
+the guest's own numbers; nothing in it decides whether the run passed.
+
+**One test does not fit every number**, and using one was a mistake worth writing down. A
+heartbeat carries three sorts of number, and the guest says which is which in the
+`stress field kinds:` line it prints once — beside the code that prints the numbers, so a field
+added without a kind is read as a count rather than guessed at from its name in `kbuild`.
+
+| Kind | Compared by | Flagged when |
+|---|---|---|
+| A **count**, which only climbs | its rate in each window | the rate moves by more than a quarter; it stood still early and climbed late; or it goes backwards, which no count may do |
+| A **level** — a high-water mark or a standing value | how much it rose within each window | it rose at least as much late as early, so nothing is bounding it |
+| A **mean** | its value directly | it moves by more than a quarter |
+
+A level's *rate* means nothing: a worst case that stopped getting worse is good news, and the
+first version reported it as a rate that had collapsed to nothing. A two-hour soak that passed
+7,200 audits of 7,200 marked four numbers that way — `passed over max` 3 → 7, `slices ran max`
+21 → 24, `served after max`, and `answered in mean`, a mean that had not moved at all and was
+reported as −100%. Four marks that mean nothing are how the one that matters hides.
+
+The same reading found the opposite hole. A count with no early rate — zero for the whole first
+window — has no ratio to compare, so the first version printed `-` and moved on: a leak that
+*began* after the first window was invisible, which is exactly the leak a long run exists to
+catch. It is now a finding of its own. The counts that should stay at zero for a whole run —
+`none charged`, `stalled waits`, `slow exchanges` — are counts for that reason, and are reported
+the moment they start.
+
+The legend and the prose it describes are written in two places, so they can drift apart. When a
+kind names a number no heartbeat carries, that is reported as a finding too, because the field it
+was meant to describe is being read as a count.
+
+**The verdict says how many findings there are**, and `none` is what a healthy run says.
 
 #### What the gates showed
 

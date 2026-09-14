@@ -433,6 +433,7 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
     c.write_str(" s, seed ");
     write_usize(c, kconfig::STRESS_SEED);
     c.write_str("\n");
+    field_kinds(c);
 
     if let Err(what) = start() {
         audit_failed(c, 0, "could not start", what);
@@ -745,6 +746,27 @@ fn audit(
     if mp::shootdown_mismatches() != 0 {
         audit_failed(c, seconds, "tlb shootdown", "a shootdown was answered by the wrong CPUs");
     }
+}
+
+/// What each heartbeat number is, for a reader comparing a run's beginning with its end.
+///
+/// Printed once, because it never changes, and named here rather than in `kbuild` so the
+/// kinds sit beside the printing they describe: a field added to [`heartbeat`] without a
+/// kind is read as a count, and a kind named here that no heartbeat carries is a finding
+/// `kbuild soak` reports rather than ignores.
+///
+/// A count only climbs, and its *rate* is what compares between two windows. A level is a
+/// high-water mark or a standing value: comparing its rate is meaningless — a worst case
+/// that stopped getting worse is good news, not a rate that collapsed. A mean is neither,
+/// and compares directly. Everything not named here is a count, which is why the counts
+/// that should stay at zero — `none charged`, `stalled waits`, `slow exchanges` — are
+/// deliberately absent: as counts, they are reported the moment they start.
+fn field_kinds(c: &dyn EarlyConsole) {
+    c.write_str("stress field kinds: ");
+    c.write_str("latest=level; peak in flight=level; cpus=level; worst=level; ");
+    c.write_str("served after max=level; slices ran max=level; passed over max=level; ");
+    c.write_str("slices to park max=level; without progress max=level; ");
+    c.write_str("answered in mean=mean\n");
 }
 
 fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {

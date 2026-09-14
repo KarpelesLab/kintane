@@ -500,7 +500,8 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             std::fs::write(&path, soak::trail_text(&trail))
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             let window = (seconds / 6).clamp(10, 600);
-            let drifts = soak::drift(&trail, window);
+            let drifts = soak::drift(&trail, window, 0.25);
+            let findings = soak::findings(&drifts, &trail.unmatched_kinds());
             println!(
                 "\n\x1b[36msoak\x1b[0m {} heartbeats, trail in {}",
                 trail.heartbeats.len(),
@@ -508,7 +509,17 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             );
             if !drifts.is_empty() {
                 println!("\nthe first {window} s against the last {window} s:");
-                print!("{}", soak::drift_report(&drifts, 0.25));
+                print!("{}", soak::drift_report(&drifts));
+            }
+            // Said plainly, because none is what a healthy run says: a table nobody can
+            // read at a glance is how a real finding hides among marks that mean nothing.
+            if findings.is_empty() {
+                println!("\nsoak findings: none");
+            } else {
+                println!("\nsoak findings: {}", findings.len());
+                for f in &findings {
+                    println!("  {f}");
+                }
             }
             match outcome.code {
                 Some(c) if outcome.passed => {
