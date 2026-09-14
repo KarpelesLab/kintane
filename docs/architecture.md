@@ -597,19 +597,92 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
     a looping list is read once. A driver is handed the node and never the bus, so what it
     reads from its own capabilities has to survive enumeration; virtio uses them to say
     where in its BARs each register structure lives.
-  - Not yet: resource assignment (BARs are read as firmware left them), MSI and MSI-X, and
-    segments other than 0.
-  - **INTx routing, decided per port.** A function's interrupt-line register holds the line
-    firmware routed its pin to, and firmware routed it *for the 8259A*. Where the 8259A is
-    the controller — i686 — that is the answer, so the platform wires it
-    (`PCI_LINE_TRUSTED`), and `virtio-blk` takes its completions on it. Under the I/O APIC —
-    x86_64 — a PCI pin arrives on a different input altogether: on q35 a global system
-    interrupt from 16 up, level-triggered and active low, named only by `_PRT` in the ACPI
-    namespace, which is AML. Wiring the register there would program an input nothing
-    drives, and the device would look wired and time out. So PCI devices on x86_64 are
-    left polled, and the boot says so. The two ways past that are an AML interpreter for
-    `_PRT`, which Phase 7 needs for ACPI anyway, or MSI-X, which delivers straight to a
-    local APIC and needs no routing table at all.
+  - Not yet: resource assignment (BARs are read as firmware left them), and segments other
+    than 0.
+  - **PCI interrupts: MSI-X, then MSI, then the line.** A function can interrupt three
+    ways. The kernel prefers them in that order, because only the last needs a route.
+    - *What every driver shares* is `device::msi`, which names no architecture. It reads the
+      MSI and MSI-X capabilities as enumeration recorded them, and turns either on through
+      configuration space. `MsixTable` reads and writes a table through `Registers`. An entry's
+      message is written only while the entry is masked, since a function may latch an unmasked
+      entry at any moment, and `retarget` is mask, write, unmask. virtio-net is meant to use
+      it the way virtio-blk does.
+    - *Claims.* A vector is claimed like a line, through `Probe::claim_msi`. Its specifier's
+      controller is the function's own node and its one cell is tagged (`msi::VECTOR_TAG`).
+      So two functions' vector 0 are different claims, and the handler table's ownership
+      check applies unchanged. The ledger grants a vector only where the platform said it
+      delivers messages (`Resources::with_msi`). The driver claims the table's window like
+      any other window: virtio-blk claims QEMU's BAR 1 beside its registers' BAR 4. The
+      platform programs the table only through a window the function's node claimed,
+      translated by `Registers::for_claim`, which reaches it through
+      `hal::paging::device_virt` exactly as `Registers::new` does. That is the one place a
+      table's pointer is made. What the table *holds* stays physical: a message's address is
+      the local APIC as the device sees it on the bus.
+    - *Delivery on x86_64.* `apic::msi::message` encodes a local APIC ID and a vector: the
+      address is `0xFEE0_0000 | id << 12`, and the data is the vector, with fixed delivery
+      and edge trigger. Sixteen lines, 16 to 31, sit on vectors 48 to 63
+      (`arch::interrupt::MSI_LINES`), with the same entry point and dispatch as an ISA line.
+      Discovery wires a vector in a line's order:
+      1. a free line;
+      2. the handler registered and enabled;
+      3. the boot CPU's message written into the masked entry;
+      4. MSI-X enabled, clearing any function-wide mask firmware left (QEMU leaves the
+         capability off, so this is also what turns it on);
+      5. the entry unmasked.
+
+      `platform::route_interrupt` moves a line to another CPU by rewriting its entry, and
+      `platform::interrupts_on_cpu` counts where its handler ran. A message-signalled line
+      nobody handles is counted but not masked the way an ISA line is: an edge interrupt
+      does not storm.
+    - *MSI* without MSI-X is programmed once, during discovery, because configuration space
+      is reachable only there, so it cannot be moved afterwards. No device the tests attach
+      has MSI without MSI-X, so that path is host-tested only.
+    - *virtio-blk* gives its one queue MSI-X entry 0, and configuration changes no vector
+      (`NO_VECTOR`): the driver reads its configuration once. With MSI-X on, the device does
+      not set the interrupt status register for a queue interrupt (virtio 1.1 §4.1.4.5), so
+      the handler stops reading it. The vector is written after the reset and read back, and
+      a refusal fails bring-up. On a PC with messages, `block irq` fails a test run whose
+      disk came up on anything else, so a silent fallback cannot turn the interrupt checks
+      into skips.
+    - **INTx is the fallback.** A function with neither capability, or one on a platform
+      without messages, keeps the line in its interrupt-line register. Firmware routed that
+      line *for the 8259A*. Where the 8259A is the controller — i686 — that is the answer, so
+      the platform wires it (`PCI_LINE_TRUSTED`), and `virtio-blk` takes its completions on
+      it. Under the I/O APIC — x86_64 — a PCI pin arrives on a different input altogether: on
+      q35, a global system interrupt from 16 up, level-triggered and active low, named only
+      by `_PRT` in the ACPI namespace, which is AML. Wiring the register there would program
+      an input nothing drives, and the device would look wired and time out. So on x86_64 a
+      PCI function with neither capability is left polled, and the boot says so.
+    - **What a minimal `_PRT` interpreter would need.** Enough AML to load the DSDT and SSDTs
+      into a namespace:
+      - `Scope`, `Device`, `Name`, `Method`, `Package`, integers, strings and buffers,
+        `_HID`, `_ADR`, `_UID` and `_STA`, and the control flow and arithmetic that real
+        `_PRT` and link methods use.
+      - Evaluate `\_PIC(1)` first, to tell firmware the I/O APIC is in use; many `_PRT`s
+        return different tables after it.
+      - Evaluate `_PRT` under each host bridge and bridge — on real firmware it is often a
+        method, not a package — into (address, pin, source, source index) entries.
+      - Where the source names a PCI interrupt link device, evaluate its `_CRS`, choose from
+        `_PRS` and commit the choice with `_SRS`.
+      - Apply the standard swizzle for a function behind a bridge with no `_PRT` of its own.
+      - Program the resulting GSI level-triggered and active low. The I/O APIC driver applies
+        polarity and trigger only to ISA source overrides today.
+
+      Operation regions are reached through memory and I/O ports. Notifications, `_OSI`
+      beyond a fixed answer, and mutex semantics can wait for the full interpreter Phase 7
+      needs.
+    - **What an IOMMU's interrupt remapping needs from this.** Intel VT-d and AMD-Vi replace
+      the message programmed here with a *remappable* format: the address carries an index
+      into the IOMMU's interrupt remapping table. The table entry holds the destination,
+      vector and trigger, and is checked against the requesting function's
+      bus/device/function. For this code that means:
+      - `apic::msi::message` becomes one of two encoders, chosen by the platform.
+      - A route owns a remapping-table index as well as a line, allocated at wiring.
+      - `route_interrupt` rewrites that entry and flushes the IOMMU's interrupt entry cache;
+        the MSI-X entry, still behind the same claim, stops changing.
+
+      It is also the only way to name a CPU whose APIC ID is above 255, which `message`
+      refuses today rather than truncate.
 - **ACPI.** `boot/acpi` parses the RSDP, RSDT/XSDT, MADT, MCFG and the FADT's PM timer
   and reset register. There is no `unsafe`: physical memory is read through a trait.
   Every table's length is capped and its checksum checked before any field is read. A
@@ -858,8 +931,9 @@ hands a device *addresses*:
   lock is what the interrupt handler takes to collect a completion; held across the wait,
   it would mask the device's interrupt and every completion would be polled. Completions
   are matched to slots by the head descriptor the used element names, since the device
-  answers in whatever order it likes. Where a line is wired, the handler acknowledges the
-  device and drains the ring; where none is, the waiter drains it itself, to a bounded
+  answers in whatever order it likes. Where an interrupt is wired — MSI-X on x86_64, a line
+  on i686 and aarch64 — the handler drains the ring, acknowledging the device first when the
+  interrupt is a line. Where none is, the waiter drains the ring itself, to a bounded
   limit, and a device that stops answering is `Error::Timeout`, not a hang. A request that
   timed out keeps its slot, because a late completion would write into its buffers.
   `IN_FLIGHT` is four, and a build-time assertion holds `QUEUE_SIZE` to three descriptors
@@ -883,7 +957,9 @@ window is what a probe claims and the kernel maps. A capability names a BAR by i
 number while `claim_mmio` counts only memory BARs; they differ on a transitional device,
 whose BAR 0 decodes I/O, and `Function::memory_bar_index` is the translation. Test runs
 attach the device with `disable-legacy=on`, for the same reason the memory-mapped transport
-needs `force-legacy=false`.
+needs `force-legacy=false`. Where the platform delivers messages, the probe also claims the
+BAR holding the MSI-X table, which QEMU puts in BAR 1, apart from the structures, and claims
+entry 0 as the interrupt. See "PCI interrupts" under the device framework.
 
 **A BAR in the user half, and the device window that fixed it.** OVMF puts a 64-bit BAR
 near the top of the CPU's address width — at 768 GiB under TCG, which is inside x86_64's
@@ -1508,8 +1584,10 @@ Also not yet:
 - a shootdown targets every online CPU, including ones that cannot have cached the
   translation, and flushes one page per request. `mm::vm` operations on many pages pay
   one round of IPIs per page.
-- every device interrupt is routed to the boot CPU, and only ISA IRQs are routed through the
-  I/O APIC: a PCI interrupt there needs `_PRT` or MSI-X, so x86_64's PCI devices poll;
+- every device interrupt is delivered to the boot CPU unless moved, and only a
+  message-signalled one can be moved (`platform::route_interrupt`, which the `block cpu`
+  check uses to move the disk's interrupt to CPU 1 and back). Only ISA IRQs are routed through
+  the I/O APIC, so on x86_64 a PCI function with neither MSI nor MSI-X is polled;
 - i686 starts no second CPU and keeps `HasSmp::MAX_CPUS = 1`;
 - the I/O APIC's select-then-access registers assume one CPU programs them, which holds
   while only the boot CPU enables lines.

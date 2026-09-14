@@ -1,13 +1,13 @@
 //! What a virtio driver's probe claims, whichever bus the device is on.
 //!
-//! The same for every device type: the register window, and the interrupt line if one can
-//! be had. What those registers become differs by bus, and a PCI function's layout has to be
-//! read at probe, while the node still borrows the enumeration record. [`Claims`] keeps all
-//! of it, and [`Claims::transport`] builds the transport later, once the kernel has mapped
-//! the window.
+//! The same for every device type: the register window, and the interrupt if one can be had
+//! (an MSI-X vector where the platform delivers messages, otherwise a line). What those
+//! registers become differs by bus, and a PCI function's layout has to be read at probe,
+//! while the node still borrows the enumeration record. [`Claims`] keeps all of it, and
+//! [`Claims::transport`] builds the transport later, once the kernel has mapped the window.
 //!
 //! This was virtio-blk's probe, moved unchanged apart from taking the device type and the
-//! claim's name as arguments.
+//! claims' names as arguments.
 
 use device::{IrqLine, Mmio as MmioClaim, Probe, ProbeError};
 
@@ -22,6 +22,9 @@ use crate::{AnyTransport, mmio, pci};
 /// configuration space once the enumerator is gone.
 pub struct Claims {
     mmio: MmioClaim,
+    /// The window the MSI-X table is in, when it is not the registers' BAR. Claimed for the
+    /// platform, which programs the table through it.
+    table: Option<MmioClaim>,
     irq: Option<IrqLine>,
     bus: Bus,
 }
@@ -37,11 +40,12 @@ enum Bus {
 }
 
 impl Claims {
-    /// Claim the bound node's register window and interrupt, naming the window `what`, for a
-    /// device of type `device_id`.
+    /// Claim the bound node's register window and interrupt for a device of type
+    /// `device_id`, naming the window `what` and an MSI-X table window `table_what`.
     pub fn claim(
         p: &mut Probe<'_, '_, '_, '_>,
         what: &'static str,
+        table_what: &'static str,
         device_id: u32,
     ) -> Result<Claims, ProbeError> {
         // Which transport this is comes from the node, not from a guess: a PCI function
@@ -84,10 +88,41 @@ impl Claims {
                 (mmio, Bus::Mmio)
             }
         };
+        // The interrupt, best first. MSI-X where the platform delivers messages and the
+        // function has a table: it needs no route, and its entry can name any CPU. The table
+        // is programmed by the platform through a window this probe claimed, so its BAR is
+        // claimed too when it is not the registers' BAR (QEMU puts it in BAR 1, the
+        // structures in BAR 4). Otherwise the line.
+        //
         // A device whose interrupt is malformed or taken can still be polled, so an
         // interrupt that cannot be claimed is not a reason to refuse the device.
-        let irq = p.claim_irq(0).ok();
-        Ok(Claims { mmio, irq, bus })
+        let mut table = None;
+        let mut irq = None;
+        if let (Some(f), Bus::Pci { bar, .. }) = (function, &bus) {
+            if let Some(cap) = device::msi::msix(f).filter(|_| p.msi_available()) {
+                let reachable = if cap.table_bar == *bar {
+                    true
+                } else if let Some(index) = f.memory_bar_index(cap.table_bar) {
+                    table = Some(p.claim_mmio(index, table_what)?);
+                    true
+                } else {
+                    false
+                };
+                if reachable {
+                    irq = p.claim_msi(0).ok();
+                }
+            }
+        }
+        let irq = match irq {
+            Some(vector) => Some(vector),
+            None => p.claim_irq(0).ok(),
+        };
+        Ok(Claims {
+            mmio,
+            table,
+            irq,
+            bus,
+        })
     }
 
     /// The claimed window, as a physical `(address, length)`.
@@ -95,9 +130,22 @@ impl Claims {
         (self.mmio.phys(), self.mmio.len())
     }
 
-    /// The claimed interrupt line, if one was.
+    /// The claimed interrupt, a line or an MSI-X vector, if one was.
     pub fn irq(&self) -> Option<&IrqLine> {
         self.irq.as_ref()
+    }
+
+    /// The MSI-X table entry the interrupt was claimed as, if it was one: what a driver's
+    /// bring-up is given once the platform has wired it.
+    pub fn msix_entry(&self) -> Option<u16> {
+        let line = self.irq.as_ref()?;
+        device::msi::vector_of(line.specifier().cells())
+    }
+
+    /// The window claimed for the MSI-X table, as a physical `(address, length)`, when it
+    /// is not the registers' window.
+    pub fn msix_table_window(&self) -> Option<(u64, u64)> {
+        self.table.as_ref().map(|t| (t.phys(), t.len()))
     }
 
     /// The transport for the claimed device, of whichever kind its bus is.

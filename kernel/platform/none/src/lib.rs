@@ -64,6 +64,26 @@ pub fn net_line() -> Option<u32> {
     None
 }
 
+/// No interrupt on these ports is message-signalled.
+pub fn interrupt_is_msi(_line: u32) -> bool {
+    false
+}
+
+/// Counted only for message-signalled lines, which these ports do not have.
+pub fn interrupts_on_cpu(_line: u32, _cpu: usize) -> u64 {
+    0
+}
+
+/// No interrupt on these ports can be moved between CPUs.
+pub fn route_interrupt(_line: u32, _cpu: usize) -> Result<(), &'static str> {
+    Err("no message-signalled interrupts on this platform")
+}
+
+/// These ports deliver no message-signalled interrupts.
+pub fn delivers_msi() -> bool {
+    false
+}
+
 /// Nothing received: `(interrupts, bytes)`.
 pub fn console_received() -> (u32, u32) {
     (0, 0)

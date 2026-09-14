@@ -360,6 +360,9 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // SAFETY: once, masked, after the kernel space and interrupt path are up and the
     // preemption check has stopped the tick: `start_secondaries`'s contract.
     let smp = unsafe { platform::start_secondaries(c) }.map_or(Check::Skipped, Check::from_ok);
+    // After the secondaries are up, because it moves the disk's interrupt to one of them.
+    c.write_str("\n  block cpu  ");
+    let block_cpu = block::cpu_check(c);
 
     // After the secondaries are up, whose readers it races.
     c.write_str("\n  epoch      ");
@@ -386,6 +389,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))
         .and(smp)
+        .and(block_cpu)
         .and(epochs)
         .and(shootdown)
         .and(lockdep);

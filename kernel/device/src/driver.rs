@@ -33,8 +33,9 @@
 
 use hal::IrqNumber;
 
+use crate::msi;
 use crate::resource::{ClaimError, IrqLine, Mmio, Owner, PortRange, Resources};
-use crate::tree::{self, DeviceTree, NodeId};
+use crate::tree::{self, DeviceTree, NodeId, Origin, Specifier};
 
 /// A driver, bound by `compatible` string.
 pub trait Driver: Sync {
@@ -152,6 +153,49 @@ impl<'a, 's> Probe<'_, 'a, 's, '_> {
     /// Claim the `index`th interrupt of the node.
     pub fn claim_irq(&mut self, index: usize) -> Result<IrqLine, ProbeError> {
         let spec = self.tree.interrupt(self.node, index)?;
+        Ok(self.resources.claim_irq(self.owner, self.node, spec)?)
+    }
+
+    /// Whether [`Self::claim_msi`] can succeed at all: the platform delivers messages, and
+    /// the node is a PCI function with an MSI-X or MSI capability.
+    pub fn msi_available(&self) -> bool {
+        self.resources.msi()
+            && match self.tree.node(self.node).origin() {
+                Origin::Pci(f) => msi::msix(f).is_some() || msi::msi(f).is_some(),
+                _ => false,
+            }
+    }
+
+    /// Claim message-signalled vector `index` of the node: entry `index` of its MSI-X table
+    /// when it has one, and otherwise MSI's single message, which is index 0.
+    ///
+    /// The claim goes in the same ledger as a line, as a specifier whose controller is the
+    /// node itself (see [`msi::VECTOR_TAG`]), so the handler table's ownership check and a
+    /// failed probe's release treat it exactly as they treat a line. Claiming the window the
+    /// MSI-X table is in stays the driver's business, like any other window: the platform
+    /// programs the table only through a window this node claimed.
+    pub fn claim_msi(&mut self, index: u16) -> Result<IrqLine, ProbeError> {
+        let no_such = ProbeError::Tree(tree::Error::NoSuchEntry {
+            node: self.node,
+            index: usize::from(index),
+        });
+        if !self.resources.msi() {
+            return Err(ProbeError::Declined(
+                "this platform delivers no message-signalled interrupts",
+            ));
+        }
+        let Origin::Pci(f) = self.tree.node(self.node).origin() else {
+            return Err(no_such);
+        };
+        let vectors = match (msi::msix(f), msi::msi(f)) {
+            (Some(x), _) => x.table_size,
+            (None, Some(_)) => 1,
+            (None, None) => return Err(no_such),
+        };
+        if index >= vectors || u32::from(index) & msi::VECTOR_TAG != 0 {
+            return Err(no_such);
+        }
+        let spec = Specifier::new(self.node, &[msi::specifier_cell(index)]).ok_or(no_such)?;
         Ok(self.resources.claim_irq(self.owner, self.node, spec)?)
     }
 }

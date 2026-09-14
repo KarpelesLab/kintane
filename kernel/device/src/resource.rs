@@ -158,6 +158,9 @@ pub struct Resources<'s> {
     /// `None` on a machine with no port space, where nothing describes ports and so
     /// nothing can claim one.
     ports: Option<&'s mut [Option<PortClaim>]>,
+    /// Whether the platform can deliver a PCI function's message-signalled interrupts; see
+    /// [`Self::with_msi`].
+    msi: bool,
     next_owner: u32,
 }
 
@@ -173,8 +176,24 @@ impl<'s> Resources<'s> {
             mmio,
             irqs,
             ports: None,
+            msi: false,
             next_owner: 0,
         }
+    }
+
+    /// Let drivers claim message-signalled vectors ([`crate::Probe::claim_msi`]) when `on`.
+    ///
+    /// Off unless the platform says so, because a vector is only an interrupt if the platform
+    /// has somewhere for the message to land and code to program it: a driver that claimed
+    /// one on a platform without would be left with an interrupt nothing delivers, where the
+    /// line it would otherwise have claimed might have worked.
+    pub fn with_msi(mut self, on: bool) -> Self {
+        self.msi = on;
+        self
+    }
+
+    pub(crate) fn msi(&self) -> bool {
+        self.msi
     }
 
     /// Let drivers claim I/O ports as well, out of `ports`.

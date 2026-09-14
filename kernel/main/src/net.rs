@@ -167,7 +167,11 @@ pub fn bring_up(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live
         c.write_str("the card's window is outside the address space");
         return Check::Failed;
     };
-    let card = match VirtioNet::<Locks>::bring_up(transport, dma) {
+    // Both queues on the card's MSI-X entry when that is how the platform wired its
+    // interrupt, as the disk's; on a line, or polled, bring-up needs to know nothing.
+    let vector = virtio_net::msix_entry()
+        .filter(|_| platform::net_line().is_some_and(platform::interrupt_is_msi));
+    let card = match VirtioNet::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(n) => n,
         Err(e) => {
             c.write_str("bring-up FAILED: ");
@@ -221,11 +225,21 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     };
     let mut now = || clock.advance(src.read()).as_nanos();
 
+    // QEMU's virtio-net-pci has an MSI-X table. On a platform that delivers messages, a card
+    // that came up on anything else fell back somewhere, and the interrupt half of this check
+    // would pass over a poll.
+    if kconfig::QEMU_NET_TEST && platform::delivers_msi() && !card.uses_msix() {
+        c.write_str("THE CARD IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
+        return Check::Failed;
+    }
     let line = platform::net_line();
     match line {
         Some(l) => {
             c.write_str("line ");
             write_usize(c, l as usize);
+            if card.uses_msix() {
+                c.write_str(", MSI-X");
+            }
         }
         None => c.write_str("polled: no interrupt route on this port"),
     }
@@ -500,5 +514,6 @@ fn bring_up_error(e: virtio::transport::Error) -> &'static str {
         Error::NoRoom => "not enough memory for the rings and buffers",
         Error::BadGeometry => "an unusable configuration",
         Error::Timeout => "the card did not answer",
+        Error::VectorRefused { .. } => "the card refused its MSI-X vector",
     }
 }

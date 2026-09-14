@@ -254,6 +254,9 @@ pub struct VirtioNet<L: LockFamily, T: Transport = AnyTransport> {
     transport: T,
     mac: [u8; 6],
     inner: L::Lock<Inner>,
+    /// Whether both queues signal on an MSI-X vector, in which case the device does not set
+    /// the interrupt status register for them and [`Self::on_interrupt`] must not ask.
+    msix: bool,
 }
 
 /// The lock class of a card's queues, for the lock-order checker.
@@ -262,12 +265,38 @@ pub static NET_LOCK: LockClass = LockClass::new("driver.virtio-net");
 impl<L: LockFamily, T: Transport> VirtioNet<L, T> {
     /// Bring a card up: the handshake, both queues, the address, and every receive buffer
     /// posted.
-    pub fn bring_up(transport: T, mut dma: Dma) -> Result<VirtioNet<L, T>, Error> {
+    pub fn bring_up(transport: T, dma: Dma) -> Result<VirtioNet<L, T>, Error> {
+        Self::bring_up_with_vector(transport, dma, None)
+    }
+
+    /// [`Self::bring_up`], with both queues' interrupts on MSI-X table entry `vector` when it
+    /// is `Some`, as virtio-blk's `bring_up_with_vector` does for its one queue.
+    ///
+    /// One vector for both queues: the handler drains both whichever finished. None for
+    /// configuration changes, which the driver never reads after bring-up. Written after
+    /// `negotiate`'s reset, which forgets it, before the queues are enabled, and read back:
+    /// a queue that silently kept no vector would never interrupt, so a refusal fails
+    /// bring-up with [`Error::VectorRefused`].
+    pub fn bring_up_with_vector(
+        transport: T,
+        mut dma: Dma,
+        vector: Option<u16>,
+    ) -> Result<VirtioNet<L, T>, Error> {
         let accepted = transport::negotiate(
             &transport,
             transport::DEVICE_ID_NET,
             [F_MAC, transport::VERSION_1_BIT],
         )?;
+
+        transport.set_config_vector(transport::NO_VECTOR);
+        if let Some(v) = vector {
+            for queue in [RX_QUEUE, TX_QUEUE] {
+                if transport.set_queue_vector(queue, v) != v {
+                    transport.set_status(transport::status::FAILED);
+                    return Err(Error::VectorRefused { queue });
+                }
+            }
+        }
 
         let rx_ring = transport::carve_ring(&mut dma, QUEUE_SIZE)?;
         let tx_ring = transport::carve_ring(&mut dma, QUEUE_SIZE)?;
@@ -327,6 +356,7 @@ impl<L: LockFamily, T: Transport> VirtioNet<L, T> {
             transport,
             mac,
             inner: L::new(inner, &NET_LOCK),
+            msix: vector.is_some(),
         })
     }
 
@@ -335,6 +365,10 @@ impl<L: LockFamily, T: Transport> VirtioNet<L, T> {
         self.mac
     }
 
+    /// Whether the queues were given an MSI-X vector at bring-up.
+    pub fn uses_msix(&self) -> bool {
+        self.msix
+    }
     /// Queue a frame for transmission. Does not wait for the device to send it.
     pub fn send(&self, frame: &[u8]) -> Result<(), SendError> {
         if frame.len() > FRAME_MAX || frame.len() < FRAME_MIN {
@@ -402,8 +436,12 @@ impl<L: LockFamily, T: Transport> VirtioNet<L, T> {
 
     /// Acknowledge the card's interrupt and collect what it finished on both queues.
     /// Returns whether the interrupt was this card's.
+    ///
+    /// On an MSI-X vector there is nothing to acknowledge: the vector is this card's alone,
+    /// and the device does not set the status register for a queue interrupt delivered that
+    /// way (virtio 1.1 §4.1.4.5), so reading it would throw the interrupt away.
     pub fn on_interrupt(&self) -> bool {
-        if self.transport.ack_interrupt() == 0 {
+        if !self.msix && self.transport.ack_interrupt() == 0 {
             return false;
         }
         let notify = L::with(&self.inner, |inner| {
@@ -474,6 +512,12 @@ pub fn has_irq() -> bool {
     CLAIMS.get().is_some_and(|c| c.irq().is_some())
 }
 
+/// The MSI-X table entry the card's interrupt was claimed as, if it was one: what
+/// [`VirtioNet::bring_up_with_vector`] is given once the platform has wired it.
+pub fn msix_entry() -> Option<u16> {
+    CLAIMS.get()?.msix_entry()
+}
+
 /// The transport for the bound card.
 ///
 /// # Safety
@@ -499,7 +543,14 @@ impl Driver for VirtioNetDriver {
     }
 
     fn probe(&self, p: &mut Probe<'_, '_, '_, '_>) -> Result<(), ProbeError> {
-        let claims = Claims::claim(p, "virtio-net registers", transport::DEVICE_ID_NET)?;
+        // An MSI-X vector where the platform delivers messages, otherwise a line; see
+        // `virtio::bind`.
+        let claims = Claims::claim(
+            p,
+            "virtio-net registers",
+            "virtio-net MSI-X table",
+            transport::DEVICE_ID_NET,
+        )?;
         // SAFETY: probe runs during single-threaded boot.
         unsafe { CLAIMS.set(claims) }
             .map(|_| ())

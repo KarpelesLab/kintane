@@ -584,6 +584,11 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         write_usize(c, block::requests() as usize);
         c.write_str(", peak in flight ");
         write_usize(c, block::peak_in_flight());
+        let (by_interrupt, polled) = block::completions();
+        c.write_str(", by interrupt ");
+        write_usize(c, by_interrupt as usize);
+        c.write_str(", polled ");
+        write_usize(c, polled as usize);
         c.write_str(")");
     }
     if fs::present() {

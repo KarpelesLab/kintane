@@ -37,6 +37,9 @@ struct FakeCard {
     notifies: Cell<u32>,
     /// Complete a transmission as soon as it is published.
     complete_tx: Cell<bool>,
+    /// Each queue's MSI-X vector, and whether the card refuses every vector it is given.
+    queue_vectors: Cell<[u16; 2]>,
+    refuse_vectors: Cell<bool>,
 }
 
 impl FakeCard {
@@ -55,6 +58,8 @@ impl FakeCard {
             pending: Cell::new(0),
             notifies: Cell::new(0),
             complete_tx: Cell::new(true),
+            queue_vectors: Cell::new([transport::NO_VECTOR; 2]),
+            refuse_vectors: Cell::new(false),
         }
     }
 
@@ -155,6 +160,19 @@ impl Transport for &FakeCard {
     }
     fn ack_interrupt(&self) -> u32 {
         self.pending.replace(0)
+    }
+    fn set_queue_vector(&self, index: u16, vector: u16) -> u16 {
+        let taken = if self.refuse_vectors.get() {
+            transport::NO_VECTOR
+        } else {
+            vector
+        };
+        let mut v = self.queue_vectors.get();
+        if let Some(slot) = v.get_mut(usize::from(index)) {
+            *slot = taken;
+        }
+        self.queue_vectors.set(v);
+        taken
     }
     fn config_read8(&self, offset: usize) -> u8 {
         MAC.get(offset).copied().unwrap_or(0)
@@ -340,6 +358,44 @@ fn in_interrupt_mode_only_the_handler_collects() {
     let c: Counters = net.counters();
     assert_eq!((c.interrupts, c.rx_by_interrupt, c.rx_polled), (1, 1, 0));
     assert!(c.balanced(), "{c:?}");
+}
+
+#[test]
+fn on_msix_both_queues_take_the_vector_and_the_status_register_is_not_read() {
+    let mut backing = Backing::new(512 * 1024);
+    let card = FakeCard::new(&backing);
+    let dma = backing.take(dma_bytes(), 16);
+    let net: Net<'_> = VirtioNet::bring_up_with_vector(&card, dma, Some(0)).unwrap();
+    assert!(net.uses_msix());
+    assert_eq!(card.queue_vectors.get(), [0, 0], "one vector for both queues");
+    net.set_interrupt_driven(true);
+    assert!(card.deliver(&frame(5, 70)));
+    // The card sets no status bit for a queue interrupt on a vector; a handler that asked
+    // would read zero and drop the frame.
+    card.pending.set(0);
+    assert!(net.on_interrupt());
+    let mut buf = [0u8; FRAME_MAX];
+    assert_eq!(net.recv(&mut buf), Some(70));
+    assert_eq!(net.counters().rx_by_interrupt, 1);
+}
+
+#[test]
+fn a_refused_vector_fails_bring_up() {
+    let mut backing = Backing::new(512 * 1024);
+    let card = FakeCard::new(&backing);
+    card.refuse_vectors.set(true);
+    let dma = backing.take(dma_bytes(), 16);
+    let refused: Result<Net<'_>, Error> = VirtioNet::bring_up_with_vector(&card, dma, Some(0));
+    assert!(matches!(refused, Err(Error::VectorRefused { queue: 0 })));
+}
+
+#[test]
+fn without_a_vector_the_queues_keep_none() {
+    let mut backing = Backing::new(512 * 1024);
+    let card = FakeCard::new(&backing);
+    let net = started(&mut backing, &card).unwrap();
+    assert!(!net.uses_msix());
+    assert_eq!(card.queue_vectors.get(), [transport::NO_VECTOR; 2]);
 }
 
 #[test]

@@ -32,6 +32,7 @@
 
 pub mod io;
 pub mod local;
+pub mod msi;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod msr;
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -509,3 +510,6 @@ pub fn is_x2apic(apic: &Apic) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod msi_tests;

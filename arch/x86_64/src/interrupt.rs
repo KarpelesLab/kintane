@@ -5,6 +5,7 @@
 //! ```text
 //!   device --> 8259A line 0..16 ----------> vector 32..48 --> irq_entry<LINE> --> dispatch
 //!         or I/O APIC GSI (overrides) --^
+//!   PCI function, MSI or MSI-X ------------> vector 48..64 --> irq_entry<LINE> --> dispatch
 //!   local APIC timer ----------------------> vector 0xEF   --> timer_entry
 //!   IPI from another CPU ------------------> vector 0xF0/1 --> ipi_*_entry --> smp
 //!   CPU fault -----------------------------> vector 0..32  --> exception::*
@@ -142,6 +143,28 @@ pub const IPI_TLB_VECTOR: u8 = 0xF2;
 /// The local APIC's spurious-interrupt vector. The low four bits set, as some local APICs
 /// require of it.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
+
+/// Device lines that message-signalled interrupts are delivered on: after the sixteen ISA
+/// lines, on the sixteen vectors just above theirs (48 to 63).
+///
+/// A PCI function that signals by message names its vector directly, so it needs no route
+/// through the I/O APIC and no `_PRT`. Each of these lines has its own entry point and the
+/// same dispatch as an ISA line; which device a line belongs to is the device model's to
+/// record, exactly as for an ISA line. Below the timer and the IPIs, so a busy device cannot
+/// hold either off.
+pub const MSI_LINES: core::ops::Range<u32> = 16..32;
+
+/// The vector `line` is delivered on, if it is one of [`MSI_LINES`].
+pub fn msi_vector(line: u32) -> Option<u8> {
+    MSI_LINES
+        .contains(&line)
+        .then(|| pic::VECTOR_BASE + line as u8)
+}
+
+const _: () = assert!(
+    pic::VECTOR_BASE as u32 + MSI_LINES.end <= TIMER_VECTOR as u32,
+    "message-signalled lines would reach the timer's vector"
+);
 
 /// Timer ticks observed since boot. Written only by the IRQ 0 handler.
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -379,6 +402,9 @@ pub fn init() {
             idt::set_gate(v as u8, idt::EntryPoint::diverging(exception::unexpected));
             v += 1;
         }
+        // The lines message-signalled interrupts arrive on; see `MSI_LINES`. After the loop
+        // above, which would otherwise overwrite them.
+        irq_gates!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
         idt::set_gate(TIMER_VECTOR, idt::EntryPoint::plain(timer_entry));
         idt::set_gate(IPI_CALL_VECTOR, idt::EntryPoint::plain(ipi_call_entry));
         idt::set_gate(IPI_RESCHEDULE_VECTOR, idt::EntryPoint::plain(ipi_reschedule_entry));

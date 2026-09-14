@@ -93,6 +93,18 @@ impl Transport for AnyTransport {
             AnyTransport::Pci(t) => t.ack_interrupt(),
         }
     }
+    fn set_config_vector(&self, vector: u16) -> u16 {
+        match self {
+            AnyTransport::Mmio(t) => t.set_config_vector(vector),
+            AnyTransport::Pci(t) => t.set_config_vector(vector),
+        }
+    }
+    fn set_queue_vector(&self, index: u16, vector: u16) -> u16 {
+        match self {
+            AnyTransport::Mmio(t) => t.set_queue_vector(index, vector),
+            AnyTransport::Pci(t) => t.set_queue_vector(index, vector),
+        }
+    }
     fn config_read8(&self, offset: usize) -> u8 {
         match self {
             AnyTransport::Mmio(t) => t.config_read8(offset),
