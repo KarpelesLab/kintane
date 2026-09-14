@@ -126,13 +126,23 @@ wrong the moment the workloads could run elsewhere.
 2. **Never let a writer's barrier come before its writes.** A target clears its shootdown
    bit after flushing. A workload marks itself parked after its last write. A thread's
    context is saved before the scheduler lock is released.
-3. **No lock held across a TLB shootdown may be waited for with interrupts masked.** The
-   initiator may itself be masked: it can be a page fault handler. It waits for every
-   other CPU to take an IPI, so a CPU spinning masked for a lock the initiator holds is a
-   deadlock. The kernel `Vm` pools in the stress run are taken with interrupts masked,
-   and are safe only because each `Vm` is used by one thread and that thread's own page
-   faults. A second user of a `Vm` needs the `Vm` lock taken with interrupts enabled, or
-   shootdowns deferred until the lock is released.
+3. **No lock held across a TLB shootdown may be waited for with interrupts masked, unless
+   the wait answers shootdowns itself.** The initiator may itself be masked: it can be a
+   page fault handler. It waits for every other CPU to take an IPI, so a CPU spinning masked
+   for a lock the initiator holds, and not answering, is a deadlock. Three locks are held
+   across shootdowns and waited for masked, and each wait answers:
+   `SpinLock::lock_irqsave_with` calls the shootdown service on every turn of its spin.
+   - the shootdown's own serial lock (rule 4);
+   - each process's lock (`userproc::lock`), an owner word whose spin answers;
+   - the frame lock every process's `Vm` operations take (`userproc::with_frames`). Until
+     the ninth round it was a plain masked spin, and a thread faulting on one CPU while
+     another installed a program, unmapped or forked hung both; the stress run's churning
+     pairs reproduce that on every SMP preset.
+
+   The kernel `Vm` pool in the stress run is taken with a plain masked spin, and is safe
+   only because that `Vm` is used by one thread and its own page faults, and the audit
+   takes the lock after that thread has parked. A second user of it needs the answering
+   wait, or shootdowns deferred until the lock is released.
 4. **Initiators answer while they wait to initiate.** Two simultaneous shootdowns would
    otherwise each wait for the other's IPI.
 5. **The scheduler lock spans the context switch**, and every path that can resume a

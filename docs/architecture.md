@@ -513,6 +513,11 @@ and waiting for that CPU's flush. And a fault inside a system call finds the loc
 CPU and uses it instead of deadlocking on itself. Two process locks are taken in slot order, a
 higher slot giving its own up when the other is busy.
 
+Below the process locks is the frame lock (`userproc::with_frames`), one spin lock for the frame
+allocator every process's `Vm` operations share. Its holder may shoot down TLBs too, so it is
+taken with `SpinLock::lock_irqsave_with`, whose spin answers shootdowns on every turn exactly as
+the process locks' does; see [TLB shootdown](#tlb-shootdown).
+
 ### `ipc` — channels
 
 A channel is two endpoints with bounded inboxes. Sending moves handles, all or nothing.
@@ -1776,7 +1781,32 @@ unchanged: the port only supplies the local flush and the IPI.
 
 **The rule that keeps the wait from deadlocking:** the initiator may wait with interrupts
 masked, so no lock it holds across a shootdown may be waited for by another CPU with
-interrupts masked. See [memory-model.md](memory-model.md).
+interrupts masked, unless that wait answers shootdowns itself. See
+[memory-model.md](memory-model.md). The locks held across a shootdown, and how each is waited
+for:
+
+| Lock | Held across a shootdown by | Waited for masked by | The wait answers? |
+|---|---|---|---|
+| `tlb.shootdown` (`shootdown::SERIAL`) | the initiator | another initiator | yes, its `try_lock` loop |
+| a process's lock (`userproc::lock`) | a system call changing mappings | a fault or call of the same process | yes, its owner-word loop |
+| the frame lock (`userproc.frames`) | a `Vm` unmap, protect, install, `fork` or `execve` | a fault on another CPU | yes, `lock_irqsave_with` |
+| the stress `vm` pool | the `vm` workload's release | its own faults, and the audit | no: one thread, and the audit waits until it parks |
+
+Locks that are waited for masked but never held across a shootdown: the scheduler lock, the
+interrupt handler and routing tables, the pipe, futex, delivery and network stack locks, and
+the stress `pages` pool. The module loader unmaps and protects on the boot path holding none.
+
+Until the ninth round the frame lock was a plain masked spin. A thread faulting on one CPU while
+another CPU installed a program, unmapped a mapping or forked stopped both; the stress run's
+churning pairs reproduce it on every run at 4 and 8 CPUs on both SMP presets (see
+[testing.md](testing.md#the-frame-lock-under-shootdowns)).
+
+The stress heartbeat reports how long requests waited for their answers, mean and worst, by
+the kernel's clock. Under QEMU's TCG that measures emulated IPIs and the host's scheduling of
+vCPU threads more than anything a CPU does. Over 40 s runs with the answering frame lock the
+means were 26–31 us at 4 CPUs and 114–174 us at 8; the worst waits, 4–103 ms, are a vCPU the
+host did not run, not a protocol that is slow. No comparison with the old lock is meaningful:
+it hung within its first seconds.
 
 **The check.** On `aarch64-virt-smp` and `x86_64-qemu-smp` the `shootdown` banner line gates
 the exit status:
