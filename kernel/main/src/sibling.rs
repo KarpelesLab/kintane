@@ -199,7 +199,9 @@ pub fn stress_cycles() -> u64 {
 /// Build, run and destroy one spinning process; see the section comment. On the auditor's
 /// thread, after the waiting process's cycle.
 pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
-    if round % 2 == 0 {
+    // One CPU is the boot check's case, and there the spinner would only take time from the
+    // workloads the run is measuring.
+    if round % 2 == 0 || preempt::stats().cpus < 2 {
         return Ok(());
     }
     let stacks = [crate::procs::stress_stack(), crate::waits::stress_stack()];

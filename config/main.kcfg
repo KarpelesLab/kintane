@@ -128,15 +128,16 @@ config NR_CPUS
 config KERNEL_THREAD_SLOTS
     int "Guarded stack slots for kernel threads"
     range 2 256
-    default 15 if STRESS_TEST && DRIVER_ISOLATION
-    default 14 if STRESS_TEST
+    default 16 if STRESS_TEST && DRIVER_ISOLATION
+    default 15 if STRESS_TEST
     default 8
     help
         How many kernel threads may hold a guarded stack at once, not
         counting the one each secondary CPU takes to come up on. The
         scheduler's own check holds four and the stress run four more, so
-        eight is the floor for a test build; a build that asks for fewer
-        than its threads need fails to compile, in kernel/main/src/preempt.rs.
+        eight is the floor for a test build; with userspace the standing
+        file server holds one more. A build that asks for fewer than its
+        threads need fails to compile, in kernel/main/src/preempt.rs.
 
         The port's linker script reserves this many slots plus one per
         secondary CPU, so the array grows with NR_CPUS without anyone

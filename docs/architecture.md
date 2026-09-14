@@ -477,7 +477,10 @@ substrate the syscall layer exposes as capabilities; see
 
 `kernel/main/src/wait.rs` is how a thread waits for something another thread, another CPU
 or an interrupt will do. Everything that blocks is built on it: the waiting system calls,
-the kernel's own file service, and the Linux personality's blocking calls to come.
+the kernel's standing file server, and the Linux personality's blocking calls to come. The file
+server waits on all its connections through one queue of its own: each channel it has adopted
+relays its wakes to that queue (`objects::ChanRef::relay_to`), so one thread blocks with no
+deadline and still sees a request on any of them.
 
 - **The primitive.** `preempt::block_until(deadline, &woken)` takes the scheduler lock, checks
   the flag, arms the thread's timer if there is a deadline, and blocks. `preempt::wake_blocked(id)`

@@ -79,6 +79,8 @@ mod timekeeping;
 #[cfg(CONFIG_USERSPACE)]
 mod channels;
 #[cfg(CONFIG_USERSPACE)]
+mod fileserver;
+#[cfg(CONFIG_USERSPACE)]
 mod objects;
 #[cfg(CONFIG_USERSPACE)]
 mod procs;

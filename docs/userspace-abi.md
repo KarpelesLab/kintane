@@ -153,10 +153,19 @@ scheduler interrupt that arrived in user mode ends its thread on the way back if
 process has ended. Nothing of the process is freed until every thread is gone. Its exit is posted to `process_wait`'s
 queue when the last thread has gone.
 
-**A file service.** `lib/vfsproto` is a channel protocol (open, read, close, one 64-byte
-message each). The boot check serves it from a kernel thread over `kernel/vfs` on the
-mounted test volume, and `init` reads `/HELLO.TXT` through it. That is the VFS as a service a
-program reaches through a channel it was handed, not a set of system calls.
+**A file server.** `lib/vfsproto` is a channel protocol (open, read, close, one 64-byte
+message each). A kernel thread, `kernel/main/src/fileserver.rs`, serves it over `kernel/vfs`
+on the mounted test volume. The thread is started once at boot and never stopped. The kernel
+gives a process a connection — a channel of its own, one end in the process's table — and
+the server adopts the other end. Each connection has its own open files, and the server lets
+go of a connection when its client's end closes. It waits on every connection through one
+queue of its own, which each adopted channel also wakes. It holds the volume only for the
+request it is answering, through a lease the stress run's filesystem workload takes too, so
+an open file is a path and an offset rather than a handle into the volume. `init` reads
+`/HELLO.TXT` through it in the `waits` check, and a second process does the same after that
+check has ended. That is the VFS as a service a program reaches through a channel it was
+handed, not a set of system calls. No program can yet ask for a connection itself: the kernel
+hands one to the processes it starts.
 
 **What the check proves** (`kernel/main/src/waits.rs`, the `waits` banner line, gating the
 verdict on every x86_64 and aarch64 preset including both SMP ones). `init`:

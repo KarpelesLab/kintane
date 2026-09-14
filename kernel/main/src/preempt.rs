@@ -180,10 +180,15 @@ pub const MAX_STACKS: usize = kconfig::KERNEL_THREAD_SLOTS;
 /// A build whose checks need more stacks than it configured would fail at run time, in the
 /// middle of a check, with "no guarded thread stack left". The threads are known here, so
 /// it fails to compile instead. `stress::WORKLOADS` reuses the four `THREAD_STACKS` slots
-/// the scheduler's check leaves behind and claims `stress::EXTRA_STACKS` more, and the
-/// driver-isolation check claims `isolation::STACKS` for its domains on every boot.
+/// the scheduler's check leaves behind and claims `stress::EXTRA_STACKS` more, the
+/// driver-isolation check claims `isolation::STACKS` for its domains on every boot, and with
+/// userspace the standing file server (`fileserver`) keeps one for as long as the machine runs.
 const _: () = assert!(
-    MAX_STACKS >= THREAD_STACKS + crate::stress::EXTRA_STACKS + crate::isolation::STACKS,
+    MAX_STACKS
+        >= THREAD_STACKS
+            + crate::stress::EXTRA_STACKS
+            + crate::isolation::STACKS
+            + kconfig::USERSPACE as usize,
     "KERNEL_THREAD_SLOTS is below what this build's kernel threads need"
 );
 
@@ -782,10 +787,10 @@ pub fn where_is(id: ThreadId) -> Option<(thread::State, Option<usize>)> {
 /// Whether the scheduler is running, so a thread that ends must go through
 /// [`exit_thread`] rather than any table of its own.
 #[cfg_attr(
-    not(CONFIG_USERSPACE),
+    not(CONFIG_MM_PAGED),
     expect(
         dead_code,
-        reason = "asked only by user threads ending, which need USERSPACE"
+        reason = "asked only by user threads ending and by the volume's lease, which need MM_PAGED"
     )
 )]
 pub fn scheduled() -> bool {

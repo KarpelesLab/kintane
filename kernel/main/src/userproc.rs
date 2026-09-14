@@ -1888,7 +1888,7 @@ pub(crate) fn endpoint_object(slot: usize, h: Handle) -> Option<ObjectId> {
 
 /// One end of a channel the kernel holds itself, for a service a program talks to: the
 /// other end is in the program's table, and this one in a small table of the kernel's own.
-/// `crate::waits`' file service is the first.
+/// `crate::fileserver` holds one per connection.
 pub(crate) struct KernelEnd {
     table: HandleTable<2>,
     handle: Handle,
@@ -1933,27 +1933,22 @@ impl Drop for KernelEnd {
 }
 
 impl KernelEnd {
-    /// Receive one message into `buf`, waiting until `deadline` for it. On a kernel thread.
-    pub(crate) fn recv(
-        &mut self,
-        buf: &mut [u8],
-        deadline: Option<Instant>,
-    ) -> Result<usize, Error> {
-        let queue = channel_queue(self.object).ok_or(Error::PeerClosed)?;
-        let (table, endpoint, object) = (&mut self.table, self.handle, self.object);
+    /// Receive one message into `buf` if one is queued: `ShouldWait` if none is, `PeerClosed`
+    /// once the program's end has closed and everything it sent has been received.
+    pub(crate) fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let ch = channel_of(self.object).ok_or(Error::PeerClosed)?;
         let mut handles = [Handle::from_raw(0); 2];
-        queue
-            .wait_until(deadline, || {
-                let Some(ch) = channel_of(object) else {
-                    return Some(Err(Error::PeerClosed));
-                };
-                match ch.receive(table, endpoint, buf, &mut handles) {
-                    Ok(got) => Some(Ok(got.bytes)),
-                    Err(ipc::Error::Empty) => None,
-                    Err(e) => Some(Err(channel_error(e))),
-                }
-            })
-            .unwrap_or(Err(Error::TimedOut))
+        ch.receive(&mut self.table, self.handle, buf, &mut handles)
+            .map(|got| got.bytes)
+            .map_err(channel_error)
+    }
+
+    /// Wake `queue` whenever this channel's waiters are woken: for a kernel thread that waits
+    /// on several channels in one queue of its own.
+    pub(crate) fn relay_to(&self, queue: &'static WaitQueue) {
+        if let Some(chan) = channel_of(self.object) {
+            chan.relay_to(queue);
+        }
     }
 
     /// Send `bytes` to the program, waking it if it waits.

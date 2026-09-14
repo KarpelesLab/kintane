@@ -26,6 +26,8 @@
 //!   forth, each blocking for the other; the stress run pins them to two CPUs. See [`pair`].
 //! * [`MODE_SPIN`] and [`MODE_SPINNER`] are two threads of one process: the second spins in user
 //!   mode for ever, and the first ends the process under it. See [`spin`].
+//! * [`MODE_FILES`] reads a file through the kernel's file server, as a process that is not the
+//!   first the server has served; see [`files`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -56,6 +58,8 @@ const MODE_PAIR_PEER: usize = 7;
 const MODE_SPIN: usize = 8;
 /// Spin in user mode for ever; see [`spinner`].
 const MODE_SPINNER: usize = 9;
+/// Read a file through the kernel's file server; see [`files`].
+const MODE_FILES: usize = 10;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -99,6 +103,7 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_PAIR_PEER => peer(handle(a)),
         MODE_SPIN => spin(handle(a)),
         MODE_SPINNER => spinner(handle(a)),
+        MODE_FILES => files(handle(a), handle(b)),
         _ => 0xbad0,
     };
     exit(code)
@@ -382,6 +387,17 @@ const PAIR_SUCCESS: u64 = 0x6c;
 const SPIN_SUCCESS: u64 = 0x6d;
 /// How long [`spin`] lets the spinner spin before ending the process under it.
 const SPIN_SETTLE_NS: u64 = 20_000_000;
+/// [`MODE_FILES`]'. Mirrors `kernel/main/src/fileserver.rs`.
+const FILES_SUCCESS: u64 = 0x6e;
+
+/// Read `/HELLO.TXT` through the file server `service` names, as [`MODE_WAITS`] does. Returns
+/// [`FILES_SUCCESS`], or the code of the step that did not behave.
+fn files(console: Handle, service: Handle) -> u64 {
+    match read_through_the_service(console, service) {
+        Ok(()) => FILES_SUCCESS,
+        Err(code) => code,
+    }
+}
 
 /// The timeout the timing steps use.
 const TIMEOUT_NS: u64 = 30_000_000;

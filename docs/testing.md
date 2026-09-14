@@ -410,7 +410,32 @@ had their spinner, pinned to a CPU other than the exiting thread's, stopped from
 One falsification did **not** fail. With the exit sending no reschedule IPI at all, the same
 stress run still passed with ten spinners stopped. The stress run keeps every CPU busy, so the
 spinner's CPU takes slice ticks, and the next tick stops it. The IPI is what reaches a spinner
-on an otherwise idle CPU, and nothing here isolates that case yet.
+on an otherwise idle CPU, and nothing here isolates that case yet. The stress cycle runs only
+with two CPUs or more; one CPU is the boot check's case.
+
+**The file server outlives the check that started it.** `waits` starts the kernel's standing
+file server (`kernel/main/src/fileserver.rs`), and `init` reads `/HELLO.TXT` through a
+connection to it. `waits` now also requires the server to have let go of that connection
+before it counts objects. The `files` line runs after `sibling`, once `waits` has torn its
+process down. It builds a second process, `init` in its files mode, gives it a new connection,
+and requires the same file read back:
+
+```
+  files      a second process read /HELLO.TXT through the server after waits ended; the same server thread, 2 connections since boot, 7 requests answered; 0 objects left, 0 frames left ok
+```
+
+The line requires the success code, the same server thread still running, exactly one new
+connection and at least two since boot, requests answered, the server's connection let go of,
+and every object and frame back. Without a disk it is skipped, and only on a machine that
+attached none.
+
+Falsified (applied, booted on `x86_64-qemu`, restored): a server thread that exits once its
+first connection closes serves `waits` and then fails this line as `the file server is NOT
+RUNNING`.
+
+The stress run's filesystem workload and the server share the volume through a lease, one
+iteration or one request at a time. The server is idle during the stress run, so that sharing
+is not exercised under load yet.
 
 ### 2b. Block storage
 

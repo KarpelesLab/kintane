@@ -17,9 +17,11 @@
 //!   that saw everything behave returns. From then on the kernel's later process checks run that
 //!   program rather than the copy embedded in the image.
 //!
-//! The mounted volume outlives the check: [`volume`] is how the stress run reaches it.
+//! The mounted volume outlives the check: a [`lease`] is how the file server and the stress run
+//! reach it.
 
 use core::cell::{SyncUnsafeCell, UnsafeCell};
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use arch::Cpu;
@@ -29,9 +31,10 @@ use block::testdisk::{self, SECTOR};
 use fat::Fat16;
 use hal::{EarlyConsole, PhysAddr};
 use mm::phys::FrameAllocator;
+use time::{Duration, Instant};
 use vfs::{Error, Kind, Vfs, Whence};
 
-use crate::{Check, Live, write_usize};
+use crate::{Check, Live, preempt, timekeeping, write_usize};
 
 /// Blocks the volume's cache holds. Fewer than `/BIG.BIN` has clusters, so reading it
 /// replaces slots and the check sees a cache under pressure rather than one that holds
@@ -63,18 +66,17 @@ static PROBE: SyncUnsafeCell<Storage<4, SECTOR>> = SyncUnsafeCell::new(Storage::
 /// SAFETY INVARIANT: borrowed only by [`contents`], on the boot path.
 static CHUNK: SyncUnsafeCell<[u8; 4096]> = SyncUnsafeCell::new([0; 4096]);
 
-/// The mounted volume, kept for the boot-time file service and the stress run.
+/// The mounted volume, kept for the file server and the stress run.
 ///
 /// Not a `SyncUnsafeCell`: a volume holds a `&dyn BlockDevice`, which is not `Sync`, so the
 /// compiler cannot vouch for sharing it and the invariant below is what does.
 struct Volume(UnsafeCell<Option<Fat16<'static, 'static>>>);
 
-// SAFETY: written once, by `check`, before `MOUNTED` is set. After that it is reached
-// only through `volume`: at boot, by `crate::waits`' file service on the boot thread, which
-// gives it up before the check returns; then by the stress run's filesystem workload thread
-// — of which there is one — or by the auditor while that thread is parked at a checkpoint.
-// So no two borrows are ever live at once, and the device it holds is itself shared-safe
-// (its driver locks).
+// SAFETY: written once, by `check`, before `MOUNTED` is set. After that it is reached through
+// `volume`, on the boot path before any other thread can use the volume, or through a `Lease`,
+// which one thread holds at a time: the file server for one request, the stress run's
+// filesystem workload for one iteration, its auditor for one audit. So no two borrows are ever
+// live at once, and the device it holds is itself shared-safe (its driver locks).
 unsafe impl Sync for Volume {}
 
 static VOLUME: Volume = Volume(UnsafeCell::new(None));
@@ -89,15 +91,87 @@ pub fn mounted() -> bool {
 /// The mounted volume, once the check has mounted it.
 ///
 /// # Safety
-/// The caller is the one thread allowed to use the volume: the boot-time file service before
-/// the stress run starts, the stress run's filesystem workload, or the auditor while that
-/// workload is parked. See [`Volume`]'s invariant.
+/// The caller is on the boot path, before the file server or the stress run has started: no
+/// other thread may use the volume. Everything after takes a [`lease`]. See [`Volume`]'s
+/// invariant.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(
+        dead_code,
+        reason = "the Linux personality's check is the one boot-path user left"
+    )
+)]
 pub unsafe fn volume() -> Option<&'static mut Fat16<'static, 'static>> {
     if !MOUNTED.load(Ordering::Acquire) {
         return None;
     }
     // SAFETY: `MOUNTED` is set only after the one write; the caller upholds exclusivity.
     unsafe { (*VOLUME.0.get()).as_mut() }
+}
+
+/// Whether a [`Lease`] on the volume is held.
+static LEASED: AtomicBool = AtomicBool::new(false);
+
+/// How often a thread waiting for the volume looks again.
+const LEASE_POLL: Duration = Duration::from_nanos(1_000_000);
+
+/// The volume, held by one thread until this is dropped.
+///
+/// Every user of the volume once other threads can run takes one: the file server for each
+/// request, the stress run's filesystem workload for each iteration, its auditor for each
+/// audit. They take turns without knowing about each other, and none holds the volume while it
+/// waits for anything else.
+pub struct Lease {
+    volume: &'static mut Fat16<'static, 'static>,
+}
+
+impl Deref for Lease {
+    type Target = Fat16<'static, 'static>;
+
+    fn deref(&self) -> &Self::Target {
+        self.volume
+    }
+}
+
+impl DerefMut for Lease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.volume
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        LEASED.store(false, Ordering::Release);
+    }
+}
+
+/// Take the volume, waiting for whoever holds it until `deadline` (`None`: for as long as it
+/// takes). `None` if no volume is mounted, or if the deadline passed first. A thread waits by
+/// sleeping, so one that is not on the scheduler is told `None` at once if the volume is held.
+pub fn lease(deadline: Option<Instant>) -> Option<Lease> {
+    if !mounted() {
+        return None;
+    }
+    loop {
+        if LEASED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // SAFETY: see `Volume`: the lease is this thread's, so this is the only borrow.
+            return match unsafe { (*VOLUME.0.get()).as_mut() } {
+                Some(volume) => Some(Lease { volume }),
+                None => {
+                    LEASED.store(false, Ordering::Release);
+                    None
+                }
+            };
+        }
+        let now = timekeeping::now();
+        if !preempt::scheduled() || deadline.is_some_and(|d| now >= d) {
+            return None;
+        }
+        preempt::sleep_until(now.saturating_add(LEASE_POLL));
+    }
 }
 
 /// What an error names, for a console with no formatter.

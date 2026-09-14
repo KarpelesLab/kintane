@@ -9,8 +9,8 @@
 //!
 //! The kernel builds `init` in its waits mode and gives it three handles: the console, a
 //! handle to its own process (so it can start a thread in itself), and, when the test disk's
-//! volume is mounted, one end of a channel whose other end this check serves as a file
-//! service. `init` then, in order:
+//! volume is mounted, a connection to the kernel's file server (`crate::fileserver`), which
+//! this check starts and which runs from then on. `init` then, in order:
 //!
 //! 1. polls an empty completion queue and is told `ShouldWait` at once, then waits on it with a
 //!    timeout and must be told `TimedOut` no earlier than the timeout and not long after. A
@@ -25,7 +25,7 @@
 //! 4. moves an event handle across a channel with only `WAIT` kept, and sees the receiver able to
 //!    wait on it and refused a signal, and the sender's handle gone. A send naming a handle it does
 //!    not hold moves nothing;
-//! 5. opens `/HELLO.TXT` through the file service, reads it in pieces, closes it, prints it, and
+//! 5. opens `/HELLO.TXT` through the file server, reads it in pieces, closes it, prints it, and
 //!    compares it with what the disk holds.
 //!
 //! # What must hold
@@ -34,8 +34,8 @@
 //! * Threads really blocked, were really woken, and a wait really timed out: [`wait::stats`] counts
 //!   each, and a kernel whose "waits" were all answered without blocking fails here even if the
 //!   program saw the right answers.
-//! * On a machine with the test disk, the service answered requests. Without one, that step is
-//!   reported skipped.
+//! * On a machine with the test disk, the server answered requests, and let go of the connection
+//!   once `init` had gone. Without one, that step is reported skipped.
 //! * Every thread ended, and every object and frame is back.
 //!
 //! A wake from another CPU cannot be shown here: secondary CPUs join the scheduler only after
@@ -46,10 +46,7 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use hal::EarlyConsole;
-use sched::ThreadId;
-use time::{Duration, Instant};
-use vfs::Vfs;
-use vfsproto::{Request, Status};
+use time::Duration;
 
 use crate::preempt::{self, sleep_until};
 use crate::{Check, objects, spawn, timekeeping, userproc, wait, write_hex, write_usize};
@@ -68,22 +65,17 @@ const STACKS: [usize; 3] = [1, 2, 3];
 
 /// The longest the check gives `init` for everything.
 const PATIENCE: Duration = Duration::from_nanos(10_000_000_000);
-/// How long the service waits for one request before looking whether `init` is still there.
-const SERVE_SLICE: Duration = Duration::from_nanos(20_000_000);
 /// How often the check looks for threads that have ended.
 const POLL: Duration = Duration::from_nanos(5_000_000);
-
-/// Files the service holds open at once.
-const FILES: usize = 4;
 
 /// What one run of `init` came to.
 struct Outcome {
     /// Whether `init`'s thread was started at all.
     started: bool,
     code: Option<u64>,
-    /// Requests the file service answered, or `None` with no volume to serve.
+    /// Requests the file server answered while `init` ran, or `None` with no volume to serve.
     served: Option<usize>,
-    /// Why the service stopped early, if it did.
+    /// Why `init` could not be given a connection, if it could not.
     service_failed: Option<&'static str>,
 }
 
@@ -110,6 +102,8 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     if ended {
         userproc::teardown(SLOT);
     }
+    // The server lets go of `init`'s connection when it sees it close, on its own thread.
+    let settled = crate::fileserver::settle();
     let after = wait::stats();
     let blocks = after.blocks - before.blocks;
     let wakes = after.wakes - before.wakes;
@@ -136,18 +130,21 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     c.write_str(" timeouts");
     let service_ok = match (outcome.served, outcome.service_failed) {
         (_, Some(why)) => {
-            c.write_str("; FILE SERVICE FAILED: ");
+            c.write_str("; FILE SERVER FAILED: ");
             c.write_str(why);
             false
         }
         (Some(n), None) => {
-            c.write_str("; file service answered ");
+            c.write_str("; file server answered ");
             write_usize(c, n);
-            n > 0
+            if !settled {
+                c.write_str(", NEVER LET GO OF THE CONNECTION");
+            }
+            n > 0 && settled
         }
         (None, None) if crate::fs::mounted() => {
-            // A volume to serve, and a service that never ran: `init` was never started.
-            c.write_str("; file service NEVER RAN");
+            // A volume to serve, and a server never asked: `init` was never started.
+            c.write_str("; file server NEVER USED");
             false
         }
         (None, None) => {
@@ -210,131 +207,43 @@ fn run(program: &elf::Program) -> Outcome {
     let Some(me) = userproc::process_handle(SLOT) else {
         return out;
     };
-    let mut service = if crate::fs::mounted() {
-        userproc::kernel_channel(SLOT)
-    } else {
+    let files = if !crate::fs::mounted() {
         None
+    } else if !crate::fileserver::start() {
+        out.service_failed = Some("the file server did not start");
+        None
+    } else {
+        let connection = crate::fileserver::connect(SLOT);
+        if connection.is_none() {
+            out.service_failed = Some("the file server refused a connection");
+        }
+        connection
     };
-    let files = service.as_ref().map_or(0, |(h, _)| h.raw() as usize);
-    let args = [MODE_WAITS, console.raw() as usize, me.raw() as usize, files];
+    let served_before = crate::fileserver::served();
+    let args = [
+        MODE_WAITS,
+        console.raw() as usize,
+        me.raw() as usize,
+        files.map_or(0, |h| h.raw() as usize),
+    ];
     let Some(main) = userproc::start(SLOT, 0, args) else {
         return out;
     };
     out.started = true;
     let give_up = timekeeping::now().saturating_add(PATIENCE);
-    if let Some((_, end)) = service.as_mut() {
-        match serve(end, main, give_up) {
-            Ok(n) => out.served = Some(n),
-            Err(why) => out.service_failed = Some(why),
-        }
-    }
     while (preempt::alive(main) || userproc::threads_live(SLOT) != 0)
         && timekeeping::now() < give_up
     {
         sleep_until(timekeeping::now().saturating_add(POLL));
+    }
+    if files.is_some() {
+        out.served = Some((crate::fileserver::served() - served_before) as usize);
     }
     if !preempt::alive(main) && userproc::threads_live(SLOT) == 0 {
         // Every thread has ended, so nothing else borrows the process.
         out.code = userproc::slot(SLOT).and_then(|p| p.exit);
     }
     out
-}
-
-/// Answer file requests on `end` until `main` exits or `give_up`. Returns how many.
-///
-/// The service is `kernel/vfs` over the mounted test volume, behind the protocol in
-/// `lib/vfsproto`: a program reaches a file only by asking this thread for it, over a
-/// channel it was handed.
-fn serve(
-    end: &mut userproc::KernelEnd,
-    main: ThreadId,
-    give_up: Instant,
-) -> Result<usize, &'static str> {
-    // SAFETY: the stress run, whose filesystem workload is the volume's other user, has not
-    // started, and nothing else on the boot path holds the volume: see `fs::volume`.
-    let Some(volume) = (unsafe { crate::fs::volume() }) else {
-        return Err("the volume is not mounted");
-    };
-    let mut ns = Vfs::<1, FILES>::new();
-    ns.mount("/", volume)
-        .map_err(|_| "the volume would not mount in the service's namespace")?;
-    let mut files: [Option<vfs::Fd>; FILES] = [None; FILES];
-    let mut served = 0;
-    let mut request = [0u8; vfsproto::MESSAGE];
-    let mut failed = None;
-    while preempt::alive(main) && timekeeping::now() < give_up {
-        let slice = timekeeping::now().saturating_add(SERVE_SLICE).min(give_up);
-        let n = match end.recv(&mut request, Some(slice)) {
-            Ok(n) => n,
-            Err(abi::Error::TimedOut) => continue,
-            // The program has gone, and its channel with it.
-            Err(abi::Error::PeerClosed) => break,
-            Err(_) => {
-                failed = Some("a request could not be received");
-                break;
-            }
-        };
-        let reply = answer(&mut ns, &mut files, request.get(..n).unwrap_or(&[]));
-        served += 1;
-        if end.send(reply.as_bytes()).is_err() {
-            failed = Some("a reply could not be sent");
-            break;
-        }
-    }
-    for fd in files.iter_mut().filter_map(Option::take) {
-        let _ = ns.close(fd);
-    }
-    let _ = ns.unmount("/");
-    failed.map_or(Ok(served), Err)
-}
-
-/// One reply to one request.
-fn answer(
-    ns: &mut Vfs<'_, 1, FILES>,
-    files: &mut [Option<vfs::Fd>; FILES],
-    request: &[u8],
-) -> vfsproto::Message {
-    match vfsproto::parse_request(request) {
-        None => vfsproto::status(Status::BadRequest, 0),
-        Some(Request::Open { path }) => {
-            let Ok(path) = core::str::from_utf8(path) else {
-                return vfsproto::status(Status::NotFound, 0);
-            };
-            let Some(free) = files.iter().position(Option::is_none) else {
-                return vfsproto::status(Status::Full, 0);
-            };
-            match ns.open(path) {
-                Ok(fd) => {
-                    files[free] = Some(fd);
-                    vfsproto::status(Status::Ok, free as u8)
-                }
-                Err(vfs::Error::NotFound) => vfsproto::status(Status::NotFound, 0),
-                Err(_) => vfsproto::status(Status::Io, 0),
-            }
-        }
-        Some(Request::Read { file, max }) => {
-            let Some(Some(fd)) = files.get(usize::from(file)).copied() else {
-                return vfsproto::status(Status::BadFile, file);
-            };
-            let mut data = [0u8; vfsproto::PAYLOAD];
-            // The request's own size is a program's word, so it is bounded here, not trusted.
-            let want = usize::from(max).min(vfsproto::PAYLOAD);
-            match ns.read(fd, &mut data[..want]) {
-                Ok(n) => vfsproto::reply(Status::Ok, file, &data[..n])
-                    .unwrap_or(vfsproto::status(Status::Io, file)),
-                Err(_) => vfsproto::status(Status::Io, file),
-            }
-        }
-        Some(Request::Close { file }) => {
-            match files.get_mut(usize::from(file)).and_then(Option::take) {
-                Some(fd) => {
-                    let _ = ns.close(fd);
-                    vfsproto::status(Status::Ok, file)
-                }
-                None => vfsproto::status(Status::BadFile, file),
-            }
-        }
-    }
 }
 
 fn free_frames() -> usize {

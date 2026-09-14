@@ -30,7 +30,7 @@
 
 use core::cell::SyncUnsafeCell;
 use core::ops::Deref;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use arch::Cpu;
 use kobject::handle::{Entry, Handle, HandleTable};
@@ -404,6 +404,21 @@ struct ChannelSlot {
     /// nothing for its end costs only a second look. Woken by every send, by an end closing,
     /// and by the channel being freed.
     waits: WaitQueue,
+    /// A second queue every wake of `waits` also wakes, or null: for a thread that waits on
+    /// many channels at once in a queue of its own (`crate::fileserver`). Only `'static`
+    /// queues are stored here.
+    relay: AtomicPtr<WaitQueue>,
+}
+
+impl ChannelSlot {
+    /// Wake this channel's waiters, and its relay's.
+    fn wake(&self) {
+        self.waits.wake_all();
+        // SAFETY: see `relay`: null, or a `'static` queue.
+        if let Some(relay) = unsafe { self.relay.load(Ordering::Acquire).as_ref() } {
+            relay.wake_all();
+        }
+    }
 }
 
 static CHANNELS: [ChannelSlot; MAX_CHANNELS] = [const {
@@ -412,6 +427,7 @@ static CHANNELS: [ChannelSlot; MAX_CHANNELS] = [const {
         claimed: AtomicBool::new(false),
         ends: AtomicUsize::new(0),
         waits: WaitQueue::new(),
+        relay: AtomicPtr::new(core::ptr::null_mut()),
     }
 }; MAX_CHANNELS];
 
@@ -426,6 +442,19 @@ impl ChanRef {
     /// The queue threads waiting to receive on this channel wait in.
     pub fn waiters(&self) -> &'static WaitQueue {
         &self.slot.waits
+    }
+
+    /// From now until the channel is freed, wake `queue` too whenever this channel's waiters
+    /// are woken.
+    pub fn relay_to(&self, queue: &'static WaitQueue) {
+        self.slot
+            .relay
+            .store(core::ptr::from_ref(queue).cast_mut(), Ordering::Release);
+    }
+
+    /// Wake this channel's waiters, and its relay's.
+    pub fn wake(&self) {
+        self.slot.wake();
     }
 }
 
@@ -500,7 +529,8 @@ fn endpoint_gone(index: usize) {
     // `ChanRef` to it does either.
     drop(unsafe { (*slot.chan.get()).take() });
     // A thread still waiting on it looks again and finds it gone.
-    slot.waits.wake_all();
+    slot.wake();
+    slot.relay.store(core::ptr::null_mut(), Ordering::Release);
     slot.claimed.store(false, Ordering::Release);
 }
 
@@ -541,20 +571,20 @@ fn after_release(chan: &ChanRef, endpoint: ObjectId) {
     {
         retire(endpoint);
     }
-    chan.waiters().wake_all();
+    chan.wake();
 }
 
 /// Wake whoever waits on the channel `endpoint` is an end of.
 pub fn wake_channel(endpoint: ObjectId) {
     if let Some(chan) = channel(endpoint) {
-        chan.waiters().wake_all();
+        chan.wake();
     }
 }
 
 /// Wake every thread waiting on any channel.
 pub fn wake_all_channel_waiters() {
     for slot in &CHANNELS {
-        slot.waits.wake_all();
+        slot.wake();
     }
 }
 

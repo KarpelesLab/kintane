@@ -139,6 +139,19 @@ pub fn sibling_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// The standing file server serves a second process after the check that started it has
+/// ended. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn files_check(c: &dyn EarlyConsole) -> Check {
+    crate::fileserver::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn files_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// Run a process whose second thread spins in user mode on another CPU, end it, and require
 /// the spinner stopped. `Ok` without USERSPACE.
 #[cfg(CONFIG_USERSPACE)]
