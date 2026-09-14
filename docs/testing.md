@@ -2047,8 +2047,10 @@ decides whether the run passed.
 
 #### What the soaks found
 
-Three attempts at a two-hour soak died before their first ten minutes, each on a different
-bound, and none on anything the kernel did wrong. They are why the bounds above changed.
+Seven attempts at a two-hour soak died, six of them inside the first ten minutes, on six
+distinct bounds — and none on anything the kernel did wrong. They are why the bounds above
+changed. Each attempt ran on the tree as it stood, so a run that died on a bound fixed later is
+evidence for that fix, not against it.
 
 | Run | Died at | On | What it was |
 |---|---|---|---|
@@ -2058,6 +2060,7 @@ bound, and none on anything the kernel did wrong. They are why the bounds above 
 | `aarch64-virt-smp`, 8 CPUs | 77 s | the same | the same, on final code: which is what settled it |
 | `x86_64-qemu-smp`, 8 CPUs | 159 s | `user process: a process ran its slices after it moved and made no progress` | `RAN_SLICES`, 16, below what healthy runs measure |
 | `x86_64-qemu-smp`, 8 CPUs | 42 s | `waiting process: a waiting process's receive timed out: a wake-up was lost` | a message that arrived a second late, reported as one that never came |
+| `aarch64-virt-smp`, 8 CPUs | 676 s | the same | the same, and the longest any attempt ran before its fix landed |
 
 Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
 
