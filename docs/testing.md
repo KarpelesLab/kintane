@@ -442,8 +442,10 @@ is not exercised under load yet.
 With `QEMU_BLOCK_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild
 writes `testdisk.img` beside the image. It is 6 MiB in three regions: 4096 sectors in which every
 byte is a function of its sector and offset, with a header in sector 0; a scratch area the
-write checks use; and a FAT16 volume for the [files check](#2e-files). QEMU attaches it with
-`snapshot=on`, so a run's writes never reach the file: to a `virtio-blk-device` in a memory-mapped
+write checks use; and a FAT16 volume for the [files check](#2e-files). Each run attaches a fresh
+copy of it, written for real, which kbuild reads back after a passing run
+([2e](#the-disk-image-after-a-run)), so the image kbuild built never changes: to a
+`virtio-blk-device` in a memory-mapped
 slot on aarch64, and to a modern-only `virtio-blk-pci` function on the PCs, through every boot
 path they have (`-kernel`, BIOS and UEFI). The format is written twice, in
 `kernel/block/src/testdisk.rs` and `kbuild/src/testdisk.rs`, and a pinned set of bytes
@@ -766,6 +768,7 @@ lists, the nightly job iterates, and the smoke run replays:
 | `aml` | DSDT and SSDT bytecode, loaded and run as the kernel routes pins | seeded: QEMU `q35` and `pc` DSDTs, body mutated, checksum always repaired; `\_PIC(1)`, pin routes, and every method under a 5000-step budget |
 | `elf` | static executables | built valid, then one deliberate mistake a third of the time |
 | `module` | relocatable modules and their bundle | seeded: a module kbuild built, sometimes bundled |
+| `fat` | FAT16 volumes, and every write the driver makes to one | seeded: a script that uses every operation; an image mounted, walked, read and written, which must walk clean after writes if it did before; or an operation script run against a model of every file, walked after each operation and replayed at every cut point |
 | `bootproto` | the boot protocol's tag stream | built with the crate's own `Builder`, then corrupted |
 | `menu` | the boot menu's entry list, and the menu it drives | built valid, then one mistake a person makes |
 | `pci` | configuration space, as devices answer enumeration | a machine with bridges and buses laid out on purpose |
@@ -871,10 +874,16 @@ On `aarch64-virt` the line reads:
 The stress run adds a filesystem workload on the same presets. It reads random ranges of
 `/BIG.BIN`, reads the small files whole, and lists the root, all through a namespace, dropping the
 whole cache every 64 iterations. The disk it reads is the one the block workload is writing at the
-same time. The audit requires every handle closed and the cache's books balanced.
+same time. It also writes: `/SUB/STRESS.TMP` grows by appends of its own bytes, is read back
+against them, is cut short once it passes 24 KB, and is removed and made again, with a sync at the
+end of every iteration. The audit requires every handle closed, the cache's books balanced with no
+block left unwritten, and the volume's consistency walk to find no lost cluster and the two tables
+the same.
 
-`vfs`, `bcache` and `fat` are host-tested (13, 10 and 17 tests). The FAT reader's tests build their
-volumes with a writer of their own, independent of kbuild's.
+`vfs`, `bcache` and `fat` are host-tested (23, 18 and 27 tests). The FAT tests build their volumes
+with a writer of their own, independent of kbuild's, or format them empty and fill them through
+the driver itself. `vfsproto` has 8 host tests, and kbuild's own FAT reader, disk check and crash
+test have theirs among kbuild's.
 
 Each property was falsified: the mutation was applied and checked, the check failed, and the file
 was restored and compared byte for byte.
@@ -898,6 +907,81 @@ Moving kbuild's FAT writer into `kbuild/src/fat16.rs` was checked for the ESP by
 writer and the new one as standalone programs over the same files. The two images are
 byte-identical, and a copy of the new writer with one boot-sector field changed is not, so the
 comparison can see a difference.
+
+#### Writing
+
+On the same presets with userspace, two checks write the volume and gate the boot.
+
+- **`files write`**, right after `files`. `init` is given two connections to the file server, one
+  writable and one not. Through the first it creates `/KINTANE/NWTMP.TXT` exclusively, writes
+  1,200 bytes a message at a time and reads them back, truncates to 90 bytes and reads those, is
+  refused a second exclusive create, makes a directory once, renames the file, removes both, is
+  refused a write on a file it opened to read, and leaves `/KINTANE/NATIVE.OUT`, synced. Through the
+  read-only connection a `mkdir` and an open for writing are both refused. Then the kernel reads
+  the volume itself: `NATIVE.OUT` holds exactly its bytes, the names it removed are gone, nothing is
+  waiting in the cache, and the consistency walk finds no lost cluster and the tables the same.
+- **The `linux` check** runs `linux-hello` a third time, in its `files` mode, which does the same
+  through Linux's calls: `openat` with `O_CREAT|O_EXCL`, `O_APPEND` and `O_TRUNC`, `write`,
+  `lseek`, `fstat`, `ftruncate`, `mkdirat`, `renameat` (and `EXDEV` across two directories),
+  `unlinkat` with and without `AT_REMOVEDIR`, `fsync`, and `ENAMETOOLONG` for a name FAT cannot
+  hold. On x86_64 `/KINTANE/LINUX.OUT` is made with `open`. It exits 46, or the step (80 to 96)
+  that was wrong; the check requires 46, reads the file back, and walks the volume.
+
+```
+  files write init: wrote the disk through the file service; created, wrote, read back, truncated, renamed and removed through a writable connection; refused through a read-only one; /KINTANE/NATIVE.OUT read back, the volume consistent: 7 files, 2 directories, no lost cluster, the tables the same; the same server thread; 0 objects left, 0 frames left ok
+```
+
+#### The disk image after a run
+
+The test disk is no longer attached with `snapshot=on`. Before each run kbuild copies the image it
+built to `testdisk.run.img` and attaches that copy, so every boot starts from the same bytes and
+the image kbuild built never changes. After a run the guest passed, kbuild reads the copy with its
+own FAT reader — `kbuild/src/fat16.rs`, which shares no code with the kernel's driver — and fails
+the run unless the volume walks consistent with no lost cluster and both tables the same, every name
+the writing checks remove is gone, and each of `NATIVE.OUT` and `LINUX.OUT` that the console says the
+kernel read back holds exactly the bytes it should. kbuild does not take the kernel's word for it:
+
+```
+  disk image: FAT16 consistent, 7 files, 2 directories, no lost cluster, the tables the same; kbuild read back /KINTANE/NATIVE.OUT and /KINTANE/LINUX.OUT
+```
+
+#### Cutting the power
+
+`kbuild crashtest --preset x86_64-qemu --count N --seed S` builds with `FS_CRASH_TEST`. With it the
+kernel, once the fs check has mounted the volume, writes it for ever instead of booting on: files in
+`/CRASH` appended to, overwritten, truncated, renamed over each other and removed, a directory made
+and removed, a sync now and then. Every byte of every file there is `out_byte(0x41, offset)`,
+whichever file it was written through, so no rename or truncation changes what a byte must be. For
+each cut kbuild starts the guest on a fresh copy of the image, waits for `fscrash: writing`, lets it
+write for a random 0 to 3 seconds, and kills QEMU with `SIGKILL`: no flush and no orderly shutdown,
+the image holds what QEMU had written when the signal arrived. Then kbuild's reader walks the copy.
+It must find no chain through a free cluster, no cluster claimed twice, no file longer than its
+chain, and no byte below a `/CRASH` file's size that the workload did not write. Lost clusters and
+table copies apart are counted, since that is what the write order allows a cut to leave.
+
+```
+$ kbuild crashtest --preset x86_64-qemu --count 30 --seed 20260914
+  cut   1 after 2777 ms,  2400+ ops: consistent; 10 files, 0 lost clusters, tables differ in 0; 5 workload files, 19443 bytes checked
+  ...
+30 cuts, 0 inconsistent; 9 left lost clusters (at most 6), 6 left the tables apart; at least 46560 operations written
+```
+
+A cut that finds an inconsistent volume keeps its image as `testdisk.crash-<n>.img`. The host
+tests make the same argument exhaustively on a smaller scale: `fat`'s
+`every_point_a_crash_could_stop_the_writes_leaves_a_consistent_volume` records every block a
+workload's cache writes, replays every prefix of that sequence on the empty volume, and walks each
+one; it also requires that some prefix left a lost cluster and some left the tables apart, so it
+cannot pass by never reaching the states the ordering exists for. The `fat` fuzz target does the
+same for every operation script it runs.
+
+The write path was falsified like the read path:
+
+| Mutation | What caught it |
+|---|---|
+| The directory entry, first cluster and size, is written before the data and the table | `fat`'s crash-point host test; `kbuild crashtest`, 2 cuts of 8: `/CRASH/F5.BIN: 1 clusters hold a 1024-byte file`. A boot with no cut still passes, as it should |
+| Only the first table copy is written | 7 `fat` host tests; boot: `files write`'s tables differ, and the `linux` check's `THE VOLUME IS NOT CONSISTENT` |
+| The same, with both kernel checks made blind to differing tables | kbuild, after the guest exited 0: `the disk image after a clean exit lost 0 clusters, and its tables differ in 6 entries` |
+| A sync writes nothing back | 7 `fat` host tests; boot: `files write`'s `2 BLOCKS NEVER WRITTEN after the sync`, and the `linux` check's `THE VOLUME IS NOT CONSISTENT` |
 
 ### 2f. The Linux personality
 
