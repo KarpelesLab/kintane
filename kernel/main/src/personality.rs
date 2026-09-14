@@ -303,6 +303,7 @@ fn dispatch(
         Call::Sigaltstack => signals::altstack(a0, a1),
         Call::Kill => signals::kill(slot, a0, a1),
         Call::Tgkill => signals::tgkill(slot, a0, a1, a2),
+        Call::RtSigqueueinfo => signals::rt_sigqueueinfo(slot, a0, a1, a2),
         Call::Socket => socket::socket(slot, a0, a1, a2),
         Call::Connect => socket::connect(slot, a0, a1, a2),
         Call::Accept => socket::accept4(slot, a0, a1, a2, 0),
@@ -2242,7 +2243,9 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("\n  linux sig  NOT RUN: the run before it left its processes in place");
         return Check::Failed;
     }
-    rich.and(signals::check(c)).and(signals::faults_check(c))
+    rich.and(signals::check(c))
+        .and(signals::faults_check(c))
+        .and(signals::rtsig_check(c))
 }
 
 fn free_frames() -> usize {

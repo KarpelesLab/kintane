@@ -36,9 +36,20 @@
 //!
 //! Stopping: `SIGSTOP` is refused by `kill` and `tgkill`, and the other stop signals' default
 //! action does nothing. Alternate signal stacks: `sigaltstack` reports none and refuses to set
-//! one. `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd`, real-time signal queueing (a pending
-//! signal is a bit, so a second before the first is delivered is lost), and saving
-//! floating-point state in the frame.
+//! one. `rt_sigsuspend`, `rt_sigtimedwait` and `signalfd`.
+//!
+//! Floating-point state is not saved in the frame, and cannot honestly be until `hal::HasFpu`
+//! exists: no context switch on either port saves those registers either, so a handler is not
+//! the only thing that changes them under the code it interrupted.
+//! `linux::signal::restore` refuses a frame that carries such state rather than reading past it.
+//!
+//! # Queued signals
+//!
+//! A signal from [`RT_FIRST`] up queues: three sent are three delivered, oldest first, each with
+//! the value `rt_sigqueueinfo` gave it. Below that a signal is one bit, so a second before the
+//! first is delivered is the same signal arriving once, keeping the first sender's value. A
+//! process may hold [`RT_QUEUED`] entries at once, and a send past that is refused with `EAGAIN`
+//! rather than dropped.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -128,6 +139,102 @@ static FIRST_MASK: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PR
 static SENDER: [[AtomicU32; SIGNALS]; MAX_PROCS] =
     [const { [const { AtomicU32::new(0) }; SIGNALS] }; MAX_PROCS];
 
+/// Signals from this number up queue: three sent are three delivered. Below it a signal is one
+/// bit, so a second before the first is delivered is the same signal arriving once.
+const RT_FIRST: u64 = 32;
+/// Entries a process may have queued at once, across every signal. Linux bounds this per user
+/// with `RLIMIT_SIGPENDING`; there is one user here, so it is per process and fixed.
+const RT_QUEUED: usize = 8;
+
+/// One queued signal: what `rt_sigqueueinfo` kept for a delivery that has not happened yet.
+struct Queued {
+    /// The signal, or zero for a slot nothing holds.
+    signo: AtomicU32,
+    /// The sender's pid, and the word it queued, which `si_value` carries.
+    pid: AtomicU32,
+    value: AtomicU64,
+    /// When it was queued. Lower is older, so one number's entries come back in order.
+    seq: AtomicU64,
+}
+
+static RT_QUEUE: [[Queued; RT_QUEUED]; MAX_PROCS] = [const {
+    [const {
+        Queued {
+            signo: AtomicU32::new(0),
+            pid: AtomicU32::new(0),
+            value: AtomicU64::new(0),
+            seq: AtomicU64::new(0),
+        }
+    }; RT_QUEUED]
+}; MAX_PROCS];
+
+/// Stamps [`Queued::seq`], so the order entries went in is the order they come out.
+static RT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Queued signals delivered, and the sends refused because the queue was full.
+static RT_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static RT_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Keep `signo` for `target` with `value`, from `from`.
+///
+/// A signal below [`RT_FIRST`] that is already queued is not queued again: it is one bit
+/// pending, so the value that arrives is the first sender's, which is what coalescing means. A
+/// real-time signal is queued until [`RT_QUEUED`] entries are held, and then refused with
+/// `EAGAIN` rather than dropped, so a sender learns the difference.
+fn queue(target: usize, signo: u64, from: u32, value: u64) -> Result<(), Failure> {
+    let slots = &RT_QUEUE[target];
+    let holds = |q: &Queued| u64::from(q.signo.load(Ordering::Acquire)) == signo;
+    if signo < RT_FIRST && slots.iter().any(holds) {
+        return Ok(());
+    }
+    let free = slots.iter().find(|q| {
+        q.signo
+            .compare_exchange(0, signo as u32, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    });
+    let Some(q) = free else {
+        RT_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(Failure::TryAgain);
+    };
+    q.pid.store(from, Ordering::Release);
+    q.value.store(value, Ordering::Release);
+    q.seq
+        .store(RT_SEQ.fetch_add(1, Ordering::AcqRel), Ordering::Release);
+    Ok(())
+}
+
+/// Take the oldest entry `target` has for `signo`, if it has one: the sender and the value.
+///
+/// The pending bit is put back when another entry of that number is still held, so the next
+/// delivery finds it. Called from [`enter_handler`], which every delivery goes through.
+fn pop_queued(target: usize, signo: u64) -> Option<(u32, u64)> {
+    let slots = &RT_QUEUE[target];
+    let holds = |q: &&Queued| u64::from(q.signo.load(Ordering::Acquire)) == signo;
+    let oldest = slots
+        .iter()
+        .filter(holds)
+        .min_by_key(|q| q.seq.load(Ordering::Acquire))?;
+    let taken = (oldest.pid.load(Ordering::Acquire), oldest.value.load(Ordering::Acquire));
+    oldest.signo.store(0, Ordering::Release);
+    if slots.iter().any(|q| holds(&q)) {
+        PROCESS_PENDING[target].fetch_or(sig::bit(signo), Ordering::AcqRel);
+    }
+    RT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    Some(taken)
+}
+
+/// Drop what `slot` has queued of `signo`, or of every signal when `signo` is `None`: a signal
+/// set to be ignored is discarded wherever it waits, and a process that goes away takes its
+/// queue with it.
+fn forget_queued(slot: usize, signo: Option<u64>) {
+    for q in &RT_QUEUE[slot] {
+        let held = u64::from(q.signo.load(Ordering::Acquire));
+        if held != 0 && signo.is_none_or(|s| s == held) {
+            q.signo.store(0, Ordering::Release);
+        }
+    }
+}
+
 /// Handlers entered, frames `rt_sigreturn` accepted, blocked calls a signal ended, and
 /// processes a signal ended.
 static HANDLED: AtomicU64 = AtomicU64::new(0);
@@ -210,6 +317,8 @@ pub(super) fn cloned(slot: usize, thread: ThreadId, tid: u64) {
 pub(super) fn forked(parent: usize, child: usize) {
     let mask = mine(parent).map_or(0, |t| t.mask.load(Ordering::Acquire));
     forget_threads(child);
+    // A child inherits nothing pending, and so none of the parent's queued signals.
+    forget_queued(child, None);
     FIRST_MASK[child].store(mask, Ordering::Release);
     PROCESS_PENDING[child].store(0, Ordering::Release);
     let mut actions = ACTIONS.lock_irqsave();
@@ -240,6 +349,7 @@ pub(super) fn thread_ended(slot: usize) {
 /// `slot`'s process is torn down: nothing of its signals is left.
 pub(super) fn release(slot: usize) {
     forget_threads(slot);
+    forget_queued(slot, None);
     PROCESS_PENDING[slot].store(0, Ordering::Release);
     FIRST_MASK[slot].store(0, Ordering::Release);
     for s in &SENDER[slot] {
@@ -474,8 +584,15 @@ fn enter_handler(
     mask: u64,
 ) -> Option<Words> {
     use sig::flags::{SA_NODEFER, SA_RESETHAND};
-    let from = SENDER[slot][(signo - 1) as usize].load(Ordering::Acquire);
-    let code = if signo == sig::SIGCHLD {
+    // A signal `rt_sigqueueinfo` queued carries its sender's own value; every other kind takes
+    // the last sender the process recorded for that number.
+    let queued = pop_queued(slot, signo);
+    let from = queued
+        .map_or_else(|| SENDER[slot][(signo - 1) as usize].load(Ordering::Acquire), |(pid, _)| pid);
+    let value = queued.map_or(0, |(_, value)| value);
+    let code = if queued.is_some() {
+        sig::SI_QUEUE
+    } else if signo == sig::SIGCHLD {
         // CLD_EXITED: the only change a child reports here.
         1
     } else if sig::from_fault(signo) {
@@ -492,6 +609,7 @@ fn enter_handler(
         code,
         pid: from,
         addr: fault_addr(slot, signo),
+        value,
     };
     let built = sig::build(ABI, ctx, &d, USER_START, USER_END)
         .ok()
@@ -687,6 +805,7 @@ pub(super) fn sigaction(
     {
         let bit = sig::bit(signo);
         PROCESS_PENDING[slot].fetch_and(!bit, Ordering::AcqRel);
+        forget_queued(slot, Some(signo));
         for t in THREAD_SIGNALS
             .iter()
             .filter(|t| held(t) && t.slot.load(Ordering::Acquire) == slot)
@@ -822,6 +941,42 @@ pub(super) fn tgkill(slot: usize, tgid: u64, tid: u64, signo: u64) -> Result<u64
     }
 }
 
+/// `rt_sigqueueinfo`: send `signo` to a process with a value its handler reads as `si_value`.
+///
+/// The `siginfo` is the sender's, so only its `si_code` and `si_value` are taken, and only
+/// `SI_QUEUE` is accepted: a sender may not claim the kernel raised a signal, nor that some
+/// other process sent it. A real-time signal queues; anything else coalesces, as it does
+/// everywhere else here.
+pub(super) fn rt_sigqueueinfo(
+    slot: usize,
+    pid_arg: u64,
+    signo: u64,
+    info: u64,
+) -> Result<u64, Failure> {
+    sendable(signo)?;
+    let target = target_of(pid_arg)?;
+    // si_code at 8 and si_value at 24, where `linux::signal`'s `info` lays them out.
+    let mut bytes = [0u8; 32];
+    super::from_user(info, &mut bytes)?;
+    let code = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    if code != sig::SI_QUEUE {
+        return Err(Failure::InvalidArgument);
+    }
+    if signo == 0 {
+        return Ok(0);
+    }
+    // A signal the target ignores is discarded where it is sent, so nothing is queued for a
+    // delivery that will never happen.
+    if sig::effect(signo, &action_of(target, signo)) == Effect::Ignore {
+        return Ok(0);
+    }
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&bytes[24..32]);
+    let from = super::pid(slot) as u32;
+    queue(target, signo, from, u64::from_le_bytes(value))?;
+    send_process(target, signo, from)
+}
+
 /// `rt_sigreturn`: resume what the handler interrupted, from the frame below the stack pointer.
 /// A frame that cannot be read or that [`sig::restore`] refuses ends the process with
 /// `SIGSEGV`, as Linux's bad frame does.
@@ -875,6 +1030,53 @@ const FAULTS_SUCCESS: u64 = 54;
 /// architecture's arithmetic trap.
 const ASYNC_HANDLERS: u64 = 1;
 const FAULT_HANDLERS: u64 = 2;
+
+/// `argv` for the program's real-time mode, and its exit code when every step behaved; mirror
+/// `user/linux-hello/src/main.rs`.
+const RTSIG_ARGV: [&[u8]; 2] = [b"hello", b"rtsig"];
+const RTSIG_SUCCESS: u64 = 56;
+/// What that mode has delivered: the queue's depth, with one more send refused.
+const RT_DELIVERIES: u64 = 8;
+
+/// Run the program in its real-time mode and grade it: everything queued is delivered, in the
+/// order a real kernel promises, and a full queue refuses a send rather than dropping it. On the
+/// boot thread, after the faults run, whose slot and stacks it reuses.
+pub(super) fn rtsig_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux rt   ");
+    let before = [&RT_DELIVERED, &RT_REFUSED].map(|n| n.load(Ordering::Relaxed));
+    let run = match super::run_mode(&RTSIG_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
+    let after = [&RT_DELIVERED, &RT_REFUSED].map(|n| n.load(Ordering::Relaxed));
+    let [delivered, refused] = [0, 1].map(|i| after[i] - before[i]);
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(RTSIG_SUCCESS)) => c.write_str(
+            "queued three deep and delivered in order, lowest number first, a full queue refused",
+        ),
+        (true, Some(code)) => {
+            c.write_str("the program exited ");
+            write_hex(c, code);
+            c.write_str(", WRONG");
+        }
+    }
+    c.write_str("; ");
+    write_usize(c, delivered as usize);
+    c.write_str(" queued signals delivered, ");
+    write_usize(c, refused as usize);
+    c.write_str(" refused when full");
+    let counted = delivered >= RT_DELIVERIES && refused >= 1;
+    if !counted {
+        c.write_str("; NOT WHAT THE MODE DOES");
+    }
+    let clean = super::report_run(c, &run);
+    Check::from_ok(run.code == Some(RTSIG_SUCCESS) && counted && clean)
+}
 
 /// Run the program in its faults mode and grade it: a handler entered for a thread that makes
 /// no system call, and handlers for the faults the program raises itself. On the boot thread,

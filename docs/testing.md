@@ -1200,6 +1200,27 @@ from an interrupt, at least two entered from a fault, and as many frames returne
   linux flt  a spinning thread took its handler, SIGSEGV was fixed from si_addr, the arithmetic trap stepped over; 1 from an interrupt, 2 from a fault, 3 of 3 returned; 0 frames left ok
 ```
 
+**Signals that queue.** A fourth run, `linux rt`, follows `linux flt` on the same slot and stacks,
+as `hello rtsig`. Its exit code is 56 when every step behaved, and otherwise the step that
+was wrong — which is why these are numbered below 256, since a Linux exit status is the low
+eight bits of the code:
+
+| Step | What it checks |
+|---|---|
+| 240–241 | a real-time signal takes a handler like any other, and both numbers are blocked before anything is sent, so what arrives later is what the queue kept rather than what happened to race |
+| 242–243 | three of one number are queued with values 1, 2 and 3, and one of a higher number with 9. Nothing runs while they are blocked |
+| 244 | `rt_sigpending` reports both numbers |
+| 245 | the queue fills to its eighth entry, and the ninth send is `EAGAIN` — refused, not dropped, which is the difference a sender can act on |
+| 246–248 | unblocked, all eight arrive: the lower number's three first, each in the order queued and with its own value, then the higher number's five |
+| 249 | the first delivery's `si_code` is `SI_QUEUE`, so a handler can tell a queued signal from one `kill` sent |
+
+The check requires that exit code and, from the kernel's own counters, at least eight queued
+deliveries and at least one send refused. On `x86_64-qemu` and `aarch64-virt`:
+
+```
+  linux rt   queued three deep and delivered in order, lowest number first, a full queue refused; 8 queued signals delivered, 1 refused when full; 0 frames left ok
+```
+
 **In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
 the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.
 It starts each process as it builds it and pins both to one CPU, a
@@ -1327,6 +1348,10 @@ was restored and compared byte for byte.
 | Nothing delivered on the way out of an interrupt (x86_64) | boot: `linux flt  the program NEVER EXITED; 0 from an interrupt, 0 from a fault, 0 of 0 returned; A THREAD NEVER ENDED, its processes left in place; 15 FRAMES LEAKED`. The spinning thread never sees its signal, and the check's patience, not a hang, ends the run |
 | `si_addr` a page away from the address that faulted (x86_64) | boot: `linux flt  the program exited 0x00000000000000d8, WRONG; 1 from an interrupt, 1 from a fault`, step 216: the handler was told about an address the store never touched |
 | A fault handler that returns without fixing anything (x86_64) | boot: `linux flt  the program exited 0x5349474e0000000b, WRONG; 1 from an interrupt, 16 from a fault, 17 of 17 returned`. The store faults again the moment the handler returns; after 16 of them at that one instruction the kernel stops running the handler and the default action ends the process, reported as `SIGSEGV` — promptly, not as a hang |
+| A queued signal delivered once instead of three times (`pop_queued` not putting the pending bit back while another entry of that number is held) | boot: `linux rt  the program exited 0x00000000000000f7, WRONG; 2 queued signals delivered, 1 refused when full; NOT WHAT THE MODE DOES`, step 247: the first of each number arrived and the rest stayed in the queue, which the kernel's own count confirms |
+| Delivery ignoring the order entries went in (`pop_queued` taking the newest rather than the oldest) | boot: `linux rt  the program exited 0x00000000000000f8, WRONG; 8 queued signals delivered, 1 refused when full`, step 248: all eight arrived, so the count is right and only the order is wrong |
+| A full queue dropping a send silently instead of refusing it (`queue` answering `Ok` when no slot is free) | boot: `linux rt  the program exited 0x00000000000000f5, WRONG; 0 queued signals delivered, 0 refused when full`, step 245: the ninth send was accepted, so the program never unblocked and nothing was delivered at all |
+| `restore` reading past a frame that claims floating-point state instead of refusing it | host: `a_frame_that_asks_for_floating_point_state_back_is_refused` fails on both architectures; a 20,000-input `sigframe` campaign stops with `Aarch64: a frame claiming floating-point state was accepted` |
 | The same, with the re-fault bound removed (`REFAULTS` raised) | boot: `linux flt  the program NEVER EXITED; 1 from an interrupt, 317451 from a fault, 317451 of 317452 returned; A THREAD NEVER ENDED, its processes left in place; 15 FRAMES LEAKED`. This is what the bound exists to stop, and what Linux itself leaves to the program |
 
 `LINUX_ENOSYS_FATAL=y` was booted as well. The boot passes, with `exit 0xffffffffffffffff ok` and

@@ -157,11 +157,12 @@ pub enum Call {
     EpollPwait,
     Sendmsg,
     Recvmsg,
+    RtSigqueueinfo,
 }
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 63] = [
+    pub const ALL: [Call; 64] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -225,6 +226,7 @@ impl Call {
         Call::EpollPwait,
         Call::Sendmsg,
         Call::Recvmsg,
+        Call::RtSigqueueinfo,
     ];
 
     /// The name the tables give it.
@@ -293,6 +295,7 @@ impl Call {
             Call::EpollPwait => "epoll_pwait",
             Call::Sendmsg => "sendmsg",
             Call::Recvmsg => "recvmsg",
+            Call::RtSigqueueinfo => "rt_sigqueueinfo",
         }
     }
 
@@ -363,6 +366,7 @@ impl Call {
             Call::EpollPwait => (281, 22),
             Call::Sendmsg => (46, 211),
             Call::Recvmsg => (47, 212),
+            Call::RtSigqueueinfo => (129, 138),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,

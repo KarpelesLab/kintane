@@ -81,6 +81,7 @@
 108	common	getegid			sys_getegid
 110	common	getppid			sys_getppid
 127	common	rt_sigpending		sys_rt_sigpending
+129	64	rt_sigqueueinfo		sys_rt_sigqueueinfo
 131	common	sigaltstack		sys_sigaltstack
 158	common	arch_prctl		sys_arch_prctl
 186	common	gettid			sys_gettid

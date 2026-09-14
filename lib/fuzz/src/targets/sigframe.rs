@@ -61,9 +61,20 @@ pub fn generate(rng: &mut Rng, _seeds: &[Vec<u8>]) -> Vec<u8> {
         // Half the frames are a fault's, whose `siginfo` carries the faulting address where
         // the others carry a pid.
         addr: rng.one_in(2).then(|| rng.next_u64()),
+        value: rng.next_u64(),
     };
     if let Ok(built) = signal::build(abi, &ctx, &d, USER_START, USER_END) {
-        bytes.extend_from_slice(&built.head[..abi.restore_len()]);
+        let mut head = built.head;
+        // A third of the built frames claim saved floating-point state, which `restore` must
+        // refuse: the pointer on x86_64, the first reserved record on aarch64.
+        if rng.one_in(3) {
+            let at = match abi {
+                Abi::X86_64 => signal::FPSTATE_AT,
+                Abi::Aarch64 => signal::RECORD_AT,
+            };
+            head[at..at + 8].copy_from_slice(&rng.next_u64().to_le_bytes());
+        }
+        bytes.extend_from_slice(&head[..abi.restore_len()]);
     }
     Mutator::mutate(rng, &mut bytes);
     bytes
@@ -85,6 +96,14 @@ pub fn run(input: &[u8]) {
             0,
             "{abi:?}: a restored mask blocks SIGKILL or SIGSTOP"
         );
+        let fp_at = match abi {
+            Abi::X86_64 => signal::FPSTATE_AT,
+            Abi::Aarch64 => signal::RECORD_AT,
+        };
+        if let Some(w) = frame.get(fp_at..fp_at + 8) {
+            let claimed = u64::from_le_bytes(w.try_into().expect("eight bytes"));
+            assert_eq!(claimed, 0, "{abi:?}: a frame claiming floating-point state was accepted");
+        }
     }
 }
 

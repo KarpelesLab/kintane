@@ -16,6 +16,7 @@ fn delivery(sig: u64) -> Delivery {
         code: SI_USER,
         pid: 3,
         addr: None,
+        value: 0,
     }
 }
 
@@ -219,7 +220,7 @@ fn a_frame_the_program_changed_cannot_return_anywhere_a_program_may_not() {
     let mut bytes = b.head;
     let flags_at = 48 + 17 * 8;
     bytes[flags_at..flags_at + 8].copy_from_slice(&0x3000u64.to_le_bytes());
-    let r = restore(abi, &bytes[..440], START, END).unwrap();
+    let r = restore(abi, &bytes[..abi.restore_len()], START, END).unwrap();
     assert_eq!(r.regs[16], 0x202);
     assert!(is_user_context(abi, &r.regs, START, END));
     // aarch64: a state that is not EL0 is refused outright, and so is a misaligned frame.
@@ -228,7 +229,8 @@ fn a_frame_the_program_changed_cannot_return_anywhere_a_program_may_not() {
     for state in [0x5u64, 0x3c5, 0x6000_0004] {
         let mut bytes = b.head;
         bytes[576..584].copy_from_slice(&state.to_le_bytes());
-        assert_eq!(restore(abi, &bytes[..584], START, END), Err(BadFrame::BadState), "{state:#x}");
+        let len = abi.restore_len();
+        assert_eq!(restore(abi, &bytes[..len], START, END), Err(BadFrame::BadState), "{state:#x}");
     }
     assert_eq!(abi.frame_at(START + 7), Err(BadFrame::Misaligned));
 }
@@ -249,5 +251,47 @@ fn a_stack_with_no_room_below_it_takes_no_frame() {
             Err(BadFrame::NoRoom),
             "{abi:?}"
         );
+    }
+}
+
+#[test]
+fn a_frame_that_asks_for_floating_point_state_back_is_refused() {
+    // Nothing here can restore those registers, so a frame naming some is refused rather than
+    // accepted with the request ignored: a program must not be told its state came back.
+    for (abi, at) in [(Abi::X86_64, x86::FPSTATE), (Abi::Aarch64, a64::RECORD)] {
+        let ctx = context(abi);
+        let b = build(abi, &ctx, &delivery(SIGUSR1), START, END).expect("room");
+        let len = abi.restore_len();
+        // What `build` writes is none: the pointer is null, the record terminates.
+        assert_eq!(u64::from_le_bytes(array8(&b.head, at)), 0, "{abi:?}");
+        restore(abi, &b.head[..len], START, END).expect("a frame this built");
+        for claimed in [1u64, START + 0x1000, u64::MAX, 0x4650_5342] {
+            let mut bytes = b.head;
+            bytes[at..at + 8].copy_from_slice(&claimed.to_le_bytes());
+            assert_eq!(
+                restore(abi, &bytes[..len], START, END),
+                Err(BadFrame::FpState),
+                "{abi:?} {claimed:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_queued_signals_value_follows_its_sender_in_the_siginfo() {
+    for (abi, info_at) in [(Abi::X86_64, 312), (Abi::Aarch64, 0)] {
+        let ctx = context(abi);
+        let d = Delivery {
+            code: SI_QUEUE,
+            value: 0x5151_5151_2727_2727,
+            ..delivery(SIGUSR1)
+        };
+        let b = build(abi, &ctx, &d, START, END).expect("room");
+        assert_eq!(&b.head[info_at + 8..info_at + 12], &SI_QUEUE.to_le_bytes(), "{abi:?}");
+        assert_eq!(&b.head[info_at + 16..info_at + 20], &3u32.to_le_bytes(), "{abi:?}");
+        assert_eq!(u64::from_le_bytes(array8(&b.head, info_at + 24)), d.value, "{abi:?}");
+        // A signal that was not queued writes no value at all, leaving those bytes zero.
+        let plain = build(abi, &ctx, &delivery(SIGUSR1), START, END).expect("room");
+        assert_eq!(u64::from_le_bytes(array8(&plain.head, info_at + 24)), 0, "{abi:?}");
     }
 }

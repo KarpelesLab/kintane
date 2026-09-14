@@ -59,6 +59,7 @@
 134	common	rt_sigaction		sys_rt_sigaction
 135	common	rt_sigprocmask		sys_rt_sigprocmask
 136	common	rt_sigpending		sys_rt_sigpending
+138	common	rt_sigqueueinfo		sys_rt_sigqueueinfo
 139	common	rt_sigreturn		sys_rt_sigreturn
 153	common	times			sys_times
 160	common	uname			sys_newuname

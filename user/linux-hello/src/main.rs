@@ -26,6 +26,8 @@
 //!   rename and remove, and a file left for kbuild to read after the guest exits.
 //! * `faults`: [`faults`], a handler run for a thread that only spins, and handlers for the faults
 //!   a program raises itself.
+//! * `rtsig`: [`rtsig`], real-time signals queued three deep and delivered in order, and a full
+//!   queue refused.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -182,6 +184,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"udp" => udp(s.arg),
         b"files" => files(),
         b"faults" => faults(),
+        b"rtsig" => rtsig(),
         b"poll" => poll_mode(),
         _ => hello(&s),
     }
@@ -802,6 +805,111 @@ fn signals() -> ! {
     let status = wait_child(child, 132);
     expect(status == SIGKILL as u32, if status == 131 << 8 { 131 } else { 132 });
     exit(SIGNALS_SUCCESS)
+}
+
+// ---- rtsig: real-time signals, queued ------------------------------------------------------
+
+/// Exits with this when every step behaved; `kernel/main/src/personality/signals.rs` mirrors it.
+const RTSIG_SUCCESS: u64 = 56;
+/// Two real-time numbers. Real-time signals are 32 to 64 as the kernel numbers them, and
+/// unlike the rest they queue: three sent are three delivered, in the order they were sent.
+const SIGRT_A: u64 = 34;
+const SIGRT_B: u64 = 35;
+const SI_QUEUE: i32 = -1;
+/// What the kernel queues per process. One more than this must be refused, not dropped.
+const RT_DEPTH: usize = 8;
+
+/// What each delivery was: the signal in the high word, its value in the low one.
+static RT_SEEN: [AtomicU64; RT_DEPTH] = [const { AtomicU64::new(0) }; RT_DEPTH];
+static RT_HITS: AtomicU64 = AtomicU64::new(0);
+/// The `si_code` of the first delivery, which must say a queued signal.
+static RT_CODE: AtomicU64 = AtomicU64::new(0);
+
+/// A `siginfo` for `rt_sigqueueinfo`: the signal, `SI_QUEUE`, this process's pid, and the value.
+fn queued_info(sig: u64, pid: u64, value: u64) -> [u8; 128] {
+    let mut info = [0u8; 128];
+    info[0..4].copy_from_slice(&(sig as u32).to_le_bytes());
+    info[8..12].copy_from_slice(&SI_QUEUE.to_le_bytes());
+    info[16..20].copy_from_slice(&(pid as u32).to_le_bytes());
+    info[24..32].copy_from_slice(&value.to_le_bytes());
+    info
+}
+
+fn rt_queue(pid: u64, sig: u64, value: u64) -> i64 {
+    let info = queued_info(sig, pid, value);
+    sys::call(sys::RT_SIGQUEUEINFO, [pid, sig, info.as_ptr() as u64, 0, 0, 0])
+}
+
+extern "C" fn on_rt(sig: i32, info: *const u8, _uc: *const u8) {
+    let n = RT_HITS.fetch_add(1, Ordering::Relaxed) as usize;
+    // SAFETY: the kernel pushed a `siginfo` whose `si_code` is at 8 and whose `si_value`, for a
+    // queued signal, is at 24.
+    let (code, value) = unsafe {
+        (
+            core::ptr::read_unaligned(info.add(8) as *const i32),
+            core::ptr::read_unaligned(info.add(24) as *const u64),
+        )
+    };
+    if n == 0 {
+        RT_CODE.store(code as i64 as u64, Ordering::Relaxed);
+    }
+    if let Some(slot) = RT_SEEN.get(n) {
+        slot.store(((sig as u64) << 32) | (value & 0xffff_ffff), Ordering::Relaxed);
+    }
+}
+
+fn rtsig() -> ! {
+    let pid = sys::call(sys::GETPID, [0; 6]) as u64;
+    let handler = on_rt as *const () as u64;
+
+    // 250: a real-time signal takes a handler like any other.
+    expect(sigaction(SIGRT_A, handler, SA_SIGINFO) == 0, 240);
+    expect(sigaction(SIGRT_B, handler, SA_SIGINFO) == 0, 240);
+
+    // 251-253: with both blocked, three of one number and one of the other are queued. Nothing
+    // runs yet, so what arrives later is what the queue kept, in the order it kept it.
+    expect(sigprocmask(SIG_BLOCK, bit(SIGRT_A) | bit(SIGRT_B)) == 0, 241);
+    for value in 1..=3u64 {
+        expect(rt_queue(pid, SIGRT_A, value) == 0, 242);
+    }
+    expect(rt_queue(pid, SIGRT_B, 9) == 0, 243);
+    expect(RT_HITS.load(Ordering::Relaxed) == 0, 243);
+
+    // 254: both numbers are pending while they are blocked.
+    let mut pending = 0u64;
+    let asked = sys::call(sys::RT_SIGPENDING, [&raw mut pending as u64, 8, 0, 0, 0, 0]);
+    expect(asked == 0 && pending & bit(SIGRT_A) != 0 && pending & bit(SIGRT_B) != 0, 244);
+
+    // 255: the queue fills, and one more is refused rather than dropped on the floor.
+    let mut queued = 4;
+    while queued < RT_DEPTH {
+        expect(rt_queue(pid, SIGRT_B, 100 + queued as u64) == 0, 245);
+        queued += 1;
+    }
+    expect(rt_queue(pid, SIGRT_B, 200) == -EAGAIN, 245);
+
+    // 256-259: unblocked, every one queued is delivered — the lower number first, and within a
+    // number in the order it was queued.
+    expect(sigprocmask(SIG_UNBLOCK, bit(SIGRT_A) | bit(SIGRT_B)) == 0, 246);
+    expect(RT_HITS.load(Ordering::Relaxed) == RT_DEPTH as u64, 247);
+    for (i, expected) in [
+        (SIGRT_A, 1u64),
+        (SIGRT_A, 2),
+        (SIGRT_A, 3),
+        (SIGRT_B, 9),
+        (SIGRT_B, 104),
+        (SIGRT_B, 105),
+        (SIGRT_B, 106),
+        (SIGRT_B, 107),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let seen = RT_SEEN[i].load(Ordering::Relaxed);
+        expect(seen == ((expected.0 << 32) | expected.1), 248);
+    }
+    expect(RT_CODE.load(Ordering::Relaxed) == SI_QUEUE as i64 as u64, 249);
+    exit(RTSIG_SUCCESS)
 }
 
 // ---- faults: a handler from an interrupt, and handlers for a program's own faults ---------

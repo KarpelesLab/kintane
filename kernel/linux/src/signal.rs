@@ -29,7 +29,11 @@
 //!
 //! Floating-point and SIMD state: x86_64's `fpstate` pointer is null and aarch64's reserved
 //! space holds only the terminating null record. A handler that uses those registers changes
-//! them under the code it interrupted.
+//! them under the code it interrupted — on the ports as they are, so does any other thread that
+//! runs, because no context switch saves them either (`hal::HasFpu` is the unbuilt work that
+//! would). [`restore`] therefore **refuses** a frame that carries such state rather than reading
+//! past it: a program that writes an `fpstate` pointer or an `fpsimd_context` record is asking
+//! for registers back, and this kernel would not give them.
 
 #[cfg(test)]
 mod tests;
@@ -140,6 +144,8 @@ pub const STACK_T_BYTES: usize = 24;
 
 /// `siginfo`'s `si_code` for a signal `kill` sent, one `tgkill` sent, and one the kernel raised.
 pub const SI_USER: i32 = 0;
+/// `si_code` for a signal `rt_sigqueueinfo` queued, which carries a value.
+pub const SI_QUEUE: i32 = -1;
 pub const SI_TKILL: i32 = -6;
 pub const SI_KERNEL: i32 = 0x80;
 
@@ -244,11 +250,18 @@ pub const fn status(sig: u64) -> u32 {
 
 // ---- the frame --------------------------------------------------------------------------
 
+/// Where a frame claims saved floating-point state: x86_64's `fpstate` pointer, and the first
+/// record in aarch64's reserved space. [`restore`] refuses a frame holding either.
+pub const FPSTATE_AT: usize = x86::FPSTATE;
+pub const RECORD_AT: usize = a64::RECORD;
+
 /// Words of a context; see the module documentation for the order.
 pub const REGISTER_WORDS: usize = 34;
 
-/// The most bytes [`Built::head`] holds: aarch64's frame up to its reserved space.
-pub const HEAD_BYTES: usize = 592;
+/// The most bytes [`Built::head`] holds: aarch64's frame up to its reserved space, and the
+/// first record header in it, which [`restore`] reads to refuse a frame carrying saved
+/// floating-point state.
+pub const HEAD_BYTES: usize = 600;
 
 /// What delivering one signal to a handler needs besides the context.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -264,6 +277,9 @@ pub struct Delivery {
     /// shares its bytes with `si_pid`. `None` for every other signal, which leaves those
     /// bytes to the sender's pid.
     pub addr: Option<u64>,
+    /// `si_value`, the word `rt_sigqueueinfo` carries, for a delivery whose `code` is
+    /// [`SI_QUEUE`]. Zero for every other, which writes no value at all.
+    pub value: u64,
 }
 
 /// A frame laid out for a thread's stack.
@@ -296,6 +312,10 @@ pub enum BadFrame {
     Misaligned,
     /// Fewer bytes than the frame.
     Short,
+    /// The frame carries saved floating-point state: x86_64's `fpstate` pointer is not null, or
+    /// aarch64's reserved space holds a record. Nothing here can restore those registers, and a
+    /// frame accepted with them unread would tell a program otherwise.
+    FpState,
 }
 
 /// The x86_64 layout: `rt_sigframe` is the return address, a `ucontext` and a `siginfo`.
@@ -305,6 +325,10 @@ mod x86 {
     pub const MCONTEXT: usize = UC + 40;
     /// `uc_sigmask`, after the 256-byte `sigcontext`.
     pub const SIGMASK: usize = MCONTEXT + 256;
+    /// `sigcontext`'s `fpstate` pointer, after `cr2`. Always null here: this kernel saves no
+    /// floating-point state, and a frame that comes back naming some is refused rather than
+    /// ignored, so no program is told its registers were restored when they were not.
+    pub const FPSTATE: usize = MCONTEXT + 23 * 8;
     pub const INFO: usize = SIGMASK + 8;
     /// `sigcontext`'s first eighteen words, as indices into the port's register order.
     pub const ORDER: [usize; 18] = [7, 8, 9, 10, 11, 12, 13, 14, 5, 4, 6, 1, 3, 0, 2, 17, 15, 16];
@@ -342,6 +366,10 @@ mod a64 {
     pub const PSTATE: usize = PC + 8;
     /// The reserved space, 4 KiB aligned to 16.
     pub const RESERVED: usize = MCONTEXT + 288;
+    /// The first record in it: a magic and a size. `build` leaves the terminating null record,
+    /// and [`restore`] refuses anything else, `fpsimd_context` above all — this kernel has no
+    /// floating-point state to give back. Linux's own magic, for the record: 0x4650_5342.
+    pub const RECORD: usize = RESERVED;
     pub const FRAME: usize = RESERVED + 4096;
     pub const X29: usize = 29;
     pub const X30: usize = 30;
@@ -381,7 +409,7 @@ impl Abi {
     pub const fn restore_len(self) -> usize {
         match self {
             Abi::X86_64 => x86::FRAME,
-            Abi::Aarch64 => a64::PSTATE + 8,
+            Abi::Aarch64 => a64::RECORD + 8,
         }
     }
 
@@ -422,6 +450,11 @@ fn info(b: &mut [u8], at: usize, d: &Delivery) {
     match d.addr {
         Some(addr) => put(b, at + 16, addr),
         None => put32(b, at + 16, d.pid),
+    }
+    // A queued signal's value follows the sender's pid and uid, which is where `sigqueue`'s
+    // `si_value` lives in the same union.
+    if d.code == SI_QUEUE {
+        put(b, at + 24, d.value);
     }
 }
 
@@ -544,6 +577,9 @@ pub fn restore(
                 regs[w] = word(x86::MCONTEXT + i * 8);
             }
             regs[x86::RFLAGS] = (regs[x86::RFLAGS] & x86::USER_FLAGS) | x86::START_FLAGS;
+            if word(x86::FPSTATE) != 0 {
+                return Err(BadFrame::FpState);
+            }
             word(x86::SIGMASK)
         }
         Abi::Aarch64 => {
@@ -557,6 +593,9 @@ pub fn restore(
                 return Err(BadFrame::BadState);
             }
             regs[a64::W_PSTATE] = pstate;
+            if word(a64::RECORD) != 0 {
+                return Err(BadFrame::FpState);
+            }
             word(a64::SIGMASK)
         }
     };
