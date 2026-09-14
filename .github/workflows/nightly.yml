@@ -68,3 +68,46 @@ jobs:
           name: randconfig-logs
           path: build/randconfig/
           if-no-files-found: ignore
+
+  # Fuzzing, nightly: docs/testing.md#fuzzing.
+  #
+  # The merge gate replays the committed corpus and runs a short campaign from a fixed
+  # seed. This runs the long ones, from a seed that changes every night, so the budget
+  # samples somewhere new each time. A failure writes its shrunk input to
+  # lib/fuzz/corpus/<target>/, which is uploaded: committing that file is how the find
+  # becomes a permanent regression test.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: |
+          channel=$(grep -E '^channel' toolchain.toml | head -1 | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "${{ steps.pin.outputs.channel }}" \
+            --component rust-src --component llvm-tools --profile minimal
+      - name: Build kbuild
+        run: cargo build --release --manifest-path kbuild/Cargo.toml
+
+      - name: Every target, a fixed budget each
+        run: |
+          # The run number makes every night a different sample; the driver prints the
+          # seed beside any failure, so no night is unreproducible.
+          seed="${{ github.event.inputs.seed }}"
+          seed="${seed:-$(( ${{ github.run_number }} * 7919 ))}"
+          # A million inputs per target. The cheap targets run tens of thousands a second
+          # and ACPI, the slowest, about two thousand, so this is some minutes rather than
+          # hours; the budget is set by what each target costs, not by a guess.
+          ./kbuild/target/release/kbuild fuzz --preset x86_64-qemu \
+            --seed "$seed" --iterations 1000000
+
+      - name: Keep the failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: lib/fuzz/corpus/**/crash-*
+          if-no-files-found: ignore

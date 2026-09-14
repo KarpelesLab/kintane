@@ -1,0 +1,39 @@
+# The fuzzing harness: one structure-aware generator per parser that reads untrusted
+# input, and the table `kbuild fuzz` drives them from.
+#
+# At the `subsystem` layer because it depends on parsers from four layers — `abi` (user),
+# `fdt`/`acpi`/`boot_protocol`/`kinboot-menu` (hal), `elf`/`module` (core) and
+# `device`/`virtio-blk` (device) — and a unit may depend only on units of equal or lower
+# rank. It is above every one of them and below `kernel`, which is what a harness that
+# links parsers but is linked into no image should be.
+#
+# Nothing links this into the kernel: no `bin` unit depends on it, so it costs a shipped
+# image nothing. `host-tests = true` because its own generators, mutators and shrinker are
+# ordinary code that needs testing, and because the committed corpus is replayed there.
+[unit]
+name = "fuzz"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "subsystem"
+
+# Only where the host is the target: `kbuild test` and `kbuild fuzz` set MOCK_ARCH, and
+# nothing else can, since the symbol has no prompt. Without this the unit was planned into
+# every configuration, and every image build failed compiling it: it links `alloc`, which a
+# kernel target does not have, and nothing in an image should pay for a fuzzer anyway.
+# `kbuild portability` never sets MOCK_ARCH either, so the no-atomics check leaves it out.
+[config]
+requires = "MOCK_ARCH"
+
+[deps]
+units = [
+    "abi",
+    "fdt",
+    "acpi",
+    "boot_protocol",
+    "kinboot-menu",
+    "elf",
+    "module",
+    "device",
+    "virtio-blk",
+]

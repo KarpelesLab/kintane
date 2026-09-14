@@ -1,0 +1,20 @@
+# kinboot boot entries, written by kbuild. See docs/bootloader.md#boot-options.
+timeout 5
+default chain-test
+on-failure firmware
+
+entry normal
+title KinTane
+mode normal
+
+entry safe
+title KinTane (safe mode)
+mode safe
+
+entry recovery
+title KinTane (recovery)
+mode recovery
+
+entry chain-test
+title Chainload test
+chain-partition 2
