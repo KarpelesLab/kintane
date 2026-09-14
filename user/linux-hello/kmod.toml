@@ -1,0 +1,28 @@
+# A static Linux program: the test of the Linux personality.
+#
+# Built in-tree with the pinned toolchain, because there is no Linux C toolchain here. It is
+# still a Linux binary in every way the kernel can tell: it makes system calls by Linux's
+# x86_64 numbers through `syscall`, reads Linux's start-up stack (argc, argv, envp, auxv)
+# from its entry, and carries no KinTane ABI note, so the loader tags it `linux`. kbuild
+# puts it on the test disk as /KINTANE/LINUX.ELF, and the kernel runs it from there.
+#
+# Linked in the user half at 512 GiB like every program here, not at Linux's customary
+# 4 MiB: the kernel still maps itself in the lower half. A program linked at 0x400000 is
+# refused by the loader until it does not.
+[unit]
+name = "linux-hello"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-T$ROOT/user/linux-hello/link.ld",
+    "-C", "link-arg=--no-warnings",
+    "-C", "strip=debuginfo",
+]
+
+[deps]
+units = []
+
+[config]
+requires = "ABI_LINUX"

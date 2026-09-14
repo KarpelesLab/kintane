@@ -1,7 +1,8 @@
 # Userspace ABI
 
-Status: **the native slice is built; the Linux personality is still a sketch.** The
-principles below are the commitment; the syscall numbers are not.
+Status: **the native slice is built; the Linux personality runs one static program on
+x86_64** ([as built](#as-built--one-static-program-x86_64)). The principles below are the
+commitment; the native syscall numbers are not.
 
 ## As built — the native vertical slice
 
@@ -243,32 +244,147 @@ generated from one source.
 
 ## The Linux personality
 
+### As built — one static program, x86_64
+
+A static Linux program runs unmodified from the filesystem on x86_64. `user/linux-hello` knows
+nothing of KinTane. It makes system calls by Linux's x86_64 numbers through `syscall`, reads a
+value or a negated errno back from `rax`, and reads Linux's start-up stack (`argc`, `argv`,
+`envp`, the auxiliary vector) at its entry. kbuild puts it on the test disk as
+`/KINTANE/LINUX.ELF`. At every boot of a configuration with `ABI_LINUX`, the kernel reads it
+from there, runs it, and grades it ([testing.md](testing.md#2f-the-linux-personality)).
+
+It is built in-tree with the pinned Rust toolchain, not with a C one, so it is a Linux binary
+in every way the kernel can tell but is not musl or glibc output. The first corpus tier below,
+static musl, has not been attempted. The program links at `0x80_0040_0000`, in the user half,
+and not at Linux's customary `0x400000`: the kernel still maps itself in the lower half, and a
+program with a segment there is refused at load (`OutsideRange`).
+
+**The tag.** Every `Process` carries a `Personality` (`Native` or `Linux`), decided once at
+load from the program alone, by `userproc::personality_of`:
+
+| The program | Tagged |
+|---|---|
+| carries the KinTane ABI note: a `PT_NOTE` holding owner `KinTane`, type `0x4b54`, the native ABI version | `Native` |
+| no note, and `EI_OSABI` is System V (0) or Linux (3) | `Linux`, if the kernel has `ABI_LINUX` |
+| no note, and `EI_OSABI` is Linux or System V, on a kernel without `ABI_LINUX` | refused at load |
+| no note, and any other `EI_OSABI` | refused at load |
+
+Every native link script (`user/init/link.ld`, `user/hwdomain/link.ld`) writes the note as data,
+so no native program can forget it. `kernel/elf` finds it by walking the notes in each `PT_NOTE`
+segment, bounded and never panicking on a corrupt one. A process cannot ask for a personality
+after it starts. A native process's `process_create` refuses a Linux image with
+`InvalidArgument`, because the child's thread would enter it the native way.
+
+**Dispatch.** The personality chooses a table, a function pointer stored on the `Process` when
+it is built. The system call entry finds the process by the loaded address space, as it always
+has, and calls through the pointer. Nothing on the path branches on the personality, and a
+native process pays one indirect call for the Linux one existing. The Linux table sets only
+`rax` (`SyscallFrame::set_return`). The native one still sets status and value.
+
+**The numbers and the table.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
+`syscall_64.tbl`, in its format: 70 calls. It is *not* turned into code. The calls the
+personality answers are constants in `linux::nr`, a host test pins each constant to its name
+in the table, and the kernel reads the table at run time only to name a call it does not
+implement. The dispatch is a `match` on those constants.
+
+**Errors.** The personality's calls fail with a `linux::Failure`, and `linux::errno` is a
+single exhaustive `match` from `Failure` to Linux's number, so a new failure does not compile
+until someone decides what Linux calls it. Filesystem errors map onto `Failure` in one more
+`match`. The mappings that are a choice rather than obvious:
+
+| Failure | errno | Why |
+|---|---|---|
+| a path the volume cannot represent (`vfs::BadPath`) | `ENAMETOOLONG` | a FAT 8.3 name that does not fit is, from the program's side, a name too long |
+| a name that is not UTF-8 | `ENOENT` | the volume cannot hold it, so it has no such file |
+| an open for writing | `EROFS` | every file is on a read-only view |
+| an executable mapping | `EACCES` | W^X is never granted, and Linux uses `EACCES` for protections the object refuses |
+| a volume or mount table full | `ENOSPC` | |
+| a corrupt volume or a device failure | `EIO` | |
+
+**Descriptors.** Each Linux process has a table of 16 descriptors, a view over what the process
+already holds rather than a second authority:
+
+- 0 is standard input. Nothing feeds it yet, so it reads as end of file.
+- 1 and 2 are two console handles in the process's own handle table. A write through either is
+  checked against the handle's rights exactly as the native `debug_write` is, and `close`
+  closes the handle.
+- `openat` opens a file in the filesystem namespace the process was started with, at the
+  lowest free number.
+
+The file descriptors are open files in the VFS, not kernel objects yet. That falls short of the
+table below, where every descriptor is a view over a `KObject`. Every operation answers at once.
+A descriptor that can have nothing to give yet (a pipe, a socket, a console with input) is where
+the native ABI's blocking calls and wait queues come in: its thread parks on that mechanism at
+the point where `read` answers today. It adds a variant to the descriptor, and the table does
+not change shape.
+
+**The calls.**
+
+| Call | As built |
+|---|---|
+| `read`, `write` | standard input reads end of file; the console takes writes; a file reads through the VFS. Up to 4096 bytes a call, a short count as Linux allows |
+| `openat` | `AT_FDCWD` or an absolute path; the working directory is `/`. Read-only (`O_ACCMODE` other than `O_RDONLY` is `EROFS`); `O_DIRECTORY` is honoured; other flags are ignored. A relative path against any other descriptor is `ENOTDIR` |
+| `close`, `fstat` | `fstat` reports a regular file or directory with its size, or a character device for 0–2; `st_ino` is a hash of the path |
+| `brk` | moves within a reservation of 64 pages made at start; the answer is the break as it now is, which is the old one when the request cannot be met |
+| `mmap`, `munmap` | anonymous private mappings, readable or read-write, where the kernel chooses. File-backed, shared, `MAP_FIXED` and `PROT_NONE` are `EINVAL`, `PROT_EXEC` is `EACCES`. `munmap` releases exactly one earlier mapping; part of one is `EINVAL` |
+| `arch_prctl` | `ARCH_SET_FS` only, below the top of the user half; everything else is `EINVAL` |
+| `uname` | `Linux`, `kintane`, `6.1.0-kintane`, `#1 KinTane`, `x86_64` |
+| `getpid`, `gettid`, `set_tid_address` | the slot number plus one: one thread per process, so the thread id is the process id |
+| `exit`, `exit_group` | the low 8 bits of the code, as Linux reports a status |
+
+**Start-up.** `argv` is `["hello"]` and `envp` is `["HOME=/"]`. The auxiliary vector carries:
+
+- `AT_PHDR`, by Linux's rule for a static executable;
+- `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ` and `AT_ENTRY`;
+- zero for `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID` and `AT_SECURE`;
+- `AT_RANDOM` and `AT_EXECFN`.
+
+`kernel/linux` lays the stack out and host-tests it by reading it back the way start-up code
+does. Every argument register is zero at entry.
+
+**Unimplemented calls** return `-ENOSYS` and log `linux: <name> (<number>) is not implemented`.
+They log the name and number, but not the arguments or the process. With `LINUX_ENOSYS_FATAL`
+the same line ends the process instead, recorded as killed. CI does not run with it on: there is
+no corpus yet for a gap to fail.
+
+**What it does not do yet:**
+
+- **The thread pointer is not saved with a thread.** `arch_prctl` writes `FS` base on the CPU
+  the process runs on, and teardown resets it. That is safe only while one Linux process runs
+  at a time on a CPU no other process relies on it for, which is the boot check's case and no
+  other.
+- **`AT_RANDOM`'s bytes are not secret.** They are a SplitMix64 stream seeded from the
+  process's page-table root and entry point. A C library seeds its stack protector from them.
+- **Only the boot check has a filesystem namespace.** A Linux process started any other way
+  would find `openat` failing with `EIO`.
+- **No signals, `clone`, `fork`, `execve`, threads, pipes or `/proc`.**
+- **x86_64 only.** The table and `uname`'s machine are x86_64's; aarch64 has the port hooks
+  (`set_return`, `set_tls`) but no table.
+
 ### The tag
 
 Every process carries a personality, fixed at load time:
 
 ```rust
-#[non_exhaustive]
 pub enum Personality {
     Native,
     Linux,
 }
 ```
 
-The tag is cached in the thread control block as a pointer to a syscall dispatch
-table, so the entry path loads a table pointer and indexes it. There is no branch on
-personality in the syscall path and no cost to a native process for the compat layer
-existing.
+The design put the tag in the thread control block as a pointer to a syscall dispatch table.
+As built, it is on the `Process`, because every process has exactly one thread. It moves to
+the thread when threads share a process. Either way, there is no branch on personality in the
+syscall path and no cost to a native process for the compat layer existing.
 
-A process is tagged `Linux` when:
+A process is tagged `Linux` when its ELF carries no KinTane ABI note and declares
+`ELFOSABI_LINUX` or `ELFOSABI_SYSV`, as the table above has it. A creating process asking for
+the tag explicitly is not built.
 
-- its ELF header declares `ELFOSABI_LINUX`, or it declares `ELFOSABI_SYSV` and carries
-  no `.note.kintane.abi` section (i.e. it was not built for us), **or**
-- the creating process asked for it explicitly when constructing the process object.
-
-Native binaries carry `.note.kintane.abi`. The fallback for unmarked SysV binaries is
-a config option, defaulting to `Linux`, because in practice an unmarked binary is a
-Linux binary and making that work without ceremony is the point.
+Native binaries carry the note. The design made the fallback for unmarked SysV binaries a
+config option. As built, it follows `ABI_LINUX`: an unmarked binary is a Linux one when the
+kernel has the personality and refused when it does not, because in practice an unmarked
+binary is a Linux binary, and making that work without ceremony is the point.
 
 ### Implemented on native primitives
 
@@ -365,9 +481,12 @@ config ABI_LINUX
         the flat memory model cannot provide.
 ```
 
-Tristate, and `m` by default: the personality is a loadable module in a
-general-purpose build, compiled in for appliance builds, and absent from embedded
-ones. A kernel that runs Linux binaries and a kernel that fits in 64 KiB are the same
+As built, `ABI_LINUX` is a `bool` that depends on `USERSPACE && ARCH_X86_64`, defaults to `y`,
+and is compiled in. `LINUX_ENOSYS_FATAL` (default `n`) turns an unimplemented call into the
+process's end. Both live in `config/main.kcfg`. The design is tristate, and `m` by default: the
+personality is a loadable module in a general-purpose build, compiled in for appliance builds,
+and absent from embedded ones. It becomes tristate when the personality can be built as a
+module. A kernel that runs Linux binaries and a kernel that fits in 64 KiB are the same
 source tree with different configurations, which is the whole thesis applied to the
 ABI layer.
 

@@ -53,6 +53,10 @@ impl SyscallFrameTrait for SyscallFrame {
             (*self.frame).x[1] = value;
         }
     }
+    fn set_return(&mut self, value: u64) {
+        // SAFETY: as above; Linux returns in `x0` alone.
+        unsafe { (*self.frame).x[0] = value };
+    }
 }
 
 /// The installed hooks.
@@ -169,6 +173,12 @@ impl hal::HasUserMode for Aarch64 {
         // switch that changes address spaces.
         ctx.user_kernel_stack = kernel_stack_top.raw() as u64;
         ctx.user_root = root.raw();
+    }
+
+    unsafe fn set_tls(value: usize) {
+        // SAFETY: `TPIDR_EL0` is EL0's thread pointer, writable at EL1 and read by nothing the
+        // kernel does.
+        unsafe { core::arch::asm!("msr tpidr_el0, {v}", v = in(reg) value, options(nostack)) };
     }
 
     unsafe fn enter_user(
