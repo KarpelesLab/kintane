@@ -23,7 +23,7 @@ use core::cell::RefCell;
 
 use bcache::{Cache, Slot};
 use block::{BlockDevice, Error as BlockError, Geometry};
-use fat::{Consistency, Fat16};
+use fat::{Consistency, Fat};
 use vfs::{Error, FileSystem, Kind};
 
 use crate::{Mutator, Rng};
@@ -187,15 +187,15 @@ fn padded(bytes: &[u8]) -> Vec<u8> {
 
 /// Mount the volume `disk` holds through a cache of `slots` blocks and run `f` on it. `None`
 /// if it does not mount.
-fn with_volume<R>(disk: &Disk, slots: usize, f: impl FnOnce(&mut Fat16<'_, '_>) -> R) -> Option<R> {
+fn with_volume<R>(disk: &Disk, slots: usize, f: impl FnOnce(&mut Fat<'_, '_>) -> R) -> Option<R> {
     let mut slot_array = vec![Slot::EMPTY; slots];
     let mut data = vec![0u8; slots * SECTOR];
     let cache = Cache::new(&mut slot_array, &mut data, SECTOR)?;
-    let mut fat = Fat16::mount(disk, cache, 0).ok()?;
+    let mut fat = Fat::mount(disk, cache, 0).ok()?;
     Some(f(&mut fat))
 }
 
-fn walk(fat: &mut Fat16<'_, '_>) -> Result<Consistency, Error> {
+fn walk(fat: &mut Fat<'_, '_>) -> Result<Consistency, Error> {
     let mut seen = vec![0u8; (fat.clusters() as usize + 2).div_ceil(8)];
     fat.check_consistency(&mut seen)
 }
@@ -285,7 +285,7 @@ fn script(ops: &[u8]) {
 
 /// One operation, `b` its four bytes and `k` the file it names, checked against the model.
 fn apply(
-    fat: &mut Fat16<'_, '_>,
+    fat: &mut Fat<'_, '_>,
     root: u64,
     model: &mut Model,
     dir: &mut bool,
@@ -363,7 +363,7 @@ fn apply(
 }
 
 /// The volume walks clean with nothing lost, and every file holds what the model says.
-fn check(fat: &mut Fat16<'_, '_>, root: u64, model: &Model, op: [u8; 4]) {
+fn check(fat: &mut Fat<'_, '_>, root: u64, model: &Model, op: [u8; 4]) {
     match walk(fat) {
         Ok(c) if c.lost == 0 && c.fats_differ == 0 => {}
         r => panic!("after operation {op:?} the volume walks {r:?}"),

@@ -1,19 +1,20 @@
-//! FAT16, read and written.
+//! FAT16 and FAT32, read and written.
 //!
 //! The first filesystem the kernel reads from a disk it did not write, and now writes to.
 //! FAT rather than a format of our own for one reason: it is already in this tree twice.
-//! kbuild writes a FAT16 volume for the EFI system partition and for the test disk, and
+//! kbuild writes FAT volumes for the EFI system partition and for the test disk, and
 //! `kinboot-efi` reads one to find the kernel. A third format would be a third thing to get
 //! right, with no third reader to check it against — and kbuild's reader is exactly what
 //! checks, after a run, that what the kernel wrote is a volume.
 //!
 //! # What is implemented, and what is refused
 //!
-//! * **FAT16 only.** The cluster count decides the type, as the specification says — not the
-//!   `FAT16` string in the boot sector, which is advisory and which real formatters get wrong. A
-//!   volume outside FAT16's cluster range is refused by name rather than read as if the table were
-//!   12 or 32 bits wide. FAT32 would need a root directory that is a chain, the FSInfo sector and
-//!   28-bit table entries: none of it shares much with this, so it is not here.
+//! * **FAT16 and FAT32.** The cluster count decides which, as the specification says — not the
+//!   `FAT16` or `FAT32` string in the boot sector, which is advisory and which real formatters get
+//!   wrong. A volume whose count falls in FAT12's range is refused by name rather than read as if
+//!   its table were 12 bits wide. The two formats differ in three places and nowhere else: a table
+//!   entry is 16 or 28 bits, the root is a fixed region or a cluster chain, and FAT32 keeps a free
+//!   count in an FSInfo sector ([`Format`]).
 //! * **8.3 names.** Long-name entries are skipped, so a file with one is reachable by its short
 //!   name. A name created or renamed here must be a valid 8.3 name, and is stored in upper case;
 //!   anything else is [`vfs::Error::BadPath`] rather than a name silently shortened.
@@ -46,6 +47,11 @@
 //! cluster and a chain never runs through one. A rename that replaces a file deletes the
 //! target's entry, then renames, then frees.
 //!
+//! FAT32's FSInfo sector is a hint the specification allows to be stale, and this driver does
+//! not let it be: the free count is kept as the table changes and written at
+//! [`sync`](FileSystem::sync), and [`check_consistency`](Fat::check_consistency) reports both
+//! what the sector says and what the table holds, so a caller can require the two to agree.
+//!
 //! What this does not give: a write that overwrites bytes inside a file is not atomic, so a
 //! crash may leave some of it; a file extended and not yet synced may lose the extension.
 //! What it does give: no cross-linked chain, no entry into a free cluster, and table copies
@@ -55,12 +61,14 @@
 //!
 //! Every read and write goes through [`bcache::Cache`], so walking a chain reads the table's
 //! sector once rather than once per cluster. The volume may sit anywhere on the device:
-//! `start` is its first block, which is what lets the test disk carry a pattern region, a
-//! volume and a scratch area on one device with one driver.
+//! `start` is its first block, which is what lets the test disk carry a pattern region, two
+//! volumes and a scratch area on one device with one driver.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+#[cfg(test)]
+mod fat32_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -83,15 +91,11 @@ const ATTR_LONG_NAME: u8 = 0x0F;
 const ENTRY_FREE: u8 = 0x00;
 /// The first byte of a deleted entry, which is skipped.
 const ENTRY_DELETED: u8 = 0xE5;
-/// Cluster values at or above this end a chain.
-const CHAIN_END: u16 = 0xFFF8;
-/// What this driver writes to end a chain.
-const END_OF_CHAIN: u16 = 0xFFFF;
-/// A cluster marked bad, which no chain may run through.
-const BAD_CLUSTER: u16 = 0xFFF7;
-/// FAT16 is defined by its cluster count, not by any string in the volume.
+/// The cluster counts that decide a volume's format, as the specification defines them.
 const MIN_CLUSTERS: u32 = 4085;
-const MAX_CLUSTERS: u32 = 65525;
+const FAT32_CLUSTERS: u32 = 65525;
+/// The most clusters FAT32 addresses: the entry is 28 bits, and the top values end a chain.
+const MAX_CLUSTERS: u32 = 0x0FFF_FFF5;
 /// The longest name this reader reports: eight, a dot, three.
 const NAME_BYTES: usize = 12;
 /// 1980-01-01 as a FAT date, the epoch kbuild's writer stamps too: this kernel keeps no
@@ -105,6 +109,14 @@ const STEP: usize = 32;
 const MAX_DEPTH: usize = 16;
 /// Characters an 8.3 name may hold besides letters and digits.
 const NAME_PUNCTUATION: &[u8] = b"_-!#$%&'()@^{}~";
+/// FSInfo's two signatures and the sector's trailing one, and where each sits.
+const FSINFO_LEAD: u32 = 0x4161_5252;
+const FSINFO_STRUCT: u32 = 0x6141_7272;
+const FSINFO_TRAIL: u32 = 0xAA55_0000;
+const FSINFO_FREE_AT: usize = 488;
+const FSINFO_NEXT_AT: usize = 492;
+/// What FSInfo holds when it knows neither count.
+const FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF;
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
@@ -114,7 +126,60 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
-/// What [`Fat16::check_consistency`] found on a volume it did not call corrupt.
+/// Which of the two formats a volume is, and everything that follows from it.
+///
+/// The cluster count alone decides this at mount; nothing below asks the boot sector's
+/// advisory string.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Format {
+    Fat16,
+    Fat32,
+}
+
+impl Format {
+    /// Bytes one table entry takes.
+    fn entry_bytes(self) -> u64 {
+        match self {
+            Format::Fat16 => 2,
+            Format::Fat32 => 4,
+        }
+    }
+
+    /// The bits of an entry that are the cluster number. FAT32 keeps the top four for
+    /// itself, and a driver that writes them would be writing to a field that is not its.
+    fn mask(self) -> u32 {
+        match self {
+            Format::Fat16 => 0xFFFF,
+            Format::Fat32 => 0x0FFF_FFFF,
+        }
+    }
+
+    /// Values at or above this end a chain.
+    fn chain_end(self) -> u32 {
+        match self {
+            Format::Fat16 => 0xFFF8,
+            Format::Fat32 => 0x0FFF_FFF8,
+        }
+    }
+
+    /// What this driver writes to end a chain.
+    fn end_of_chain(self) -> u32 {
+        match self {
+            Format::Fat16 => 0xFFFF,
+            Format::Fat32 => 0x0FFF_FFFF,
+        }
+    }
+
+    /// A cluster marked bad, which no chain may run through.
+    fn bad(self) -> u32 {
+        match self {
+            Format::Fat16 => 0xFFF7,
+            Format::Fat32 => 0x0FFF_FFF7,
+        }
+    }
+}
+
+/// What [`Fat::check_consistency`] found on a volume it did not call corrupt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Consistency {
     pub files: u32,
@@ -125,16 +190,33 @@ pub struct Consistency {
     pub lost: u32,
     /// Table entries on which the copies disagree.
     pub fats_differ: u32,
+    /// Clusters the table calls free, counted during the walk.
+    pub free: u32,
+    /// What FAT32's FSInfo sector says is free, if there is one and it claims to know.
+    /// A caller that has just synced may require this to be `Some(free)`.
+    pub fsinfo_free: Option<u32>,
 }
 
-/// A mounted FAT16 volume.
+/// What a volume is, as [`Fat::statfs`] reports it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StatFs {
+    pub format: Format,
+    /// Bytes in one cluster: the unit everything below a file's size is allocated in.
+    pub cluster_bytes: u64,
+    /// Clusters the volume has, and how many of them are free.
+    pub clusters: u32,
+    pub free: u32,
+}
+
+/// A mounted FAT volume.
 ///
 /// Owns its cache: the cache is only ever reached through the filesystem, and a filesystem
 /// that borrowed one would make every caller thread two lifetimes through its own types
 /// for no benefit.
-pub struct Fat16<'s, 'd> {
+pub struct Fat<'s, 'd> {
     dev: &'d dyn BlockDevice,
     cache: Cache<'s>,
+    format: Format,
     sector: usize,
     cluster_sectors: u64,
     /// Absolute block of the first file allocation table. Every other position the driver
@@ -144,17 +226,31 @@ pub struct Fat16<'s, 'd> {
     /// Copies of the table, and sectors in each.
     fats: u64,
     fat_sectors: u64,
-    /// Absolute block of the root directory's own region.
-    root_start: u64,
-    root_entries: usize,
+    /// Where the root lives: a region of its own on FAT16, a chain like any other on FAT32.
+    root: Root,
     /// Absolute block the data region starts at, where cluster 2 lives.
     data_start: u64,
     clusters: u32,
     /// Where the next search for a free cluster starts.
     free_hint: u32,
+    /// Clusters the table calls free, counted at mount and kept as the table changes.
+    free_count: u32,
+    /// FAT32's FSInfo sector, absolute, and whether what it holds is behind
+    /// [`free_count`](Self::free_count).
+    fsinfo: Option<u64>,
+    fsinfo_stale: bool,
 }
 
-impl<'s, 'd> Fat16<'s, 'd> {
+/// Where a volume's root directory is.
+#[derive(Clone, Copy)]
+enum Root {
+    /// FAT16: a region of `entries` entries at an absolute block of its own.
+    Region { start: u64, entries: usize },
+    /// FAT32: the first cluster of a chain, which grows like any directory's.
+    Cluster(u32),
+}
+
+impl<'s, 'd> Fat<'s, 'd> {
     /// Read the volume starting at block `start` of `dev` and check its geometry.
     ///
     /// The cache's block size must be the device's, since everything below is counted in
@@ -163,25 +259,24 @@ impl<'s, 'd> Fat16<'s, 'd> {
         dev: &'d dyn BlockDevice,
         mut cache: Cache<'s>,
         start: u64,
-    ) -> Result<Fat16<'s, 'd>, Error> {
+    ) -> Result<Fat<'s, 'd>, Error> {
         let geometry = dev.geometry();
         if cache.block_size() != geometry.block_size {
             return Err(Error::Corrupt("the cache's block size is not the device's"));
         }
         let sector = geometry.block_size;
-        if sector < 64 {
+        if sector < 512 {
             return Err(Error::Corrupt("a block too small to hold a boot sector"));
         }
         let mut boot = [0u8; 512];
-        let boot = &mut boot[..sector.min(512)];
         cache
-            .read_blocks(dev, start, boot)
+            .read_blocks(dev, start, &mut boot)
             .map_err(|_| Error::Device("the volume's first block could not be read"))?;
 
-        if u16_at(boot, 510) != 0xAA55 {
+        if u16_at(&boot, 510) != 0xAA55 {
             return Err(Error::Corrupt("no boot-sector signature"));
         }
-        let bytes_per_sector = u16_at(boot, 11) as usize;
+        let bytes_per_sector = u16_at(&boot, 11) as usize;
         if bytes_per_sector != sector {
             return Err(Error::Corrupt("the volume's sector size is not the device's"));
         }
@@ -189,7 +284,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
         if cluster_sectors == 0 || !cluster_sectors.is_power_of_two() || cluster_sectors > 128 {
             return Err(Error::Corrupt("sectors per cluster"));
         }
-        let reserved = u64::from(u16_at(boot, 14));
+        let reserved = u64::from(u16_at(&boot, 14));
         if reserved == 0 {
             return Err(Error::Corrupt("reserved sectors"));
         }
@@ -197,18 +292,23 @@ impl<'s, 'd> Fat16<'s, 'd> {
         if fats == 0 || fats > 4 {
             return Err(Error::Corrupt("file allocation table count"));
         }
-        let root_entries = u16_at(boot, 17) as usize;
-        if root_entries == 0 || (root_entries * ENTRY) % sector != 0 {
-            return Err(Error::Corrupt("root directory entries"));
-        }
-        let fat_sectors = u64::from(u16_at(boot, 22));
+        let root_entries = u16_at(&boot, 17) as usize;
+        // A table of zero 16-bit sectors means the 32-bit field holds the size, which is
+        // what a FAT32 volume looks like before its cluster count is known.
+        let fat_sectors = match u64::from(u16_at(&boot, 22)) {
+            0 => u64::from(u32_at(&boot, 36)),
+            small => small,
+        };
         if fat_sectors == 0 {
             return Err(Error::Corrupt("sectors per file allocation table"));
         }
-        let total = match u16_at(boot, 19) {
-            0 => u64::from(u32_at(boot, 32)),
+        let total = match u16_at(&boot, 19) {
+            0 => u64::from(u32_at(&boot, 32)),
             small => u64::from(small),
         };
+        if (root_entries * ENTRY) % sector != 0 {
+            return Err(Error::Corrupt("root directory entries"));
+        }
         let root_sectors = (root_entries * ENTRY / sector) as u64;
         let overhead = reserved + fats * fat_sectors + root_sectors;
         if total <= overhead {
@@ -221,30 +321,158 @@ impl<'s, 'd> Fat16<'s, 'd> {
         }
         let clusters = u32::try_from((total - overhead) / cluster_sectors)
             .map_err(|_| Error::Corrupt("cluster count"))?;
-        if !(MIN_CLUSTERS..MAX_CLUSTERS).contains(&clusters) {
-            // The specification decides the width of a table entry by this count alone.
-            return Err(Error::Corrupt("not FAT16: the cluster count is another type's"));
+        // The specification decides the width of a table entry by this count alone.
+        if clusters < MIN_CLUSTERS {
+            return Err(Error::Corrupt(
+                "not a FAT volume this reads: the cluster count is FAT12's",
+            ));
         }
+        if clusters > MAX_CLUSTERS {
+            return Err(Error::Corrupt("more clusters than a table entry can name"));
+        }
+        let format = if clusters < FAT32_CLUSTERS {
+            Format::Fat16
+        } else {
+            Format::Fat32
+        };
         // Every entry of the table must be inside it, or a chain could read the root
-        // directory as if it were table entries.
-        if u64::from(clusters + 2) * 2 > fat_sectors * sector as u64 {
+        // directory, or the data region, as if it were table entries.
+        if u64::from(clusters + 2) * format.entry_bytes() > fat_sectors * sector as u64 {
             return Err(Error::Corrupt("a table too small for its own clusters"));
         }
 
-        Ok(Fat16 {
+        let data_start = start + overhead;
+        let root = match format {
+            Format::Fat16 => {
+                if root_entries == 0 {
+                    return Err(Error::Corrupt("a FAT16 volume with no root directory"));
+                }
+                Root::Region {
+                    start: start + reserved + fats * fat_sectors,
+                    entries: root_entries,
+                }
+            }
+            Format::Fat32 => {
+                if root_entries != 0 {
+                    return Err(Error::Corrupt("a FAT32 volume with a fixed root directory"));
+                }
+                let first = u32_at(&boot, 44) & Format::Fat32.mask();
+                if first < 2 || first >= clusters + 2 {
+                    return Err(Error::Corrupt("a root directory outside the volume"));
+                }
+                Root::Cluster(first)
+            }
+        };
+        // FSInfo's sector number is the boot sector's, and the sector must be inside the
+        // reserved region: one outside it would be a table sector or a file's.
+        let fsinfo = match format {
+            Format::Fat16 => None,
+            Format::Fat32 => {
+                let at = u64::from(u16_at(&boot, 48));
+                if at == 0 || at >= reserved {
+                    return Err(Error::Corrupt("an FSInfo sector outside the reserved region"));
+                }
+                Some(start + at)
+            }
+        };
+
+        let mut fat = Fat {
             dev,
             cache,
+            format,
             sector,
             cluster_sectors,
             fat_start: start + reserved,
             fats,
             fat_sectors,
-            root_start: start + reserved + fats * fat_sectors,
-            root_entries,
-            data_start: start + overhead,
+            root,
+            data_start,
             clusters,
             free_hint: 2,
-        })
+            free_count: 0,
+            fsinfo,
+            fsinfo_stale: false,
+        };
+        // The free count is this driver's own, counted from the table rather than taken
+        // from a hint a crash may have left behind. FSInfo's value is only ever compared
+        // with it, by the consistency walk.
+        fat.free_count = fat.count_free()?;
+        fat.check_fsinfo()?;
+        // A count a crash left behind is not this driver's, and the next sync replaces it.
+        fat.fsinfo_stale = fat.fsinfo_free()? != Some(fat.free_count);
+        Ok(fat)
+    }
+
+    /// The FSInfo sector's signatures, checked at mount so a volume whose reserved region
+    /// holds something else is refused rather than written over at the first sync.
+    fn check_fsinfo(&mut self) -> Result<(), Error> {
+        let Some(at) = self.fsinfo else {
+            return Ok(());
+        };
+        let mut bytes = [0u8; 512];
+        self.read_at_device(at * self.sector as u64, &mut bytes)?;
+        if u32_at(&bytes, 0) != FSINFO_LEAD
+            || u32_at(&bytes, 484) != FSINFO_STRUCT
+            || u32_at(&bytes, 508) != FSINFO_TRAIL
+        {
+            return Err(Error::Corrupt("an FSInfo sector without its signatures"));
+        }
+        Ok(())
+    }
+
+    /// What the FSInfo sector says is free, if it says.
+    fn fsinfo_free(&mut self) -> Result<Option<u32>, Error> {
+        let Some(at) = self.fsinfo else {
+            return Ok(None);
+        };
+        let mut bytes = [0u8; 4];
+        self.read_at_device(at * self.sector as u64 + FSINFO_FREE_AT as u64, &mut bytes)?;
+        let free = u32::from_le_bytes(bytes);
+        Ok((free != FSINFO_UNKNOWN).then_some(free))
+    }
+
+    /// Write the free count and the search hint to FSInfo. A step of its own at
+    /// [`sync`](FileSystem::sync): the sector is a hint, so nothing else waits for it, but a
+    /// volume this driver synced has one that agrees with its table.
+    fn write_fsinfo(&mut self) -> Result<(), Error> {
+        let Some(at) = self.fsinfo else {
+            return Ok(());
+        };
+        if !self.fsinfo_stale {
+            return Ok(());
+        }
+        let base = at * self.sector as u64;
+        self.write_at_device(base + FSINFO_FREE_AT as u64, &self.free_count.to_le_bytes())?;
+        self.write_at_device(base + FSINFO_NEXT_AT as u64, &self.free_hint.to_le_bytes())?;
+        self.step();
+        self.fsinfo_stale = false;
+        Ok(())
+    }
+
+    /// Clusters the table calls free, counted from the table itself.
+    fn count_free(&mut self) -> Result<u32, Error> {
+        let mut free = 0;
+        for cluster in 2..self.clusters + 2 {
+            if self.table_entry(0, cluster)? == 0 {
+                free += 1;
+            }
+        }
+        Ok(free)
+    }
+
+    /// Which format the volume is.
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    /// What the volume is and how much of it is free.
+    pub fn statfs(&self) -> StatFs {
+        StatFs {
+            format: self.format,
+            cluster_bytes: self.bytes_per_cluster(),
+            clusters: self.clusters,
+            free: self.free_count,
+        }
     }
 
     /// What the cache has done, for a caller proving the volume is being read through it.
@@ -300,26 +528,70 @@ impl<'s, 'd> Fat16<'s, 'd> {
         cluster >= 2 && cluster < self.clusters + 2
     }
 
+    /// Where table copy `copy`'s entry for `cluster` sits on the device.
+    fn table_at(&self, copy: u64, cluster: u32) -> u64 {
+        (self.fat_start + copy * self.fat_sectors) * self.sector as u64
+            + u64::from(cluster) * self.format.entry_bytes()
+    }
+
     /// Table copy `copy`'s entry for `cluster`, unchecked beyond its position.
-    fn table_entry(&mut self, copy: u64, cluster: u32) -> Result<u16, Error> {
-        let at = (self.fat_start + copy * self.fat_sectors) * self.sector as u64
-            + u64::from(cluster) * 2;
-        let mut bytes = [0u8; 2];
-        self.read_at_device(at, &mut bytes)?;
-        Ok(u16::from_le_bytes(bytes))
+    fn table_entry(&mut self, copy: u64, cluster: u32) -> Result<u32, Error> {
+        let at = self.table_at(copy, cluster);
+        match self.format {
+            Format::Fat16 => {
+                let mut bytes = [0u8; 2];
+                self.read_at_device(at, &mut bytes)?;
+                Ok(u32::from(u16::from_le_bytes(bytes)))
+            }
+            Format::Fat32 => {
+                let mut bytes = [0u8; 4];
+                self.read_at_device(at, &mut bytes)?;
+                Ok(u32::from_le_bytes(bytes) & Format::Fat32.mask())
+            }
+        }
     }
 
     /// Write `changes` to every table copy, the first copy's as one step and each later
     /// copy's as the next.
-    fn table_step(&mut self, changes: &[(u32, u16)]) -> Result<(), Error> {
+    ///
+    /// The free count follows the first copy: an entry that goes from free to taken, or
+    /// back, is the only thing that changes it, and this is the only place entries change.
+    fn table_step(&mut self, changes: &[(u32, u32)]) -> Result<(), Error> {
         for copy in 0..self.fats {
             for &(cluster, value) in changes {
                 if !self.in_volume(cluster) {
                     return Err(Error::Corrupt("a table change outside the volume"));
                 }
-                let at = (self.fat_start + copy * self.fat_sectors) * self.sector as u64
-                    + u64::from(cluster) * 2;
-                self.write_at_device(at, &value.to_le_bytes())?;
+                if value & !self.format.mask() != 0 {
+                    return Err(Error::Corrupt("a table value wider than an entry"));
+                }
+                let was = self.table_entry(copy, cluster)?;
+                if copy == 0 {
+                    match (was == 0, value == 0) {
+                        (false, true) => {
+                            self.free_count += 1;
+                            self.fsinfo_stale = true;
+                        }
+                        (true, false) => {
+                            self.free_count = self.free_count.saturating_sub(1);
+                            self.fsinfo_stale = true;
+                        }
+                        _ => {}
+                    }
+                }
+                let at = self.table_at(copy, cluster);
+                match self.format {
+                    Format::Fat16 => self.write_at_device(at, &(value as u16).to_le_bytes())?,
+                    Format::Fat32 => {
+                        // The top four bits are not this driver's: a volume's own flags live
+                        // there, and a write that cleared them would be writing another
+                        // field.
+                        let mut whole = [0u8; 4];
+                        self.read_at_device(at, &mut whole)?;
+                        let kept = u32::from_le_bytes(whole) & !Format::Fat32.mask();
+                        self.write_at_device(at, &(kept | value).to_le_bytes())?;
+                    }
+                }
             }
             self.step();
         }
@@ -332,10 +604,9 @@ impl<'s, 'd> Fat16<'s, 'd> {
             return Err(Error::Corrupt("a cluster number outside the volume"));
         }
         let next = self.table_entry(0, cluster)?;
-        if next >= CHAIN_END {
+        if next >= self.format.chain_end() {
             return Ok(None);
         }
-        let next = u32::from(next);
         if !self.in_volume(next) {
             return Err(Error::Corrupt("a chain entry outside the volume"));
         }
@@ -403,38 +674,23 @@ impl<'s, 'd> Fat16<'s, 'd> {
 
     /// Whether at least `want` clusters are free.
     fn have_free(&mut self, want: u64) -> Result<bool, Error> {
-        if want == 0 {
-            return Ok(true);
-        }
-        if want > u64::from(self.clusters) {
-            return Ok(false);
-        }
-        let mut seen = 0u64;
-        for cluster in 2..self.clusters + 2 {
-            if self.table_entry(0, cluster)? == 0 {
-                seen += 1;
-                if seen == want {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        Ok(want <= u64::from(self.free_count))
     }
 
     /// Where the `index`th raw entry of a directory lives on the device, or `None` past
     /// the end of the directory.
     ///
-    /// The root has a region of its own, of a fixed number of entries. Every other
-    /// directory is a chain of clusters like a file's.
+    /// FAT16's root has a region of its own, of a fixed number of entries. Every other
+    /// directory, FAT32's root included, is a chain of clusters like a file's.
     fn entry_offset(&mut self, dir: Dir, index: usize) -> Result<Option<u64>, Error> {
-        match dir {
-            Dir::Root => {
-                if index >= self.root_entries {
+        match self.resolve(dir) {
+            Place::Region { start, entries } => {
+                if index >= entries {
                     return Ok(None);
                 }
-                Ok(Some(self.root_start * self.sector as u64 + (index * ENTRY) as u64))
+                Ok(Some(start * self.sector as u64 + (index * ENTRY) as u64))
             }
-            Dir::Cluster(first) => {
+            Place::Cluster(first) => {
                 let per_cluster = self.bytes_per_cluster() / ENTRY as u64;
                 if per_cluster == 0 {
                     return Err(Error::Corrupt("a cluster too small for an entry"));
@@ -446,6 +702,18 @@ impl<'s, 'd> Fat16<'s, 'd> {
                     None => Ok(None),
                 }
             }
+        }
+    }
+
+    /// Where a directory's entries are, with the root resolved to whichever shape this
+    /// volume's format gives it.
+    fn resolve(&self, dir: Dir) -> Place {
+        match dir {
+            Dir::Root => match self.root {
+                Root::Region { start, entries } => Place::Region { start, entries },
+                Root::Cluster(first) => Place::Cluster(first),
+            },
+            Dir::Cluster(first) => Place::Cluster(first),
         }
     }
 
@@ -510,15 +778,51 @@ impl<'s, 'd> Fat16<'s, 'd> {
         if bytes[11] & ATTR_DIRECTORY == 0 {
             return Err(Error::NotADirectory);
         }
-        match first_cluster(bytes) {
+        match self.first_cluster(bytes) {
             // A directory with no chain has no entries: `.` and `..` are entries like any
-            // other, so a real one always has at least one cluster.
+            // other, so a real one always has at least one cluster. `..` one below the root
+            // names cluster 0, and never reaches here: a reader skips it, so nothing looks
+            // a directory up through it.
             0 => Err(Error::Corrupt("a directory with no clusters")),
             c if !self.in_volume(c) => {
                 Err(Error::Corrupt("a directory starting outside the volume"))
             }
             c => Ok(Dir::Cluster(c)),
         }
+    }
+
+    /// The first cluster an entry names.
+    ///
+    /// FAT16 keeps the low half only, and the high half is zero on such a volume: a
+    /// formatter that left something there would be describing a FAT32 cluster, so it is
+    /// ignored rather than believed.
+    fn first_cluster(&self, entry: &[u8; ENTRY]) -> u32 {
+        let low = u32::from(u16_at(entry, 26));
+        match self.format {
+            Format::Fat16 => low,
+            Format::Fat32 => (u32::from(u16_at(entry, 20)) << 16) | low,
+        }
+    }
+
+    /// Put `cluster` in `entry`, in whichever halves this format keeps it.
+    fn set_first_cluster(&self, entry: &mut [u8; ENTRY], cluster: u32) {
+        entry[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+        if self.format == Format::Fat32 {
+            entry[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+        }
+    }
+
+    /// A fresh directory entry, with its first cluster where this format keeps it.
+    fn new_entry(&self, name: [u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; ENTRY] {
+        let mut e = [0u8; ENTRY];
+        e[..11].copy_from_slice(&name);
+        e[11] = attr;
+        for at in [16, 18, 24] {
+            e[at..at + 2].copy_from_slice(&FAT_EPOCH_DATE.to_le_bytes());
+        }
+        self.set_first_cluster(&mut e, cluster);
+        e[28..32].copy_from_slice(&size.to_le_bytes());
+        e
     }
 
     /// The 32 bytes of the directory entry a node names.
@@ -559,7 +863,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
         let len = u64::from(u32_at(&entry, 28));
         let end = offset + from.len() as u64;
         let per = self.bytes_per_cluster();
-        let first = first_cluster(&entry);
+        let first = self.first_cluster(&entry);
         let (have, mut tail) = match first {
             0 => (0, None),
             f => {
@@ -593,6 +897,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
         // Clusters the file does not have yet, a step's worth at a time.
         let mut placed = have;
         let mut new_first = None;
+        let end_of_chain = self.format.end_of_chain();
         while placed < need {
             let want = ((need - placed) as usize).min(STEP);
             let mut fresh = [0u32; STEP];
@@ -612,18 +917,18 @@ impl<'s, 'd> Fat16<'s, 'd> {
             }
             self.step();
             // The new clusters' own entries, then the link to them.
-            let mut chain = [(0u32, 0u16); STEP];
+            let mut chain = [(0u32, 0u32); STEP];
             for i in 0..want {
                 let value = if i + 1 < want {
-                    fresh[i + 1] as u16
+                    fresh[i + 1]
                 } else {
-                    END_OF_CHAIN
+                    end_of_chain
                 };
                 chain[i] = (fresh[i], value);
             }
             self.table_step(&chain[..want])?;
             match tail {
-                Some(last) => self.table_step(&[(last, fresh[0] as u16)])?,
+                Some(last) => self.table_step(&[(last, fresh[0])])?,
                 None => new_first = Some(fresh[0]),
             }
             tail = Some(fresh[want - 1]);
@@ -634,7 +939,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
         // The entry last: its first cluster if it had none, and its size.
         if end > len || new_first.is_some() {
             if let Some(f) = new_first {
-                entry[26..28].copy_from_slice(&(f as u16).to_le_bytes());
+                self.set_first_cluster(&mut entry, f);
             }
             entry[28..32].copy_from_slice(&(end.max(len) as u32).to_le_bytes());
             self.write_at_device(node - 1, &entry)?;
@@ -660,12 +965,13 @@ impl<'s, 'd> Fat16<'s, 'd> {
     /// cluster.
     fn free_chain(&mut self, start: u32, new_end: Option<u32>) -> Result<(), Error> {
         if let Some(last) = new_end {
-            self.table_step(&[(last, END_OF_CHAIN)])?;
+            let end_of_chain = self.format.end_of_chain();
+            self.table_step(&[(last, end_of_chain)])?;
         }
         let mut next = Some(start);
         let mut freed = 0u64;
         while let Some(first) = next {
-            let mut batch = [(0u32, 0u16); STEP];
+            let mut batch = [(0u32, 0u32); STEP];
             let mut n = 0;
             let mut cluster = Some(first);
             while let Some(c) = cluster {
@@ -689,8 +995,9 @@ impl<'s, 'd> Fat16<'s, 'd> {
         Ok(())
     }
 
-    /// An entry of `dir` free to hold a new name, growing a subdirectory by a cluster when it
-    /// has none. The root's region is fixed, and full is [`Error::Full`].
+    /// An entry of `dir` free to hold a new name, growing the directory by a cluster when
+    /// every entry is taken. FAT16's root region is fixed, and full is [`Error::Full`];
+    /// FAT32's root is a chain and grows like any other directory.
     fn free_entry(&mut self, dir: Dir) -> Result<u64, Error> {
         let mut index = 0usize;
         loop {
@@ -702,7 +1009,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
                 None => break,
             }
         }
-        let Dir::Cluster(first) = dir else {
+        let Place::Cluster(first) = self.resolve(dir) else {
             return Err(Error::Full);
         };
         let (_, last) = self.chain_end(first)?;
@@ -711,10 +1018,11 @@ impl<'s, 'd> Fat16<'s, 'd> {
             return Err(Error::Full);
         }
         let cluster = fresh[0];
+        let end_of_chain = self.format.end_of_chain();
         self.zero_cluster(cluster)?;
         self.step();
-        self.table_step(&[(cluster, END_OF_CHAIN)])?;
-        self.table_step(&[(last, cluster as u16)])?;
+        self.table_step(&[(cluster, end_of_chain)])?;
+        self.table_step(&[(last, cluster)])?;
         self.free_hint = cluster + 1;
         Ok(self.cluster_offset(cluster))
     }
@@ -746,8 +1054,9 @@ impl<'s, 'd> Fat16<'s, 'd> {
     ///
     /// `seen` is a bitmap of at least [`clusters`](Self::clusters) + 2 bits the caller lends,
     /// so the check allocates nothing and runs in the kernel as well as on a host. What a
-    /// crash may leave — lost clusters, table copies that differ — is counted, not refused:
-    /// the caller decides whether a clean volume must have none.
+    /// crash may leave — lost clusters, table copies that differ, an FSInfo count behind the
+    /// table — is counted, not refused: the caller decides whether a clean volume must have
+    /// none.
     pub fn check_consistency(&mut self, seen: &mut [u8]) -> Result<Consistency, Error> {
         let bits = self.clusters as usize + 2;
         let seen = seen
@@ -755,11 +1064,17 @@ impl<'s, 'd> Fat16<'s, 'd> {
             .ok_or(Error::Corrupt("a bitmap too small for the volume"))?;
         seen.fill(0);
         let mut report = Consistency::default();
+        // FAT32's root is a chain, and its clusters are claimed like any other directory's.
+        if let Root::Cluster(first) = self.root {
+            self.claim_chain(first, seen, &mut report)?;
+        }
         self.walk(Dir::Root, 0, seen, &mut report)?;
         for cluster in 2..self.clusters + 2 {
             let first = self.table_entry(0, cluster)?;
             let claimed = seen[cluster as usize / 8] & (1 << (cluster % 8)) != 0;
-            if first != 0 && first != BAD_CLUSTER && !claimed {
+            if first == 0 {
+                report.free += 1;
+            } else if first != self.format.bad() && !claimed {
                 report.lost += 1;
             }
             for copy in 1..self.fats {
@@ -769,6 +1084,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
                 }
             }
         }
+        report.fsinfo_free = self.fsinfo_free()?;
         Ok(report)
     }
 
@@ -791,7 +1107,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
                 }
                 continue;
             }
-            let first = first_cluster(&bytes);
+            let first = self.first_cluster(&bytes);
             match entry_kind(&bytes) {
                 Kind::File => {
                     report.files += 1;
@@ -837,7 +1153,7 @@ impl<'s, 'd> Fat16<'s, 'd> {
             if value == 0 {
                 return Err(Error::Corrupt("a chain through a free cluster"));
             }
-            if value == BAD_CLUSTER {
+            if value == self.format.bad() {
                 return Err(Error::Corrupt("a chain through a bad cluster"));
             }
             let bit = 1u8 << (cluster % 8);
@@ -848,10 +1164,10 @@ impl<'s, 'd> Fat16<'s, 'd> {
             *byte |= bit;
             count += 1;
             report.claimed += 1;
-            if value >= CHAIN_END {
+            if value >= self.format.chain_end() {
                 return Ok(count);
             }
-            cluster = u32::from(value);
+            cluster = value;
         }
     }
 }
@@ -859,11 +1175,20 @@ impl<'s, 'd> Fat16<'s, 'd> {
 /// The root, which has no directory entry of its own.
 const ROOT: NodeId = 0;
 
-/// How a directory is reached.
+/// How a directory is reached, as a caller names it.
 #[derive(Clone, Copy)]
 enum Dir {
     Root,
     /// The first cluster of its chain.
+    Cluster(u32),
+}
+
+/// Where a directory's entries are, once the root is resolved for this volume's format.
+#[derive(Clone, Copy)]
+enum Place {
+    /// A region of `entries` entries at an absolute block: FAT16's root, and nothing else.
+    Region { start: u64, entries: usize },
+    /// The first cluster of a chain.
     Cluster(u32),
 }
 
@@ -883,12 +1208,6 @@ fn names_something(bytes: &[u8; ENTRY]) -> Result<bool, Error> {
     }
     let (name, len) = entry_name(bytes);
     Ok(!(len == 0 || &name[..len] == b"." || &name[..len] == b".."))
-}
-
-fn first_cluster(entry: &[u8; ENTRY]) -> u32 {
-    // FAT16 keeps the low half only; the high half is zero on a FAT16 volume, and a
-    // formatter that left something there would be describing a FAT32 cluster.
-    u32::from(u16_at(entry, 26))
 }
 
 fn entry_kind(entry: &[u8; ENTRY]) -> Kind {
@@ -965,20 +1284,7 @@ fn name_byte(c: u8) -> Result<u8, Error> {
     }
 }
 
-/// A fresh directory entry.
-fn new_entry(name: [u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; ENTRY] {
-    let mut e = [0u8; ENTRY];
-    e[..11].copy_from_slice(&name);
-    e[11] = attr;
-    for at in [16, 18, 24] {
-        e[at..at + 2].copy_from_slice(&FAT_EPOCH_DATE.to_le_bytes());
-    }
-    e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
-    e[28..32].copy_from_slice(&size.to_le_bytes());
-    e
-}
-
-impl FileSystem for Fat16<'_, '_> {
+impl FileSystem for Fat<'_, '_> {
     fn root(&self) -> NodeId {
         ROOT
     }
@@ -1021,7 +1327,7 @@ impl FileSystem for Fat16<'_, '_> {
         if offset >= len {
             return Ok(0);
         }
-        let first = first_cluster(&bytes);
+        let first = self.first_cluster(&bytes);
         if first == 0 {
             // An empty file has no chain. A non-empty one that claims none is corrupt.
             return Err(Error::Corrupt("a file with bytes but no clusters"));
@@ -1049,11 +1355,10 @@ impl FileSystem for Fat16<'_, '_> {
         if from.is_empty() {
             return Ok(0);
         }
-        let end = offset
+        offset
             .checked_add(from.len() as u64)
             .filter(|&e| e <= u64::from(u32::MAX))
             .ok_or(Error::Full)?;
-        let _ = end;
         let len = u64::from(u32_at(&entry, 28));
         if offset > len {
             self.zero_fill(node, len, offset)?;
@@ -1070,7 +1375,7 @@ impl FileSystem for Fat16<'_, '_> {
         }
         let slot = self.free_entry(parent)?;
         let entry = match kind {
-            Kind::File => new_entry(short, ATTR_ARCHIVE, 0, 0),
+            Kind::File => self.new_entry(short, ATTR_ARCHIVE, 0, 0),
             Kind::Dir => {
                 let mut fresh = [0u32; 1];
                 if self.free_clusters(&mut fresh)? != 1 {
@@ -1080,19 +1385,22 @@ impl FileSystem for Fat16<'_, '_> {
                 // The directory's own cluster, with `.` and `..`, while the table still calls
                 // it free; then the table; then the entry naming it.
                 self.zero_cluster(cluster)?;
-                let dot = new_entry(*b".          ", ATTR_DIRECTORY, cluster, 0);
+                let dot = self.new_entry(*b".          ", ATTR_DIRECTORY, cluster, 0);
+                // `..` names the root as cluster 0 on both formats, whatever cluster FAT32's
+                // root actually starts at: that is what every other reader writes there.
                 let up = match parent {
                     Dir::Root => 0,
                     Dir::Cluster(c) => c,
                 };
-                let dotdot = new_entry(*b"..         ", ATTR_DIRECTORY, up, 0);
+                let dotdot = self.new_entry(*b"..         ", ATTR_DIRECTORY, up, 0);
                 let at = self.cluster_offset(cluster);
                 self.write_at_device(at, &dot)?;
                 self.write_at_device(at + ENTRY as u64, &dotdot)?;
                 self.step();
-                self.table_step(&[(cluster, END_OF_CHAIN)])?;
+                let end_of_chain = self.format.end_of_chain();
+                self.table_step(&[(cluster, end_of_chain)])?;
                 self.free_hint = cluster + 1;
-                new_entry(short, ATTR_DIRECTORY, cluster, 0)
+                self.new_entry(short, ATTR_DIRECTORY, cluster, 0)
             }
         };
         self.write_at_device(slot, &entry)?;
@@ -1109,12 +1417,12 @@ impl FileSystem for Fat16<'_, '_> {
         if len >= old {
             return self.zero_fill(node, old, len);
         }
-        let first = first_cluster(&entry);
+        let first = self.first_cluster(&entry);
         let keep = len.div_ceil(self.bytes_per_cluster());
         // The entry first, so it never names a cluster about to be freed.
         entry[28..32].copy_from_slice(&(len as u32).to_le_bytes());
         if keep == 0 {
-            entry[26..28].copy_from_slice(&0u16.to_le_bytes());
+            self.set_first_cluster(&mut entry, 0);
         }
         self.write_at_device(node - 1, &entry)?;
         self.step();
@@ -1142,7 +1450,7 @@ impl FileSystem for Fat16<'_, '_> {
         // The entry first: once it is gone, its chain is lost clusters until it is freed.
         self.write_at_device(offset, &[ENTRY_DELETED])?;
         self.step();
-        match first_cluster(&entry) {
+        match self.first_cluster(&entry) {
             0 => Ok(()),
             first => self.free_chain(first, None),
         }
@@ -1167,7 +1475,7 @@ impl FileSystem for Fat16<'_, '_> {
                 // chain is lost clusters until it is freed below.
                 self.write_at_device(target_at, &[ENTRY_DELETED])?;
                 self.step();
-                replaced = Some(first_cluster(&target));
+                replaced = Some(self.first_cluster(&target));
             }
         }
         self.write_at_device(offset, &short)?;
@@ -1179,6 +1487,9 @@ impl FileSystem for Fat16<'_, '_> {
     }
 
     fn sync(&mut self) -> Result<(), Error> {
+        // FSInfo before the flush, so a volume that synced has a free count that agrees
+        // with its table rather than the hint a crash left.
+        self.write_fsinfo()?;
         self.cache
             .sync(self.dev)
             .map_err(|_| Error::Device("writing the volume back failed"))

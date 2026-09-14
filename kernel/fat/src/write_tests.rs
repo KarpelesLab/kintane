@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use block::{BlockDevice, Error as BlockError, Geometry};
 use vfs::{Error, FileSystem, Kind, OpenFlags, Vfs};
 
-use crate::{Consistency, Fat16};
+use crate::{Consistency, Fat};
 
 const SECTOR: usize = 512;
 /// One sector per cluster: a 4 200-sector volume is FAT16 by its cluster count and small
@@ -101,21 +101,21 @@ impl BlockDevice for Disk {
 }
 
 /// Run `f` on the volume `disk` holds, through a cache of `slots` blocks.
-fn with_volume<R>(disk: &Disk, slots: usize, f: impl FnOnce(&mut Fat16<'_, '_>) -> R) -> R {
+fn with_volume<R>(disk: &Disk, slots: usize, f: impl FnOnce(&mut Fat<'_, '_>) -> R) -> R {
     let mut slot_array = vec![bcache::Slot::EMPTY; slots];
     let mut data = vec![0u8; slots * SECTOR];
     let cache = bcache::Cache::new(&mut slot_array, &mut data, SECTOR).unwrap();
-    let mut fat = Fat16::mount(disk, cache, 0).unwrap();
+    let mut fat = Fat::mount(disk, cache, 0).unwrap();
     f(&mut fat)
 }
 
-fn consistency(fat: &mut Fat16<'_, '_>) -> Result<Consistency, Error> {
+fn consistency(fat: &mut Fat<'_, '_>) -> Result<Consistency, Error> {
     let mut seen = vec![0u8; (fat.clusters() as usize + 2).div_ceil(8)];
     fat.check_consistency(&mut seen)
 }
 
 /// A clean volume: consistent, nothing lost, both tables the same, nothing left unwritten.
-fn assert_clean(fat: &mut Fat16<'_, '_>) -> Consistency {
+fn assert_clean(fat: &mut Fat<'_, '_>) -> Consistency {
     assert_eq!(fat.dirty_blocks(), 0, "a synced volume holds nothing back");
     fat.check_cache().unwrap();
     let c = consistency(fat).unwrap();
@@ -377,7 +377,7 @@ fn a_read_only_file_is_not_written() {
 
 /// A workload that creates, grows, overwrites, truncates, renames and removes, with a sync
 /// in the middle and one at the end.
-fn workload(fat: &mut Fat16<'_, '_>) {
+fn workload(fat: &mut Fat<'_, '_>) {
     let mut ns = Vfs::<1, 4>::new();
     ns.mount("/", fat).unwrap();
     ns.mkdir("/dir").unwrap();

@@ -28,7 +28,7 @@ use arch::Cpu;
 use bcache::Storage;
 use block::BlockDevice;
 use block::testdisk::{self, SECTOR};
-use fat::Fat16;
+use fat::Fat;
 use hal::{EarlyConsole, PhysAddr};
 use mm::phys::FrameAllocator;
 use time::{Duration, Instant};
@@ -70,7 +70,7 @@ static CHUNK: SyncUnsafeCell<[u8; 4096]> = SyncUnsafeCell::new([0; 4096]);
 ///
 /// Not a `SyncUnsafeCell`: a volume holds a `&dyn BlockDevice`, which is not `Sync`, so the
 /// compiler cannot vouch for sharing it and the invariant below is what does.
-struct Volume(UnsafeCell<Option<Fat16<'static, 'static>>>);
+struct Volume(UnsafeCell<Option<Fat<'static, 'static>>>);
 
 // SAFETY: written once, by `check`, before `MOUNTED` is set. After that it is reached through
 // `volume`, on the boot path before any other thread can use the volume, or through a `Lease`,
@@ -101,7 +101,7 @@ pub fn mounted() -> bool {
         reason = "the Linux personality's check is the one boot-path user left"
     )
 )]
-pub unsafe fn volume() -> Option<&'static mut Fat16<'static, 'static>> {
+pub unsafe fn volume() -> Option<&'static mut Fat<'static, 'static>> {
     if !MOUNTED.load(Ordering::Acquire) {
         return None;
     }
@@ -122,10 +122,10 @@ const BITMAP_BYTES: usize = 2048;
 static BITMAP: SyncUnsafeCell<[u8; BITMAP_BYTES]> = SyncUnsafeCell::new([0; BITMAP_BYTES]);
 static BITMAP_BUSY: AtomicBool = AtomicBool::new(false);
 
-/// Walk `volume` for what a crash must never leave — see `fat::Fat16::check_consistency` — with
+/// Walk `volume` for what a crash must never leave — see `fat::Fat::check_consistency` — with
 /// a bitmap of this module's, so no caller needs a kilobyte of stack for one.
 /// [`Error::Device`] if another thread is walking at the same moment.
-pub fn consistency(volume: &mut Fat16<'_, '_>) -> Result<fat::Consistency, Error> {
+pub fn consistency(volume: &mut Fat<'_, '_>) -> Result<fat::Consistency, Error> {
     if BITMAP_BUSY
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -145,11 +145,11 @@ pub fn consistency(volume: &mut Fat16<'_, '_>) -> Result<fat::Consistency, Error
 /// audit. They take turns without knowing about each other, and none holds the volume while it
 /// waits for anything else.
 pub struct Lease {
-    volume: &'static mut Fat16<'static, 'static>,
+    volume: &'static mut Fat<'static, 'static>,
 }
 
 impl Deref for Lease {
-    type Target = Fat16<'static, 'static>;
+    type Target = Fat<'static, 'static>;
 
     fn deref(&self) -> &Self::Target {
         self.volume
@@ -243,7 +243,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
         c.write_str("the cache's storage is not whole blocks");
         return Check::Failed;
     };
-    let mut fat = match Fat16::mount(disk, cache, testdisk::FS_START) {
+    let mut fat = match Fat::mount(disk, cache, testdisk::FS_START) {
         Ok(f) => f,
         Err(e) => {
             failed(c, "mounting the volume", e);
@@ -517,7 +517,7 @@ fn set_disk_program(bytes: &'static [u8]) {
 fn set_disk_program(_bytes: &'static [u8]) {}
 
 /// The volume was read through its cache, and the cache's books balance.
-fn cache_books(c: &dyn EarlyConsole, fat: &Fat16<'_, '_>) -> bool {
+fn cache_books(c: &dyn EarlyConsole, fat: &Fat<'_, '_>) -> bool {
     if let Err(what) = fat.check_cache() {
         c.write_str("; THE CACHE'S BOOKS ARE WRONG: ");
         c.write_str(what);
@@ -600,7 +600,7 @@ const CRASH_SEED: u8 = 0x41;
 /// point. Every byte of every file below [`CRASH_DIR`] is `out_byte(CRASH_SEED, offset)`,
 /// whichever file it was written through and however it was renamed since, so after any cut a
 /// byte below a file's size that is anything else was never written there. Never returns.
-fn crash_writes(c: &dyn EarlyConsole, mut fat: Fat16<'static, 'static>) -> ! {
+fn crash_writes(c: &dyn EarlyConsole, mut fat: Fat<'static, 'static>) -> ! {
     let mut ns = Vfs::<1, 1>::new();
     if ns.mount("/", &mut fat).is_err() {
         c.write_str("\nfscrash: THE VOLUME DID NOT MOUNT\n");

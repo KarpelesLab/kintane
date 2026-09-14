@@ -14,7 +14,7 @@ use bcache::Storage;
 use block::{BlockDevice, Error as BlockError, Geometry};
 use vfs::{Error, FileSystem, Kind, Vfs};
 
-use crate::Fat16;
+use crate::Fat;
 
 const SECTOR: usize = 512;
 /// One sector per cluster, which is what makes a 4 000-cluster volume small enough for a
@@ -282,7 +282,7 @@ macro_rules! mounted {
     ($disk:ident, $fat:ident, $volume:expr) => {
         let $disk = MockDisk::with(&$volume);
         let mut storage = Storage::<8, SECTOR>::new();
-        let mut $fat = Fat16::mount(&$disk, storage.cache().unwrap(), START).unwrap();
+        let mut $fat = Fat::mount(&$disk, storage.cache().unwrap(), START).unwrap();
     };
 }
 
@@ -456,14 +456,14 @@ fn a_volume_that_is_not_fat16_is_refused_by_name() {
         (510, 0x00, "no boot-sector signature"),
         (13, 0, "sectors per cluster"),
         (16, 0, "file allocation table count"),
-        (17, 0, "root directory entries"),
+        (17, 0, "a FAT16 volume with no root directory"),
         (22, 0, "sectors per file allocation table"),
     ];
     for (offset, byte, want) in cases {
         let disk = MockDisk::with(&v);
         disk.poke(offset, byte);
         let mut storage = Storage::<4, SECTOR>::new();
-        let err = Fat16::mount(&disk, storage.cache().unwrap(), START)
+        let err = Fat::mount(&disk, storage.cache().unwrap(), START)
             .map(|_| ())
             .unwrap_err();
         assert_eq!(err, Error::Corrupt(want), "poking {offset}");
@@ -473,10 +473,10 @@ fn a_volume_that_is_not_fat16_is_refused_by_name() {
     let disk = MockDisk::with(&v);
     disk.poke(13, 64); // 64 sectors per cluster leaves ~65 clusters
     let mut storage = Storage::<4, SECTOR>::new();
-    let err = Fat16::mount(&disk, storage.cache().unwrap(), START)
+    let err = Fat::mount(&disk, storage.cache().unwrap(), START)
         .map(|_| ())
         .unwrap_err();
-    assert_eq!(err, Error::Corrupt("not FAT16: the cluster count is another type's"));
+    assert_eq!(err, Error::Corrupt("not a FAT volume this reads: the cluster count is FAT12's"));
 }
 
 #[test]
@@ -485,7 +485,7 @@ fn a_volume_that_runs_past_the_device_is_refused() {
     // The volume says it has TOTAL sectors; the device stops eight short of that.
     let disk = MockDisk::truncated(&v, 8);
     let mut storage = Storage::<4, SECTOR>::new();
-    let err = Fat16::mount(&disk, storage.cache().unwrap(), START)
+    let err = Fat::mount(&disk, storage.cache().unwrap(), START)
         .map(|_| ())
         .unwrap_err();
     assert_eq!(err, Error::Corrupt("a volume that runs past the end of the device"));
@@ -499,7 +499,7 @@ fn a_chain_that_loops_is_refused_rather_than_walked_for_ever() {
     // The file's first cluster is 2; point its third at its second.
     disk.set_fat(4, 3);
     let mut storage = Storage::<8, SECTOR>::new();
-    let mut fat = Fat16::mount(&disk, storage.cache().unwrap(), START).unwrap();
+    let mut fat = Fat::mount(&disk, storage.cache().unwrap(), START).unwrap();
     let root = fat.root();
     let node = fat.lookup(root, b"BIG.BIN").unwrap();
 
@@ -526,7 +526,7 @@ fn a_chain_entry_outside_the_volume_is_refused() {
     let disk = MockDisk::with(&v);
     disk.set_fat(2, 60000); // past the last cluster of this volume
     let mut storage = Storage::<8, SECTOR>::new();
-    let mut fat = Fat16::mount(&disk, storage.cache().unwrap(), START).unwrap();
+    let mut fat = Fat::mount(&disk, storage.cache().unwrap(), START).unwrap();
     let root = fat.root();
     let node = fat.lookup(root, b"BIG.BIN").unwrap();
     let mut buf = [0u8; 16];
@@ -544,7 +544,7 @@ fn a_file_whose_chain_ends_early_is_corrupt_not_short() {
     // End the chain after its first cluster, leaving the size claiming six.
     disk.set_fat(2, 0xFFFF);
     let mut storage = Storage::<8, SECTOR>::new();
-    let mut fat = Fat16::mount(&disk, storage.cache().unwrap(), START).unwrap();
+    let mut fat = Fat::mount(&disk, storage.cache().unwrap(), START).unwrap();
     let root = fat.root();
     let node = fat.lookup(root, b"BIG.BIN").unwrap();
     let mut buf = [0u8; 16];
@@ -562,7 +562,7 @@ fn a_deleted_entry_is_skipped_and_a_never_used_one_ends_the_directory() {
     let root_at = (RESERVED + FATS * layout().fat_sectors) * SECTOR;
     disk.poke(root_at + 2 * ENTRY, 0xE5);
     let mut storage = Storage::<8, SECTOR>::new();
-    let mut fat = Fat16::mount(&disk, storage.cache().unwrap(), START).unwrap();
+    let mut fat = Fat::mount(&disk, storage.cache().unwrap(), START).unwrap();
     let root = fat.root();
 
     let mut names = Vec::new();
@@ -584,7 +584,7 @@ fn a_long_name_entry_is_skipped_and_its_short_name_still_works() {
     let root_at = (RESERVED + FATS * layout().fat_sectors) * SECTOR;
     disk.poke(root_at + ENTRY + 11, 0x0F);
     let mut storage = Storage::<8, SECTOR>::new();
-    let mut fat = Fat16::mount(&disk, storage.cache().unwrap(), START).unwrap();
+    let mut fat = Fat::mount(&disk, storage.cache().unwrap(), START).unwrap();
     let root = fat.root();
 
     let mut names = Vec::new();
