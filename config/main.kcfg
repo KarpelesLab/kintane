@@ -592,3 +592,19 @@ config QEMU_PCI_TEST_DEVICE
         4 KiB of memory), so the device check on x86 requires both to be
         found exactly. Also turns on the checks that only hold on QEMU's
         machines, such as the host bridge's identity.
+
+config QEMU_BLOCK_TEST
+    bool "A virtio-blk disk with a known pattern under QEMU"
+    depends on QEMU_EXIT && MM_PAGED
+    default y if ARCH_AARCH64
+    help
+        Attach a 2 MiB disk image kbuild writes at build time to a virtio-blk
+        device, and gate the boot on the block check: the driver reads sectors
+        whose contents are a function of their position, writes and reads
+        back a scratch area, flushes, and must refuse a read past the end
+        with no request or descriptor left outstanding. The image is attached
+        with snapshot=on, so a run's writes never reach the file.
+
+        On aarch64, where the device is a memory-mapped virtio slot the
+        device tree describes. Needs MM_PAGED, because the check maps the
+        driver's DMA region through the kernel's direct map.

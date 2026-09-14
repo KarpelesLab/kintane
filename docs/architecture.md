@@ -624,6 +624,75 @@ without hanging, when:
 A mutation that claims the GICv3 redistributor but leaves it out of the mapped windows
 faults on the redistributor's first register after the switch.
 
+### `block` — the block layer, and the first driver with DMA
+
+`kernel/block` is what a storage driver implements and the bookkeeping above it. It does
+not allocate, cache or block:
+
+- **`BlockDevice`:** geometry, a per-request transfer limit, `read_blocks`, `write_blocks` and
+  `flush`, all `&self` and fallible.
+- **`Geometry::range`:** the range and alignment check every driver needs, including the
+  overflow of a request that starts near `u64::MAX`.
+- **`block::read` / `block::write`:** split a transfer larger than the device takes into pieces
+  that cover the buffer exactly once.
+- **`Queue<N>`:** fixed-capacity request tracking with generation-checked tickets. Its counters
+  balance, `issued == completed + in_flight`, which the boot check and the stress audit both
+  assert. A request whose outcome is recorded but not collected is no longer in flight.
+
+It is host-tested against a RAM disk that fails on request.
+
+#### virtio-blk (`drivers/block/virtio-blk`)
+
+virtio 1.x over the memory-mapped transport, bound from the device tree on aarch64. It is
+the first driver that hands a device *addresses*:
+
+- **`mem::Dma`** carries a region's physical and virtual addresses and keeps them apart. A
+  descriptor takes `Dma::phys`, and the CPU dereferences `Dma::virt`. Host tests place the fake
+  device's memory at a different offset from the driver's, so handing it a virtual address fails
+  on a laptop rather than in an emulator.
+- **No IOMMU yet.** The device can reach all of memory. With Phase 5's IOMMU, `Dma` becomes a
+  grant of a range to one device, and `phys` becomes a device address. Nothing above `mem` changes.
+- **Split virtqueue** (`queue::Ring`): the driver fills descriptors and the ring entry, then
+  publishes `avail.idx` with a release fence before it. It reads `used.idx` with an acquire
+  fence before reading the element that index names. QEMU cannot show either fence missing.
+  Both are argument in the sense of [memory-model.md](memory-model.md), following virtio 1.1
+  §2.6.13.
+- **Enumeration is not probing.** QEMU's `virt` lists thirty-two `virtio,mmio` slots whether
+  or not anything is plugged in, and only a slot's `DeviceID` register says which is occupied.
+  The platform reads it during discovery, as `pci::enumerate` reads configuration space, and
+  binds the driver to the slot holding a block device. The driver's probe keeps its rule of
+  touching no hardware.
+- **Bring-up waits for memory.** Discovery runs before the frame allocator exists, and the
+  handshake ends by handing the device queue addresses. So the driver's `start` does nothing,
+  and the kernel calls `VirtioBlk::bring_up` once it has a DMA region to give. An untouched
+  virtio device is quiescent.
+- **Completion is polled.** The interrupt line is claimed and `on_interrupt` acknowledges it,
+  but nothing dispatches device interrupts yet. The request path polls the used ring to a
+  bounded limit, and a device that stops answering is `Error::Timeout`, not a hang. Moving to
+  interrupts means registering `on_interrupt` and waiting instead of spinning.
+- **A bounce buffer.** Data is copied through a buffer inside the DMA region, so a caller's
+  buffer need not be physically contiguous. That costs a copy, and bounds a request by the
+  buffer, which is what `max_transfer_blocks` reports and `block::read` splits around.
+- **Legacy devices are refused.** QEMU's memory-mapped transport presents the legacy
+  register layout by default, so test runs pass `virtio-mmio.force-legacy=false`. A legacy
+  slot is reported as one during discovery.
+
+The PCI transport, for x86, is not written yet. The memory-mapped one is what the device
+tree machines have.
+
+**The check** (`kernel/main/src/block.rs`, on presets with `QEMU_BLOCK_TEST`) brings the
+device up on three frames and gates the boot on the following:
+
+- the disk's header naming the geometry the device reported;
+- 32 sectors reading back kbuild's pattern through a split read;
+- a scratch-area write reading back after a flush, with the sector below it untouched;
+- a read past the end refused by the driver;
+- the same read with the driver's check skipped refused *by the device*, and returned as
+  an error;
+- nothing in flight and every descriptor back on the ring after 64 more requests.
+
+The started device lives on for the stress run's block workload.
+
 ### `sched` — scheduling
 
 Pluggable policy behind a trait, with the config selecting one or more:

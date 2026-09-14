@@ -11,7 +11,7 @@ root = "src/lib.rs"
 layer = "kernel"
 
 [deps]
-units = ["hal", "arch", "bootinfo", "device", "gic", "pl011", "sync"]
+units = ["hal", "arch", "bootinfo", "device", "gic", "pl011", "sync", "virtio-blk"]
 
 [config]
 requires = "ARCH_AARCH64"

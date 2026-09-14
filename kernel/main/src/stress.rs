@@ -41,6 +41,7 @@
 //! emulator with a failure at once. After `STRESS_SECONDS` the last audit is the final
 //! one, and a pass exits with success.
 
+mod block;
 mod heap;
 mod ipc;
 mod pages;
@@ -79,11 +80,15 @@ pub enum Workload {
     Sleep,
     Vm,
     Pages,
+    /// Present only on a machine with the test disk.
+    Block,
 }
 
-const WORKLOADS: usize = 7;
+const WORKLOADS: usize = 8;
 
-const NAMES: [&str; WORKLOADS] = ["heap A", "heap B", "ping", "pong", "sleep", "vm", "pages"];
+const NAMES: [&str; WORKLOADS] = [
+    "heap A", "heap B", "ping", "pong", "sleep", "vm", "pages", "block",
+];
 
 /// Where a parked workload stopped.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -336,12 +341,14 @@ fn start() -> Result<(), &'static str> {
     ipc::setup()?;
     pages::setup()?;
     vm::setup()?;
+    block::setup()?;
 
     // Idle keeps the first of the scheduler's stacks. The other three the boot checks
     // used are free again; four more come from the port's array.
     let extra = preempt::claim_stacks(&["heap B", "sleep", "vm", "pages"])
         .ok_or("not enough guarded thread stacks")?;
-    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS] = [
+    // Every workload but the block one, which is spawned below only if the disk exists.
+    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 1] = [
         (heap::worker, 0, 4, 1),
         (heap::worker, 1, 4, extra),
         (ipc::ping, 0, 4, 2),
@@ -356,10 +363,26 @@ fn start() -> Result<(), &'static str> {
         .all(|&(entry, arg, level, stack)| preempt::spawn(stack, entry, arg, level).is_some());
     // SAFETY: pairs with the `irq_save` above.
     unsafe { Cpu::irq_restore(irq) };
+    if !spawned {
+        return Err("a workload thread was refused");
+    }
+
+    // The block workload needs the disk, and a stack only when it runs: a machine without
+    // the disk has neither, and its slot reads as parked holding nothing, so the auditor
+    // neither waits for it nor asks it for progress.
+    if !block::present() {
+        PARKED[Workload::Block as usize].store(Parked::Empty as u8, Ordering::Release);
+        return Ok(());
+    }
+    let stack = preempt::claim_stacks(&["block"]).ok_or("not enough guarded thread stacks")?;
+    let irq = Cpu::irq_save();
+    let spawned = preempt::spawn(stack, block::worker, 0, 5).is_some();
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { Cpu::irq_restore(irq) };
     if spawned {
         Ok(())
     } else {
-        Err("a workload thread was refused")
+        Err("the block workload's thread was refused")
     }
 }
 
@@ -372,6 +395,9 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
             audit_failed(c, seconds, "a workload found something wrong", what);
         }
         let now = PROGRESS[w].load(Ordering::Acquire);
+        if w == Workload::Block as usize && !block::present() {
+            continue;
+        }
         if now == last[w] {
             audit_failed(c, seconds, "a workload made no progress since the last audit", name);
         }
@@ -388,6 +414,9 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
     }
     if let Err(what) = pages::audit() {
         audit_failed(c, seconds, "buddy pages", what);
+    }
+    if let Err(what) = block::audit() {
+        audit_failed(c, seconds, "block", what);
     }
     if !preempt::table_ok() {
         audit_failed(c, seconds, "thread table", "an invariant does not hold");
@@ -454,6 +483,13 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
     write_usize(c, vm::huge() as usize);
     c.write_str("), pages ");
     write_usize(c, p(Workload::Pages));
+    if block::present() {
+        c.write_str(", block ");
+        write_usize(c, p(Workload::Block));
+        c.write_str(" (requests ");
+        write_usize(c, block::requests() as usize);
+        c.write_str(")");
+    }
     if mp::CPUS > 1 {
         let s = preempt::stats();
         let (shootdowns, _, _) = mp::shootdown_stats();

@@ -25,6 +25,7 @@ mod sha256;
 mod size;
 mod stress;
 mod symbolize;
+mod testdisk;
 mod toml;
 mod toolchain;
 
@@ -813,6 +814,10 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     } else {
         image
     };
+    // The disk a test build's virtio-blk device reads, beside the image QEMU boots.
+    if res.is_on(testdisk::SYMBOL) {
+        testdisk::write(image.parent().unwrap_or(Path::new(".")))?;
+    }
     // A module asking for another configuration gets this one with its overrides on top.
     // A `--set` the overridden configuration cannot honour is dropped for that build only:
     // `LOCKDEP_ABBA_TEST=y` needs the lock checking a module built for `DEBUG_BUILD=n` does
