@@ -85,6 +85,11 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// The stack, shared by the check and the stress workload after it. Its buffers are inside
 /// it, so it lives here rather than on a 16 KiB boot stack.
+///
+/// Taken with `lock_irqsave` everywhere, although no handler takes it: a kernel spinlock is
+/// held with preemption off, and masking is how a thread gets that. Taken with plain `lock`
+/// from the stress workload, a timer interrupt could switch the holder out mid-poll and move
+/// it to another CPU, and the stress run hung twice at about 40 s doing exactly that.
 static STACK: SpinLock<Stack, Cpu> = SpinLock::with_class(Stack::new(CONFIG), &STACK_CLASS);
 static STACK_CLASS: LockClass = LockClass::new("kernel.net");
 
@@ -240,7 +245,7 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
 
     let after = card.counters();
     let (balanced, in_use) = {
-        let s = STACK.lock();
+        let s = STACK.lock_irqsave();
         (s.balanced(), s.buffers_in_use())
     };
     let polled = after.rx_polled - before.rx_polled;
@@ -335,7 +340,7 @@ fn wait<T>(
     loop {
         let t = now();
         let got = {
-            let mut s = STACK.lock();
+            let mut s = STACK.lock_irqsave();
             s.poll(card, t);
             step(&mut s, t)
         };
@@ -422,7 +427,7 @@ pub fn audit() -> Result<(), &'static str> {
     let Some(card) = nic() else {
         return Ok(());
     };
-    if !STACK.lock().balanced() {
+    if !STACK.lock_irqsave().balanced() {
         return Err("a stack buffer is out of its pool with nothing using it (a leak)");
     }
     card.settle();
