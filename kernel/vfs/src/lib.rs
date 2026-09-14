@@ -708,6 +708,16 @@ impl<'fs, const MOUNTS: usize, const OPEN: usize> Vfs<'fs, MOUNTS, OPEN> {
         self.slot_of(fd).map(|i| self.open[i].pos)
     }
 
+    /// What the filesystem the handle's file is on is, as [`Vfs::statfs`] reports it of a path.
+    ///
+    /// The handle already names its mount, so this asks that filesystem rather than resolving
+    /// a path again: a caller holding an open file may have no path to give, and the file may
+    /// have been renamed or removed since it was opened.
+    pub fn statfs_fd(&mut self, fd: Fd) -> Result<StatFs, Error> {
+        let mount = self.open[self.slot_of(fd)?].mount;
+        self.fs_of(mount)?.statfs()
+    }
+
     /// The `index`th entry of the directory at `path`.
     pub fn readdir(&mut self, path: &str, index: usize) -> Result<Option<Entry>, Error> {
         let (mount, node, stat) = self.resolve(path)?;

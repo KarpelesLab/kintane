@@ -2044,6 +2044,13 @@ const BAD_NAME: &[u8] =
 /// What this mode leaves on the disk for kbuild to read after the guest exits; mirrors
 /// `LINUX_OUT_PATH`, `LINUX_OUT_LEN` and `out_byte` in `kernel/block/src/testdisk.rs`.
 const OUT: &[u8] = b"/KINTANE/LINUX.OUT\0";
+/// A long name renamed to another long name, so a rename carries one end to end rather than
+/// only a create and an unlink.
+const LONG_RENAMED: &[u8] = b"/KINTANE/ALSO.NOT.83\0";
+/// The second volume's mount point, and a name on it: `statfs` about this must answer for that
+/// volume and not for the root.
+const ON_FAT32: &[u8] = b"/FAT32/HELLO32.TXT\0";
+const AT_ROOT: &[u8] = b"/\0";
 const OUT_LEN: usize = 2000;
 const OUT_SEED: u8 = 0x4c;
 
@@ -2093,6 +2100,54 @@ fn read_exact(fd: u64, into: &mut [u8]) -> bool {
 }
 
 /// `st_size`, which both architectures' `struct stat` keep at byte 48.
+/// Bytes of this architecture's `struct statfs`. x86_64's fields are all 64-bit; the generic
+/// layout aarch64 uses keeps `f_bsize` and `f_namelen` at 32 bits with the counts still 64.
+#[cfg(target_arch = "x86_64")]
+const STATFS_LEN: usize = 120;
+#[cfg(target_arch = "aarch64")]
+const STATFS_LEN: usize = 88;
+
+/// `(offset, width)` of the fields the steps below read.
+const BSIZE: (usize, usize) = if cfg!(target_arch = "x86_64") {
+    (8, 8)
+} else {
+    (8, 4)
+};
+const BLOCKS: (usize, usize) = (16, 8);
+const BFREE: (usize, usize) = (24, 8);
+const NAMELEN: (usize, usize) = if cfg!(target_arch = "x86_64") {
+    (56, 8)
+} else {
+    (56, 4)
+};
+
+/// A little-endian field of a `struct statfs`.
+fn field(s: &[u8; STATFS_LEN], (at, width): (usize, usize)) -> u64 {
+    let mut v = 0u64;
+    let mut i = 0;
+    while i < width {
+        v |= (s[at + i] as u64) << (8 * i);
+        i += 1;
+    }
+    v
+}
+
+/// An answer that stands on its own: a real allocation unit, some units, no more free than
+/// there are, and a longest name a directory entry could hold.
+fn coherent(s: &[u8; STATFS_LEN]) -> bool {
+    let (bsize, blocks, free, namelen) =
+        (field(s, BSIZE), field(s, BLOCKS), field(s, BFREE), field(s, NAMELEN));
+    bsize >= 512 && blocks > 0 && free <= blocks && namelen >= 8
+}
+
+fn statfs_at(path: &[u8], out: &mut [u8; STATFS_LEN]) -> i64 {
+    sys::call(sys::STATFS, [path.as_ptr() as u64, out.as_mut_ptr() as u64, 0, 0, 0, 0])
+}
+
+fn statfs_of_fd(fd: u64, out: &mut [u8; STATFS_LEN]) -> i64 {
+    sys::call(sys::FSTATFS, [fd, out.as_mut_ptr() as u64, 0, 0, 0, 0])
+}
+
 fn size_of_fd(fd: u64) -> i64 {
     let mut stat = [0u8; 144];
     if sys::call(sys::FSTAT, [fd, stat.as_mut_ptr() as u64, 0, 0, 0, 0]) != 0 {
@@ -2201,6 +2256,20 @@ fn files() -> ! {
     expect(call1(sys::CLOSE, again as u64) == 0, 94);
     expect(unlink(LONG_NAME, 0) == 0, 94);
 
+    // 190-192: a long name survives a rename to another long name, which `openat` and
+    // `unlinkat` already showed for a create and a removal. Both entry sets are freed. Before
+    // step 95, like step 94 and for the same reason: this writes, so step 95's `fsync` is what
+    // makes it durable, and the check that follows requires nothing left in the cache.
+    let made = openat(LONG_NAME, O_WRONLY | O_CREAT);
+    expect(made >= 0, 190);
+    expect(call1(sys::CLOSE, made as u64) == 0, 190);
+    expect(rename(LONG_NAME, LONG_RENAMED) == 0, 191);
+    expect(openat(LONG_NAME, 0) == -ENOENT, 191);
+    let back = openat(LONG_RENAMED, 0);
+    expect(back >= 0, 192);
+    expect(call1(sys::CLOSE, back as u64) == 0, 192);
+    expect(unlink(LONG_RENAMED, 0) == 0, 192);
+
     // 95: what kbuild reads after the guest exits, through `open` where the architecture has
     // one, made durable with `fsync`.
     let flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -2221,5 +2290,30 @@ fn files() -> ! {
     // 96: a name longer than the namespace holds is refused, not shortened. It creates
     // nothing, so nothing is left unwritten after step 95 made everything durable.
     expect(openat(BAD_NAME, O_WRONLY | O_CREAT) == -ENAMETOOLONG, 96);
+
+    // 193-198: `statfs` answers for the filesystem covering the path it is given, so the two
+    // volumes answer differently, and `fstatfs` answers the same for an open file on one.
+    // After step 95 rather than before it: these ask and do not write, so they leave nothing
+    // in the cache for the check that follows.
+    let mut root = [0u8; STATFS_LEN];
+    let mut second = [0u8; STATFS_LEN];
+    expect(statfs_at(AT_ROOT, &mut root) == 0, 193);
+    expect(statfs_at(ON_FAT32, &mut second) == 0, 194);
+    expect(coherent(&root) && coherent(&second), 195);
+    // The two volumes are not the same filesystem: FAT16 and FAT32 here differ in how many
+    // allocation units they have, whatever else they share.
+    expect(field(&root, BLOCKS) != field(&second, BLOCKS), 196);
+    let fd = openat(ON_FAT32, 0);
+    expect(fd >= 0, 197);
+    let mut by_fd = [0u8; STATFS_LEN];
+    expect(statfs_of_fd(fd as u64, &mut by_fd) == 0, 197);
+    expect(call1(sys::CLOSE, fd as u64) == 0, 197);
+    // The same filesystem, asked two ways: everything that cannot change must match.
+    expect(
+        field(&by_fd, BSIZE) == field(&second, BSIZE)
+            && field(&by_fd, BLOCKS) == field(&second, BLOCKS)
+            && field(&by_fd, NAMELEN) == field(&second, NAMELEN),
+        198,
+    );
     exit(FILES_SUCCESS)
 }

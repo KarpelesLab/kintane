@@ -27,6 +27,8 @@ pub const FTRUNCATE: u64 = 46;
 pub const MKDIRAT: u64 = 34;
 pub const UNLINKAT: u64 = 35;
 pub const RENAMEAT: u64 = 38;
+pub const STATFS: u64 = 43;
+pub const FSTATFS: u64 = 44;
 /// aarch64 has no `open`: a C library opens with `openat`.
 pub const OPEN: Option<u64> = None;
 pub const PIPE2: u64 = 59;
