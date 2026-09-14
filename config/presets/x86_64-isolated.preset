@@ -1,0 +1,18 @@
+# x86_64 under QEMU q35 with the disk's driver in an isolated domain behind VT-d.
+#
+# `x86_64-iommu` with BLOCK_DOMAIN on. The same machine — `-device intel-iommu,intremap=on`
+# behind a split irqchip, the test disk with `iommu_platform=on` — and the same boot, until
+# the scheduler runs. Then the kernel hands the disk to `user/blkdomain`, an unprivileged
+# process that runs virtio-blk's protocol core over the register window and DMA buffer it
+# was granted. The block check runs again with every request served by the domain and every
+# completion announced by an interrupt the kernel forwarded as a message; a rogue DMA from
+# the domain is stopped by the IOMMU, a faulting domain is killed and replaced, and the disk
+# returns to the kernel. See docs/isolation.md.
+ARCH_X86_64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+IOMMU=y
+BLOCK_DOMAIN=y
+SIZE_BUDGET_KIB=1536

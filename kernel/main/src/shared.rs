@@ -523,6 +523,10 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // wants everything but idle gone.
     c.write_str("\n  isolation  ");
     let isolation = crate::isolation::check(c);
+    // After `isolation`, whose process slot and stack slot it reuses: on x86_64 that check is
+    // skipped, so the slots are free either way. This is the disk served from a domain.
+    c.write_str("\n  blk domain ");
+    let blk_domain = crate::blockdomain::check(c);
     let tickless = tickless_phase(c);
     let abba = if kconfig::LOCKDEP_ABBA_TEST {
         lockcheck::abba(c)
@@ -536,6 +540,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(spawn)
         .and(waits)
         .and(isolation)
+        .and(blk_domain)
         .and(tickless)
         .and(abba)
         .and(Check::from_ok(unbroken))

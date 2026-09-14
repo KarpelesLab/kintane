@@ -63,6 +63,13 @@ mod block;
 #[cfg(CONFIG_MM_FLAT)]
 #[path = "block_off.rs"]
 mod block;
+// Serving the disk from an isolated driver domain behind the IOMMU; without one, the same
+// calls doing nothing. See `docs/isolation.md`.
+#[cfg(CONFIG_BLOCK_DOMAIN)]
+mod blockdomain;
+#[cfg(not(CONFIG_BLOCK_DOMAIN))]
+#[path = "blockdomain_off.rs"]
+mod blockdomain;
 #[cfg(CONFIG_MM_PAGED)]
 mod net;
 #[cfg(CONFIG_MM_FLAT)]

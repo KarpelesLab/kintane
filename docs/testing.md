@@ -560,6 +560,36 @@ that is the in-grant DMA working. Then the `iommu` line requires all of:
 (`q35-iommu.bin`) and the register programming, page tables, attach and fault decode against
 models of the hardware. The live falsifications above were run by hand.
 
+### 2c-ter. The disk's driver in a domain
+
+On x86_64 with `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the disk's driver runs in an
+unprivileged ring-3 domain confined by VT-d, not in the kernel. Once the scheduler is up, the
+`blk domain` line hands the disk to `user/blkdomain`, serves the block check from the kernel over a
+channel, delivers the disk's MSI-X interrupt to the domain as a message, and gates the boot on the
+whole thing; [isolation.md](isolation.md#running-the-driver-in-a-domain-x86_64) covers the design
+and the costs. The same driver source, `virtio-blk-core`, is what the in-kernel `x86_64-iommu` build
+runs — both are in CI.
+
+```
+  blk domain 12544 sectors of 512 bytes, 15 per request, in a domain; 32 sectors read back the pattern; a write read back after a flush; the device's own refusal was an error; 73 requests, 73 completions in 73 interrupt messages (42008 ns mean, 579930 ns worst forward); the domain's out-of-grant DMA stopped at 0x00000000004ff000 from 0x0000000000000010; a faulting domain was killed, disk marked failed; a new domain served a read; restarted and served a read; disk back in the kernel
+```
+
+The boot fails if any of these happens: the domain cannot bring the disk up; a read, write, flush or
+the device's own refusal comes back wrong; a completion arrives without an interrupt message or a
+descriptor leaks; the domain's out-of-grant DMA is not stopped and logged, or its target is touched;
+a faulting domain is not killed; or a fresh domain does not serve a read after it.
+
+| Mutation | Result |
+|---|---|
+| Grant the domain the wrong register window | `the domain could not bring the disk up` |
+| Acknowledge the interrupt but do not forward it | `reading sector 0 in the domain FAILED` — every read times out with no message |
+| Skip the restart's read after the faulting domain is killed | `THE NEW DOMAIN DID NOT SERVE A READ` |
+| Aim the rogue DMA inside the grant (an over-broad grant) | `THE IOMMU DOMAIN DOES NOT MAP EXACTLY THE GRANT` |
+
+The wire types between the kernel and the domain (`virtio_blk_core::domain`: `Setup`, `Request`,
+`Reply`, `Facts`, `Interrupt`) are host-tested for their encode/decode round trips. The live
+falsifications above were run by hand.
+
 ### 2d. Fuzzing
 
 Every parser that reads bytes the kernel did not write is fuzzed on the host, and so is

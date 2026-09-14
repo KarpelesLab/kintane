@@ -1,0 +1,14 @@
+# `blkdomain` on a configuration without a block driver domain: nothing to embed. The kernel
+# image depends on the name in every configuration; only this provider is selected when
+# BLOCK_DOMAIN is off, and the kernel's block-domain module is not compiled then either.
+[unit]
+name = "blkdomain"
+kind = "lib"
+root = "src/lib.rs"
+layer = "user"
+
+[deps]
+units = []
+
+[config]
+requires = "!BLOCK_DOMAIN"

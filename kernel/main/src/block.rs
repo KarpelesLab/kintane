@@ -62,15 +62,67 @@ pub fn disk() -> Option<&'static VirtioBlk<Locks>> {
     unsafe { (*DISK.get()).as_ref() }
 }
 
+/// The DMA grant the disk runs on: the address the CPU reaches it at, the address the device
+/// (and the IOMMU) uses, and its length. The block-domain check reuses exactly this — the
+/// IOMMU already maps `[phys, phys + len)` for the device and nothing else — so a domain
+/// serving the disk needs no second grant to confine.
+///
+/// SAFETY INVARIANT: written once by [`check`], before `STARTED`; read only after.
+static GRANT: SyncUnsafeCell<Option<(usize, u64, usize)>> = SyncUnsafeCell::new(None);
+
+/// `(virt, phys, len)` of the disk's DMA grant, once the disk is up.
+#[cfg_attr(
+    not(CONFIG_BLOCK_DOMAIN),
+    expect(dead_code, reason = "read only by the block-domain check")
+)]
+pub fn grant() -> Option<(usize, u64, usize)> {
+    disk().and(unsafe { *GRANT.get() })
+}
+
+/// Whether the disk's interrupt is being forwarded to a driver domain instead of collected
+/// in the kernel. Set around [`crate::blockdomain`]'s run.
+static FORWARDING: AtomicBool = AtomicBool::new(false);
+
+/// Hand the disk's interrupt to the domain, or take it back. While forwarding, the handler
+/// does not touch the in-kernel `VirtioBlk`, whose engine the domain has reset out from under.
+#[cfg_attr(
+    not(CONFIG_BLOCK_DOMAIN),
+    expect(dead_code, reason = "set only by the block-domain check")
+)]
+pub fn forward_interrupts(on: bool) {
+    FORWARDING.store(on, Ordering::Release);
+}
+
 /// The disk's interrupt handler, installed with `virtio_blk::set_handler`.
 ///
 /// The device model's table holds a plain function, and the started device belongs to the
 /// kernel, which brought it up with memory it provides. So the handler reaches the device
 /// through [`disk`], which is readable before the first request is submitted.
+///
+/// While the disk is served from a driver domain, the completion is the domain's to collect;
+/// the handler forwards the interrupt to it as a message instead (see [`crate::blockdomain`]).
 fn on_disk_interrupt() {
+    if FORWARDING.load(Ordering::Acquire) && crate::blockdomain::forward_interrupt() {
+        return;
+    }
     if let Some(d) = disk() {
         d.on_interrupt();
     }
+}
+
+/// Reset the disk and bring a fresh in-kernel driver up over the same grant, after a driver
+/// domain has run on it, so the stress run and the filesystem find a working disk. `false` if
+/// the disk was never up or the fresh bring-up fails.
+#[cfg_attr(
+    not(CONFIG_BLOCK_DOMAIN),
+    expect(dead_code, reason = "called only after the block-domain check")
+)]
+pub fn restart_in_kernel(c: &dyn EarlyConsole) -> bool {
+    let Some((virt, phys, len)) = (unsafe { *GRANT.get() }) else {
+        return false;
+    };
+    let mut sector = [0u8; testdisk::SECTOR];
+    restart(c, virt, phys, len, &mut sector)
 }
 
 /// Bring the disk up and check it.
@@ -161,6 +213,10 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
     //
     // SAFETY: the one write to `DISK`, before `STARTED` makes it readable.
     unsafe { *DISK.get() = Some(blk) };
+    // The grant the disk runs on, for the block-domain check to reuse: written before
+    // `STARTED`, like `DISK`, and read only through `grant`, which gates on `STARTED`.
+    // SAFETY: the one write, on the boot path before `STARTED`.
+    unsafe { *GRANT.get() = Some((virt.raw(), phys, len)) };
     STARTED.store(true, Ordering::Release);
     // SAFETY: once, on the boot path, before any interrupt can be delivered for the line:
     // interrupts are masked here, and the first request is submitted below.

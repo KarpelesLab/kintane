@@ -492,6 +492,12 @@ pub fn msix_table_window() -> Option<(u64, u64)> {
     CLAIMS.get()?.msix_table_window()
 }
 
+/// The bound PCI function's structure layout, BAR and device ID: what a driver domain is
+/// told so it can build its own transport over its grant. `None` for a memory-mapped slot.
+pub fn pci_layout() -> Option<(virtio::pci::Layout, u8, u32)> {
+    CLAIMS.get()?.pci_layout()
+}
+
 /// The transport for the bound device, of whichever kind its bus is.
 ///
 /// # Safety

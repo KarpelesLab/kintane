@@ -150,6 +150,21 @@ impl Claims {
         self.table.as_ref().map(|t| (t.phys(), t.len()))
     }
 
+    /// A PCI function's structure layout, the one BAR they are all in, and its device ID:
+    /// what a host other than the kernel is told so it can build the transport over its own
+    /// mapping of the window, since only the kernel can read configuration space. `None` for
+    /// a memory-mapped slot, whose layout is fixed.
+    pub fn pci_layout(&self) -> Option<(Layout, u8, u32)> {
+        match &self.bus {
+            Bus::Pci {
+                layout,
+                bar,
+                device_id,
+            } => Some((*layout, *bar, *device_id)),
+            Bus::Mmio => None,
+        }
+    }
+
     /// The transport for the claimed device, of whichever kind its bus is.
     ///
     /// Reached through [`hal::paging::device_virt`] of the window's physical address, never at

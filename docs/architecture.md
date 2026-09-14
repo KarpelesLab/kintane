@@ -943,8 +943,24 @@ isolated DMA-capable driver's containment rests on, demonstrated in the kernel:
 
 The driver source does not change: `virtio_blk_core` puts physical addresses in descriptors and
 accepts `VIRTIO_F_ACCESS_PLATFORM`, and behind the IOMMU those addresses are the I/O virtual
-addresses the grant maps identity. Measurements, the interrupt-as-a-message gap, and the
-still-missing x86_64 *domain* (as opposed to in-kernel) driver are in
+addresses the grant maps identity.
+
+### The disk's driver in a domain — Phase 5's x86_64 exit
+
+With `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the two halves above — a driver body in a
+ring-3 domain, and a DMA-capable driver confined by an IOMMU — are joined. Once the scheduler is
+up, `kernel/main/src/blockdomain.rs` hands the disk to `user/blkdomain`, an unprivileged program
+that runs the same `virtio_blk_core` the kernel does, over a grant: the register window, the DMA
+buffer the IOMMU confines the device to, and data pages shared with the kernel. The kernel's block
+layer is its client over a channel; the disk's MSI-X interrupt is taken by the kernel and forwarded
+to the domain as a message, so the domain collects a completion only after an interrupt arrives.
+The same `block` checks run against the disk served from the domain, a rogue DMA is stopped by VT-d,
+a faulting domain is killed and replaced, and the disk is handed back to the kernel. So the disk's
+driver source is shared three ways now — in the kernel, and in a domain, over the one `hwproxy` seam
+— which is what Phase 5 promised. An x86_64 user program links at 512 GiB, out of the static model's
+reach, so `kbuild` builds user programs and their `user`-layer closure position-independent against a
+PIC `core` in an `out/user` flavor; the kernel and its modules stay static. Measurements, the
+software interrupt forward (VT-d interrupt remapping would replace it), and the caveats are in
 [isolation.md](isolation.md).
 
 ### `block` — the block layer, and the first driver with DMA

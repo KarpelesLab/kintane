@@ -1,0 +1,29 @@
+# The block driver domain: an unprivileged program that runs virtio-blk's protocol core
+# against a disk the kernel granted it, and serves the kernel's block requests over a channel.
+#
+# It links `virtio-blk-core` and `virtio` — the same crates the kernel's in-kernel host of
+# the driver links — with `hwproxy` and `abi`. All four are `user`-layer crates, so layering
+# guarantees what "the same driver source, either way" claims: nothing this program runs can
+# be kernel code, and everything it runs, the kernel runs too.
+#
+# `blkdomain` is a provider name: with BLOCK_DOMAIN off, `user/blkdomain-none` provides it as
+# an empty library, so the kernel image depends on the name in every configuration.
+[unit]
+name = "blkdomain"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+# As `user/hwdomain`: position-independent code at a static link address, debug info
+# stripped because the kernel embeds the file, symbol names kept so a crash can be named.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "strip=debuginfo",
+    "-C", "link-arg=-T$ROOT/user/blkdomain/link.ld",
+    "-C", "link-arg=--no-warnings",
+]
+
+[deps]
+units = ["abi", "hwproxy", "virtio", "virtio-blk-core"]
+
+[config]
+requires = "BLOCK_DOMAIN"

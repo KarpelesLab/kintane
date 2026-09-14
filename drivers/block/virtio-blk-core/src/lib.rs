@@ -30,6 +30,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+pub mod domain;
 pub mod engine;
 
 // The virtqueue, the transports and DMA regions are every virtio driver's, in `drivers/virtio`,
