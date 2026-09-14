@@ -880,7 +880,7 @@ end of every iteration. The audit requires every handle closed, the cache's book
 block left unwritten, and the volume's consistency walk to find no lost cluster and the two tables
 the same.
 
-`vfs`, `bcache` and `fat` are host-tested (23, 18 and 27 tests). The FAT tests build their volumes
+`vfs`, `bcache` and `fat` are host-tested (19, 18 and 27 tests). The FAT tests build their volumes
 with a writer of their own, independent of kbuild's, or format them empty and fill them through
 the driver itself. `vfsproto` has 8 host tests, and kbuild's own FAT reader, disk check and crash
 test have theirs among kbuild's.
