@@ -4,13 +4,44 @@ use super::*;
 
 #[test]
 fn every_dispatched_number_has_the_name_the_table_gives_it() {
-    for (number, expected) in nr::IMPLEMENTED {
-        assert_eq!(
-            name(TABLE_X86_64, number),
-            Some(expected),
-            "the constant for {expected} is {number}, which the table names otherwise"
-        );
+    for abi in [Abi::X86_64, Abi::Aarch64] {
+        for call in Call::ALL {
+            let Some(number) = call.number(abi) else {
+                continue;
+            };
+            assert_eq!(
+                name(abi.table(), number),
+                Some(call.name()),
+                "{abi:?} numbers {} as {number}, which its table names otherwise",
+                call.name()
+            );
+            assert_eq!(decode(abi, number), Some(call), "{abi:?} {number}");
+        }
     }
+}
+
+#[test]
+fn aarch64_has_no_call_its_architecture_left_out() {
+    for call in [Call::Fork, Call::Pipe, Call::ArchPrctl] {
+        assert_eq!(call.number(Abi::Aarch64), None, "{call:?}");
+    }
+    // x86_64's number for `read` is `io_setup` on aarch64, which the personality does not
+    // implement: the numbering is the architecture's, not x86_64's.
+    assert_eq!(decode(Abi::Aarch64, 0), None);
+    assert_eq!(decode(Abi::Aarch64, 63), Some(Call::Read));
+    assert_eq!(name(TABLE_AARCH64, 278), Some("getrandom"));
+    assert_eq!(Abi::for_machine(183), Some(Abi::Aarch64));
+    assert_eq!(Abi::for_machine(62), Some(Abi::X86_64));
+    assert_eq!(Abi::for_machine(3), None);
+}
+
+#[test]
+fn clone_arguments_are_read_in_each_architectures_order() {
+    let a = [1, 2, 3, 4, 5, 0];
+    // (flags, stack, parent_tid, child_tid, tls)
+    assert_eq!(Abi::X86_64.clone_args(a), [1, 2, 3, 4, 5]);
+    assert_eq!(Abi::Aarch64.clone_args(a), [1, 2, 3, 5, 4]);
+    assert_eq!(exited_status(0x12a), 0x2a00);
 }
 
 #[test]
@@ -43,6 +74,11 @@ fn errors_travel_as_negated_linux_numbers() {
         Failure::AccessDenied,
         Failure::Io,
         Failure::NoSpace,
+        Failure::TryAgain,
+        Failure::NoChild,
+        Failure::BrokenPipe,
+        Failure::NotExecutable,
+        Failure::TimedOut,
         Failure::NotImplemented,
     ] {
         assert!(ret(Err(f)) > (-4096i64) as u64, "{f:?} is not in the error range");
@@ -182,11 +218,19 @@ fn the_stack_pointer_is_aligned_whatever_the_strings_add_up_to() {
 
 #[test]
 fn stat_and_utsname_have_linux_layouts() {
-    let s = stat_bytes(FileKind::Regular, 1000, 7);
+    let s = stat_bytes(Abi::X86_64, FileKind::Regular, 1000, 7);
     assert_eq!(u64::from_le_bytes(s[8..16].try_into().unwrap()), 7);
     assert_eq!(u32::from_le_bytes(s[24..28].try_into().unwrap()), 0o100444);
     assert_eq!(u64::from_le_bytes(s[48..56].try_into().unwrap()), 1000);
     assert_eq!(u64::from_le_bytes(s[64..72].try_into().unwrap()), 2);
+
+    // The generic layout aarch64 uses: `st_mode` before a 32-bit `st_nlink`.
+    let s = stat_bytes(Abi::Aarch64, FileKind::Fifo, 0, 9);
+    assert_eq!(Abi::Aarch64.stat_len(), 128);
+    assert_eq!(u64::from_le_bytes(s[8..16].try_into().unwrap()), 9);
+    assert_eq!(u32::from_le_bytes(s[16..20].try_into().unwrap()), 0o010600);
+    assert_eq!(u32::from_le_bytes(s[20..24].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(s[56..60].try_into().unwrap()), 512);
 
     let u = utsname("x86_64");
     assert_eq!(&u[0..6], b"Linux\0");

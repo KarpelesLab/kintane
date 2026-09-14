@@ -91,6 +91,10 @@ pub struct Context {
     /// See `hal::HasUserMode::bind` and `super::user`.
     pub(crate) user_kernel_stack: u64,
     pub(crate) user_root: u64,
+    /// For a thread that runs user code: its `FS` base, the thread pointer. Saved when the
+    /// thread is switched away from and loaded when it is switched to, so a value a program
+    /// set follows its thread to whichever CPU runs it next. See `hal::HasUserMode::set_tls`.
+    pub(crate) user_tls: u64,
 }
 
 /// Size of the return address a `call` pushes, and of the slot `init` fabricates for
@@ -140,10 +144,26 @@ impl HasContextSwitch for X86_64 {
             r15: 0,
             user_kernel_stack: 0,
             user_root: 0,
+            user_tls: 0,
         };
     }
 
     unsafe fn switch(from: *mut Context, to: *const Context) {
+        // The thread pointer of a thread that runs user code. `FS` base is one register per
+        // CPU, and a program changes it only through the kernel, so it is read back when the
+        // thread leaves and written when it arrives. Kernel threads neither read it nor
+        // change it, and a switch between two of them costs nothing here.
+        // SAFETY: the caller's contract makes `from` the running thread's context, `to` a
+        // suspended one, and the switch masked on this CPU; `IA32_FS_BASE` is defined at
+        // CPL 0, and the kernel addresses nothing through `FS`.
+        unsafe {
+            if (*from).user_kernel_stack != 0 {
+                (*from).user_tls = crate::paging::read_msr(crate::user::MSR_FS_BASE);
+            }
+            if (*to).user_kernel_stack != 0 {
+                crate::paging::write_msr(crate::user::MSR_FS_BASE, (*to).user_tls);
+            }
+        }
         // A thread that runs user code takes its kernel stack to whichever CPU it resumes
         // on: that CPU's `TSS.rsp0` and `syscall` stack are what a trap from its user code
         // will land on. Kernel-only threads leave both alone; nothing enters ring 0 from a
@@ -302,6 +322,7 @@ static BOOT_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     r15: 0,
     user_kernel_stack: 0,
     user_root: 0,
+    user_tls: 0,
 }));
 static THREAD_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     rsp: 0,
@@ -313,6 +334,7 @@ static THREAD_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     r15: 0,
     user_kernel_stack: 0,
     user_root: 0,
+    user_tls: 0,
 }));
 
 /// Set by the first selftest run. A second would re-`init` a stack a suspended thread

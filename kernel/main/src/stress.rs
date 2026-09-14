@@ -362,6 +362,14 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
                 / 1_000_000_000;
             audit_failed(c, seconds, "spinning sibling", what);
         }
+        // Then two Linux processes sharing one CPU, each checking its own thread pointer.
+        if let Err(what) = crate::model::linux_stress_cycle(audits) {
+            let seconds = timekeeping::now()
+                .saturating_duration_since(start)
+                .as_nanos()
+                / 1_000_000_000;
+            audit_failed(c, seconds, "linux processes", what);
+        }
         sleep_until(next.min(end));
         let now = timekeeping::now();
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;

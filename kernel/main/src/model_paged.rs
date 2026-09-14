@@ -139,6 +139,19 @@ pub fn sibling_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// The Linux program again, with the scheduler: pipes, `fork`, `execve`, `wait4`, a thread
+/// and a futex. Passed, silently, without the personality.
+#[cfg(CONFIG_USERSPACE)]
+pub fn linux_check(c: &dyn EarlyConsole) -> Check {
+    crate::personality::scheduled_check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn linux_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// The standing file server serves a second process after the check that started it has
 /// ended. Passed when USERSPACE is off.
 #[cfg(CONFIG_USERSPACE)]
@@ -161,6 +174,19 @@ pub fn sibling_stress_cycle(round: u64) -> Result<(), &'static str> {
 
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn sibling_stress_cycle(round: u64) -> Result<(), &'static str> {
+    let _ = round;
+    Ok(())
+}
+
+/// Two Linux processes on one CPU, each checking its own thread pointer. `Ok` without the
+/// personality.
+#[cfg(CONFIG_USERSPACE)]
+pub fn linux_stress_cycle(round: u64) -> Result<(), &'static str> {
+    crate::personality::stress_cycle(round)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn linux_stress_cycle(round: u64) -> Result<(), &'static str> {
     let _ = round;
     Ok(())
 }
@@ -214,6 +240,11 @@ pub fn wait_stress_heartbeat(c: &dyn EarlyConsole) {
         c.write_str(" (from an interrupt ");
         crate::write_usize(c, crate::userproc::interrupt_kills() as usize);
         c.write_str(")");
+    }
+    let linux = crate::personality::stress_cycles();
+    if linux != 0 {
+        c.write_str(", linux pairs ");
+        crate::write_usize(c, linux as usize);
     }
 }
 

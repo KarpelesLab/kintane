@@ -14,6 +14,9 @@
 //! small and the wrong one for a fork-heavy userspace, which wants a per-frame array
 //! alongside the frame allocator's bitmap. The interface does not change.
 
+use core::marker::PhantomData;
+use core::ptr::NonNull;
+
 use hal::PhysAddr;
 
 use super::VmError;
@@ -41,15 +44,55 @@ pub enum Remaining {
 }
 
 /// Share counts over caller-provided slots.
+///
+/// Usually one `Vm`'s own ([`Shares::new`]). Two address spaces that map the same frames —
+/// a process and the child `fork` made of it — must count them in one store, so that the
+/// side that writes first sees the other still maps the page; each then holds a view of that
+/// store ([`Shares::shared`]).
 pub struct Shares<'s> {
-    slots: &'s mut [ShareSlot],
+    slots: NonNull<[ShareSlot]>,
+    _store: PhantomData<&'s mut [ShareSlot]>,
 }
+
+// SAFETY: a `Shares` is the exclusive borrow `new` took, which is `Send` and `Sync` like the
+// slice it came from, or a view `shared` made under a contract that serialises every use of
+// the store, from whichever thread makes it.
+unsafe impl Send for Shares<'_> {}
+// SAFETY: as above.
+unsafe impl Sync for Shares<'_> {}
 
 impl<'s> Shares<'s> {
     /// Use `slots` as the table. Existing contents are discarded.
     pub fn new(slots: &'s mut [ShareSlot]) -> Self {
         slots.fill(ShareSlot::EMPTY);
-        Shares { slots }
+        Shares {
+            slots: NonNull::from(slots),
+            _store: PhantomData,
+        }
+    }
+
+    /// A view of `store`, which other views may share, keeping what it holds.
+    ///
+    /// # Safety
+    /// `store` is valid for reads and writes for `'s`, and no two views of it are used at
+    /// once. Each call on a view borrows the store only until it returns, so serialising the
+    /// calls is enough; the kernel does it with the lock every `Vm` operation is made under.
+    pub unsafe fn shared(store: NonNull<[ShareSlot]>) -> Self {
+        Shares {
+            slots: store,
+            _store: PhantomData,
+        }
+    }
+
+    fn slots(&self) -> &[ShareSlot] {
+        // SAFETY: valid for `'s` by `new`'s borrow or `shared`'s contract, and no other view
+        // is in use while this call runs.
+        unsafe { self.slots.as_ref() }
+    }
+
+    fn slots_mut(&mut self) -> &mut [ShareSlot] {
+        // SAFETY: as in `slots`.
+        unsafe { self.slots.as_mut() }
     }
 
     /// Mappings of `frame`, assuming it is mapped at all.
@@ -59,7 +102,7 @@ impl<'s> Shares<'s> {
 
     /// Slots not in use.
     pub fn free_slots(&self) -> usize {
-        self.slots.iter().filter(|s| s.frame == 0).count()
+        self.slots().iter().filter(|s| s.frame == 0).count()
     }
 
     /// Whether `frame` has a slot, meaning more than one mapping.
@@ -69,7 +112,7 @@ impl<'s> Shares<'s> {
 
     /// The frames that are shared, with their mapping counts.
     pub fn iter(&self) -> impl Iterator<Item = (PhysAddr, u32)> + '_ {
-        self.slots
+        self.slots()
             .iter()
             .filter(|s| s.frame != 0)
             .map(|s| (PhysAddr::new(s.frame), s.extra.saturating_add(1)))
@@ -81,12 +124,12 @@ impl<'s> Shares<'s> {
             return Err(VmError::Mismatch);
         }
         if let Some(i) = self.index(frame) {
-            let s = &mut self.slots[i];
+            let s = &mut self.slots_mut()[i];
             s.extra = s.extra.checked_add(1).ok_or(VmError::Overflow)?;
             return Ok(());
         }
         let slot = self
-            .slots
+            .slots_mut()
             .iter_mut()
             .find(|s| s.frame == 0)
             .ok_or(VmError::SharesFull)?;
@@ -102,7 +145,7 @@ impl<'s> Shares<'s> {
         let Some(i) = self.index(frame) else {
             return Remaining::Last;
         };
-        let s = &mut self.slots[i];
+        let s = &mut self.slots_mut()[i];
         s.extra -= 1;
         if s.extra == 0 {
             *s = ShareSlot::EMPTY;
@@ -114,10 +157,10 @@ impl<'s> Shares<'s> {
         if frame.raw() == 0 {
             return None;
         }
-        self.slots.iter().position(|s| s.frame == frame.raw())
+        self.slots().iter().position(|s| s.frame == frame.raw())
     }
 
     fn slot(&self, frame: PhysAddr) -> Option<ShareSlot> {
-        self.index(frame).map(|i| self.slots[i])
+        self.index(frame).map(|i| self.slots()[i])
     }
 }

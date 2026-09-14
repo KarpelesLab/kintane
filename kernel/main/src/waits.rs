@@ -281,8 +281,9 @@ pub fn stress_cycles() -> u64 {
     PAIRS.load(Ordering::Relaxed)
 }
 
-/// The second stack, for the stress run's other two-threaded process (`crate::sibling`), which
-/// runs after this one's cycle has reaped its threads.
+/// The second stack, for the stress run's other two-threaded processes (`crate::sibling`'s,
+/// and the Linux personality's pair), each of which runs after this one's cycle has reaped
+/// its threads.
 pub fn stress_stack() -> usize {
     STRESS_STACK.load(Ordering::Relaxed)
 }

@@ -43,6 +43,7 @@
 
 #![allow(unsafe_code)]
 
+use core::cell::SyncUnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arch::Cpu;
@@ -116,6 +117,14 @@ static INSTALL: [AtomicBool; POOL] = [const { AtomicBool::new(false) }; POOL];
 static ARGS: [[AtomicUsize; 4]; POOL] = [const { [const { AtomicUsize::new(0) }; 4] }; POOL];
 /// The kernel stack each entry's traps land on.
 static TOP: [AtomicUsize; POOL] = [const { AtomicUsize::new(0) }; POOL];
+/// For a thread [`start_resumed`] started — a Linux `fork`'s child, or a `clone`'s thread —
+/// the registers it resumes user code with and its thread pointer. `None` for a thread that
+/// enters its program at an entry point.
+///
+/// SAFETY INVARIANT: written by the starter while its pool entry is claimed and before the
+/// thread exists, and taken by that thread in [`user_entry`]; nothing else reaches an entry.
+type Resume = (<Cpu as HasUserMode>::UserRegisters, usize);
+static RESUME: [SyncUnsafeCell<Option<Resume>>; POOL] = [const { SyncUnsafeCell::new(None) }; POOL];
 
 /// Hand this module the scheduler stack slots process threads run on, for the check now
 /// running. Every thread started on the previous ones must have ended: see [`end_threads`].
@@ -133,6 +142,18 @@ pub fn use_stacks(stacks: &[usize]) {
 /// space, so the copy lands in the right space and may be preempted freely.
 extern "C" fn user_entry(index: usize) -> ! {
     preempt::begin();
+    // SAFETY: see `RESUME`; this is the thread the entry was written for.
+    if let Some((regs, tls)) = unsafe { (*RESUME[index].get()).take() } {
+        let top = TOP[index].load(Ordering::Relaxed);
+        let _ = Cpu::irq_save();
+        // SAFETY: bound to `top` and its process's root before any CPU could switch to it;
+        // its memory is already there, shared from a parent or its own; masked, so the thread
+        // pointer is set on the CPU that resumes it.
+        unsafe {
+            Cpu::set_tls(tls);
+            Cpu::resume_user(&regs, KernAddr::new(top))
+        }
+    }
     let slot = SLOT[index].load(Ordering::Relaxed);
     let ready = if INSTALL[index].load(Ordering::Relaxed) {
         userproc::install_image(slot).is_some()
@@ -178,12 +199,42 @@ const NOT_LOADED: u64 = 0x10ad;
 /// Start the thread `start` describes, on a free pool entry. This is what `thread_create`
 /// reaches, and what the kernel uses to start a thread in a process it built.
 pub fn start_thread(start: Start) -> Option<ThreadId> {
+    start_on_pool(start, None)
+}
+
+/// Start a thread in process `slot`, whose space is `root`, that resumes user code with
+/// `regs` and thread pointer `tls` rather than entering at an entry point: a Linux `fork`'s
+/// child, or a `clone`'s new thread. The process's memory must already be in place.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub fn start_resumed(
+    slot: usize,
+    root: PhysAddr,
+    regs: <Cpu as HasUserMode>::UserRegisters,
+    tls: usize,
+) -> Option<ThreadId> {
+    let start = Start {
+        slot,
+        root,
+        entry: hal::user::UserRegisters::pc(&regs),
+        user_sp: 0,
+        install: false,
+        args: [0; 4],
+    };
+    start_on_pool(start, Some((regs, tls)))
+}
+
+fn start_on_pool(start: Start, resume: Option<Resume>) -> Option<ThreadId> {
     let index = (0..POOL).find(|&i| {
         STACK[i].load(Ordering::Relaxed) != usize::MAX
             && THREAD[i]
                 .compare_exchange(FREE, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
     })?;
+    // SAFETY: see `RESUME`; the entry is claimed and its thread does not exist yet.
+    unsafe { *RESUME[index].get() = resume };
     SLOT[index].store(start.slot, Ordering::Relaxed);
     ENTRY[index].store(start.entry, Ordering::Relaxed);
     USER_SP[index].store(start.user_sp, Ordering::Relaxed);

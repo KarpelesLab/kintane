@@ -835,12 +835,13 @@ comparison can see a difference.
 
 ### 2f. The Linux personality
 
-On the x86_64 presets with userspace and the test disk, where `ABI_LINUX` defaults on, every boot
-runs a `linux` check right after `fs`
-([userspace-abi.md](userspace-abi.md#as-built--one-static-program-x86_64)). It reads
+On the x86_64 and aarch64 presets with userspace and the test disk, where `ABI_LINUX` defaults on,
+every boot runs a `linux` check right after `fs`
+([userspace-abi.md](userspace-abi.md#as-built--static-programs-x86_64-and-aarch64)). It reads
 `/KINTANE/LINUX.ELF` from the volume. That file is `user/linux-hello`, a static program that makes
-Linux's system calls by Linux's numbers and knows nothing of KinTane. The check runs it unmodified
-and requires:
+Linux's system calls by Linux's numbers for the architecture it is built for and knows nothing of
+KinTane; one source builds for both. The check runs it unmodified, with no argument, in the
+boot-time slice, and requires:
 
 - the file loads and is tagged `linux`: it has no KinTane ABI note and a System V `EI_OSABI`;
 - it exits with 42. It returns 42 only if every step behaved; otherwise its exit code is the
@@ -857,17 +858,18 @@ and requires:
   | 16 | `uname` |
   | 17–18 | `brk`, and the memory behind it |
   | 19–20 | anonymous `mmap` and `munmap` |
-  | 21–22 | `arch_prctl(ARCH_SET_FS)`, read back through `fs:0` |
+  | 21–22 | the thread pointer, set with `arch_prctl(ARCH_SET_FS)` on x86_64 or written to `TPIDR_EL0` on aarch64, and read back through it |
   | 23–26 | `openat`, `fstat`, `read` and `close` on `/HELLO.TXT` |
   | 27 | `ENOENT` for a missing file |
   | 28 | `EBADF` for a descriptor that names nothing |
   | 29 | `ENOSYS` for `getrandom` |
 
 - what it wrote to standard output, as the kernel captured it, is exactly `hello from linux\n`;
-- the kernel logged the unimplemented call, and the number it recorded is the one the table names
-  `getrandom`;
+- the kernel logged the unimplemented call, and the number it recorded is the one the
+  architecture's table names `getrandom`;
 - `init` then runs natively on the same kernel, to its success code;
-- no file is left open in the namespace, and no frame is leaked.
+- no file is left open in the namespace, and no frame is leaked, apart from the program's own
+  frames, which a passing check keeps for the two runs below.
 
 With `LINUX_ENOSYS_FATAL=y` the check expects the process to be killed at `getrandom` instead, and
 the log line says so.
@@ -875,7 +877,7 @@ the log line says so.
 On `x86_64-qemu` the line reads:
 
 ```
-  linux      /KINTANE/LINUX.ELF (13424 bytes, tagged linux):
+  linux      /KINTANE/LINUX.ELF (18560 bytes, tagged linux):
              hello from linux
 linux: getrandom (318) is not implemented
              exit 0x000000000000002a ok, output ok, getrandom logged as unimplemented; init after it:
@@ -883,13 +885,94 @@ linux: getrandom (318) is not implemented
              native init unaffected
 ```
 
-`kernel/linux` is host-tested (7 tests), covering:
+On `aarch64-virt` the program is 81064 bytes, since aarch64's linker aligns its segments to
+64 KiB, and the logged call is `getrandom (278)`.
 
-- every dispatched number against its name in the table;
+**With the scheduler.** After `waits`, a `linux mt` check starts the kept program again, as
+`hello rich`, and hands it the volume's namespace. `rich` pipes, forks, `execve`s the same file in
+its `child` mode, waits, and starts a thread that bumps a counter under a futex-based lock, each of
+its threads with a thread pointer of its own. Its exit code is 43 when every step behaved, or the
+first step that went wrong:
+
+| Step | What it checks |
+|---|---|
+| 50–51 | `pipe2`, at descriptors 3 and 4 |
+| 52 | a thread pointer of the parent's own |
+| 53 | `fork` on x86_64, `clone(SIGCHLD)` on aarch64 |
+| 54–55 | the parent closes its write end and reads: the pipe is empty until the child, after its `execve`, writes, so the read blocks, and then returns the child's line |
+| 56 | the parent's thread pointer is its own after that block |
+| 57–58 | `wait4` names the child and reports its exit code, 45; a child that failed passes its own step on instead |
+| 59 | the page the child wrote before its `execve` still holds the parent's value |
+| 60 | end of file, now that the last writer's process has ended |
+| 61 | `ECHILD` with no child left |
+| 62–63 | `clone` with `CLONE_THREAD`, on a mapped stack with a thread pointer of its own; `CLONE_PARENT_SETTID` writes the tid |
+| 64 | both threads bump the counter 40 times each, yielding while they hold the lock, so the other waits on the futex |
+| 65 | the parent's thread pointer is its own throughout |
+| 66 | a join: `FUTEX_WAIT` on the tid word until the kernel zeroes it as the thread exits (`CLONE_CHILD_CLEARTID`) |
+| 67 | the counter is 80: no bump was lost |
+| 68–71 | what the thread found: its thread pointer is the one `clone` gave it, its tid is not the pid, and its pointer stays its own across the switches |
+| 72–76 | the forked child, before its `execve`: the shared page reads the parent's value, a write changes its own copy, and its own thread pointer holds across 50 yields while the parent is blocked |
+| 77–78 | the `child` mode, after it: descriptor 4 is still the pipe, and the memory is the new program's |
+
+The check requires that exit code; that at least one pipe read blocked, at least one futex wait
+blocked, and at least one waiter was woken by a futex wake, each counted by the kernel; that every
+thread ended; that no file is left open; and that every frame of the process pool is back once the
+parent and child are torn down. It runs on the boot CPU alone, since the secondaries join the
+scheduler after the verdict, so the parent, the child and the thread share one CPU and every
+switch between them is one a thread pointer must survive. On `x86_64-qemu` the line reads:
+
+```
+  linux mt   pipe, fork, execve, wait4, a thread and a futex ok; 1 pipe reads blocked, 41 futex waits blocked, 41 woken; 0 frames left ok
+```
+
+On `aarch64-virt` it read 42 futex waits blocked and 42 woken.
+
+**In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
+the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.
+It builds and installs both processes before starting either, then pins both to one CPU, a
+different one each pair. Each sets its own thread pointer to a block marked with its pid and checks
+it after each of 100 yields, then exits with 44. A process that reads another's mark exits 91 and
+fails the audit, and so does a pair that is not over in 10 s or that leaves a frame behind. The
+heartbeat counts the pairs. In 20 s runs, `x86_64-qemu`, `aarch64-virt`, and both SMP presets at 4
+and at 8 CPUs each ran 5 pairs and 20 audits.
+
+Three versions came before this one, and the stress run found something wrong with each:
+
+- **2000 yields.** On `aarch64-virt-smp` one pair in twenty did not end within its patience. A
+  yield on a CPU a busy stress workload shares can hand that workload a whole 10 ms slice, so 2000
+  yields could take 20 s. The count went down, and the patience did not go up past what a pair
+  should take.
+- **A pair every interval.** On one CPU a pair costs the workloads a good part of a second, and a
+  20 s run on `aarch64-virt` fell from 20 audits to 12, and on `x86_64-qemu` from 20 to 16.
+- **Starting each process as it was built.** On 8 CPUs, both `x86_64-qemu-smp` and
+  `aarch64-virt-smp` hung: the heartbeat watchdog stopped the runs after heartbeats 12 and 8. The
+  first process's thread was faulting on another CPU, spinning with interrupts masked for the
+  frame lock, while the auditor installed the second process, whose segment protection shoots down
+  TLBs holding that lock. `shootdown.rs` forbids waiting masked for a lock held across a shootdown.
+  `userproc::prepare_linux` now builds a process without starting it, and the same hazard for
+  `fork` and `execve` on a multiprocessor is written down in
+  [userspace-abi.md](userspace-abi.md#as-built--static-programs-x86_64-and-aarch64) as open.
+
+During this branch's verification, 20 s single-CPU stress runs also failed as the round-7 notes
+describe: `x86_64-qemu` with "user process: a process made no progress", and `i686-qemu` with
+"a workload made no progress since the last audit: heap A", under a host load average near 9. The
+base commit, `9576bb2`, failed both the same way in the same conditions, `i686-qemu` once in three
+runs. `i686` does not build the personality.
+
+`kernel/linux` is host-tested (9 tests), covering:
+
+- every dispatched number, for both architectures, against its name in that architecture's table,
+  and `decode` finding it;
+- aarch64 lacking `fork`, `pipe` and `arch_prctl`, and its numbering not being x86_64's;
+- `clone`'s argument order on each architecture, and `wait4`'s status encoding;
 - the errno encoding and its range;
 - the start-up stack, read back the way start-up code reads it, at 40 string lengths for its
   alignment;
-- the `struct stat` and `struct utsname` offsets.
+- the `struct stat` offsets in both layouts, and `struct utsname`'s.
+
+`kernel/mm` has 2 more, for `Vm::fork_into`: two address spaces over one share store, where a write
+on either side after the fork stays on that side and the other still reads the value from before,
+and a fork into a space that already has regions is refused.
 
 `kernel/elf` has 4 more tests for the note walk: the KinTane note found, a prefix of its owner not
 matching, notes truncated at every length and with an oversized name never panicking, and
@@ -906,6 +989,10 @@ was restored and compared byte for byte.
 | A native process given the Linux table | boot: the `userspace` check logs `linux: stat (4) is not implemented` for `init`'s native calls, and the boot fails |
 | The unimplemented call logged but not recorded | boot: `THE UNIMPLEMENTED CALL WAS NOT LOGGED` |
 | Every program tagged native, the note test reading `true` | boot: `/KINTANE/LINUX.ELF IS NOT TAGGED linux` |
+| The x86_64 context switch neither saving nor loading `FS` base | boot: `linux mt  the program exited 0xffffffffffffffff, WRONG; 1 pipe reads blocked, 0 futex waits blocked`. The parent was killed after its blocked read, with the thread part never reached, which is what follows when the child's `execve` zeroes `FS` base on the one CPU and nothing puts the parent's back |
+| A pipe read that answers `EAGAIN` instead of blocking while a writer is left | boot: `linux mt  the program exited 0x0000000000000037, WRONG; 0 pipe reads blocked`, step 55 |
+| `Vm::fork_into` mapping the shared pages writable in both spaces, so no write copies | boot: `linux mt  the program exited 0x000000000000003b, WRONG`, step 59: the parent read the child's write. Host: `a_fork_shares_every_page_and_a_write_on_either_side_stays_on_that_side` fails |
+| A futex wake that wakes its bucket without counting the wake | boot: `linux mt  the program NEVER EXITED; 1 pipe reads blocked, 0 futex waits blocked, 1 woken; NOTHING REALLY BLOCKED; A THREAD NEVER ENDED`. The woken waiter found the count unchanged and waited again, and nothing woke it after |
 
 `LINUX_ENOSYS_FATAL=y` was booted as well. The boot passes, with `exit 0xffffffffffffffff ok` and
 the log line `linux: getrandom (318) is not implemented, and LINUX_ENOSYS_FATAL ends the process`.

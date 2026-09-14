@@ -527,7 +527,10 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `sibling`, whose process slot and stack slots it reuses; and after `waits` has
     // finished, so the file server is serving a second process, not the check that started it.
     let files = crate::model::files_check(c);
-    // After `files`, which has torn its process down by now: this borrows the process
+    // After `files`, which has torn its process down by now, and reusing its process slot:
+    // the Linux program with the scheduler, forking and starting a thread.
+    let linux = crate::model::linux_check(c);
+    // After `linux`, which has torn its processes down by now: this borrows the process
     // check's frame pool and reuses its process slot and stack. Before tickless, which
     // wants everything but idle gone.
     c.write_str("\n  isolation  ");
@@ -551,6 +554,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(waits)
         .and(sibling)
         .and(files)
+        .and(linux)
         .and(isolation)
         .and(blk_domain)
         .and(tickless)

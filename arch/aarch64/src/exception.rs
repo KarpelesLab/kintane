@@ -113,24 +113,32 @@ __exception_vectors:
 // Two addresses are tested. The frame's bottom, `sp - 0x120`, catches a frame that would
 // open inside a guard. `sp - 1` catches a stack pointer that is already in one, whose
 // frame would open below it. A guard page is larger than a frame, so between them nothing
-// the frame writes can be in a guard page unnoticed. The two EL0 thread-pointer registers
-// are scratch: nothing runs at EL0, so nothing reads them.
+// the frame writes can be in a guard page unnoticed.
+//
+// Two registers are scratch. `SP_EL0` is one: this entry is taken only at EL1 on `SP_EL1`,
+// and the process stack pointer it banks is already in the frame of the trap from EL0 that
+// brought the kernel here, which restores it on the way back. `TPIDRRO_EL0` is the other,
+// zeroed again before anything returns, so a program reading it never sees a kernel value.
+// `TPIDR_EL0` is not: it is a thread's own, which its program sets at EL0 and the context
+// switch carries (`context.rs`).
 __sync_spx_entry:
     msr     tpidrro_el0, x0
-    msr     tpidr_el0, x1
+    msr     sp_el0, x1
     sub     x0, sp, #0x120
     GUARD_TEST
     sub     x0, sp, #1
     GUARD_TEST
-    mrs     x1, tpidr_el0
+    mrs     x1, sp_el0
     mrs     x0, tpidrro_el0
+    msr     tpidrro_el0, xzr
     sub     sp, sp, #0x120
     str     x0, [sp, #0x00]
     mov     x0, #4
     b       __exc_common
 9:
-    mrs     x1, tpidr_el0
+    mrs     x1, sp_el0
     mrs     x0, tpidrro_el0
+    msr     tpidrro_el0, xzr
     b       __kspace_stack_overflow
 
 // x0 holds the vector index; the frame is open and x0's original value is in it.
@@ -211,14 +219,14 @@ pub(crate) struct TrapFrame {
     /// Address the exception will return to.
     pub(crate) elr: u64,
     /// Processor state to restore on return.
-    spsr: u64,
+    pub(crate) spsr: u64,
     /// Syndrome — the reason for a synchronous exception.
     esr: u64,
     /// Faulting address, when the syndrome says there is one.
     far: u64,
     /// The interrupted context's `SP_EL0`, restored on return. It is also what keeps the
     /// frame a multiple of 16, which SP must always be.
-    sp_el0: u64,
+    pub(crate) sp_el0: u64,
 }
 
 /// Vector index for "current EL with `SP_ELx`, IRQ" — the only entry a working kernel

@@ -53,6 +53,7 @@
 #![allow(unsafe_code)]
 
 use core::cell::SyncUnsafeCell;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use abi::{Error, Handle as AbiHandle, UserPtr};
@@ -373,6 +374,37 @@ static FRAME_LOCK: sync::SpinLock<(), Cpu> = sync::SpinLock::with_class((), &FRA
 /// processes can exist at once.
 static SHARE_STORE: [SyncUnsafeCell<[ShareSlot; N]>; MAX_PROCS] =
     [const { SyncUnsafeCell::new([ShareSlot::EMPTY; N]) }; MAX_PROCS];
+/// Every Linux process's share counts, in one store.
+///
+/// A process and the child `fork` made of it map the same frames, and whichever writes one
+/// first must see that the other still maps it; so both count in here, rather than each in
+/// its slot's [`SHARE_STORE`]. Sized for the pages of a few small static programs shared at
+/// once; a `fork` that would need more fails with nothing shared.
+///
+/// SAFETY INVARIANT: reached only through the [`Shares`] views [`shares_for`] makes, and a
+/// `Vm` touches its shares only in operations made under [`FRAME_LOCK`] ([`with_frames`]).
+const LINUX_SHARED: usize = 128;
+static LINUX_SHARES: SyncUnsafeCell<[ShareSlot; LINUX_SHARED]> =
+    SyncUnsafeCell::new([ShareSlot::EMPTY; LINUX_SHARED]);
+
+/// The share counts a process in `slot` of `personality` is built with.
+fn shares_for(slot: usize, personality: Personality) -> Shares<'static> {
+    match personality {
+        // SAFETY: one store per slot, borrowed while that slot is `Some`, and the caller
+        // builds into a slot that is `None`, so no other borrow of this store is live.
+        Personality::Native => Shares::new(unsafe { &mut *SHARE_STORE[slot].get() }),
+        Personality::Linux => {
+            let store = core::ptr::slice_from_raw_parts_mut(
+                LINUX_SHARES.get().cast::<ShareSlot>(),
+                LINUX_SHARED,
+            );
+            // SAFETY: a static, valid for ever, and serialised by `FRAME_LOCK`; see
+            // `LINUX_SHARES`.
+            unsafe { Shares::shared(NonNull::new(store).expect("a static is never null")) }
+        }
+    }
+}
+
 /// The kernel direct map, set by [`check`] and used to reach frames. Its raw parts, since
 /// `DirectMap` is `Copy` but has no `const` default; stored as an `Option`.
 static DIRECT: SyncUnsafeCell<Option<DirectMap>> = SyncUnsafeCell::new(None);
@@ -653,6 +685,8 @@ fn leave(slot: usize) -> bool {
 fn finish_thread(slot: usize, last: bool, exit: Option<u64>) -> ! {
     if last {
         crate::objects::on_process_exit(slot, exit.unwrap_or(KILLED));
+        // A Linux parent waiting in `wait4` learns of it here, once no thread is left.
+        crate::personality::process_ended(slot, exit.unwrap_or(KILLED));
     }
     end_thread()
 }
@@ -693,6 +727,8 @@ fn record_exit(p: &mut Process, code: u64) {
     if threads_live(p.slot) > 1 {
         preempt::interrupt_other_cpus();
     }
+    // And the Linux personality's own queues: pipes, futexes, `wait4`.
+    crate::personality::wake_all_waiters();
 }
 
 /// End the running process with `code`, from its own system call. Never returns.
@@ -764,16 +800,242 @@ fn native_syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFrame) 
     frame.set_result(status, value);
 }
 
-/// The Linux table: [`crate::personality::syscalls`], over the process borrowed under its lock
-/// for the whole call. A Linux process has one thread and no call that blocks yet; one that
-/// does will wait through [`crate::wait`] and let go of the lock around it, as the native
-/// calls do.
+/// The Linux table: [`crate::personality::syscalls`]. It takes the process's lock itself, a
+/// piece of a call at a time ([`with_locked`]), so that a call that blocks — a pipe, a futex,
+/// `wait4` — waits through [`crate::wait`] holding nothing, as the native calls do.
 fn linux_syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
-    let Some(mut held) = lock(slot) else {
-        unsupported(frame);
+    crate::personality::syscalls(slot, frame)
+}
+
+// ---- what the Linux personality asks of a process ---------------------------------------
+
+/// Run `f` on process `slot` under its lock. `None` if there is no such process.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn with_locked<R>(slot: usize, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    let mut held = lock(slot)?;
+    Some(f(held.process()))
+}
+
+/// Whether process `slot` is ending, so a thread of it must end at the call it is in.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn exiting(slot: usize) -> bool {
+    EXITING.get(slot).is_some_and(|e| e.load(Ordering::Acquire))
+}
+
+/// End the calling thread if its process is ending. Called holding no process lock.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn end_if_exiting(slot: usize) {
+    if !exiting(slot) {
         return;
+    }
+    let last = leave(slot);
+    let exit = lock(slot).and_then(|mut held| held.process().exit);
+    finish_thread(slot, last, exit)
+}
+
+/// End the calling thread of process `slot` alone, as Linux's `exit` does; the process
+/// ends with `code` if it was the last. Called holding no process lock. Never returns.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn exit_thread_current(slot: usize, code: u64) -> ! {
+    let ended = lock(slot).map(|mut held| {
+        // Counted under the lock, as the native `thread_exit` counts it.
+        let last = leave(slot);
+        let p = held.process();
+        if last {
+            record_exit(p, code);
+        }
+        (last, p.exit)
+    });
+    let (last, exit) = match ended {
+        Some(ended) => ended,
+        None => (leave(slot), Some(code)),
     };
-    crate::personality::syscalls(held.process(), frame)
+    finish_thread(slot, last, exit)
+}
+
+/// Build a Linux process for `program` in `slot` and start its first thread, from a kernel
+/// thread with the scheduler running: install its segments, let `start` lay out what it
+/// starts with and return its stack pointer, and enter it there. What a check or the stress
+/// run starts a Linux program with; [`run_linux`] is the boot-time slice's.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn start_linux(
+    slot: usize,
+    program: &Program,
+    start: impl FnOnce(&mut Process, &Program) -> Option<usize>,
+) -> Option<ThreadId> {
+    let begun = crate::spawn::start_thread(prepare_linux(slot, program, start)?);
+    if begun.is_none() {
+        teardown(slot);
+    }
+    begun
+}
+
+/// [`start_linux`] without starting the thread: build the process, install it, lay out its
+/// start, and return how its first thread enters it, for `spawn::start_thread`. `None` has
+/// torn down whatever it built.
+///
+/// A caller starting several processes prepares them all before starting any. Installing a
+/// program protects its segments, which shoots down TLBs holding the frame lock with
+/// interrupts masked, and a thread already running on another CPU may be spinning, masked,
+/// for that same lock in a fault: neither could go on (see `shootdown`).
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn prepare_linux(
+    slot: usize,
+    program: &Program,
+    start: impl FnOnce(&mut Process, &Program) -> Option<usize>,
+) -> Option<crate::spawn::Start> {
+    let root = build_as(slot, program, Personality::Linux)?;
+    // Masked from loading the space to putting the kernel's back: a switch in between would
+    // load this kernel thread's own space, the kernel's, under the copy.
+    let irq = Cpu::irq_save();
+    // SAFETY: `root` mirrors the kernel half, where the running code and stack live.
+    unsafe { Cpu::set_root(root) };
+    let sp = install_program(program).and_then(|()| start(self::slot(slot)?, program));
+    // SAFETY: as above.
+    unsafe { Cpu::set_root(kernel_root()) };
+    // SAFETY: pairs with the `irq_save` above.
+    unsafe { Cpu::irq_restore(irq) };
+    let prepared = sp.and_then(|user_sp| {
+        let mut held = lock(slot)?;
+        held.process().started = true;
+        Some(crate::spawn::Start {
+            slot,
+            root,
+            entry: program.entry as usize,
+            user_sp,
+            install: false,
+            args: [0; 4],
+        })
+    });
+    if prepared.is_none() {
+        teardown(slot);
+    }
+    prepared
+}
+
+/// Make a copy-on-write child of Linux process `parent` in a free slot, as `fork` does: its
+/// address space shares every page with the parent's, and it has no thread and no handles
+/// yet. Returns the child's slot and root. Called holding no process lock.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn fork_linux(parent: usize) -> Option<(usize, PhysAddr)> {
+    let child = (0..MAX_PROCS).find(|&i| !USED[i].swap(true, Ordering::AcqRel))?;
+    let built = fork_claimed(parent, child);
+    if built.is_none() {
+        USED[child].store(false, Ordering::Release);
+    }
+    built.map(|root| (child, root))
+}
+
+/// [`fork_linux`], into a slot it has claimed.
+fn fork_claimed(parent: usize, child: usize) -> Option<PhysAddr> {
+    if self::slot(child).is_some() {
+        return None;
+    }
+    let direct = direct();
+    let mut space = with_frames(|f| AddressSpace::<Cpu>::new(direct, f).ok())??;
+    // SAFETY: as in `build_claimed`.
+    unsafe { space.mirror_top_level(kernel_root()).ok()? };
+    let mut vm = Vm::new(space, shares_for(child, Personality::Linux));
+    let mut held = lock(parent)?;
+    let p = held.process();
+    if p.personality != Personality::Linux {
+        return None;
+    }
+    let shared = with_frames(|f| p.vm.fork_into(&mut vm, f).is_ok()).unwrap_or(false);
+    let root = vm.space().root();
+    // In place even if the share failed part-way, so that teardown releases what was shared
+    // and every count goes back.
+    // SAFETY: see `PROCS`; the slot is `None` and no thread exists for it.
+    unsafe {
+        *PROCS[child].get() = Some(Process {
+            table: HandleTable::new(),
+            vm,
+            ids: ObjectIds::new(),
+            next_map: p.next_map,
+            image: None,
+            console: ObjectId::from_raw(0),
+            exit: None,
+            root,
+            slot: child,
+            started: true,
+            stacks: p.stacks,
+            personality: Personality::Linux,
+            syscalls: table_for(Personality::Linux),
+        });
+    }
+    drop(held);
+    LIVE[child].store(0, Ordering::Release);
+    EXITING[child].store(false, Ordering::Release);
+    INSTALLED[child].store(true, Ordering::Release);
+    ROOTS[child].store(root.raw(), Ordering::Release);
+    if !shared {
+        teardown(child);
+        return None;
+    }
+    Some(root)
+}
+
+/// Replace Linux process `slot`'s memory with `program`, as `execve` does: every region
+/// released, the program's segments and a stack reserved, and the segments installed. On
+/// the process's own thread, its only one, holding no process lock. `None` leaves the
+/// process with no memory to return to, which the caller must end.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn exec_linux(slot: usize, program: &Program) -> Option<()> {
+    {
+        let mut held = lock(slot)?;
+        let p = held.process();
+        with_frames(|f| {
+            let mut starts = [0usize; REGIONS];
+            let mut n = 0;
+            for r in p.vm.regions().iter() {
+                if let Some(s) = starts.get_mut(n) {
+                    *s = r.start;
+                    n += 1;
+                }
+            }
+            starts[..n].iter().all(|&s| p.vm.release(s, f).is_ok())
+        })
+        .filter(|&released| released)?;
+        for seg in program.segments() {
+            let seg = seg.ok()?;
+            if seg.mem_size == 0 {
+                continue;
+            }
+            let (lo, hi) = seg.pages(Cpu::PAGE_SIZE as u64);
+            p.vm.reserve(anon(lo as usize, (hi - lo) as usize)).ok()?;
+        }
+        let stack_bottom = user_stack_top() - USER_STACK_PAGES * Cpu::PAGE_SIZE;
+        p.vm.reserve(anon(stack_bottom, USER_STACK_PAGES * Cpu::PAGE_SIZE))
+            .ok()?;
+        p.next_map = first_map_addr(program);
+        p.stacks = 0;
+        p.image = None;
+    }
+    install_program(program)
 }
 
 /// The kernel's implementation of the native ABI, over one process.
@@ -1683,10 +1945,7 @@ fn build_claimed(slot: usize, program: &Program, personality: Personality) -> Op
     // SAFETY: `kernel_root` is the live kernel root, reachable through `direct`, and its
     // tables outlive this process.
     unsafe { space.mirror_top_level(kernel_root).ok()? };
-    // SAFETY: one store per slot, borrowed while that slot is `Some`, and this slot is
-    // `None` (checked above), so no other borrow of this store is live.
-    let shares = Shares::new(unsafe { &mut *SHARE_STORE[slot].get() });
-    let mut vm = Vm::new(space, shares);
+    let mut vm = Vm::new(space, shares_for(slot, personality));
 
     // Every segment as a writable region, filled once the space is loaded, then tightened.
     for seg in program.segments() {

@@ -40,6 +40,21 @@ pub trait SyscallFrame {
     fn set_return(&mut self, value: u64);
 }
 
+/// A user thread's registers in full: what a system call interrupted, and what a thread is
+/// resumed with. What a Linux `fork` or `clone` copies into the new thread, and what an
+/// `execve` replaces.
+pub trait UserRegisters: Copy {
+    /// Registers that start a program at `pc` on stack `sp`, with every other register zero
+    /// and the flags a program starts with.
+    fn start(pc: usize, sp: usize) -> Self;
+    /// Set the register a system call returns in (`rax`, `x0`).
+    fn set_return(&mut self, value: u64);
+    /// Set the stack pointer.
+    fn set_stack(&mut self, sp: usize);
+    /// The address the thread resumes at.
+    fn pc(&self) -> usize;
+}
+
 /// Why a user thread must stop: a trap its process did not ask for and the kernel could
 /// not resolve.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,13 +156,41 @@ pub trait HasUserMode: HasPageTables + HasContextSwitch {
     /// Set the running CPU's user thread pointer: `FS` base on x86_64, `TPIDR_EL0` on aarch64.
     /// What a Linux process's `arch_prctl(ARCH_SET_FS)` asks for.
     ///
-    /// Not yet part of a thread's saved context: a switch to another thread does not change
-    /// it. So a caller must reset it when the process that set it is done, and a process that
-    /// sets it must not share a CPU with another that relies on it.
+    /// The thread pointer is part of a user thread's saved context: a switch away from a
+    /// thread bound with [`HasUserMode::bind`] saves it, and a switch to one loads it. So a
+    /// value set here stays with the calling thread wherever it next runs, and no other
+    /// thread sees it.
     ///
     /// # Safety
-    /// On the CPU the process runs on, with interrupts masked or from its own system call.
+    /// On the CPU the thread runs on, with interrupts masked or from its own system call.
     unsafe fn set_tls(value: usize);
+
+    /// The running CPU's user thread pointer, as [`HasUserMode::set_tls`] or the program
+    /// itself last left it. What a `fork` gives the child.
+    ///
+    /// # Safety
+    /// As [`HasUserMode::set_tls`].
+    unsafe fn tls() -> usize;
+
+    /// A user thread's registers in full.
+    type UserRegisters: UserRegisters;
+
+    /// The registers of the thread that made the system call in `frame`, as it will see them
+    /// when the call returns.
+    fn registers(frame: &Self::SyscallFrame) -> Self::UserRegisters;
+
+    /// Make the system call in `frame` return to `regs` rather than to where it was made.
+    /// The address must be one [`HasUserMode::USER_START`]..[`HasUserMode::USER_END`] holds,
+    /// and a caller checks it: the port returns to it.
+    fn set_registers(frame: &mut Self::SyscallFrame, regs: &Self::UserRegisters);
+
+    /// Leave the kernel for user code with every register as `regs` has it. The flags are
+    /// sanitised to user mode with interrupts enabled. The kernel stack is reset to
+    /// `kernel_stack_top`, as [`HasUserMode::enter_user`] does.
+    ///
+    /// # Safety
+    /// As [`HasUserMode::enter_user`], for `regs`' address and stack pointer.
+    unsafe fn resume_user(regs: &Self::UserRegisters, kernel_stack_top: KernAddr) -> !;
 }
 
 /// Whether `[addr, addr + len)` lies in the user half. The first check of every copy, so

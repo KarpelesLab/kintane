@@ -104,6 +104,10 @@ pub struct Context {
     /// so the assembly offsets (which stop at `sp`, 0x60) are unchanged.
     pub(crate) user_kernel_stack: u64,
     pub(crate) user_root: u64,
+    /// For a thread that runs user code: its `TPIDR_EL0`, the thread pointer. A program
+    /// writes that register itself, at EL0, so it is read back when the thread is switched
+    /// away from and loaded when it is switched to. See `hal::HasUserMode::set_tls`.
+    pub(crate) user_tls: u64,
 }
 
 impl Context {
@@ -125,6 +129,7 @@ impl Context {
             sp: 0,
             user_kernel_stack: 0,
             user_root: 0,
+            user_tls: 0,
         }
     }
 }
@@ -248,6 +253,18 @@ impl HasContextSwitch for Aarch64 {
         // switch masked, on the CPU `to` is about to run on; `user_root` is what `bind`
         // recorded, or zero.
         unsafe { crate::user::load_space((*to).user_root) };
+        // The thread pointer of a thread that runs user code, which its program may have
+        // changed at EL0 since it last arrived. Kernel threads neither read nor write it.
+        // SAFETY: as above; `from` is the running thread's context. `TPIDR_EL0` is EL0's
+        // register, read and written at EL1, and nothing in the kernel uses it.
+        unsafe {
+            if (*from).user_kernel_stack != 0 {
+                (*from).user_tls = crate::user::read_tpidr_el0();
+            }
+            if (*to).user_kernel_stack != 0 {
+                crate::user::write_tpidr_el0((*to).user_tls);
+            }
+        }
         // SAFETY: the caller upholds the contract — interrupts masked, `from` writable
         // and distinct from `to`, `to` a suspended context with a live stack. The call
         // is an ordinary AAPCS64 call, so the compiler already treats every caller-saved

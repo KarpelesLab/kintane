@@ -1,0 +1,88 @@
+# The aarch64 Linux system call table, in the format of Linux's own scripts/syscall.tbl,
+# which the generic numbering in include/uapi/asm-generic/unistd.h is generated from:
+# number, ABI, name, entry point.
+#
+# Not the whole table. It holds every call the personality implements and the calls a
+# static program's start-up, or a common libc, is known to make, so an unimplemented one
+# is logged by name rather than by number. aarch64 has no `open`, `pipe`, `fork` or
+# `arch_prctl`: a C library reaches them as `openat`, `pipe2`, `clone` with SIGCHLD, and a
+# write to TPIDR_EL0 from EL0. The numbers are Linux's and never change; `kernel/linux`'s
+# host tests pin every number the kernel dispatches on to the name this file gives it.
+#
+# <number> <abi> <name> <entry point>
+17	common	getcwd			sys_getcwd
+23	common	dup			sys_dup
+24	common	dup3			sys_dup3
+25	common	fcntl			sys_fcntl
+29	common	ioctl			sys_ioctl
+34	common	mkdirat			sys_mkdirat
+35	common	unlinkat		sys_unlinkat
+46	common	ftruncate		sys_ftruncate
+48	common	faccessat		sys_faccessat
+49	common	chdir			sys_chdir
+56	common	openat			sys_openat
+57	common	close			sys_close
+59	common	pipe2			sys_pipe2
+61	common	getdents64		sys_getdents64
+62	common	lseek			sys_lseek
+63	common	read			sys_read
+64	common	write			sys_write
+65	common	readv			sys_readv
+66	common	writev			sys_writev
+67	common	pread64			sys_pread64
+68	common	pwrite64		sys_pwrite64
+72	common	pselect6		sys_pselect6
+73	common	ppoll			sys_ppoll
+78	common	readlinkat		sys_readlinkat
+79	common	newfstatat		sys_newfstatat
+80	common	fstat			sys_newfstat
+93	common	exit			sys_exit
+94	common	exit_group		sys_exit_group
+96	common	set_tid_address		sys_set_tid_address
+98	common	futex			sys_futex
+99	common	set_robust_list		sys_set_robust_list
+100	common	get_robust_list		sys_get_robust_list
+101	common	nanosleep		sys_nanosleep
+113	common	clock_gettime		sys_clock_gettime
+114	common	clock_getres		sys_clock_getres
+115	common	clock_nanosleep		sys_clock_nanosleep
+124	common	sched_yield		sys_sched_yield
+129	common	kill			sys_kill
+130	common	tkill			sys_tkill
+131	common	tgkill			sys_tgkill
+134	common	rt_sigaction		sys_rt_sigaction
+135	common	rt_sigprocmask		sys_rt_sigprocmask
+139	common	rt_sigreturn		sys_rt_sigreturn
+153	common	times			sys_times
+160	common	uname			sys_newuname
+163	common	getrlimit		sys_getrlimit
+164	common	setrlimit		sys_setrlimit
+165	common	getrusage		sys_getrusage
+166	common	umask			sys_umask
+167	common	prctl			sys_prctl
+169	common	gettimeofday		sys_gettimeofday
+172	common	getpid			sys_getpid
+173	common	getppid			sys_getppid
+174	common	getuid			sys_getuid
+175	common	geteuid			sys_geteuid
+176	common	getgid			sys_getgid
+177	common	getegid			sys_getegid
+178	common	gettid			sys_gettid
+179	common	sysinfo			sys_sysinfo
+198	common	socket			sys_socket
+203	common	connect			sys_connect
+206	common	sendto			sys_sendto
+207	common	recvfrom		sys_recvfrom
+214	common	brk			sys_brk
+215	common	munmap			sys_munmap
+216	common	mremap			sys_mremap
+220	common	clone			sys_clone
+221	common	execve			sys_execve
+222	common	mmap			sys_mmap
+226	common	mprotect		sys_mprotect
+233	common	madvise			sys_madvise
+260	common	wait4			sys_wait4
+261	common	prlimit64		sys_prlimit64
+278	common	getrandom		sys_getrandom
+291	common	statx			sys_statx
+435	common	clone3			sys_clone3
