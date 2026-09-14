@@ -1,0 +1,21 @@
+# The slice of UEFI the loaders call: one binding table, shared.
+#
+# A library rather than a module inside `kinboot-efi`, because the EFI stub calls the
+# same firmware and a second copy of a function-pointer table is exactly the thing that
+# is right in one place and wrong in the other. Nothing in the kernel links it: it is
+# built for whichever loader's target the loader is built for.
+[unit]
+name = "uefi"
+kind = "lib"
+root = "src/lib.rs"
+layer = "loader"
+
+[deps]
+units = ["boot_protocol"]
+
+# Only when a UEFI loader is. Without this the unit is planned in every configuration, and
+# kbuild compiles every planned library for the kernel's own target too: on aarch64 or
+# ARMv7-M there is no `arch` module here, and the first build after this unit existed
+# failed on `crate::arch` for every kernel that is not x86_64.
+[config]
+requires = "KINBOOT_EFI || KINBOOT_STUB"

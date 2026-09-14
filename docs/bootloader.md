@@ -174,6 +174,43 @@ boot counter, and the aarch64 and i686 UEFI builds. The loader carries no symbol
 yet either: it is linked without a PDB, because lld-link's PDB records a path rustc
 picks at random and would make the image irreproducible.
 
+#### As built: the EFI stub
+
+The kernel is its own UEFI application with `KINBOOT_STUB` (preset `x86_64-efistub`). The
+firmware starts one file, `EFI/BOOT/BOOTX64.EFI`, and that file is the kernel with the
+handover in front of it. There is no loader beside it and nothing to read off a partition.
+
+No single link can produce that file, so it is built in three steps:
+
+1. `boot/kinboot-stub` is linked for `x86_64-unknown-uefi`, like `kinboot-efi`, knowing
+   nothing about the kernel.
+2. Once the kernel is linked and stamped with its build ID, kbuild appends two sections to
+   the stub's PE (`kbuild/src/pe.rs`): `.kernel`, the stripped ELF64, and `.cmdline`, the
+   command line, which is where a unified kernel image carries it. The firmware loads every
+   section a PE declares, so both arrive in memory with the stub.
+3. kbuild writes where each landed into a descriptor the stub declares after a sixteen-byte
+   marker, under the rule the build ID follows: the marker must occur exactly once.
+
+The stub reads the descriptor, checks every range against the image size the firmware
+reports, and calls the same handover `kinboot-efi` does. That handover now lives in
+`boot/uefi` as `uefi::handover`. Placing the segments, finding the RSDP, `ExitBootServices`
+with the stale-key retry and writing `BootInfo` are identical for both loaders, so the part
+that is easy to get wrong exists once.
+
+It deliberately has no menu, no entry list and no chainloading. A stub is the configuration
+that says "boot this kernel with these arguments"; `kinboot-efi` is the one that says
+"choose". A stub that fails returns to the firmware, which may have other ways to boot,
+except in test builds: a stamped flag makes it reset instead, so `-no-reboot` ends the run
+at once rather than after the harness's timeout.
+
+**The first boot found a layout bug the host tests could not.** The marker was twelve
+bytes, which left four bytes of padding before the descriptor's first 64-bit word. kbuild
+wrote the words straight after the marker, the stub read them four bytes later, and the
+first boot reported a kernel of 2.3 petabytes. The marker is sixteen bytes now, and the stub
+asserts `offset_of!(Blob, words) == MARKER.len()` at compile time, so that layout fails the
+build rather than the boot. kbuild's test of the stamped image could not have caught it,
+because it read back the layout kbuild wrote, not the one the stub reads.
+
 ### `kinboot-bios` — MBR / BIOS
 
 The legacy PC path, required because tier-1 [`i686`](targets.md#i686) boots this way.
@@ -417,11 +454,50 @@ This is a small amount of machinery that turns an unbootable machine into a mach
 that boots badly, which on hardware without a serial console is the difference between
 debuggable and bricked.
 
-**Not built yet, deliberately.** The loader half is small: an EFI variable, or a reserved
-sector. The kernel half is not. The kernel clears the counter, so it needs to write an
-EFI variable through runtime services, or a sector through a disk driver, and it has
-neither. A counter that nothing clears would put every machine into safe mode on its
-third boot. It lands with the first kernel-side writer.
+#### As built: the EFI stub counts, the kernel confirms
+
+The counter is the EFI variable `KinTaneBootAttempts`. Its name, vendor GUID and limit
+are in `boot_protocol::uefi::boot_counter`, which both sides link.
+
+- **The stub counts** (`boot/uefi/src/counter.rs`). Before anything else in the boot path
+  can fail, it reads the number of attempts since the last confirmed boot, adds this one
+  and writes it back. After three unconfirmed attempts in a row, the fourth starts with
+  `mode=safe` in place of the built mode. The rest of the line is kept byte for byte.
+- **The kernel confirms** (`kernel/lastgood/uefi`). Once `kmain`'s bring-up verdict is a
+  pass, it deletes the variable with `SetVariable` and reads it back with `GetVariable`,
+  requiring `EFI_NOT_FOUND`: a confirmation the firmware dropped would otherwise surface
+  as safe mode a few boots later, with nothing in any log. A failed verdict leaves the
+  count standing, and so does anything that stops the kernel before the verdict. A boot
+  the tag says is past the limit must have arrived in safe mode, or the verdict fails.
+- **How the kernel calls firmware.** Runtime code lives in memory the kernel does not map,
+  and nothing the kernel maps outside its text is executable. So, while boot services are
+  still up, the stub allocates a call space in memory the kernel sees as reserved:
+  - six pages of page tables identity-mapping the first 4 GiB, writable and executable as
+    the firmware ran on them;
+  - a 64 KiB stack.
+
+  It passes the call space and the three entry points it needs in a `UefiRuntime` tag. A
+  call masks interrupts, loads that root, switches to that stack, calls, and restores
+  both. The kernel's own tables never gain a page that is both writable and executable.
+  `SetVirtualAddressMap` is never called, so the firmware runs at the addresses it was
+  built for. The stub passes no tag if any runtime region lies above 4 GiB.
+- **How it is proved.** `BOOT_COUNTER_TEST` runs on `x86_64-efistub`. It boots one QEMU
+  machine without `-no-reboot`, so its variable store lives through the resets. Every
+  boot before the fallback fails on purpose and resets through `ResetSystem`. The run
+  passes only if:
+  - attempts 1 to 3 arrive in normal mode;
+  - attempt 4 arrives in safe mode;
+  - that boot's confirmation reads back as gone.
+
+  Every other `x86_64-efistub` boot confirms as well, so the runtime call also runs under
+  the in-kernel, safe-mode and stack guard tests.
+
+**Not built.**
+- `kinboot-efi` and `kinboot-bios` do not count. For the first, the menu is the fallback,
+  and a counter waits on a way to tell which entry a confirmed boot came from.
+- Escalation stops at safe mode. There is no previously installed kernel to fall back to.
+- A kernel that hangs rather than fails needs a watchdog, or a person, to reset it before
+  the count moves.
 
 ## Chainloading other operating systems
 
@@ -495,6 +571,28 @@ it this small.
 - **BIOS has no root of trust.** An MBR chain cannot be verified and we will not
   pretend otherwise. `kinboot-bios` does not offer a security guarantee, and the
   documentation says so wherever the option appears.
+
+### As built: what is not verified, and why
+
+Neither Secure Boot nor measured boot exists yet. This says precisely what that means, so
+the design above is not read as a description of the code.
+
+- **No signature is checked.** `kinboot-efi` and the EFI stub start whatever kernel they read
+  or carry. The stub checks that its descriptor points inside its own image, which is bounds
+  safety against a corrupt file, not authenticity: whoever can change the kernel can change
+  the descriptor as well.
+- **Secure Boot cannot be demonstrated here yet.** QEMU ships a Secure-Boot-capable OVMF
+  (`edk2-x86_64-secure-code.fd`), but with the variable store that comes with it no keys are
+  enrolled. The firmware is in setup mode and refuses nothing: the unsigned `kinboot-efi`
+  starts under it and hands over to the kernel. Showing a refusal needs a key hierarchy
+  enrolled into the variable store, and passing the check needs the image signed with
+  Authenticode, a PKCS#7 signature over the PE's hash. Neither exists in the tree, and D8
+  rules out taking them from a crate. They are one piece of work, not two.
+- **Measured boot needs a TPM**, which QEMU provides only through `swtpm`. That is not part of
+  the test environment, so no PCR is extended and no event log is passed.
+- **Modules are not signed**, for the same missing primitive. A module carries a build
+  identity and an interface hash, which refuse one built for another configuration. That
+  guards against a mistake, not an adversary.
 
 ## Build integration
 

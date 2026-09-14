@@ -50,10 +50,11 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         }
     };
 
-    if res.is_on("ARCH_X86_64") && res.is_on("KINBOOT_EFI") {
-        // The firmware path: OVMF boots the disk image's EFI system partition, which
-        // starts kinboot-efi, which starts the kernel. No -kernel: QEMU's own loader is
-        // exactly what this configuration exists to not use.
+    if res.is_on("ARCH_X86_64") && (res.is_on("KINBOOT_EFI") || res.is_on("KINBOOT_STUB")) {
+        // The firmware path: OVMF boots the disk image's EFI system partition. With
+        // KINBOOT_EFI that starts kinboot-efi, which starts the kernel; with KINBOOT_STUB
+        // the application it starts is the kernel. No -kernel either way: QEMU's own
+        // loader is exactly what these configurations exist to not use.
         let fw = uefi_firmware(log.parent().unwrap_or(Path::new(".")))?;
         // A 36-bit physical address width, so OVMF's 64-bit PCI window lands below 64 GiB.
         // OVMF sizes and places that window from the CPU's address width: at TCG's 40 bits
@@ -91,7 +92,6 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             s("stdio"),
             s("-display"),
             s("none"),
-            s("-no-reboot"),
             // Guest errors only, not every interrupt: the firmware takes thousands of
             // timer interrupts before the kernel runs, and logging each one would bury
             // the kernel's few in megabytes of OVMF.
@@ -100,6 +100,11 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             s("-D"),
             log.display().to_string(),
         ]);
+        // A reset ends the run, except in the boot counter test, which is a sequence of
+        // boots of one machine: its variable store must live through the resets it counts.
+        if !res.is_on("BOOT_COUNTER_TEST") {
+            args.push(s("-no-reboot"));
+        }
         return Ok(Machine {
             binary: "qemu-system-x86_64",
             args,

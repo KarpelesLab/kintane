@@ -483,3 +483,40 @@ fn an_overlong_command_line_is_refused_by_both_sides() {
         Err(Error::Malformed { .. })
     ));
 }
+
+#[test]
+fn a_uefi_runtime_tag_round_trips_and_a_short_one_is_malformed() {
+    let r = uefi::Runtime {
+        call_root: 0x3F00_0000,
+        call_stack_top: 0x3F01_6000,
+        get_variable: 0x3FE1_2340,
+        set_variable: 0x3FE1_5670,
+        reset_system: 0x3FE1_89A0,
+        attempt: 4,
+        failures_before_safe: 3,
+    };
+    let bytes = build(|b| b.uefi_runtime(&r).unwrap());
+    assert_eq!(tags::parse(&bytes).unwrap().uefi_runtime().unwrap(), Some(r));
+
+    let without = build(|b| b.firmware(Firmware::Uefi).unwrap());
+    assert_eq!(tags::parse(&without).unwrap().uefi_runtime().unwrap(), None);
+
+    // Cut short, it is malformed rather than a runtime whose entry points read as zero.
+    let short = build(|b| b.tag(TagKind::UefiRuntime, &[0u8; 40]).unwrap());
+    assert!(matches!(
+        tags::parse(&short).unwrap().uefi_runtime(),
+        Err(Error::Malformed { .. })
+    ));
+}
+
+#[test]
+fn the_boot_counter_is_named_in_terminated_ucs2_and_its_call_space_is_reserved() {
+    let name = uefi::boot_counter::NAME;
+    assert_eq!(name.last(), Some(&0));
+    let text: String = name[..name.len() - 1]
+        .iter()
+        .map(|&u| char::from(u8::try_from(u).unwrap()))
+        .collect();
+    assert_eq!(text, "KinTaneBootAttempts");
+    assert_eq!(uefi::kind_of(memory_type::KINTANE_FIRMWARE_CALL), MemoryKind::Reserved as u32);
+}

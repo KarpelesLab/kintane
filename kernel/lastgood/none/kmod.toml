@@ -1,0 +1,16 @@
+# The `lastgood` provider for images no counting loader starts: `kinboot-efi`,
+# `kinboot-bios`, Multiboot and the bare-metal ports. Nothing counted this boot, so there is
+# nothing to confirm.
+#
+# The condition must exclude every configuration another provider claims.
+[unit]
+name = "lastgood"
+kind = "lib"
+root = "src/lib.rs"
+layer = "kernel"
+
+[deps]
+units = ["hal"]
+
+[config]
+requires = "!KINBOOT_STUB"

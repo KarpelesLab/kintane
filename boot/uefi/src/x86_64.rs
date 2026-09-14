@@ -66,6 +66,39 @@ pub unsafe fn enter(entry: u64, boot_info: u64) -> ! {
     }
 }
 
+/// Pages [`identity_4gib`] fills: a PML4, a PDPT and one page directory per gigabyte.
+pub const CALL_TABLE_PAGES: usize = 6;
+
+/// Fill `pages`, which lie at physical `base`, with page tables identity-mapping the first
+/// 4 GiB in 2 MiB pages, present, writable and executable, and return the root for `CR3`.
+///
+/// The address space the kernel calls runtime services in: what the firmware ran on, so
+/// its runtime code and data and the flash it writes variables to are where it expects
+/// them, and the kernel image, below 1 GiB, is mapped where it runs too. `None` if `pages`
+/// is shorter than [`CALL_TABLE_PAGES`].
+pub fn identity_4gib(pages: &mut [u8], base: u64) -> Option<u64> {
+    const PAGE: usize = 4096;
+    const PRESENT_WRITABLE: u64 = 0b11;
+    const HUGE: u64 = 1 << 7;
+    let pages = pages.get_mut(..CALL_TABLE_PAGES * PAGE)?;
+    pages.fill(0);
+    let (root, rest) = pages.split_at_mut(PAGE);
+    let (pdpt, directories) = rest.split_at_mut(PAGE);
+    put_entry(root, 0, (base + PAGE as u64) | PRESENT_WRITABLE);
+    for (gib, directory) in directories.chunks_exact_mut(PAGE).enumerate() {
+        put_entry(pdpt, gib, (base + ((2 + gib) * PAGE) as u64) | PRESENT_WRITABLE);
+        for entry in 0..512 {
+            let address = ((gib as u64) << 30) | ((entry as u64) << 21);
+            put_entry(directory, entry, address | PRESENT_WRITABLE | HUGE);
+        }
+    }
+    Some(base)
+}
+
+fn put_entry(table: &mut [u8], index: usize, entry: u64) {
+    table[index * 8..index * 8 + 8].copy_from_slice(&entry.to_le_bytes());
+}
+
 /// Stop, for good.
 pub fn halt() -> ! {
     loop {

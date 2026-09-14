@@ -199,6 +199,9 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // printed FAILED and still exited as a pass. A check that cannot change the outcome
     // is a log line.
     let verdict = ok && boot != Check::Failed && intact;
+    // A loader that counts boots hears from here whether this one worked; one that fell
+    // back to safe mode is held to having done so. Every other image's verdict stands.
+    let verdict = lastgood::settle(c, boot_arg, verdict);
 
     // A test image reports and stops. A stress image, and any image with no channel to
     // report through, goes on: everything above assumed one masked boot thread and has

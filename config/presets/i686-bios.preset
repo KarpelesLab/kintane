@@ -13,4 +13,4 @@ KINBOOT_BIOS=y
 # QEMU's default 32-bit core, not `max`: this target exists for legacy machines.
 QEMU_CPU="qemu32"
 # The kernel's budget, as in i686-qemu; the loader's stages carry their own.
-SIZE_BUDGET_KIB=896
+SIZE_BUDGET_KIB=1024

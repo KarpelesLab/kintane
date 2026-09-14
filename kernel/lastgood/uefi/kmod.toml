@@ -1,0 +1,16 @@
+# The `lastgood` provider for the EFI stub: confirming a boot to the loader's counter,
+# through the firmware's runtime services.
+#
+# Layer `kernel`, like `platform/acpi`: it reads the boot information and the command
+# line, and calls into firmware on the boot CPU, which only the kernel image may do.
+[unit]
+name = "lastgood"
+kind = "lib"
+root = "src/lib.rs"
+layer = "kernel"
+
+[deps]
+units = ["hal", "boot_protocol", "bootinfo", "cmdline"]
+
+[config]
+requires = "KINBOOT_STUB"

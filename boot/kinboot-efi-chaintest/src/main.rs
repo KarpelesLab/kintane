@@ -17,10 +17,6 @@
 use core::ffi::c_void;
 use core::{ptr, slice};
 
-#[allow(dead_code)] // the loader's bindings; this application calls a few of them
-#[path = "../../kinboot-efi/src/uefi.rs"]
-mod uefi;
-
 use uefi::{Handle, Status, SystemTable};
 
 /// What the loader puts in `LoadOptions`, terminator included.

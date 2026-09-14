@@ -1,0 +1,14 @@
+# x86_64 as its own UEFI application: the EFI stub.
+#
+# The same kernel as x86_64-efi, started a third way. There is no loader file beside it:
+# the firmware starts one image, and that image is the kernel with the handover in front
+# of it. See docs/bootloader.md.
+ARCH_X86_64=y
+KINBOOT_STUB=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+# OVMF itself wants memory, as in x86_64-efi.
+QEMU_MEMORY_MB=256
+SIZE_BUDGET_KIB=1280

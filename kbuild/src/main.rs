@@ -15,14 +15,17 @@ mod fat16;
 mod fuzz;
 mod graph;
 mod hosttest;
+mod image;
 mod kcfg;
 mod lint;
 mod menuconfig;
 mod modules;
+mod pe;
 mod portable;
 mod qemu;
 mod qemu_armv7m;
 mod randconfig;
+mod release;
 mod sha256;
 mod size;
 mod stress;
@@ -49,6 +52,9 @@ COMMANDS:
     menuconfig           edit a configuration interactively; saves .config and
                          menuconfig.preset
     build                build the kernel image
+    image --format <f>   build, then write the image as elf, bin, uki or uimage
+    release              build, then gather one preset's image, symbols, modules,
+                         SDK and configuration, with a manifest, in build/release
     randconfig-build     build --count random configurations from --seed, and
                          report each failure with the command that reproduces it
     size                 build, then report section and per-crate sizes against
@@ -88,6 +94,7 @@ OPTIONS:
     --compare REF|FILE   `size`: baseline to compare with (default: the committed one)
     --save FILE          `size`: also write the report to FILE
     --update-baseline    `size`: rewrite config/size-baseline/<preset>.size
+    --format <f>         `image`: elf, bin, uki or uimage
     --verbose, -v        show each rustc invocation
     --timeout <secs>     QEMU timeout for `run` (default 30)
     --only <name>        `test`: only units whose name contains <name>
@@ -140,6 +147,8 @@ struct Opts {
     corpus: Option<String>,
     file: Option<String>,
     smoke: bool,
+    /// `image`: which bootable format to write.
+    format: Option<String>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -164,6 +173,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         corpus: None,
         file: None,
         smoke: false,
+        format: None,
     };
     let mut random = false;
     let mut seed: Option<u64> = None;
@@ -252,6 +262,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 o.file = Some(args.get(i).ok_or("--file needs a path")?.clone());
             }
             "--smoke" => o.smoke = true,
+            "--format" => {
+                i += 1;
+                o.format = Some(
+                    args.get(i)
+                        .ok_or("--format needs one of elf, bin, uki, uimage")?
+                        .clone(),
+                );
+            }
             other if !other.starts_with('-') => o.positional.push(other.to_string()),
             other => return Err(format!("unknown option `{other}`")),
         }
@@ -306,6 +324,8 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "build" | "modules" => do_build(&root, &opts).map(|_| ()),
+        "image" => image::run(&root, &opts),
+        "release" => release::run(&root, &opts),
         "sdk" => {
             let mut sopts = opts.clone();
             sopts.sdk = true;
@@ -906,7 +926,17 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     let symbols = b.split_symbols(&linked)?;
     let build_id = buildid::stamp(&b.tc.tool("llvm-objcopy")?, &linked, &symbols)?;
     let entries = bootcfg::entry_list(&res, bootcfg::Chain::File(build::ESP_CHAIN_TEST_ENTRY_PATH));
-    let image = b.package(res.str("IMAGE_FORMAT"), &linked, &images, &entries)?;
+    let command_line = bootcfg::kernel_command_line(&res);
+    // A test build resets on a boot failure, so the harness sees it at once under
+    // -no-reboot; a machine returns to its firmware, which may have other ways to boot.
+    let image = b.package(
+        res.str("IMAGE_FORMAT"),
+        &linked,
+        &images,
+        &entries,
+        &command_line,
+        res.is_on("QEMU_EXIT"),
+    )?;
     // A BIOS disk wraps the packaged image rather than replacing it: the kernel on the
     // disk is byte for byte the one `-kernel` boots.
     let image = if res.is_on(bios::SYMBOL) {

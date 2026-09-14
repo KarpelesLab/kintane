@@ -1,4 +1,4 @@
-//! The slice of the UEFI specification this loader calls.
+//! The slice of the UEFI specification KinTane's loaders call.
 //!
 //! Written out by hand rather than taken from a crate: units cannot pull crates, and D8
 //! keeps third-party code out of the boot path anyway. Only what is called is described,
@@ -8,13 +8,27 @@
 //!
 //! Layouts and numbers are from the UEFI 2.10 specification. Every function uses the
 //! `efiapi` calling convention, which is the Microsoft x64 ABI on x86_64.
+//!
+//! One unit, shared by `kinboot-efi` and the EFI stub, so there is one table rather than
+//! two that can disagree. Nothing in the kernel links it.
+
+#![no_std]
+
+pub mod counter;
+pub mod handover;
+
+/// What the handover needs that is not UEFI: a console for after the firmware's is gone,
+/// and the jump into the kernel.
+#[cfg(target_arch = "x86_64")]
+#[path = "x86_64.rs"]
+pub mod arch;
 
 use core::ffi::c_void;
 
 pub type Handle = *mut c_void;
 
 /// A UEFI status. The top bit marks an error.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
 pub struct Status(pub usize);
 
@@ -158,9 +172,21 @@ pub struct RuntimeServices {
     pub set_wakeup_time: Unused,
     pub set_virtual_address_map: Unused,
     pub convert_pointer: Unused,
-    pub get_variable: Unused,
+    pub get_variable: unsafe extern "efiapi" fn(
+        name: *const u16,
+        vendor: *const Guid,
+        attributes: *mut u32,
+        data_size: *mut usize,
+        data: *mut c_void,
+    ) -> Status,
     pub get_next_variable_name: Unused,
-    pub set_variable: Unused,
+    pub set_variable: unsafe extern "efiapi" fn(
+        name: *const u16,
+        vendor: *const Guid,
+        attributes: u32,
+        data_size: usize,
+        data: *const c_void,
+    ) -> Status,
     pub get_next_high_monotonic_count: Unused,
     pub reset_system: unsafe extern "efiapi" fn(
         kind: u32,
@@ -169,6 +195,10 @@ pub struct RuntimeServices {
         data: *const c_void,
     ) -> !,
 }
+
+/// `EFI_MEMORY_RUNTIME`: a memory map descriptor the firmware needs after
+/// `ExitBootServices`.
+pub const MEMORY_RUNTIME: u64 = 1 << 63;
 
 /// `EFI_RESET_TYPE`.
 pub const RESET_COLD: u32 = 0;

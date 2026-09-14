@@ -207,6 +207,16 @@ for what they are.
   default entry, on `i686-bios`, `x86_64-bios` and `x86_64-efi`. The payload exits QEMU
   itself: 33 if it was entered correctly, 35 if not. The BIOS payload checks `DL` and
   `DS:SI`; the UEFI one checks its load options and `FilePath`.
+- **Three failed boots fall back to safe mode, and a good boot clears the count.**
+  `BOOT_COUNTER_TEST` on `x86_64-efistub` boots one machine without `-no-reboot`. Every
+  boot the EFI stub did not fall back on fails on purpose and resets through
+  `ResetSystem`. The run exits 33 only if all of these hold:
+  - attempts 1 to 3 arrive in normal mode;
+  - attempt 4 arrives in safe mode;
+  - that boot's deletion of the count reads back as `EFI_NOT_FOUND`.
+
+  CI also requires exactly three `failed on purpose` lines. See
+  [bootloader.md](bootloader.md#as-built-the-efi-stub-counts-the-kernel-confirms).
 
 Each verdict was falsified by a mutation confirmed to have applied:
 
@@ -225,6 +235,11 @@ Each verdict was falsified by a mutation confirmed to have applied:
 | Entry list CRC written wrong | `boot entries checksum mismatch`, exit 0 (a failure) at once |
 | `kinboot-efi` sets no load options | the application prints `FAILED, not started by kinboot-efi`, exit 35 |
 | Chain entry names a missing EFI file | `cannot open`, then the `on-failure reboot` reset: exit 0 (a failure) two seconds in. **Control:** with `on-failure firmware`, OVMF moves on to PXE and the run times out at 60 s, which is why test builds write `reboot` |
+| The kernel skips `SetVariable` when confirming | the read-back finds the count, `FAILED: the count still reads back after clearing`, exit 35 |
+| The firmware call keeps the kernel's page tables (no `mov cr3`) | `#PF` inside the call; the run times out |
+| The stub falls back one boot early | attempt 3 arrives in safe mode, `FAILED: not started in normal mode before the limit`, exit 35 |
+| The stub never writes the count back | 40 boots in 150 s, every one attempt 1 and none in safe mode; the run times out |
+| The stub counts but keeps the built mode | attempt 4 arrives in normal mode, `FAILED: past the limit, and not started in safe mode`, exit 35 |
 | Safe mode's verbose map removed | the boot still passes, as intended, since output is not a verdict, but the CI step's check for the map fails |
 | Multiboot image path not stripped | the kernel sees QEMU's file name as its first word, exit 35. This proves QEMU does pass the path |
 | `/chosen` not recognised | aarch64 `none passed`, exit 35; an `fdt` host test fails too |
@@ -818,6 +833,7 @@ hand:
 | Target | Emulator | Machine | Firmware | Result channel |
 |---|---|---|---|---|
 | x86_64 (UEFI) | `qemu-system-x86_64` | `q35` | OVMF, booting `kinboot-efi` from the image's ESP | `isa-debug-exit` |
+| x86_64 (`x86_64-efistub`) | `qemu-system-x86_64` | `q35` | OVMF, booting the kernel itself: the EFI stub | `isa-debug-exit` |
 | x86_64 (`x86_64-qemu`) | `qemu-system-x86_64` | `q35` | `-kernel` | `isa-debug-exit` |
 | x86_64 (`x86_64-bios`) | `qemu-system-x86_64` | `q35`, raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | i686 (`i686-qemu`) | `qemu-system-i386` | `pc` (i440FX) | `-kernel` | `isa-debug-exit` |

@@ -261,6 +261,24 @@ impl<'a> Parsed<'a> {
         )))
     }
 
+    /// What the loader passed for calling UEFI runtime services, if it passed anything.
+    pub fn uefi_runtime(&self) -> Result<Option<crate::uefi::Runtime>, Error> {
+        let Some(tag) = self.find(TagKind::UefiRuntime)? else {
+            return Ok(None);
+        };
+        let bad = Error::Malformed { offset: tag.offset };
+        let word = |i: usize| read_u64(tag.payload, i * 8).ok_or(bad);
+        Ok(Some(crate::uefi::Runtime {
+            call_root: word(0)?,
+            call_stack_top: word(1)?,
+            get_variable: word(2)?,
+            set_variable: word(3)?,
+            reset_system: word(4)?,
+            attempt: read_u32(tag.payload, 40).ok_or(bad)?,
+            failures_before_safe: read_u32(tag.payload, 44).ok_or(bad)?,
+        }))
+    }
+
     fn u64_tag(&self, kind: TagKind) -> Result<Option<u64>, Error> {
         let Some(tag) = self.find(kind)? else {
             return Ok(None);
@@ -381,6 +399,23 @@ impl<'a> Builder<'a> {
         p[..8].copy_from_slice(&start.to_ne_bytes());
         p[8..].copy_from_slice(&len.to_ne_bytes());
         self.tag(TagKind::KernelRange, &p)
+    }
+
+    pub fn uefi_runtime(&mut self, r: &crate::uefi::Runtime) -> Result<(), Error> {
+        let mut p = [0u8; 48];
+        let words = [
+            r.call_root,
+            r.call_stack_top,
+            r.get_variable,
+            r.set_variable,
+            r.reset_system,
+        ];
+        for (slot, word) in p.chunks_exact_mut(8).zip(words) {
+            slot.copy_from_slice(&word.to_ne_bytes());
+        }
+        p[40..44].copy_from_slice(&r.attempt.to_ne_bytes());
+        p[44..48].copy_from_slice(&r.failures_before_safe.to_ne_bytes());
+        self.tag(TagKind::UefiRuntime, &p)
     }
 
     /// Append a memory map tag with room for `capacity` regions, and return a writer
