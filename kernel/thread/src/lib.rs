@@ -114,6 +114,29 @@ struct Meta {
     affinity: CpuSet,
     /// A CPU's idle thread: not counted as load, never migrated.
     idle: bool,
+    /// Timer interrupts that found it running.
+    ran: u64,
+    /// Timer interrupts that found it ready on the CPU taking them, behind a thread no more
+    /// urgent than itself.
+    passed: u64,
+}
+
+/// What the scheduler has given a thread, counted in slices rather than time: see
+/// [`Threads::charge`].
+///
+/// A count and not a duration because a duration measures the host too. Under an emulator
+/// the guest's clock follows the host's, so a thread charged the time between two switches
+/// is charged every moment the host did not run the emulator in between; a thread charged
+/// one slice per timer interrupt is charged once however long that interrupt was delayed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Slices {
+    /// Timer interrupts that found the thread running, in kernel or user mode.
+    pub ran: u64,
+    /// Timer interrupts that found it ready on the CPU that took them while a thread no more
+    /// urgent than itself ran there: slices it was passed over for. Round robin among equals
+    /// passes a thread over once for each peer; only a queue that never reaches it passes it
+    /// over without bound.
+    pub passed: u64,
 }
 
 /// Where a woken thread was queued, and whether that CPU needs a reschedule IPI to notice
@@ -171,6 +194,8 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
             cpu: 0,
             affinity: CpuSet::all(CPUS),
             idle: false,
+            ran: 0,
+            passed: 0,
         });
         let mut current = [None; CPUS];
         current[0] = Some(0);
@@ -218,6 +243,8 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
                 cpu: 0,
                 affinity: CpuSet::all(CPUS),
                 idle: false,
+                ran: 0,
+                passed: 0,
             }));
             let runq = core::ptr::addr_of_mut!((*slot).runq).cast::<RunQueue<N>>();
             let current = core::ptr::addr_of_mut!((*slot).current).cast::<Option<usize>>();
@@ -246,6 +273,36 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
         self.index_of(id)
             .and_then(|i| self.meta[i])
             .map(|m| m.state)
+    }
+
+    /// Charge one slice on CPU `cpu`, for a timer interrupt it took: to the thread running
+    /// there, and as a slice passed over to every thread ready on that CPU at a priority no
+    /// lower than that thread's. Called by the interrupt before it wakes or switches anything,
+    /// so the charge falls on the threads as the interrupt found them.
+    pub fn charge(&mut self, cpu: usize) {
+        let Some(Some(slot)) = self.current.get(cpu).copied() else {
+            return;
+        };
+        let Some(running) = self.meta[slot].as_mut() else {
+            return;
+        };
+        running.ran = running.ran.wrapping_add(1);
+        let bar = running.priority;
+        for m in self.meta.iter_mut().flatten() {
+            if m.state == State::Ready && m.cpu == cpu && m.priority >= bar {
+                m.passed = m.passed.wrapping_add(1);
+            }
+        }
+    }
+
+    /// What [`Threads::charge`] has counted for a thread since it was created.
+    pub fn slices(&self, id: ThreadId) -> Option<Slices> {
+        self.index_of(id)
+            .and_then(|i| self.meta[i])
+            .map(|m| Slices {
+                ran: m.ran,
+                passed: m.passed,
+            })
     }
 
     /// The CPU a thread is queued on, runs on, or last ran on.
@@ -350,6 +407,8 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
             cpu,
             affinity,
             idle,
+            ran: 0,
+            passed: 0,
         });
         self.current[cpu] = Some(slot);
         Ok(id)
@@ -431,6 +490,8 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
             cpu,
             affinity,
             idle,
+            ran: 0,
+            passed: 0,
         });
         self.next_id = self.next_id.wrapping_add(1);
         Ok(id)
@@ -916,6 +977,36 @@ mod tests {
         assert_eq!(t.current(), ThreadId::new(0));
         assert_eq!(t.state(ThreadId::new(0)), Some(State::Running));
         assert_eq!(t.runnable(), 0);
+        t.check().unwrap();
+    }
+
+    #[test]
+    fn a_tick_charges_the_running_thread_and_passes_over_only_threads_as_urgent() {
+        let _serial = serial();
+        let mut t: Threads<MockFull, 8> = Threads::new(p(5));
+        let boot = ThreadId::new(0);
+        let equal = spawn(&mut t, 11, 5);
+        let lower = spawn(&mut t, 12, 4);
+        t.charge(0);
+        t.charge(0);
+        assert_eq!(t.slices(boot), Some(Slices { ran: 2, passed: 0 }));
+        assert_eq!(t.slices(equal), Some(Slices { ran: 0, passed: 2 }));
+        assert_eq!(
+            t.slices(lower),
+            Some(Slices { ran: 0, passed: 0 }),
+            "a more urgent thread running is not a pass"
+        );
+
+        yield_now(&mut t).unwrap();
+        assert_eq!(t.current(), equal);
+        t.charge(0);
+        assert_eq!(t.slices(equal), Some(Slices { ran: 1, passed: 2 }));
+        assert_eq!(t.slices(boot), Some(Slices { ran: 2, passed: 1 }));
+
+        // A CPU with no current thread charges nobody.
+        t.charge(7);
+        assert_eq!(t.slices(equal), Some(Slices { ran: 1, passed: 2 }));
+        assert_eq!(t.slices(ThreadId::new(99)), None);
         t.check().unwrap();
     }
 

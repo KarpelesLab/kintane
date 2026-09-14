@@ -340,6 +340,8 @@ fn on_tick() {
         // is released. The timer lock nests inside the scheduler lock here, and never the
         // other way round.
         let s = unsafe { &mut *sched() };
+        // Before any wake, so the slice is charged to the threads as the interrupt found them.
+        s.threads.charge(cpu);
         let woke = timekeeping::with_timers(|q| {
             let mut all = true;
             while let Some(expired) = q.pop_expired(now) {
@@ -757,6 +759,19 @@ pub fn alive(id: ThreadId) -> bool {
 )]
 pub fn where_is(id: ThreadId) -> Option<(thread::State, Option<usize>)> {
     with_table(|t| t.state(id).map(|s| (s, t.cpu_of(id))))
+}
+
+/// The slices `id` has run and been passed over for since it was created, as the timer
+/// interrupt charges them ([`Threads::charge`]). `None` when the table has never heard of it.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "used only by the process checks, which need USERSPACE"
+    )
+)]
+pub fn slices(id: ThreadId) -> Option<thread::Slices> {
+    with_table(|t| t.slices(id))
 }
 
 /// Whether the scheduler is running, so a thread that ends must go through

@@ -204,6 +204,18 @@ pub fn process_stress_serve_worst_us() -> u64 {
     0
 }
 
+/// The most slices any of the process cycles' waits ran and was passed over for before it
+/// succeeded.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_stress_slices_worst() -> (u64, u64) {
+    crate::procs::stress_slices_worst()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_stress_slices_worst() -> (u64, u64) {
+    (0, 0)
+}
+
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn process_stress_cycles() -> u64 {
     0
