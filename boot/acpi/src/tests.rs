@@ -14,12 +14,17 @@
 //! - `pc.bin`: `-machine pc -smp 2` under SeaBIOS, with the PCI bridge and test device. An RSDT, no
 //!   MCFG, and a 116-byte ACPI 1.0 FADT.
 //! - `q35-ovmf.bin`: the q35 machine under OVMF. A revision 2 RSDP, whose XSDT is the root.
+//! - `q35-iommu.bin`: the q35 machine with `-device intel-iommu,intremap=on`. As `q35.bin`, plus a
+//!   DMAR the others do not have.
 
 use super::*;
 
 const Q35: &[u8] = include_bytes!("testdata/q35.bin");
 const PC: &[u8] = include_bytes!("testdata/pc.bin");
 const Q35_OVMF: &[u8] = include_bytes!("testdata/q35-ovmf.bin");
+/// `-machine q35,kernel-irqchip=split -device intel-iommu,intremap=on`, otherwise as
+/// `q35.bin`. Publishes a DMAR the others do not.
+const Q35_IOMMU: &[u8] = include_bytes!("testdata/q35-iommu.bin");
 
 /// Physical memory that holds only the records of a fixture, or regions built by a test.
 #[derive(Clone)]
@@ -448,6 +453,96 @@ fn asking_for_the_wrong_kind_of_table_is_an_error() {
     assert!(matches!(Fadt::parse(mem.table(b"APIC")), Err(Error::WrongSignature { .. })));
 }
 
+#[test]
+fn the_iommu_machine_publishes_a_dmar_the_others_do_not() {
+    for fixture in [Q35, PC, Q35_OVMF] {
+        assert!(
+            Memory::fixture(fixture)
+                .tables()
+                .find(b"DMAR")
+                .unwrap()
+                .is_none(),
+            "a machine with no intel-iommu has no DMAR"
+        );
+    }
+    let mem = Memory::fixture(Q35_IOMMU);
+    let dmar = Dmar::parse(mem.table(b"DMAR")).unwrap();
+    // QEMU's intel-iommu defaults to a 48-bit address width and turns interrupt remapping
+    // on when it is asked for with intremap=on.
+    assert_eq!(dmar.host_address_width(), 48);
+    assert_ne!(dmar.flags() & dmar::INTR_REMAP, 0, "intremap=on");
+}
+
+#[test]
+fn the_dmar_names_one_remapping_unit_at_qemus_register_base() {
+    let mem = Memory::fixture(Q35_IOMMU);
+    let dmar = Dmar::parse(mem.table(b"DMAR")).unwrap();
+    let units: Vec<Drhd> = dmar.units().map(Result::unwrap).collect();
+    assert_eq!(units.len(), 1, "QEMU presents a single remapping unit");
+    // The register base QEMU's intel-iommu always uses.
+    assert_eq!(units[0].register_base, 0xfed9_0000);
+    assert_eq!(units[0].segment, 0);
+    // Every remapping structure that is not a DRHD comes back as `Other`, not an error, so
+    // a kind this parser does not know does not hide the unit.
+    assert!(dmar.structures().all(|s| s.is_ok()));
+}
+
+#[test]
+fn a_dmar_structure_with_a_bad_length_ends_the_walk_with_an_error() {
+    let mut bytes = Memory::fixture(Q35_IOMMU).table(b"DMAR").bytes().to_vec();
+    // The first remapping structure's length word, zeroed: a structure that cannot advance
+    // the walk. STRUCTURES_OFFSET is 48, its length is the u16 at 50.
+    bytes[50] = 0;
+    bytes[51] = 0;
+    fix_checksum(&mut bytes);
+    let sdt = Sdt::from_bytes(0x2000, &bytes).unwrap();
+    let dmar = Dmar::parse(sdt).unwrap();
+    assert!(
+        matches!(dmar.units().next(), Some(Err(Error::Malformed { .. }))),
+        "a zero-length structure is malformed, not skipped"
+    );
+}
+
+/// A hand-built DMAR: a 48-byte header (with a host address width byte and flags) followed
+/// by `structures`, with the length and checksum made right.
+fn dmar_with(haw: u8, flags: u8, structures: &[u8]) -> Vec<u8> {
+    let mut t = vec![0u8; 48];
+    t[0..4].copy_from_slice(b"DMAR");
+    t[36] = haw;
+    t[37] = flags;
+    t.extend_from_slice(structures);
+    let len = t.len() as u32;
+    t[4..8].copy_from_slice(&len.to_le_bytes());
+    fix_checksum(&mut t);
+    t
+}
+
+#[test]
+fn an_unknown_dmar_structure_is_skipped_and_later_units_are_still_found() {
+    // An RMRR (type 1) of 24 bytes, then a DRHD (type 0) of 16 bytes at base 0xabc000.
+    let mut structures = vec![1, 0, 24, 0];
+    structures.extend(core::iter::repeat_n(0u8, 20));
+    let mut drhd = vec![0, 0, 16, 0, dmar::INCLUDE_PCI_ALL, 0, 0, 0];
+    drhd.extend_from_slice(&0x00ab_c000u64.to_le_bytes());
+    structures.extend_from_slice(&drhd);
+
+    let bytes = dmar_with(0x26, dmar::INTR_REMAP, &structures);
+    let sdt = Sdt::from_bytes(0x3000, &bytes).unwrap();
+    let dmar = Dmar::parse(sdt).unwrap();
+    assert_eq!(dmar.host_address_width(), 39, "0x26 + 1");
+    assert!(matches!(
+        dmar.structures().next(),
+        Some(Ok(Remapping::Other {
+            kind: 1,
+            length: 24
+        }))
+    ));
+    let units: Vec<Drhd> = dmar.units().map(Result::unwrap).collect();
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].register_base, 0x00ab_c000);
+    assert!(units[0].includes_all(), "INCLUDE_PCI_ALL was set");
+}
+
 /// A small deterministic generator, so a fuzz failure is reproducible by its seed.
 struct XorShift(u64);
 
@@ -463,9 +558,9 @@ impl XorShift {
 #[test]
 fn fuzzed_tables_with_valid_checksums_never_panic_or_loop() {
     let mut rng = XorShift(0x6b69_6e74_616e_6531);
-    for fixture in [Q35, PC, Q35_OVMF] {
+    for fixture in [Q35, PC, Q35_OVMF, Q35_IOMMU] {
         let mem = Memory::fixture(fixture);
-        for signature in [b"APIC", b"MCFG", b"FACP"] {
+        for signature in [b"APIC", b"MCFG", b"FACP", b"DMAR"] {
             let Some(original) = mem.tables().find(signature).unwrap() else {
                 continue;
             };
@@ -498,6 +593,13 @@ fn fuzzed_tables_with_valid_checksums_never_panic_or_loop() {
                 }
                 if let Ok(fadt) = Fadt::parse(sdt) {
                     let _ = (fadt.pm_timer(), fadt.reset(), fadt.dsdt());
+                }
+                if let Ok(dmar) = Dmar::parse(sdt) {
+                    let n = dmar.structures().count();
+                    assert!(n <= t.len() / 4, "each structure is at least four bytes");
+                    for unit in dmar.units() {
+                        let _ = unit.map(|u| (u.register_base, u.includes_all()));
+                    }
                 }
             }
         }

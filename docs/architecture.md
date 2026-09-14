@@ -915,11 +915,37 @@ empty slot and passed. A domain that succeeds therefore also has its grant audit
 window's address must translate, in the domain's own page tables, to exactly the physical
 window the platform recorded.
 
-**What it does not show.** The subject device does no DMA, and without an IOMMU a domain
-granted a DMA-capable device could program it to read or write any physical address anyway.
-The PCs have no memory-mapped device to grant: COM1 is in the port space, which cannot be
-mapped, and virtio-blk reaches x86 only over PCI. Measurements, and exactly what an IOMMU
-has to add, are in [isolation.md](isolation.md).
+**What the aarch64 prototype does not show.** The subject device does no DMA, and without an
+IOMMU a domain granted a DMA-capable device could program it to read or write any physical
+address anyway. Confining DMA is what the IOMMU below adds.
+
+### DMA confinement — the VT-d IOMMU
+
+An `IOMMU` build (x86_64, the `x86_64-iommu` preset) puts the disk — the one device here that
+reads and writes memory on its own — behind an Intel VT-d IOMMU, so a device address that its
+driver was not granted *faults in hardware* instead of reaching memory. This is what an
+isolated DMA-capable driver's containment rests on, demonstrated in the kernel:
+
+- **`boot/acpi::dmar`** reads the DMA remapping table for each hardware unit's register base — the
+  one place that names it.
+- **`drivers/iommu/vtd`** programs a unit: a root table, per-bus context tables, and a four-level
+  second-level page table per translation [`Domain`]. It maps a grant (4 KiB leaves, or 2 MiB
+  superpages where a range allows), attaches a device by its PCI source id, enables translation
+  with the spec's SRTP/invalidate/TE sequence, and reads faults back from the log. The whole
+  driver is plain logic over three traits — registers, a frame source, physical memory — and is
+  host-tested against models of each; the `unsafe` that turns a physical address into a load is
+  the kernel's, in `kernel/main/src/iommu.rs`.
+- **`kernel/main/src/block.rs`** builds a domain that maps *exactly* the disk's DMA grant and
+  nothing else, attaches the disk, and turns translation on before the device does any DMA. The
+  block check then runs with every DMA translated, proving an in-grant DMA still works; a
+  deliberate out-of-grant DMA is stopped and read back from the fault log; and the faulted
+  device is reset and brought up again so it serves once more.
+
+The driver source does not change: `virtio_blk_core` puts physical addresses in descriptors and
+accepts `VIRTIO_F_ACCESS_PLATFORM`, and behind the IOMMU those addresses are the I/O virtual
+addresses the grant maps identity. Measurements, the interrupt-as-a-message gap, and the
+still-missing x86_64 *domain* (as opposed to in-kernel) driver are in
+[isolation.md](isolation.md).
 
 ### `block` — the block layer, and the first driver with DMA
 

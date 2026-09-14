@@ -4,7 +4,7 @@
 #
 # No kernel runs: the firmware builds the tables and then fails to find anything to boot,
 # and memory is saved through the monitor while it waits. Run from anywhere; writes
-# `q35.bin`, `pc.bin` and `q35-ovmf.bin` beside this script.
+# `q35.bin`, `q35-iommu.bin`, `pc.bin` and `q35-ovmf.bin` beside this script.
 set -e
 cd "$(dirname "$0")"
 QEMU_SHARE=$(dirname $(dirname $(command -v qemu-system-x86_64)))/share/qemu
@@ -28,6 +28,11 @@ run() {
 }
 # The same bridge and test device the x86 presets add (QEMU_PCI_TEST_DEVICE).
 run qemu-system-x86_64 q35 q35 4 \
+  -device pcie-root-port,id=kt_rp,chassis=1 -device pci-testdev,bus=kt_rp
+# With the Intel IOMMU the x86_64-isolation preset adds, which publishes a DMAR. Interrupt
+# remapping needs the split irqchip.
+run qemu-system-x86_64 q35,kernel-irqchip=split q35-iommu 4 \
+  -device intel-iommu,intremap=on \
   -device pcie-root-port,id=kt_rp,chassis=1 -device pci-testdev,bus=kt_rp
 run qemu-system-i386 pc pc 4 \
   -device pci-bridge,id=kt_br,chassis_nr=1 -device pci-testdev,bus=kt_br,addr=3

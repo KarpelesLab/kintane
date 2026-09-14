@@ -530,6 +530,35 @@ offsets, an empty slot, non-virtio memory, a window too small to read, and the r
 wire format round trip. The falsifications above were run by hand; nothing in CI mutates
 the code.
 
+### 2c-bis. DMA confinement with the IOMMU
+
+On x86_64 with `IOMMU` (the `x86_64-iommu` preset), the disk runs behind an Intel VT-d IOMMU:
+a translation domain that maps *exactly* its DMA grant. The `iommu` line gates the boot:
+
+```
+  iommu      in-grant DMA served behind VT-d; out-of-grant DMA stopped at 0x000000000023d000 from 0x0000000000000018; restarted and served a read ok
+```
+
+The `block` line first shows the device brought up behind the IOMMU (`VT-d on, 48-bit; disk
+00:03.0 mapped to its grant only`) and passes every functional check with its DMA translated —
+that is the in-grant DMA working. Then the `iommu` line requires all of:
+
+- the domain maps the grant and does **not** map the canary frame beside it (map exactly the grant);
+- a deliberate out-of-grant DMA (a read into the canary) is stopped, and the unit's fault log names
+  the canary's address and the disk's own source id `00:03.0`;
+- the canary still holds its sentinel — the blocked write never landed;
+- the faulted device is reset, brought up again over the same grant, and serves a read.
+
+| Mutation | Result |
+|---|---|
+| Grant one extra page, so the canary is inside the grant | `THE DOMAIN DOES NOT MAP EXACTLY THE GRANT` |
+| Skip mapping the grant into the domain | the device faults reading its own ring; the block check fails |
+| Drop the restart | the device is not re-stored; `restarted and served a read` never prints and the boot fails |
+
+`drivers/iommu/vtd` and `boot/acpi::dmar` are host-tested under every preset: the DMAR fixture
+(`q35-iommu.bin`) and the register programming, page tables, attach and fault decode against
+models of the hardware. The live falsifications above were run by hand.
+
 ### 2d. Fuzzing
 
 Every parser that reads bytes the kernel did not write is fuzzed on the host, and so is

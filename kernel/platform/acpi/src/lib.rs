@@ -499,6 +499,25 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         ok &= qemu_agrees(c, functions, cpus, matches!(access, Access::Ecam(_)));
     }
 
+    // The IOMMU, if this build asks for one and the machine has a DMAR: its register window
+    // is added below so the kernel maps it, and its facts are stored for `block` to program.
+    let iommu_window = if kconfig::IOMMU && ok {
+        match iommu_discover(c, &tables, functions) {
+            Some(facts) => {
+                // SAFETY: once, on the single-threaded boot path.
+                let _ = unsafe { IOMMU.set(facts) };
+                Some(DeviceWindow {
+                    phys: facts.register_base,
+                    len: 0x1000,
+                    what: "IOMMU registers",
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     if ok {
         let mut windows = [DeviceWindow {
             phys: 0,
@@ -514,7 +533,8 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         let all = arch::kspace::device_windows()
             .iter()
             .copied()
-            .chain(claimed);
+            .chain(claimed)
+            .chain(iommu_window);
         for (slot, w) in windows.iter_mut().zip(all) {
             *slot = w;
             count += 1;
@@ -1496,6 +1516,56 @@ pub fn device_windows() -> Option<&'static [DeviceWindow]> {
 /// virtio driver does not speak yet. See `docs/isolation.md`.
 pub fn isolation_window() -> Option<(u64, u64)> {
     None
+}
+
+/// What the IOMMU check needs: the DMA remapping unit's register base, the address width the
+/// hardware translates, and the source id (`bus << 8 | dev << 3 | fn`) of the virtio-blk
+/// device that will be put behind it.
+#[derive(Clone, Copy)]
+pub struct IommuFacts {
+    pub register_base: u64,
+    pub host_address_width: u8,
+    pub block_source_id: u16,
+}
+
+static IOMMU: BootCell<IommuFacts> = BootCell::new();
+
+/// The IOMMU the machine has, or `None`: no DMAR, no block device to confine, or a build
+/// without `IOMMU`. `Some` only after a successful [`discover`].
+pub fn iommu() -> Option<IommuFacts> {
+    IOMMU.get().copied()
+}
+
+/// Read the DMAR for the first remapping unit, and pair it with the block device's source id.
+fn iommu_discover(
+    c: &dyn EarlyConsole,
+    tables: &Tables<'_, BootMemory>,
+    functions: &[Function],
+) -> Option<IommuFacts> {
+    let dmar = match tables.find(b"DMAR") {
+        Ok(Some(sdt)) => match acpi::Dmar::parse(sdt) {
+            Ok(dmar) => dmar,
+            Err(_) => {
+                c.write_str("; DMAR UNUSABLE");
+                return None;
+            }
+        },
+        _ => {
+            c.write_str("; no DMAR, so no IOMMU");
+            return None;
+        }
+    };
+    let unit = dmar.units().flatten().next()?;
+    let block = functions
+        .iter()
+        .find(|f| virtio_blk::pci::is_block_device(f))?;
+    let a = block.address;
+    let source = (u16::from(a.bus) << 8) | (u16::from(a.device) << 3) | u16::from(a.function);
+    Some(IommuFacts {
+        register_base: unit.register_base,
+        host_address_width: dmar.host_address_width(),
+        block_source_id: source,
+    })
 }
 
 fn write_acpi_error(c: &dyn EarlyConsole, e: acpi::Error) {

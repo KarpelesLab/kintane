@@ -1,0 +1,17 @@
+# Intel VT-d (Virtualization Technology for Directed I/O): the IOMMU that confines what a
+# device can reach by DMA.
+#
+# Like the APIC and the GIC, the whole of it is plain logic over traits — a register-access
+# trait for the unit's MMIO, a frame source for the page tables, and physical-memory access
+# for the entries the hardware reads — so it is host-tested under every preset. The kernel
+# provides those traits over its direct map and frame allocator; nothing here is
+# architecture-specific, because the register layout is the same wherever VT-d exists.
+[unit]
+name = "vtd"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = []
