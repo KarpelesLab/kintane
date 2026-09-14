@@ -20,13 +20,13 @@ crate device text 23554 rodata 0 data 0 bss 0
 crate fat text 5767 rodata 0 data 0 bss 0
 crate hal text 1412 rodata 0 data 0 bss 0
 crate kalloc text 13307 rodata 0 data 0 bss 0
-crate kintane text 68553 rodata 24 data 3844 bss 76794
+crate kintane text 69205 rodata 24 data 3844 bss 77014
 crate mm text 23101 rodata 0 data 0 bss 0
 crate multiboot text 625 rodata 0 data 0 bss 0
 crate platform text 22403 rodata 88 data 108332 bss 1502
 crate sched text 2357 rodata 0 data 0 bss 0
 crate strip_suffix text 39 rodata 0 data 0 bss 0
-crate sync text 12315 rodata 16 data 800 bss 136
+crate sync text 12350 rodata 16 data 800 bss 136
 crate thread text 4786 rodata 0 data 0 bss 0
 crate time text 3971 rodata 0 data 0 bss 0
 crate uart16550 text 1959 rodata 0 data 208 bss 88
