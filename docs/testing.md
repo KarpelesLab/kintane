@@ -1998,6 +1998,14 @@ and every heartbeat carries the stalled-wait count beside the mean and worst ans
 kernel that grows slower at this shows it. A shootdown that is never answered still fails the
 run: the wait never returns, the heartbeat stops, and kbuild kills the guest.
 
+| Mutation | Result |
+|---|---|
+| Every request recorded as answered by the wrong CPUs | the *boot* shootdown check catches it first: `bring-up failed; not starting the scheduler`, and the audit never runs |
+| The same, but only after the boot check's first requests | `tlb shootdown: a shootdown was answered by the wrong CPUs`, at 9 s |
+
+The first mutation is why the second exists: a check that fails at boot proves nothing about
+the one in the audit, so the mutation has to let bring-up through to reach it.
+
 ### 3a-bis. The soak
 
 `kbuild soak --duration <len>` is a stress run nobody watches. It builds and runs the stress
