@@ -1187,7 +1187,6 @@ const SEEK_SET: u64 = 0;
 const SEEK_END: u64 = 2;
 const AT_REMOVEDIR: u64 = 0x200;
 const EEXIST: i64 = 17;
-const EXDEV: i64 = 18;
 const EISDIR: i64 = 21;
 const ENAMETOOLONG: i64 = 36;
 
@@ -1312,7 +1311,9 @@ fn files() -> ! {
         |path: &[u8]| sys::call(sys::MKDIRAT, [AT_FDCWD, path.as_ptr() as u64, 0o755, 0, 0, 0]);
     expect(mkdir(DIR) == 0 && mkdir(DIR) == -EEXIST, 90);
 
-    // 91–92: rename within a directory; across two is `EXDEV`.
+    // 91–92: a rename within a directory, and one into another directory of the same
+    // filesystem, which moves the name rather than refusing it. It moves back out, so the
+    // steps below find the directory empty and the file where they left it.
     let rename = |from: &[u8], to: &[u8]| {
         sys::call(
             sys::RENAMEAT,
@@ -1328,7 +1329,12 @@ fn files() -> ! {
     };
     expect(rename(TEMP, RENAMED) == 0, 91);
     expect(openat(TEMP, 0) == -ENOENT, 91);
-    expect(rename(RENAMED, INTO_DIR) == -EXDEV, 92);
+    expect(rename(RENAMED, INTO_DIR) == 0, 92);
+    expect(openat(RENAMED, 0) == -ENOENT, 92);
+    let moved = openat(INTO_DIR, 0);
+    expect(moved >= 0, 92);
+    expect(call1(sys::CLOSE, moved as u64) == 0, 92);
+    expect(rename(INTO_DIR, RENAMED) == 0, 92);
 
     // 93–94: a directory is removed only as one; a file is removed and gone.
     let unlink = |path: &[u8], flags: u64| {

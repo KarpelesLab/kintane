@@ -28,7 +28,8 @@
 //! * `seek` and `truncate`: `a` is the file number and the payload an eight-byte little-endian
 //!   offset or length.
 //! * `unlink` and `mkdir`: the payload is a path.
-//! * `rename`: the payload is the old path, a zero byte, and the new path, in the same directory.
+//! * `rename`: the payload is the old path, a zero byte, and the new path, which may name another
+//!   directory of the same filesystem.
 //! * `sync`: nothing; every write so far reaches the disk before the reply.
 //! * `close`: `a` is the file number.
 //!
@@ -110,8 +111,10 @@ pub enum Status {
     NotEmpty = 9,
     /// A file operation named a directory, or a directory operation a file.
     WrongKind = 10,
-    /// A name the volume cannot hold, or a rename between directories.
+    /// A name the volume cannot hold.
     BadName = 11,
+    /// A rename whose two paths are on different filesystems, which no rename can cross.
+    CrossDevice = 12,
 }
 
 impl Status {
@@ -129,6 +132,7 @@ impl Status {
             9 => Status::NotEmpty,
             10 => Status::WrongKind,
             11 => Status::BadName,
+            12 => Status::CrossDevice,
             _ => return None,
         })
     }

@@ -15,6 +15,7 @@ mod diskcheck;
 mod dwarf;
 mod esp;
 mod fat16;
+mod fat32;
 mod fuzz;
 mod graph;
 mod hosttest;

@@ -202,7 +202,7 @@ fn locked<R>(
 // ---- the namespace ----------------------------------------------------------------------
 
 /// The namespace Linux processes open files in.
-type Namespace = Vfs<'static, 1, 4>;
+type Namespace = Vfs<'static, 2, 4>;
 
 /// The namespace, while a check runs Linux processes in it; null otherwise.
 ///
@@ -679,16 +679,8 @@ fn renameat(slot: usize, from_dir: u64, from: u64, to_dir: u64, to: u64) -> Resu
     let mut new = [0u8; PATH_MAX + 1];
     let n = absolute_path(slot, to_dir, to, &mut new)?;
     let new = path_str(&new, n)?;
-    // The namespace renames only within a directory. Across two, Linux's answer for a
-    // rename the filesystem cannot do is `EXDEV`, which a program handles by copying.
-    fn parent(p: &str) -> Option<&str> {
-        let p = p.trim_end_matches('/');
-        p.rfind('/').map(|cut| &p[..cut])
-    }
-    match (parent(old), parent(new)) {
-        (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => {}
-        _ => return Err(Failure::CrossDevice),
-    }
+    // The namespace moves a name between directories of one filesystem, and answers
+    // `CrossDevice` for two: Linux's `EXDEV`, which a program handles by copying.
     with_ns(|ns| ns.rename(old, new).map_err(failure))?;
     Ok(0)
 }
@@ -811,6 +803,7 @@ fn failure(e: vfs::Error) -> Failure {
         E::Full | E::MountFull => Failure::NoSpace,
         E::Exists => Failure::Exists,
         E::NotEmpty => Failure::NotEmpty,
+        E::CrossDevice => Failure::CrossDevice,
         E::Corrupt(_) | E::Device(_) => Failure::Io,
     }
 }
@@ -1818,7 +1811,12 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
         unsafe { core::slice::from_raw_parts_mut(virt.raw() as *mut u8, len) };
 
     let mut ns: Namespace = Vfs::new();
-    let (ok, kept) = match ns.mount("/", volume) {
+    let mounted = ns.mount("/", volume);
+    // SAFETY: as for `volume`: the boot path, before any other thread holds the volumes.
+    if let Some(second) = unsafe { crate::fs::volume32() } {
+        let _ = ns.mount(crate::fileserver::FAT32_AT, second);
+    }
+    let (ok, kept) = match mounted {
         Ok(()) => run_hello(c, frames, &mut ns, buf),
         Err(_) => {
             c.write_str("MOUNTING THE VOLUME FAILED");
@@ -2018,6 +2016,12 @@ fn run_mode(argv: &'static [&'static [u8]]) -> Result<Run, (Check, &'static str)
     let mut ns: Namespace = Vfs::new();
     if ns.mount("/", volume).is_err() {
         return Err((Check::Failed, "MOUNTING THE VOLUME FAILED"));
+    }
+    // The second volume below the first, so a Linux program can read it and can meet the
+    // refusal a rename across two filesystems gets.
+    // SAFETY: as for `volume`.
+    if let Some(second) = unsafe { crate::fs::volume32() } {
+        let _ = ns.mount(crate::fileserver::FAT32_AT, second);
     }
     spawn::use_stacks(&STACKS);
     let frames_before = free_frames();

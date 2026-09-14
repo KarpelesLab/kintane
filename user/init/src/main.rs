@@ -830,6 +830,9 @@ fn write_through_the_service(rw: Handle, ro: Handle) -> Result<(), u64> {
     const TEMP: &[u8] = b"/KINTANE/NWTMP.TXT";
     const RENAMED: &[u8] = b"/KINTANE/NWREN.TXT";
     const DIR: &[u8] = b"/KINTANE/NWDIR";
+    /// On the disk's second volume, which the kernel mounts below the first.
+    const FAT32_HELLO: &[u8] = b"/FAT32/HELLO32.TXT";
+    const FAT32_TARGET: &[u8] = b"/FAT32/NWTMP.TXT";
     let mut buf = [0u8; vfsproto::MESSAGE];
     let b = &mut buf;
 
@@ -869,6 +872,14 @@ fn write_through_the_service(rw: Handle, ro: Handle) -> Result<(), u64> {
     let (hello, _) = expect_status(rw, vfsproto::open(b"/HELLO.TXT"), OK, 0x90b, b)?;
     expect_status(rw, vfsproto::write(hello, b"x"), Status::ReadOnly, 0x90b, b)?;
     expect_status(rw, Some(vfsproto::close(hello)), OK, 0x90b, b)?;
+    // 13: the disk's second volume is reachable through the same connection, and a rename
+    // onto it is refused: one filesystem cannot move a name into another.
+    let (h32, _) = expect_status(rw, vfsproto::open(FAT32_HELLO), OK, 0x90d, b)?;
+    expect_status(rw, Some(vfsproto::close(h32)), OK, 0x90d, b)?;
+    let (tmp, _) = expect_status(rw, vfsproto::open_with(TEMP, create), OK, 0x90d, b)?;
+    expect_status(rw, Some(vfsproto::close(tmp)), OK, 0x90d, b)?;
+    expect_status(rw, vfsproto::rename(TEMP, FAT32_TARGET), Status::CrossDevice, 0x90d, b)?;
+    expect_status(rw, vfsproto::unlink(TEMP), OK, 0x90d, b)?;
     // 12: the file kbuild reads after the guest exits, synced.
     let replace = flags::WRITE | flags::CREATE | flags::TRUNCATE;
     let (out, _) = expect_status(rw, vfsproto::open_with(NATIVE_OUT, replace), OK, 0x90c, b)?;
