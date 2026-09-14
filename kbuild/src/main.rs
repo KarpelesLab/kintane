@@ -644,8 +644,12 @@ impl UserFlavor {
 }
 
 /// The names of `unit`'s transitive dependencies, walked over `ordered`.
-fn transitive_deps(unit: &graph::Unit, ordered: &[graph::Unit]) -> std::collections::BTreeSet<String> {
-    let by_name: BTreeMap<&str, &graph::Unit> = ordered.iter().map(|u| (u.name.as_str(), u)).collect();
+fn transitive_deps(
+    unit: &graph::Unit,
+    ordered: &[graph::Unit],
+) -> std::collections::BTreeSet<String> {
+    let by_name: BTreeMap<&str, &graph::Unit> =
+        ordered.iter().map(|u| (u.name.as_str(), u)).collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<String> = unit.deps.clone();
     while let Some(name) = stack.pop() {
