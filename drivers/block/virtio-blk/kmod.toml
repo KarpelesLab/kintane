@@ -15,4 +15,4 @@ host-tests = true
 layer = "device"
 
 [deps]
-units = ["hal", "device", "block", "sync", "hwproxy", "virtio-blk-core"]
+units = ["hal", "device", "block", "sync", "hwproxy", "virtio", "virtio-bind", "virtio-blk-core"]

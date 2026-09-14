@@ -128,6 +128,19 @@ fn enabling_msix_clears_the_function_mask_and_keeps_the_list_pointer() {
 }
 
 #[test]
+fn a_bus_master_keeps_the_rest_of_its_command_register() {
+    let cfg = Config::new();
+    // Memory decode on, bus mastering off: how QEMU leaves a function no firmware drove.
+    cfg.set(0x04, 0x0010_0002);
+    assert!(msi::set_bus_master(&cfg, AT));
+    assert_eq!(cfg.word(0x04), 0x0010_0006, "only the bus master bit is added");
+
+    let mut stuck = Config::new();
+    stuck.writable[1] = !(1 << 2);
+    assert!(!msi::set_bus_master(&stuck, AT), "a function that refuses it reports failure");
+}
+
+#[test]
 fn enabling_msix_on_a_function_that_ignores_it_reports_failure() {
     let mut cfg = Config::new();
     let cap = MsixCapability::read(&virtio_msix()).unwrap();

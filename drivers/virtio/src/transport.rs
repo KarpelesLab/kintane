@@ -38,6 +38,9 @@ pub const ACCESS_PLATFORM_BIT: u32 = 1 << 1;
 /// The virtio device type for a block device (virtio 1.1 §5.2).
 pub const DEVICE_ID_BLOCK: u32 = 2;
 
+/// The virtio device type for a network card (virtio 1.1 §5.1).
+pub const DEVICE_ID_NET: u32 = 1;
+
 /// What a vector field holds when no MSI-X vector is assigned, and what a device reads back
 /// when it refuses one (virtio 1.1 §4.1.4.3, §4.1.5.1.3).
 pub const NO_VECTOR: u16 = 0xffff;

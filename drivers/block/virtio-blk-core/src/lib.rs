@@ -31,11 +31,10 @@
 #![deny(unsafe_code)]
 
 pub mod engine;
-pub mod mem;
-pub mod mmio;
-pub mod pci;
-pub mod queue;
-pub mod transport;
+
+// The virtqueue, the transports and DMA regions are every virtio driver's, in `drivers/virtio`,
+// a crate at this same layer. Re-exported under the paths this crate always had.
+pub use virtio::{mem, mmio, pci, queue, transport};
 
 #[cfg(test)]
 mod test_support;

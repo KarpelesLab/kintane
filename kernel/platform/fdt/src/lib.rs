@@ -46,11 +46,22 @@ const DRIVERS: &[&dyn Driver] = &[
     &gic::v3::DRIVER,
     &pl011::DRIVER,
     &virtio_blk::DRIVER,
+    &virtio_net::DRIVER,
 ];
 #[cfg(all(CONFIG_GIC_V2, not(CONFIG_GIC_V3)))]
-const DRIVERS: &[&dyn Driver] = &[&gic::v2::DRIVER, &pl011::DRIVER, &virtio_blk::DRIVER];
+const DRIVERS: &[&dyn Driver] = &[
+    &gic::v2::DRIVER,
+    &pl011::DRIVER,
+    &virtio_blk::DRIVER,
+    &virtio_net::DRIVER,
+];
 #[cfg(all(CONFIG_GIC_V3, not(CONFIG_GIC_V2)))]
-const DRIVERS: &[&dyn Driver] = &[&gic::v3::DRIVER, &pl011::DRIVER, &virtio_blk::DRIVER];
+const DRIVERS: &[&dyn Driver] = &[
+    &gic::v3::DRIVER,
+    &pl011::DRIVER,
+    &virtio_blk::DRIVER,
+    &virtio_net::DRIVER,
+];
 
 /// The controller one of those drivers started, whichever kinds this image has.
 #[cfg(all(CONFIG_GIC_V2, CONFIG_GIC_V3))]
@@ -134,6 +145,8 @@ static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
 static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
 /// The block device's interrupt line, once its handler is wired.
 static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
+/// The network card's interrupt line, once its handler is wired.
+static NET_LINE: BootCell<IrqNumber> = BootCell::new();
 
 /// Where this platform's devices come from, for the banner.
 pub const SOURCE: &str = "device tree";
@@ -185,11 +198,13 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     // Probe everything first and start nothing until every claim is in: a start that ran
     // before a later probe's claim was refused would be driving hardware the ledger never
     // agreed was its.
-    // Which memory-mapped virtio slot holds a block device. The tree lists every slot the
-    // machine has, occupied or not, and only the slot's own registers say which is which:
-    // this is enumeration, done here as `pci::enumerate` is, so that the driver's probe
-    // keeps its rule of touching no hardware. See `virtio_blk::mmio`.
+    // Which memory-mapped virtio slot holds a block device, and which a network card. The
+    // tree lists every slot the machine has, occupied or not, and only the slot's own
+    // registers say which is which: this is enumeration, done here as `pci::enumerate` is,
+    // so that the drivers' probes keep their rule of touching no hardware. See
+    // `virtio::mmio`.
     let mut block_slot = None;
+    let mut net_slot = None;
     let (mut slots, mut legacy) = (0usize, 0usize);
     for id in tree
         .ids()
@@ -209,6 +224,9 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         match unsafe { virtio_blk::mmio::identify(base, len) } {
             Slot::Device { device_id } if device_id == virtio_blk::transport::DEVICE_ID_BLOCK => {
                 block_slot = block_slot.or(Some(id));
+            }
+            Slot::Device { device_id } if device_id == virtio::transport::DEVICE_ID_NET => {
+                net_slot = net_slot.or(Some(id));
             }
             Slot::Legacy { device_id } if device_id == virtio_blk::transport::DEVICE_ID_BLOCK => {
                 legacy += 1;
@@ -236,12 +254,24 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     let mut ok = true;
     let mut n = 0;
     for id in tree.ids() {
-        let Some((d, _)) = best_match(&tree, id, DRIVERS) else {
+        let Some((mut d, _)) = best_match(&tree, id, DRIVERS) else {
             continue;
         };
-        // An empty slot, or one holding a device this image has no driver for.
-        if tree.node(id).is_compatible("virtio,mmio") && Some(id) != block_slot {
-            continue;
+        // A memory-mapped virtio slot's compatible string is the same whatever it holds, so
+        // its driver is the one for what the slot's registers said above. An empty slot, or
+        // one holding a device this image has no driver for, binds nothing.
+        if tree.node(id).is_compatible("virtio,mmio") {
+            let wanted = if Some(id) == block_slot {
+                virtio_blk::DRIVER.name()
+            } else if Some(id) == net_slot {
+                virtio_net::DRIVER.name()
+            } else {
+                continue;
+            };
+            let Some(i) = DRIVERS.iter().position(|drv| drv.name() == wanted) else {
+                continue;
+            };
+            d = i;
         }
         let Some(&drv) = DRIVERS.get(d) else { continue };
         c.write_str(" ");
@@ -424,6 +454,10 @@ fn wire(
         // SAFETY: once, on the single-threaded boot path.
         let _ = unsafe { BLOCK_LINE.set(number) };
     }
+    if drv.name() == virtio_net::DRIVER.name() {
+        // SAFETY: once, on the single-threaded boot path.
+        let _ = unsafe { NET_LINE.set(number) };
+    }
     c.write_str("; ");
     c.write_str(drv.name());
     c.write_str(" receives on IRQ ");
@@ -440,6 +474,12 @@ pub fn console_line() -> Option<u32> {
 /// is polled.
 pub fn block_line() -> Option<u32> {
     BLOCK_LINE.get().map(|n| n.0)
+}
+
+/// The network card's interrupt line, once its handler is wired. `None` when the card is
+/// polled.
+pub fn net_line() -> Option<u32> {
+    NET_LINE.get().map(|n| n.0)
 }
 
 /// Whether `line` is a message-signalled interrupt's. Never here: every device on these

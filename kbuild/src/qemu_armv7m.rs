@@ -38,5 +38,6 @@ pub fn machine(res: &Resolution, image: &Path, log: &Path) -> Machine {
         success_code: 0,
         input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
         serial_probe: res.is_on("SERIAL_IRQ_TEST"),
+        net_port: None,
     }
 }

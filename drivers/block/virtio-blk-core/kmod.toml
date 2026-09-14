@@ -15,4 +15,4 @@ host-tests = true
 layer = "user"
 
 [deps]
-units = ["hwproxy"]
+units = ["hwproxy", "virtio"]

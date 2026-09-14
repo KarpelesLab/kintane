@@ -59,6 +59,11 @@ pub fn block_line() -> Option<u32> {
     None
 }
 
+/// No network card is bound on these ports either.
+pub fn net_line() -> Option<u32> {
+    None
+}
+
 /// No interrupt on these ports is message-signalled.
 pub fn interrupt_is_msi(_line: u32) -> bool {
     false

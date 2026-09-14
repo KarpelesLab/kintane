@@ -260,7 +260,7 @@ impl Ring {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Backing, FakeDevice};
+    use crate::fake::{Backing, FakeDevice};
 
     /// A queue of `size` over host memory, with the device's addresses deliberately
     /// different from the CPU's.

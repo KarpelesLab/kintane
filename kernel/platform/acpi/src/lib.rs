@@ -131,6 +131,8 @@ static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
 static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
 /// The block device's interrupt line, once its handler is wired.
 static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
+/// The network card's interrupt line, once its handler is wired.
+static NET_LINE: BootCell<IrqNumber> = BootCell::new();
 
 /// Message-signalled lines there can be; `controller::MSI_LINES` is at most this long.
 const MAX_MSI_ROUTES: usize = 16;
@@ -980,6 +982,10 @@ unsafe fn wire_all(
                     // SAFETY: once, on the single-threaded boot path.
                     let _ = unsafe { BLOCK_LINE.set(line) };
                 }
+                if drv.name() == virtio_net::DRIVER.name() {
+                    // SAFETY: once, on the single-threaded boot path.
+                    let _ = unsafe { NET_LINE.set(line) };
+                }
                 if drv.name() == uart16550::DRIVER.name() && console.is_none() {
                     // SAFETY: once, on the single-threaded boot path.
                     let _ = unsafe { CONSOLE_LINE.set(line) };
@@ -1074,6 +1080,11 @@ fn wire_msi(
     };
     if registered.is_err() {
         return failed("HANDLER NOT REGISTERED");
+    }
+    // Before the function is told where to write: a function that is not a bus master sends
+    // no message. See `msi::set_bus_master` for how that went unnoticed.
+    if !msi::set_bus_master(cfg, f.address) {
+        return failed("DID NOT BECOME A BUS MASTER");
     }
 
     let route = if let Some(cap) = msi::msix(f) {
@@ -1293,6 +1304,12 @@ pub fn console_line() -> Option<u32> {
 /// is polled, including on a port whose controller no PCI interrupt route reaches.
 pub fn block_line() -> Option<u32> {
     BLOCK_LINE.get().map(|n| n.0)
+}
+
+/// The network card's interrupt line, once its handler is wired. `None` when the card is
+/// polled, as for the block device.
+pub fn net_line() -> Option<u32> {
+    NET_LINE.get().map(|n| n.0)
 }
 
 /// Receive interrupts the console driver has taken, and the bytes they carried.

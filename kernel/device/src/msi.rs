@@ -201,6 +201,25 @@ pub fn set_msix_enabled(
     (back & msix_ctl::ENABLE != 0) == on && (!on || back & msix_ctl::FUNCTION_MASK == 0)
 }
 
+/// The command register, and its bus master bit (PCI Local Bus Specification 3.0, §6.2.2).
+const COMMAND: u16 = 0x04;
+const COMMAND_BUS_MASTER: u32 = 1 << 2;
+
+/// Make the function at `at` a bus master, leaving the rest of its command register as it
+/// was. Returns whether the bit reads back set.
+///
+/// A message-signalled interrupt is a write the function makes, and a function that is not
+/// a bus master makes none. Nothing else in discovery sets the bit, because nothing else
+/// needed it: a virtio device without `VIRTIO_F_IOMMU_PLATFORM` reaches memory outside that
+/// gate under QEMU, so its queues work without it. Only its interrupts went missing, on a
+/// virtio-net function no firmware driver had touched, while a disk SeaBIOS had set up to
+/// boot from kept its.
+pub fn set_bus_master(cfg: &(impl ConfigSpace + ?Sized), at: Address) -> bool {
+    let command = cfg.read(at, COMMAND);
+    cfg.write(at, COMMAND, command | COMMAND_BUS_MASTER);
+    cfg.read(at, COMMAND) & COMMAND_BUS_MASTER != 0
+}
+
 /// Program MSI's single message and enable it: the fallback for a function with MSI but no
 /// MSI-X.
 ///

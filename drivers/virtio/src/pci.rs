@@ -8,7 +8,7 @@
 //! configuration — and says where each is through vendor-specific capabilities in its
 //! configuration space: a BAR index, an offset into it, and a length. [`Layout`] is that
 //! answer, as data. Reading the capabilities needs configuration space, which only the
-//! kernel's enumerator has, so the kernel builds the layout (`drivers/block/virtio-blk`'s
+//! kernel's enumerator has, so the kernel builds the layout (`drivers/virtio-bind`'s
 //! `layout_of`) and a domain is *told* it; [`Layout::from_capabilities`] is the rule both
 //! apply.
 //!
@@ -75,6 +75,10 @@ const COMMON_BYTES: u32 = 0x38;
 pub const VENDOR: u16 = 0x1af4;
 pub const DEVICE_MODERN_BLOCK: u16 = 0x1042;
 pub const DEVICE_TRANSITIONAL_BLOCK: u16 = 0x1001;
+
+/// The same pair for a network card: 0x1041, and 0x1000 transitional.
+pub const DEVICE_MODERN_NET: u16 = 0x1041;
+pub const DEVICE_TRANSITIONAL_NET: u16 = 0x1000;
 
 /// One structure's place: which BAR, how far into it, and how long.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

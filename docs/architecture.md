@@ -968,8 +968,11 @@ It is host-tested against a RAM disk that fails on request.
 
 virtio 1.x over two transports: memory-mapped, bound from the device tree on aarch64, and
 PCI, bound from enumeration on the PCs. The device's protocol is written once against the
-`Transport` trait, and each transport is only where its registers are. It is the first
-driver that hands a device *addresses*:
+`Transport` trait, and each transport is only where its registers are. Everything here
+that is not about blocks (`mem`, `queue`, `transport`, `mmio`, `pci`, and what a probe
+claims) now lives in `drivers/virtio`, shared with virtio-net; see
+[the network stack](#net--the-network-stack-and-virtio-net). It is the first driver that
+hands a device *addresses*:
 
 - **`mem::Dma`** carries a region's physical and virtual addresses and keeps them apart. A
   descriptor takes `Dma::phys`, and the CPU dereferences `Dma::virt`. Host tests place the fake
@@ -1057,6 +1060,114 @@ disk is polled.
 
 The started device lives on for the stress run's two block workloads, which must be seen
 outstanding together at least once in a run.
+
+### `net` — the network stack, and virtio-net
+
+One network card driver and enough IPv4 to prove it. `kernel/net` is Ethernet, ARP, IPv4,
+ICMP echo and UDP, host-tested against a simulated gateway. `drivers/net/virtio-net` is the
+card. The boot's `net` check drives both against QEMU's user-mode network. What it is not:
+
+- **No TCP.** Out of scope for this slice.
+- **No fragment reassembly.** A fragment is refused and counted (`WireError::Fragmented`),
+  and a datagram that does not fit one 1500-byte frame is not sent.
+- **No socket API and no blocking calls.** The stack is `&mut self`, driven by whoever holds
+  it: the boot check and the stress workload poll it under one lock. A socket layer waits
+  for Phase 6a's blocking calls.
+- **No IPv6, DHCP, DNS or routing table.** One static address, a netmask and a gateway.
+
+#### `kernel/net`
+
+- **`wire`:** a parser and a writer for each layer, none of which allocates. A parser verifies
+  before it trusts: the IPv4 header checksum before any field, the UDP checksum over its
+  pseudo-header unless the sender left it zero (which IPv4 allows), and every length against
+  the bytes actually present. `parse_frame` classifies a whole frame, and is what the fuzzer
+  drives.
+- **`arp::Cache`:** eight entries, each expiring 60 s after it was learned. A full cache replaces
+  the entry closest to expiry. The stack learns only from ARP messages addressed to its own
+  address, answers requests for it, and sends a request at most every 200 ms.
+- **`pool::Pool`:** four frame-sized buffers, and books for them: taken, returned, held. `poll`
+  takes a receive buffer and a reply buffer for each frame and gives both back before the
+  next. A send takes one and gives it back whether or not the card took the frame. A second
+  give of the same buffer is refused. `balanced` (nothing held, as many returned as taken) is
+  what the boot check and every stress audit require.
+- **No allocation on receive.** A frame is copied from the card into a pool buffer and handled
+  there. A datagram's payload, up to 256 bytes, is copied into a four-slot inbox, and a full
+  inbox drops and counts. Echo replies go into an eight-entry ring that the sender matches by
+  identifier and sequence number.
+- **Bounded work.** One `poll` handles at most sixteen frames, so a flood cannot hold its caller.
+- **`Nic`:** `mac`, `send` and `recv`, all `&self`. virtio-net implements it, and so do the host
+  tests' gateway and the fuzzer's one-frame card.
+
+The stack takes `now`, in nanoseconds, from its caller rather than reading a clock, which is
+what lets the host tests expire an ARP entry without waiting a minute.
+
+#### virtio-net (`drivers/net/virtio-net`) and `drivers/virtio`
+
+The second virtio driver is why `drivers/virtio` exists. virtio-blk's `mem`, `queue`,
+`transport`, `mmio` and `pci` modules moved there unchanged, and virtio-blk re-exports them
+under their old paths. Its probe's claims became `virtio::bind::Claims`, which takes the
+device type and the claim's name, and its `AnyTransport` moved with them. The fake device
+the host tests drive moved too, minus virtio-blk's request serving, which stayed in
+virtio-blk's test support. It compiles only for host builds (`MOCK_ARCH`), so both drivers'
+tests use it and no image carries it.
+
+- **Two queues, buffers carved once.** Eight receive buffers of 1526 bytes, the 12-byte header
+  and a whole untagged frame, are posted at bring-up, and eight transmit slots of the same size
+  are carved beside them. Nothing is allocated after that. A completed receive buffer is
+  *ready* until `recv` copies its frame out, and is posted again at once, so a receive buffer
+  is always either with the device or ready. `Counters::balanced` checks that, together with
+  nothing outstanding on the transmit queue and every descriptor free.
+- **No mergeable receive buffers and no offloads.** Without `VIRTIO_NET_F_MRG_RXBUF` a receive
+  buffer must hold a whole frame, which these do. Checksum and segmentation offloads are not
+  negotiated, so frames arrive exactly as they were on the wire. The address comes from the
+  device configuration when `VIRTIO_NET_F_MAC` is offered, and is a locally administered
+  constant otherwise.
+- **Completion as in virtio-blk.** The platform wires the claimed line, and the handler drains
+  both queues under the card's lock. Where no line is wired, `recv` drains the receive queue
+  itself. `set_interrupt_driven` forbids that, which is how the boot check proves frames
+  arrive by interrupt rather than inferring it. A completion naming a buffer the driver did not
+  post completes nothing, and one too short to be a frame is dropped and its buffer posted
+  again.
+- **Where the card takes interrupts.** On aarch64, through the GIC. On i686, through the 8259A
+  on the line firmware routed: the test machine puts the card at PCI slot `0x1e` on `pc`,
+  whose INTA routes to IRQ 10, because the disk's function is on 11 and a line has one handler.
+  On x86_64, by MSI-X through `device::msi`, as the disk: `virtio::bind::Claims` claims the
+  table's BAR and entry 0, the platform programs and unmasks it, and
+  `VirtioNet::bring_up_with_vector` puts both queues on that entry. On a vector the handler
+  does not read the interrupt status register, which the device does not set for it.
+- **Bus mastering.** A message-signalled interrupt is a write the function makes, and a
+  function that is not a bus master makes none. Nothing in discovery set the command
+  register's bit, and under QEMU virtio's DMA does not need it, so the card's queues worked
+  and only its interrupts went missing. The disk's arrived only because SeaBIOS had set the
+  bit to boot from it. The platform now sets it (`msi::set_bus_master`) before it programs a
+  function's message.
+- **Registers through the device window.** `Claims::transport` reaches both transports through
+  `hal::paging::device_virt`, as virtio-blk did, and the platform's slot scan identifies a
+  memory-mapped network card the way it identifies a disk.
+
+**Two windows in one page.** QEMU's `virt` packs eight virtio slots into each 4 KiB page,
+and the disk and the card land in neighbouring slots. `space::map_devices` refused the
+second window as already mapped. It now leaves a page that an earlier window mapped as
+device memory to the same physical page, and still refuses any other overlap.
+
+**The check** (`kernel/main/src/net.rs`, with `QEMU_NET_TEST`). Bring-up runs in the memory
+chain beside the disk's, on the `nic` line. The exchange runs in the banner after `block
+irq`, with interrupts enabled, and gates the boot on:
+
+- the gateway, 10.0.2.2, resolved by ARP;
+- four echo requests to it, each answered with its own sequence number;
+- three UDP round trips with kbuild: kbuild forwards a loopback port to the guest's port
+  5555 and sends a probe, the kernel answers the probe's source with a numbered echo, and
+  kbuild's acknowledgement of each must come back;
+- every stack buffer back in its pool, every receive buffer with the card or holding a frame,
+  and nothing on its way out;
+- where a line is wired, every frame collected by the handler and none by polling.
+
+It needs no host network. QEMU's user-mode stack answers ARP and echo requests for its
+gateway itself, and the UDP peer is kbuild on the loopback interface. The started card and
+stack live on for the stress run's network workload. The stack's lock is taken with
+interrupts masked although no handler takes it, because a kernel spinlock is held with
+preemption off ([testing.md](testing.md#2g-network) has the hang that showed it).
 
 ### `vfs`, `bcache` and `fat` — files
 

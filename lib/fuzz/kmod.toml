@@ -2,7 +2,7 @@
 # input, and the table `kbuild fuzz` drives them from.
 #
 # At the `subsystem` layer because it depends on parsers from four layers — `abi` (user),
-# `fdt`/`acpi`/`boot_protocol`/`kinboot-menu` (hal), `elf`/`module` (core) and
+# `fdt`/`acpi`/`boot_protocol`/`kinboot-menu` (hal), `elf`/`module`/`net` (core) and
 # `device`/`virtio-blk` (device) — and a unit may depend only on units of equal or lower
 # rank. It is above every one of them and below `kernel`, which is what a harness that
 # links parsers but is linked into no image should be.
@@ -34,6 +34,7 @@ units = [
     "kinboot-menu",
     "elf",
     "module",
+    "net",
     "device",
     "virtio-blk",
 ]

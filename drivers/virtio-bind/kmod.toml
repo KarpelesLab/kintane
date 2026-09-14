@@ -1,0 +1,15 @@
+# virtio-bind: what the kernel adds to the shared virtio crate to drive a device it found —
+# the probe's claims (the register window, an MSI-X table and vector or a line), the PCI
+# layout read from the enumeration record, and a transport over the claimed window.
+#
+# Layer `device`, because it needs the device model; `virtio` itself is `user`, so a
+# driver's protocol core can build into a domain without any of this. virtio-blk and
+# virtio-net both bind through it.
+[unit]
+name = "virtio-bind"
+kind = "lib"
+root = "src/lib.rs"
+layer = "device"
+
+[deps]
+units = ["hal", "device", "hwproxy", "virtio"]

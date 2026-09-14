@@ -128,8 +128,8 @@ config NR_CPUS
 config KERNEL_THREAD_SLOTS
     int "Guarded stack slots for kernel threads"
     range 2 256
-    default 14 if STRESS_TEST && DRIVER_ISOLATION
-    default 13 if STRESS_TEST
+    default 15 if STRESS_TEST && DRIVER_ISOLATION
+    default 14 if STRESS_TEST
     default 8
     help
         How many kernel threads may hold a guarded stack at once, not
@@ -713,6 +713,27 @@ config QEMU_BLOCK_TEST
         driver's `Transport` seam exists for, and the check is the same either
         way. Needs MM_PAGED, because the check maps the driver's DMA region
         through the kernel's direct map.
+
+config QEMU_NET_TEST
+    bool "A virtio-net card on QEMU's user-mode network"
+    depends on QEMU_EXIT && MM_PAGED
+    default y if ARCH_AARCH64 || ARCH_X86_64 || ARCH_I686
+    help
+        Attach a virtio-net card to QEMU's user-mode network (-netdev user,
+        no host network needed) and gate the boot on the net check: the
+        stack must resolve the gateway 10.0.2.2 by ARP, get an echo reply
+        with the matching sequence number for every ping it sends it, and
+        complete UDP round trips with kbuild, which forwards a host port to
+        the guest's port 5555 and answers each datagram the guest sends
+        back. Every stack buffer must be back in its pool and every receive
+        buffer back with the card or holding a frame. Where the platform
+        wired the card's interrupt (aarch64, i686 through the 8259A, x86_64
+        by MSI-X), every frame must be collected by the interrupt handler
+        and none by polling.
+
+        A memory-mapped virtio slot on aarch64, a modern-only PCI function
+        on the PCs. Needs MM_PAGED, because the driver's DMA region is
+        mapped through the kernel's direct map.
 
 config IOMMU
     bool "Confine device DMA with an Intel VT-d IOMMU"
