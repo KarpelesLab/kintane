@@ -425,7 +425,7 @@ until someone decides what Linux calls it. Filesystem errors map onto `Failure` 
 | a name that is not UTF-8 | `ENOENT` | the volume cannot hold it, so it has no such file |
 | a name that exists, for `O_CREAT|O_EXCL`, `mkdirat` or a rename onto a directory | `EEXIST` | |
 | a directory to remove, or to rename over, that is not empty | `ENOTEMPTY` | |
-| a rename between two directories | `EXDEV` | the namespace renames only within one directory, and a program meets `EXDEV` across filesystems anyway and copies |
+| a rename between two filesystems | `EXDEV` | one filesystem moves a name between its own directories; two cannot move one between themselves, and a program meets `EXDEV` there anyway and copies |
 | `lseek` on a pipe or the console | `ESPIPE` | |
 | `ftruncate` on a descriptor not open for writing | `EINVAL` | Linux's own answer |
 | an executable mapping | `EACCES` | W^X is never granted, and Linux uses `EACCES` for protections the object refuses |

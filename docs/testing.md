@@ -955,7 +955,7 @@ end of every iteration. The audit requires every handle closed, the cache's book
 block left unwritten, and the volume's consistency walk to find no lost cluster and the two tables
 the same.
 
-`vfs`, `bcache` and `fat` are host-tested (19, 18 and 27 tests). The FAT tests build their volumes
+`vfs`, `bcache` and `fat` are host-tested (20, 18 and 37 tests, the last of them against FAT32 volumes as well as FAT16). The FAT tests build their volumes
 with a writer of their own, independent of kbuild's, or format them empty and fill them through
 the driver itself. `vfsproto` has 8 host tests, and kbuild's own FAT reader, disk check and crash
 test have theirs among kbuild's.
@@ -997,10 +997,10 @@ On the same presets with userspace, two checks write the volume and gate the boo
   waiting in the cache, and the consistency walk finds no lost cluster and the tables the same.
 - **The `linux` check** runs `linux-hello` a third time, in its `files` mode, which does the same
   through Linux's calls: `openat` with `O_CREAT|O_EXCL`, `O_APPEND` and `O_TRUNC`, `write`,
-  `lseek`, `fstat`, `ftruncate`, `mkdirat`, `renameat` (and `EXDEV` across two directories),
+  `lseek`, `fstat`, `ftruncate`, `mkdirat`, `renameat`, which moves a name between two directories of one filesystem,
   `unlinkat` with and without `AT_REMOVEDIR`, `fsync`, and `ENAMETOOLONG` for a name FAT cannot
   hold. On x86_64 `/KINTANE/LINUX.OUT` is made with `open`. It exits 50, or the step (80 to 96)
-  that was wrong; the check requires 46, reads the file back, and walks the volume.
+  that was wrong; the check requires 50, reads the file back, and walks the volume.
 
 ```
   files write init: wrote the disk through the file service; created, wrote, read back, truncated, renamed and removed through a writable connection; refused through a read-only one; /KINTANE/NATIVE.OUT read back, the volume consistent: 7 files, 2 directories, no lost cluster, the tables the same; the same server thread; 0 objects left, 0 frames left ok

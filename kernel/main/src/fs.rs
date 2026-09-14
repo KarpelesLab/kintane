@@ -271,6 +271,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
     }
     ok &= cache_books(c, &fat);
     ok &= write_through(c, disk);
+    ok &= volume_size(c, &mut fat);
     if kconfig::FS_CRASH_TEST {
         crash_writes(c, fat);
     }
@@ -536,6 +537,37 @@ fn cache_books(c: &dyn EarlyConsole, fat: &Fat<'_, '_>) -> bool {
     c.write_str(" hits, ");
     write_usize(c, s.misses as usize);
     c.write_str(" misses");
+    true
+}
+
+/// What the volume says it is, against what the walk counts.
+///
+/// The driver keeps its free count as the table changes rather than counting on demand, so
+/// this is the check that the two never drift: the walk counts free clusters from the table
+/// itself, and `statfs` reports the number the driver has been keeping.
+fn volume_size(c: &dyn EarlyConsole, fat: &mut Fat<'static, 'static>) -> bool {
+    use vfs::FileSystem;
+    let size = match fat.statfs() {
+        Ok(s) => s,
+        Err(e) => return failed(c, "asking the volume its size", e),
+    };
+    let walk = match consistency(fat) {
+        Ok(k) => k,
+        Err(e) => return failed(c, "walking the volume", e),
+    };
+    if size.block_size == 0 || size.blocks == 0 || size.free > size.blocks {
+        c.write_str("; THE VOLUME'S SIZE MAKES NO SENSE");
+        return false;
+    }
+    if size.free != u64::from(walk.free) {
+        c.write_str("; THE VOLUME'S FREE COUNT IS NOT WHAT THE WALK COUNTED");
+        return false;
+    }
+    c.write_str("; ");
+    write_usize(c, size.free as usize);
+    c.write_str(" of ");
+    write_usize(c, size.blocks as usize);
+    c.write_str(" clusters free");
     true
 }
 
