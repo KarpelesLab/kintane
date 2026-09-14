@@ -45,7 +45,7 @@ ENTRY(_start)
 
 /* See `.thread_stacks` below. */
 THREAD_STACK_SLOT = 32K;
-THREAD_STACK_SLOTS = 8;
+THREAD_STACK_SLOTS = 12;
 
 
 SECTIONS {

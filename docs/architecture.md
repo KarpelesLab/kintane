@@ -450,12 +450,21 @@ waiting for the CPU. How far one arming reaches is a fact about the hardware:
 
 - **Arm generic timer:** a signed 32-bit count of ticks, 2.15 s at QEMU's 1 GHz. A 500 ms idle
   period takes one interrupt.
+- **x86_64 local APIC timer:** a 32-bit count at divide-by-16, measured against the TSC
+  when the APIC driver is installed, and about 68 s at QEMU's rate. A 500 ms idle period
+  takes one interrupt, and the `tickless` bound derived from the reach tightened from twelve
+  interrupts to three.
 - **x86 PIT (mode 0):** 16 bits, 54.9 ms. The same idle period takes nine interrupts,
-  where a 10 ms tick would take fifty. The PIT is the interim one-shot, and the local
-  APIC timer, which has a 32-bit count and a divider, replaces it with the APIC driver.
+  where a 10 ms tick would take fifty. i686 still uses it, and x86_64 falls back to it on a
+  machine without a MADT.
 
 The boot check `tickless` measures exactly this, and fails if an idle period takes more
-interrupts than the hardware's reach requires.
+interrupts than the hardware's reach requires. It also arms the full reach and requires no interrupt for 20 ms.
+Before counting, it takes any interrupt an earlier arming already raised: a local APIC
+latches a timer interrupt that fires while the CPU is masked, and rearming does not withdraw
+it. Before that drain, one x86_64 SMP boot in fifteen reported a stale slice's tick as the
+full arming firing early. Injecting a stale tick on purpose fails the check without the
+drain and passes with it, and the aarch64 signed-reach bug still fails it.
 
 The boot banner's `clock` line checks the real counter on each port. It times ten
 timer interrupts of known period with the clock, and fails if the two disagree by
@@ -553,9 +562,14 @@ On a PC, `platform/acpi` does the following, before the kernel address space exi
    hardware has in a device tree.
 4. **Enumerates PCI**, through ECAM on q35 or configuration mechanism #1 on pc, and puts
    every function under its host node or its bridge.
-5. **Binds placeholder drivers** that claim the APIC and ECAM windows and drive nothing.
-   Claiming them now is what gets them mapped, so the SMP work starts from a mapped
-   window instead of a constant.
+5. **Binds the interrupt controllers.** On x86_64 the local APIC and I/O APIC drivers
+   (`drivers/irqchip/apic`) bind the MADT's nodes. The platform then builds the controller
+   with the MADT's ISA source overrides, measures its timer against the TSC, and installs
+   it in the architecture's interrupt path (`arch::interrupt::set_chip`) and tick
+   (`arch::tick::set_event_timer`). On i686, placeholder drivers claim the same windows and
+   drive nothing. That port keeps the 8259A and the PIT, because its interrupt path has no
+   controller seam and it has no second CPU for an APIC to start. The ECAM window is claimed
+   by a placeholder on both.
 
 x86_64's boot identity map was widened from 1 GiB to 4 GiB for this, so that discovery
 reaches the MMIO hole below 4 GiB. Discovery also moved ahead of the paging check, whose
@@ -629,7 +643,8 @@ split where the knowledge actually is:
   is two live exclusive references to one object.
 
 **Preemption is `yield_now` called from the timer interrupt.** Each port's `tick`
-module drives a one-shot timer (PIT mode 0 on x86, the generic timer on aarch64) and
+module drives a one-shot timer (the local APIC timer on x86_64, PIT mode 0 on i686, the
+generic timer on aarch64) and
 calls one registered `fn()` after acknowledging each interrupt. The hook wakes the
 threads whose timers expired, arms the next interrupt, and yields. The next interrupt
 is the earliest timer, or the end of a 10 ms slice if `Threads::contended` says a
@@ -641,7 +656,7 @@ happens inside the interrupt handler. The interrupted thread's whole trap frame 
 on its own stack, and it resumes, much later, by returning through that handler. Three
 conditions make this sound, and each port's `tick` module states them:
 
-1. **EOI before the hook.** Otherwise the 8259A's in-service bit, or the GIC's running
+1. **EOI before the hook.** Otherwise the 8259A's or local APIC's in-service bit, or the GIC's running
    priority, stays set while the thread that raised it is suspended, and the next thread
    never receives a tick. The in-kernel check below catches exactly this. With the EOI
    moved after the hook, round robin and priority *still looked correct*, because the
@@ -715,24 +730,30 @@ A failed bring-up never starts the scheduler: it halts, or exits with the failur
 Not yet:
 
 - A stack is never given back to the port when its thread exits; the scheduler reuses
-  the slots it claimed. The ports reserve eight: the boot checks claim four, and the
-  stress run four more.
+  the slots it claimed. i686 and riscv32 reserve eight: the boot checks claim four, and
+  the stress run four more. aarch64 and x86_64 reserve twelve, and the extra four are for
+  the stacks of secondary CPUs.
 - Nothing creates threads except the checks and the stress run.
 - Boot keeps its boot-check priority for good, which is above every stress workload.
 
 ### SMP
 
-Phase 3 starts on aarch64. With `SMP=y`, the boot CPU starts every CPU the device tree
-lists, up to `NR_CPUS` and the port's `HasSmp::MAX_CPUS`. Each one it starts runs an
-idle loop until the scheduler is handed every CPU after bring-up, and from then on each
-schedules threads from its own run queue ([the SMP scheduler](#the-smp-scheduler)).
+Phase 3 has started on aarch64 and x86_64. With `SMP=y`, the boot CPU starts every CPU
+firmware lists (the device tree's `/cpus`, or the MADT's enabled processors), up to
+`NR_CPUS` and the port's `HasSmp::MAX_CPUS`. Each one it starts runs an idle loop until the
+scheduler is handed every CPU after bring-up, and from then on each schedules threads from
+its own run queue ([the SMP scheduler](#the-smp-scheduler)). Both ports reach the scheduler
+through the same `hal::HasIpi`.
 
 **A CPU's number.** Hardware names a CPU sparsely: an MPIDR on Arm, an APIC ID on x86.
 The kernel names it densely, 0 being the boot CPU, because per-CPU storage is an array.
 `hal::Arch::cpu_index` answers "which CPU am I" on every port. It defaults to 0, and a
 port that starts a second CPU overrides it. `HasSmp::cpu_id` returns the same number.
 On aarch64 the answer is read through `TPIDR_EL1`, which each CPU points at its own
-block in `arch/aarch64/src/smp.rs`.
+block in `arch/aarch64/src/smp.rs`. On x86_64 it is read through `GS`: `MSR_GS_BASE` holds
+the address of the CPU's block in `arch/x86_64/src/smp.rs`, whose first field is the
+index, and both boot entries set the boot CPU's before any Rust runs, because lock-order
+checking asks for the number inside the first lock taken.
 
 **Per-CPU data.** `sync::PerCpu<T, N>` holds one `T` per CPU. Its constructors are the
 gate:
@@ -763,25 +784,59 @@ undefined behaviour. Lock-order checking keeps each CPU's held-lock stack in one
    banked CPU interface and SGI/PPI priorities.
 5. It enables its two IPIs and its generic timer at 100 Hz, and reports in.
 
-**IPIs** are SGIs. SGI 0 runs a function on the target, SGI 1 is a reschedule, and
+**Bring-up on x86_64** (`arch/x86_64/src/smp.rs`, driven by
+`kernel/platform/acpi/src/smp_x86_64.rs`, with the INIT and startup IPIs sent by
+`drivers/irqchip/apic`):
+
+1. Discovery records every processor entry in the MADT (APIC ID, enabled) and installs the
+   local APIC and I/O APIC.
+2. For each enabled processor, `smp::prepare` claims a guarded thread-stack slot named after
+   the CPU. It copies the real-mode trampoline to physical page `0x1000`, the first page
+   above the never-mapped page 0, which the frame allocator never hands out. It captures
+   the boot CPU's `CR4`, `CR3` and `CR0` for the entry. The driver sends INIT, waits
+   10 ms, and sends up to two startup IPIs with vector 1.
+3. The trampoline enters protected mode, then long mode on the bootstrap tables `boot.rs`
+   built. Those identity-map 4 GiB with every page executable, where the kernel's own
+   tables map low memory as data only. It sets `EFER.NXE` when the boot CPU has it, and
+   jumps to `__ap_long_mode_entry` in the kernel's text. That loads the captured control
+   registers, so the CPU joins the one kernel address space, points `GS` at its block, and
+   takes its stack.
+4. In Rust the secondary loads its own GDT and TSS, which carry its own #DF IST stack
+   (8 KiB, where the boot CPU's is 16 KiB), and the shared IDT. It prepares its local APIC
+   through `IrqChip::init_cpu` (x2APIC mode when CPUID has it, MMIO otherwise), starts its
+   local APIC timer periodic at 100 Hz, and reports in.
+
+**IPIs** on x86_64 are fixed-delivery interrupts on vectors `0xF0` (function call) and
+`0xF1` (reschedule) and `0xF2` (TLB shootdown), addressed by APIC ID, which `init_cpu`
+returned on the target.
+`arch::smp::send(cpu, IPI_CALL | IPI_RESCHEDULE | IPI_TLB)` has the same names and
+meaning on both ports. It raises one IPI and returns without waiting, from any CPU. The local APIC timer is vector `0xEF` and the spurious
+vector `0xFF`. Device lines stay on 32..48, routed through the I/O APIC, so the per-line
+entry points serve the 8259A and the I/O APIC alike.
+
+**IPIs** on aarch64 are SGIs. SGI 0 runs a function on the target, SGI 1 is a reschedule, and
 SGI 2 is a TLB shootdown. `IrqChip::send_ipi` takes the routing token the target's
 `init_cpu` returned: an affinity value on a GICv3, and a CPU interface bit on a GICv2,
 which routes by interface number rather than MPIDR. A GICv2 SGI is acknowledged with its
 sender, so `claim` keeps it and `IrqChip::id` strips it.
 
-**The check.** On the `aarch64-virt-smp` preset, the `smp` line in the banner gates the
-exit status. It requires all of the following:
+**The check.** On the `aarch64-virt-smp` and `x86_64-qemu-smp` presets, the `smp` line
+in the banner gates the exit status. It requires all of the following:
 
-- the tree lists exactly `QEMU_CPUS` CPUs;
+- firmware lists exactly `QEMU_CPUS` CPUs;
 - each CPU reports its own number through both interfaces, asked on itself;
-- each secondary takes its own timer interrupts;
+- on x86_64, each CPU's local APIC reports the APIC ID it was started for, no two alike,
+  and each has its own GDT, TSS and #DF stack loaded, read back with `sgdt`;
+- each secondary takes its own timer interrupts. On x86_64 the rate must also be within a
+  factor of two of 100 Hz over a 200 ms TSC window, because the kernel calibrated that
+  timer itself;
 - a function-call IPI reaches each secondary, runs there, and a reschedule IPI comes
   back;
 - each CPU's `PerCpu` counter holds its own count;
 - one CPU holding a lock while another takes a second one records no ordering between
   them, which a shared held-lock stack would.
 
-These mutations each made the boot fail:
+These mutations each made the aarch64 boot fail:
 
 - two CPUs sharing a block;
 - IPIs sent to the boot CPU's token;
@@ -789,6 +844,24 @@ These mutations each made the boot fail:
 - a skipped redistributor wake;
 - a single lock-order stack;
 - a `-smp` smaller than the configuration.
+
+And these the x86_64 one:
+
+- every secondary's `GS` pointing at the boot CPU's block: `ids 0 WRONG(1) WRONG(2) WRONG(3)`,
+  and every IPI lost;
+- IPIs sent to the APIC ID after the target's: `ipi 0/3`;
+- INIT and startup IPIs sent to the APIC ID after the intended one: a CPU never reports in,
+  and the others come up under the wrong logical numbers;
+- the trampoline never copied: no secondary reports in;
+- every secondary loading CPU 0's GDT and TSS, which `ltr` accepts once the descriptor is
+  rewritten as available: `ids 0 WRONG(1) WRONG(2) WRONG(3)`. This one passed until the
+  `sgdt` read-back was added;
+- the timer's rate read ten times slow: the secondaries tick 132 times in 200 ms, and the
+  `tickless` check takes 39 interrupts;
+- the timer's rate read ten times fast: `preempt` sees 3 interrupts in 302 ms, and the run
+  hangs in the sleep phase until the harness times out;
+- the source overrides ignored, with IRQ 0 routed to GSI 0 instead of 2: `IRQ0 0 of 3 ticks`
+  and a failed `clock` line.
 
 The skipped wake is only visible because `init_cpu` refuses a redistributor that stays
 asleep: QEMU delivers to one anyway.
@@ -884,11 +957,16 @@ uses it. It is not used here, so that one protocol with acknowledgements serves 
 port, including those whose TLBs have no broadcast form. It also means a shootdown that
 misses a CPU cannot be quietly covered by the broadcast.
 
+On x86_64 the local flush is `invlpg`, or a `CR3` reload for everything, and the
+`Ipi::TlbFlush` is a fixed-delivery interrupt on vector `0xF2`. The protocol above is
+unchanged: the port only supplies the local flush and the IPI.
+
 **The rule that keeps the wait from deadlocking:** the initiator may wait with interrupts
 masked, so no lock it holds across a shootdown may be waited for by another CPU with
 interrupts masked. See [memory-model.md](memory-model.md).
 
-**The check.** On `aarch64-virt-smp` the `shootdown` banner line gates the exit status:
+**The check.** On `aarch64-virt-smp` and `x86_64-qemu-smp` the `shootdown` banner line gates
+the exit status:
 
 1. A page is mapped at a free address, and every secondary reads it through an IPI, so
    each caches the translation.
@@ -908,13 +986,17 @@ Also not yet:
   overflows would share it;
 - SPIs are all delivered to CPU 0;
 - CPUs are never stopped or hot-unplugged;
-- x86 has `HasSmp::MAX_CPUS = 1` and no `HasIpi` until the APIC driver exists;
 - timers are one queue, so the boot CPU takes every expiry and wakes sleepers for every
   CPU;
 - the scheduler lock is one lock for every run queue;
 - a shootdown targets every online CPU, including ones that cannot have cached the
   translation, and flushes one page per request. `mm::vm` operations on many pages pay
   one round of IPIs per page.
+- every device interrupt is routed to the boot CPU, and only ISA IRQs are routed at all:
+  PCI interrupts need `_PRT` from the ACPI namespace;
+- i686 starts no second CPU and keeps `HasSmp::MAX_CPUS = 1`;
+- the I/O APIC's select-then-access registers assume one CPU programs them, which holds
+  while only the boot CPU enables lines.
 
 ## Boot flow
 

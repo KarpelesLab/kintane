@@ -38,6 +38,13 @@
 //! Phase 1 replaces the identity map with a high-half mapping, which also changes the
 //! code model in the target specification.
 //!
+//! Both entries point `GS` at CPU 0's block (`smp.rs`) before any Rust runs, because
+//! [`crate::smp::cpu_index`] reads the CPU's number through `GS` and lock-order checking
+//! asks for it inside the first lock taken. A secondary does the same in its own entry,
+//! with its own block. The bootstrap page tables are also named `__boot_pml4` for a
+//! secondary's trampoline, which enters long mode on them before switching to the
+//! kernel's.
+//!
 //! # The second way in: `kinboot_entry`
 //!
 //! A UEFI loader cannot call `_start`. The firmware runs in long mode and has no 32-bit
@@ -149,6 +156,13 @@ long_mode_start:
     movq $__stack_top, %rsp
     xorq %rbp, %rbp
 
+    /* GS base: CPU 0's block. After the selector loads above, which may clear it. */
+    movl $0xC0000101, %ecx
+    leaq __cpu_blocks(%rip), %rax
+    movq %rax, %rdx
+    shrq $32, %rdx
+    wrmsr
+
     movl multiboot_info, %edi
     call kmain
 
@@ -211,6 +225,12 @@ kinboot_entry:
     movw %ax, %fs
     movw %ax, %gs
 
+    movl $0xC0000101, %ecx
+    leaq __cpu_blocks(%rip), %rax
+    movq %rax, %rdx
+    shrq $32, %rdx
+    wrmsr
+
     movq %rbx, %rdi
     xorq %rbp, %rbp
     call kmain
@@ -227,6 +247,8 @@ gdt64_pointer:
 
 .section .bss
 .align 4096
+.globl __boot_pml4
+__boot_pml4:
 pml4:
     .skip 4096
 pdpt:

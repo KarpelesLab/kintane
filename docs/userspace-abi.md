@@ -24,7 +24,9 @@ exists:
 - **`hal::HasUserMode`** — the per-port contract: enter user mode, take a system call
   and a fault from it, and copy across the boundary without trusting the pointer.
   Implemented for x86_64 (`arch/x86_64/src/user.rs`: the `syscall`/`sysret` fast path,
-  ring-3 GDT segments, `TSS.rsp0` per thread, the `SYSRET` canonical hazard handled) and
+  ring-3 GDT segments in every CPU's GDT, `TSS.rsp0` per thread installed on whichever CPU
+  it runs, the `swapgs` discipline for per-CPU `GS`, the `SYSRET` canonical hazard
+  handled) and
   aarch64 (`arch/aarch64/src/user.rs`: `eret` to EL0t, the `svc` decode in the lower-EL
   vector, `SP_EL0` per thread).
 - **The syscalls** for the slice: `process_exit`, `thread_exit`, `thread_yield`,

@@ -83,7 +83,11 @@ A target clears its bit **after** it flushes. The cleared bit is the initiator's
 to reuse a frame, so clearing first would publish that licence before it was true. A host
 test runs the flush callback while asserting the bit is still outstanding.
 
-### The architecture's per-CPU blocks and hooks (`arch/aarch64/src/smp.rs`, `tick.rs`)
+### The architecture's per-CPU blocks and hooks (`arch/aarch64/src/smp.rs`, `arch/x86_64/src/smp.rs`, `tick.rs`)
+
+Both ports publish the same state the same way; the x86_64 names differ only in the
+start-up column (APIC ID and captured control registers instead of MPIDR and translation
+registers).
 
 | State | Written | Read | Ordering |
 |---|---|---|---|

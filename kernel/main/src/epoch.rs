@@ -240,8 +240,12 @@ fn reader(cpu: u64) -> u64 {
         };
         if let Some(node) = head.load(&guard) {
             let first = node.stamp.load(Ordering::Acquire);
-            for _ in 0..READ_PAUSE {
-                core::hint::spin_loop();
+            // A plain counted loop, not `spin_loop`: QEMU's x86 emulation ends the translated
+            // block at every `pause`, so 4096 of them took milliseconds. The window stayed
+            // wide, but a reader then re-pinned so rarely that the writer's bag filled before
+            // the epoch could advance, and the check failed on timing it never meant to test.
+            for i in 0..READ_PAUSE {
+                core::hint::black_box(i);
             }
             let again = node.stamp.load(Ordering::Acquire);
             if first == POISON || first != again {

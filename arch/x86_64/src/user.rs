@@ -13,15 +13,25 @@
 //! 4. **A way back.** `SYSRET` for a return from a system call, `iretq` for the first entry into
 //!    user mode and for resuming after a fault.
 //!
-//! # The `swapgs` discipline, and why there is none yet
+//! # The `swapgs` discipline
 //!
-//! On a machine with per-CPU state reached through `GS`, the entry's first act is
-//! `swapgs`, so a kernel `GS` base replaces the user one before any `gs:`-relative access,
-//! and its last act before `sysret` swaps back. This port has one CPU and no per-CPU `GS`,
-//! so the entry keeps the kernel stack in a plain global and does no `swapgs`. When the
-//! SMP work gives each CPU a `GS` base, the saved user stack and the kernel stack move
-//! into that per-CPU block and the entry gains a `swapgs` at each end; the entry is shaped
-//! for that — it touches exactly two globals, which become two `gs:` offsets.
+//! Each CPU's `GS` base names its block (`smp.rs`). While the kernel runs, `GS` is that block
+//! and `MSR_KERNEL_GS_BASE` holds the user value; while user code runs, the two are
+//! exchanged. So every way into ring 3 swaps once on the way out, and every way back swaps
+//! once on the way in:
+//!
+//! * [`syscall_entry`] swaps first, before any `gs:` access, and swaps back just before `sysretq`;
+//! * an interrupt or exception from ring 3 swaps at the top of its handler and, if it returns, at
+//!   the bottom (`smp::gs_enter`, `smp::gs_leave`);
+//! * [`X86_64::enter_user`] swaps just before its `iretq`.
+//!
+//! The kernel stack a `syscall` switches to is the running CPU's `kernel_rsp`, reached through
+//! `GS`, and installed together with `TSS.rsp0` whenever a user thread starts or is switched
+//! to on that CPU. The user stack pointer is parked in the block for the two instructions it
+//! takes to reach the kernel stack, then pushed there, so a system call that blocks and
+//! resumes on another CPU returns to the right stack. User code can load its own `GS`
+//! selector; the only descriptors it can name have a zero base, and the swap on entry takes
+//! whatever base it left out of the kernel's way.
 //!
 //! # The `SYSRET` canonical-address hazard
 //!
@@ -79,13 +89,6 @@ impl SyscallFrameTrait for SyscallFrame {
     }
 }
 
-/// The running thread's kernel stack top, loaded by [`syscall_entry`]. One global on this
-/// uniprocessor port; a `gs:` offset once there is per-CPU state. Set by [`bind_current`]
-/// and [`X86_64::enter_user`].
-static KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
-/// Where [`syscall_entry`] stashes the user stack pointer across the call.
-static USER_RSP: AtomicU64 = AtomicU64::new(0);
-
 /// The installed hooks. `syscall` and `kill` are called through it; `fault` is used by the
 /// page-fault path and the user copies.
 struct Hooks(UnsafeCell<Option<UserHooks<SyscallFrame>>>);
@@ -131,10 +134,12 @@ core::arch::global_asm!(
 .section .text, "ax"
 .globl __syscall_entry
 __syscall_entry:
-    // Interrupts are already off: SFMASK cleared IF on entry. Swap to the kernel stack,
-    // saving the user one. (No swapgs: see the module comment.)
-    mov     [rip + {user_rsp}], rsp
-    mov     rsp, [rip + {kernel_rsp}]
+    // Interrupts are already off: SFMASK cleared IF on entry. The kernel's GS first, then
+    // the kernel stack, parking the user one in this CPU's block only until it is pushed.
+    swapgs
+    mov     gs:[{user_rsp}], rsp
+    mov     rsp, gs:[{kernel_rsp}]
+    push    qword ptr gs:[{user_rsp}]
 
     // Build a SyscallFrame. Push order is reverse of the struct, so rax (the number) ends
     // up at the lowest address, which is where rsp points and where the struct begins.
@@ -160,11 +165,12 @@ __syscall_entry:
     pop     r9
     pop     rcx                 // user rip
     pop     r11                 // user rflags
-    mov     rsp, [rip + {user_rsp}]
+    pop     rsp                 // user stack, from this thread's own kernel stack
+    swapgs
     sysretq
 "#,
-    user_rsp = sym USER_RSP,
-    kernel_rsp = sym KERNEL_RSP,
+    user_rsp = const crate::smp::USER_RSP_OFFSET,
+    kernel_rsp = const crate::smp::KERNEL_RSP_OFFSET,
 );
 
 unsafe extern "C" {
@@ -179,10 +185,13 @@ const EFER_SCE: u64 = 1 << 0;
 /// Clear the interrupt flag and the direction flag on entry.
 const SFMASK: u64 = (1 << 9) | (1 << 10);
 
-/// Turn on `syscall`, and point it at [`syscall_entry`].
+/// Turn on `syscall` on the running CPU, and point it at [`syscall_entry`].
+///
+/// The four MSRs are per CPU, so this runs on the boot CPU from `install` and on each
+/// secondary as it comes up (`smp::set_cpu_init`).
 ///
 /// # Safety
-/// Once, on the boot CPU with interrupts masked, after the GDT is loaded.
+/// Once per CPU, on that CPU with interrupts masked, after its GDT is loaded.
 unsafe fn init_syscall() {
     // STAR[47:32] = kernel code (syscall loads CS = this, SS = this + 8 = kernel data).
     // STAR[63:48] = kernel data (sysret loads CS = this + 16 = user code, SS = this + 8 =
@@ -214,6 +223,8 @@ impl hal::HasUserMode for X86_64 {
         KERNEL_ROOT.store(kernel_root.raw(), Ordering::Relaxed);
         // SAFETY: caller's obligation — boot CPU, masked, GDT loaded.
         unsafe { init_syscall() };
+        // Every secondary started from here on sets its own MSRs the same way.
+        crate::smp::set_cpu_init(init_syscall);
     }
 
     fn bind(ctx: &mut Self::Context, kernel_stack_top: KernAddr, root: PhysAddr) {
@@ -227,16 +238,17 @@ impl hal::HasUserMode for X86_64 {
         args: [usize; 4],
         kernel_stack_top: KernAddr,
     ) -> ! {
-        // Traps from ring 3, and the syscall entry, both return to this stack.
+        // Traps from ring 3, and the syscall entry, both land on this stack, on this CPU.
         // SAFETY: the TSS is loaded and interrupts are masked (a thread enters user mode
         // from its own kernel context with them masked); `top` is this thread's kernel
         // stack.
-        unsafe { gdt::set_kernel_stack(kernel_stack_top.raw() as u64) };
-        KERNEL_RSP.store(kernel_stack_top.raw() as u64, Ordering::Relaxed);
+        unsafe { crate::smp::install_kernel_stack(kernel_stack_top.raw() as u64) };
         // SAFETY: an `iretq` into ring 3 with a frame this builds; the segment selectors
         // are the ring-3 pair, RFLAGS has IF set so user code runs with interrupts on, and
         // `entry`/`stack` are in the process's mapped user half. Every register not carrying
-        // an argument is cleared, so nothing kernel-side leaks into the process.
+        // an argument is cleared, so nothing kernel-side leaks into the process. The
+        // `swapgs` puts the CPU's `GS` pair in the user arrangement, the last thing before
+        // ring 3; interrupts stay masked from it to the `iretq`.
         unsafe {
             core::arch::asm!(
                 "push {ss}",
@@ -255,6 +267,7 @@ impl hal::HasUserMode for X86_64 {
                 "xor r13, r13",
                 "xor r14, r14",
                 "xor r15, r15",
+                "swapgs",
                 "iretq",
                 ss = in(reg) u64::from(USER_DATA_SELECTOR),
                 rsp = in(reg) stack as u64,
@@ -331,20 +344,5 @@ fn page_ready(va: usize, write: bool) -> bool {
     match paging::user_leaf_bits(va) {
         Some(bits) => bits & USER_BIT != 0 && (!write || bits & WRITABLE != 0),
         None => false,
-    }
-}
-
-/// Set the current thread's kernel stack and process root, for a switch that returns into
-/// its user code. On this single-process slice the root is loaded once by `enter_user`;
-/// this exists for the switch path a second process will need.
-///
-/// # Safety
-/// On the thread being switched to, with interrupts masked.
-#[allow(dead_code)]
-pub(crate) unsafe fn bind_current(ctx: &crate::context::Context) {
-    if ctx.user_kernel_stack != 0 {
-        KERNEL_RSP.store(ctx.user_kernel_stack, Ordering::Relaxed);
-        // SAFETY: the TSS is loaded; caller guarantees masked, on the target thread.
-        unsafe { gdt::set_kernel_stack(ctx.user_kernel_stack) };
     }
 }

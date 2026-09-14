@@ -1,0 +1,16 @@
+# The x86 local APIC and I/O APIC, bound from the ACPI MADT.
+#
+# The register arithmetic — redirection entries, source-override routing, timer counts,
+# interrupt command words — is plain logic over a register-access trait, so it is
+# host-tested under every preset, like the GIC. Only the model-specific-register access
+# that x2APIC mode needs is instructions, and that one module is selected by target
+# architecture.
+[unit]
+name = "apic"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = ["hal", "device"]

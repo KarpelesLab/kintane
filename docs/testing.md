@@ -377,7 +377,7 @@ hook, which re-armed the same deadline, so the bug became a hang again. The thir
 unmasks explicitly and removes the hook while it watches, and it reports FAILED on the
 unsigned limit.
 
-**On several CPUs** (`aarch64-virt-smp`) the scheduler runs every CPU and the same
+**On several CPUs** (`aarch64-virt-smp`, `x86_64-qemu-smp`) the scheduler runs every CPU and the same
 workloads spread across them. Two more checks join the audit there:
 
 - **Spread.** The two heap workloads never block, so only balancing moves them off the CPU that
@@ -417,7 +417,7 @@ reschedule IPIs and 3.97 million shootdowns. The four CPUs completed 27.9, 27.6,
 24.9 million workload iterations.
 
 Every merge runs a 20-second stress smoke on each tier-1 architecture and on
-`aarch64-virt-smp`, which keeps the image building and passing its first audits. A nightly workflow
+`aarch64-virt-smp` and `x86_64-qemu-smp`, which keeps the image building and passing its first audits. A nightly workflow
 (`.github/workflows/stress.yml`) runs 30 minutes per tier-1 preset,
 and takes a duration input when dispatched by hand. The 24-hour run is that dispatch
 with `24h`. GitHub-hosted runners cap a job at six hours, so it needs a self-hosted
@@ -451,6 +451,7 @@ hand:
 | aarch64 | `qemu-system-aarch64` | `virt` | AAVMF, or `-kernel` | semihosting |
 | aarch64 (`aarch64-virt-smp`) | `qemu-system-aarch64` | `virt`, `-smp 4` | `-kernel`, secondaries through PSCI | semihosting |
 | armv7m (`armv7m-mps2`) | `qemu-system-arm` | `mps2-an385` (Cortex-M3) | none: `-kernel`, executing in place | semihosting |
+| x86_64 (`x86_64-qemu-smp`) | `qemu-system-x86_64` | `q35`, `-smp 4` | `-kernel`, secondaries through INIT and startup IPIs | `isa-debug-exit` |
 | riscv32 (`riscv32-virt`) | `qemu-system-riscv32` | `virt` | `-bios none`, `-kernel` | `sifive_test` |
 
 The `-kernel` rows also pass `-append` with the command line the configuration's default
@@ -478,10 +479,18 @@ passing an SMP check on one CPU. Its `smp` and `shootdown` banner lines are desc
 and the stress run, where the scheduler works across all four CPUs. The one-CPU preset
 reports both lines as skipped: `SMP=n`, so nothing was started.
 
+The `x86_64-qemu-smp` preset is the same for x86_64: the `x86_64-qemu` kernel with `SMP=y`
+and `QEMU_CPUS=4`, whose `smp` line requires the MADT to list exactly four processors and
+each started one to prove its number, its APIC ID, its own GDT and TSS, its timer's rate,
+an IPI round trip, its per-CPU counter and its lock-order stack. It runs every mode
+`x86_64-qemu` runs. The two-CPU x86_64 presets report the line as skipped. With a local
+APIC that lacks x2APIC mode (`--set QEMU_CPU=max,-x2apic`) the same preset exercises the
+driver's MMIO path; that run is not in CI.
+
 Every x86 row also gets two CPUs (`QEMU_CPUS`) and, with `QEMU_PCI_TEST_DEVICE`, a
 `pci-testdev` behind a bridge: a PCI Express root port on q35, a PCI-to-PCI bridge on pc.
-The kernel starts only one CPU, and nothing drives the test device. They exist so that
-device discovery has something to be wrong about:
+Outside the SMP presets the kernel starts only one CPU, and nothing drives the test
+device. They exist so that device discovery has something to be wrong about:
 
 - the MADT must list exactly two enabled processors;
 - enumeration must follow the bridge to find the device;

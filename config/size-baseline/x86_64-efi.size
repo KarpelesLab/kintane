@@ -1,35 +1,36 @@
 # kbuild size report for preset x86_64-efi. Rewrite with `kbuild size --preset x86_64-efi --update-baseline`.
 section .bss 188416
-section .data 100560
+section .data 103280
 section .note.kintane 36
-section .rodata 73688
+section .rodata 77784
 section .stack 16384
-section .text 237568
-section .thread_stacks 262144
-crate (anonymous) text 0 rodata 2269 data 0 bss 0
-crate (unmangled) text 1239 rodata 0 data 0 bss 0
+section .text 249856
+section .thread_stacks 393216
+crate (anonymous) text 0 rodata 3144 data 0 bss 0
+crate (unmangled) text 1239 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 2575 rodata 0 data 0 bss 0
 crate acpi text 5696 rodata 0 data 0 bss 0
-crate arch text 32376 rodata 0 data 361 bss 90497
+crate apic text 5340 rodata 0 data 304 bss 232
+crate arch text 32275 rodata 0 data 1089 bss 90993
 crate boot_protocol text 2143 rodata 0 data 0 bss 0
 crate bootinfo text 2069 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
-crate core text 9764 rodata 0 data 0 bss 0
-crate device text 17750 rodata 0 data 0 bss 0
+crate core text 9887 rodata 0 data 0 bss 0
+crate device text 17892 rodata 0 data 0 bss 0
 crate elf text 2383 rodata 0 data 0 bss 0
 crate hal text 531 rodata 0 data 0 bss 0
 crate ipc text 1513 rodata 16 data 0 bss 0
 crate kalloc text 13946 rodata 0 data 0 bss 0
-crate kintane text 59895 rodata 48 data 6444 bss 55616
+crate kintane text 66319 rodata 48 data 6444 bss 55705
 crate kobject text 2603 rodata 0 data 0 bss 0
 crate mm text 32751 rodata 0 data 0 bss 0
-crate platform text 16449 rodata 192 data 92624 bss 1672
+crate platform text 18090 rodata 48 data 93288 bss 1672
 crate sched text 3385 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
-crate sync text 9345 rodata 32 data 1088 bss 272
+crate sync text 8284 rodata 32 data 1088 bss 272
 crate thread text 6694 rodata 0 data 0 bss 0
 crate time text 2782 rodata 0 data 0 bss 0
 crate unwind text 3206 rodata 0 data 0 bss 0
-total 878796
+total 1028972

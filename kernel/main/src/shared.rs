@@ -414,6 +414,9 @@ fn tickless_phase(c: &dyn EarlyConsole) -> Check {
     Check::from_ok(ok && full_reach)
 }
 
+/// How long [`full_reach_is_not_early`] takes interrupts before it starts counting.
+const DRAIN: Duration = Duration::from_nanos(2_000_000);
+
 /// How long [`full_reach_is_not_early`] waits for an interrupt that must not come.
 const REACH_WATCH: Duration = Duration::from_nanos(20_000_000);
 
@@ -433,6 +436,21 @@ fn full_reach_is_not_early(c: &dyn EarlyConsole, reach: u64) -> bool {
     arch::tick::set_hook(None);
     // SAFETY: masked, as `arm_ns` requires. The timer is in one-shot mode, since
     // `timekeeping::init` succeeded or `reach` would be zero.
+    unsafe { arch::tick::arm_ns(reach) };
+    // Take any interrupt an earlier arming already raised before counting. A local APIC
+    // latches a timer interrupt that fires while the CPU is masked, and rearming does not
+    // withdraw it, so without this the watch counted a stale slice's tick as the new arming
+    // firing early: once in fifteen x86_64 SMP boots. An arming that really fires at once
+    // fires again after the second arming below, and is still caught.
+    //
+    // SAFETY: as for the watch below; with no hook the handler only counts.
+    unsafe { arch::tick::enable_interrupts() };
+    let drain = timekeeping::now();
+    while timekeeping::now().saturating_duration_since(drain) < DRAIN {
+        core::hint::spin_loop();
+    }
+    let _ = <arch::Cpu as Arch>::irq_save();
+    // SAFETY: masked again, as `arm_ns` requires.
     unsafe { arch::tick::arm_ns(reach) };
     let interrupts = arch::tick::ticks();
     let start = timekeeping::now();

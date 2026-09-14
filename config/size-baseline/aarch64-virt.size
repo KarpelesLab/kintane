@@ -22,7 +22,7 @@ crate gic text 4152 rodata 0 data 0 bss 224
 crate hal text 592 rodata 0 data 0 bss 0
 crate ipc text 1688 rodata 16 data 0 bss 0
 crate kalloc text 12388 rodata 0 data 0 bss 0
-crate kintane text 59316 rodata 48 data 6444 bss 56329
+crate kintane text 59484 rodata 48 data 6444 bss 56329
 crate kobject text 2876 rodata 0 data 0 bss 0
 crate mm text 27932 rodata 0 data 0 bss 0
 crate pl011 text 1140 rodata 0 data 80 bss 24

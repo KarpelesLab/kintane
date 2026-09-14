@@ -27,12 +27,13 @@ pub mod pc;
 pub mod pic;
 pub mod pit;
 pub mod serial;
+pub mod smp;
 pub mod tick;
 #[cfg(CONFIG_USERSPACE)]
 pub mod user;
 
 pub use clock::{clock_source, spin_with_timer_interrupts};
-use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasMmu, HasSmp};
+use hal::{Arch, Endian, HasCas, HasCoherentDma, HasFpu, HasIpi, HasMmu, HasSmp, Ipi};
 pub use serial::EARLY;
 
 /// The x86-64 architecture.
@@ -96,6 +97,10 @@ impl Arch for X86_64 {
             }
         }
     }
+
+    fn cpu_index() -> usize {
+        smp::cpu_index()
+    }
 }
 
 impl HasMmu for X86_64 {
@@ -104,14 +109,50 @@ impl HasMmu for X86_64 {
 }
 
 impl HasSmp for X86_64 {
-    // One until the APIC driver brings up a second CPU; see `cpu_id`.
-    const MAX_CPUS: usize = 1;
+    const MAX_CPUS: usize = smp::MAX_CPUS;
 
     fn cpu_id() -> u32 {
-        // Placeholder until the APIC driver exists in Phase 3. Correct for the
-        // uniprocessor Phase 0 build and wrong for any other, which is why SMP is
-        // off in every preset that exists today.
-        0
+        // The logical index `GS` names, the same number `cpu_index` returns; see `smp`.
+        smp::cpu_index() as u32
+    }
+}
+
+impl HasIpi for X86_64 {
+    fn cpu_online(cpu: usize) -> bool {
+        smp::is_online(cpu)
+    }
+
+    fn send_ipi(cpu: usize, ipi: Ipi) -> bool {
+        smp::send(
+            cpu,
+            match ipi {
+                Ipi::Call => smp::IPI_CALL,
+                Ipi::Reschedule => smp::IPI_RESCHEDULE,
+                Ipi::TlbFlush => smp::IPI_TLB,
+            },
+        )
+    }
+
+    fn call_on(cpu: usize, f: fn(u64) -> u64, arg: u64) -> Option<u64> {
+        smp::call(cpu, f, arg)
+    }
+
+    fn set_tlb_flush_handler(handler: Option<fn()>) {
+        smp::set_tlb_handler(handler);
+    }
+
+    fn set_tlb_shootdown(hook: Option<fn(Option<usize>)>) {
+        smp::set_shootdown(hook);
+    }
+
+    unsafe fn flush_tlb_local(addr: Option<usize>) {
+        // SAFETY: forwarded; the caller's contract.
+        unsafe { paging::flush_local(addr) };
+    }
+
+    unsafe fn release_secondaries(entry: fn(usize) -> !) {
+        // SAFETY: the caller's contract is `release`'s.
+        unsafe { smp::release(entry) };
     }
 }
 

@@ -10,4 +10,4 @@ DEBUG_BUILD=y
 QEMU_EXIT=y
 KINBOOT_BIOS=y
 # The kernel's budget, as in x86_64-qemu; the loader's stages carry their own.
-SIZE_BUDGET_KIB=1024
+SIZE_BUDGET_KIB=1280

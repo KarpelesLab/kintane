@@ -297,25 +297,37 @@ impl HasPageTables for X86_64 {
     }
 
     unsafe fn flush_tlb(addr: Option<usize>) {
-        match addr {
-            Some(a) => {
-                // SAFETY: `invlpg` drops any cached translation for one address and
-                // has no other effect; an address with no cached translation is a
-                // no-op rather than a fault. Not `nomem`, because the point of the
-                // instruction is that memory accesses after it mean something
-                // different from those before.
-                unsafe { asm!("invlpg [{}]", in(reg) a, options(nostack, preserves_flags)) };
-            }
-            None => {
-                // Reloading CR3 with its own value flushes everything that is not
-                // global. Global entries would need CR4.PGE toggled; this kernel never
-                // sets PGE, so there are none.
-                let cr3 = X86_64::root().raw();
-                // SAFETY: writing back the value just read leaves the active table
-                // unchanged, so the mapping the current instruction stream depends on
-                // cannot go away underneath it.
-                unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
-            }
+        // SAFETY: forwarded; the caller's contract.
+        unsafe { flush_local(addr) };
+        // Then every other CPU that may cache it, once the kernel has installed the
+        // shootdown; until then no other CPU runs anything a remap could reach.
+        crate::smp::shootdown(addr);
+    }
+}
+
+/// Invalidate `addr` (`None` for everything) on this CPU only: what [`HasPageTables::flush_tlb`]
+/// does before extending the invalidation, and what a shootdown target does.
+///
+/// # Safety
+/// As [`HasPageTables::flush_tlb`].
+pub(crate) unsafe fn flush_local(addr: Option<usize>) {
+    match addr {
+        Some(a) => {
+            // SAFETY: `invlpg` drops any cached translation for one address and has no
+            // other effect; an address with no cached translation is a no-op rather than a
+            // fault. Not `nomem`, because the point of the instruction is that memory
+            // accesses after it mean something different from those before.
+            unsafe { asm!("invlpg [{}]", in(reg) a, options(nostack, preserves_flags)) };
+        }
+        None => {
+            // Reloading CR3 with its own value flushes everything that is not global.
+            // Global entries would need CR4.PGE toggled; this kernel never sets PGE, so
+            // there are none.
+            let cr3 = X86_64::root().raw();
+            // SAFETY: writing back the value just read leaves the active table unchanged,
+            // so the mapping the current instruction stream depends on cannot go away
+            // underneath it.
+            unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
         }
     }
 }

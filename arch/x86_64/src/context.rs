@@ -144,6 +144,18 @@ impl HasContextSwitch for X86_64 {
     }
 
     unsafe fn switch(from: *mut Context, to: *const Context) {
+        // A thread that runs user code takes its kernel stack to whichever CPU it resumes
+        // on: that CPU's `TSS.rsp0` and `syscall` stack are what a trap from its user code
+        // will land on. Kernel-only threads leave both alone; nothing enters ring 0 from a
+        // lower ring while they run.
+        // SAFETY: the caller's contract makes `to` a valid context and the switch masked,
+        // on the CPU `to` is about to run on.
+        let user_stack = unsafe { (*to).user_kernel_stack };
+        if user_stack != 0 {
+            // SAFETY: masked, on the CPU that is about to run the thread the stack belongs
+            // to, which `bind` recorded.
+            unsafe { crate::smp::install_kernel_stack(user_stack) };
+        }
         // SAFETY: forwarded verbatim; the caller upholds `switch_raw`'s contract, which
         // is this function's own.
         unsafe { switch_raw(from, to) }

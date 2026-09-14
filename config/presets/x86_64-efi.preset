@@ -13,4 +13,4 @@ QEMU_EXIT=y
 # OVMF itself wants memory: 128 MiB boots, but leaves the kernel little to test with.
 QEMU_MEMORY_MB=256
 # The kernel's budget, as in x86_64-qemu.
-SIZE_BUDGET_KIB=1024
+SIZE_BUDGET_KIB=1280

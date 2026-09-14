@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [x86_64-qemu, i686-qemu, aarch64-virt, aarch64-virt-smp]
+        preset: [x86_64-qemu, i686-qemu, aarch64-virt, aarch64-virt-smp, x86_64-qemu-smp]
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     # The job's own budget: the longest duration a hosted runner allows. A self-hosted
     # runner is not held to it by GitHub, and kbuild's timeout bounds the run anyway.

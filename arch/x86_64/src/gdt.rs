@@ -35,17 +35,14 @@
 //!
 //! ## Layout and why it is not larger
 //!
-//! Four slots: null, the 64-bit code segment, and the TSS descriptor, which is a
-//! *system* descriptor and so occupies two slots rather than one. The code descriptor
-//! is bit-for-bit the one `boot.rs` installed, at the same index, so `CS` stays valid
-//! across the `lgdt` with no far jump — and it must exist, because every `iret` out of
-//! an interrupt reloads `CS` from the stack and re-reads this table.
-//!
-//! No data segment is defined. In 64-bit mode `DS`/`ES`/`SS` are ignored for
-//! addressing and the boot path loads them with the null selector; the descriptors
-//! that will be needed are the ring-3 pair, and those arrive with userspace, together
-//! with `rsp0` in the TSS below, which is meaningless until there is a ring to come
-//! back from.
+//! Seven slots: null, the 64-bit kernel code segment, kernel data, user data, user code,
+//! and the TSS descriptor, which is a *system* descriptor and so occupies two slots rather
+//! than one. The code descriptor is bit-for-bit the one `boot.rs` installed, at the same
+//! index, so `CS` stays valid across the `lgdt` with no far jump — and it must exist,
+//! because every `iret` out of an interrupt reloads `CS` from the stack and re-reads this
+//! table. The data and user descriptors sit in the order `SYSCALL`/`SYSRET` derive their
+//! selectors in; see [`CODE_INDEX`]. Every CPU's GDT carries all of them, so a user thread
+//! can run on any CPU.
 //!
 //! ## What this was verified against, and the gap it exposed
 //!
@@ -80,12 +77,13 @@
 //!
 //! ## Per-CPU
 //!
-//! One GDT, one TSS, one IST stack, all statics. That is correct for exactly as long
-//! as `HasSmp::cpu_id` returns a constant 0. SMP needs one of each per CPU — two CPUs
-//! sharing an IST stack would have the second's double fault overwrite the first's
-//! frame — and that is the per-CPU work in Phase 3, which this file is deliberately
-//! shaped to accept: everything below is addressed through one `init` rather than
-//! referenced by name from elsewhere.
+//! One GDT, one TSS and one #DF stack per CPU, indexed by the CPU's logical number. Two
+//! CPUs sharing an IST stack would have the second's double fault overwrite the first's
+//! frame, and a TSS is marked busy by the `ltr` that loads it, so a second CPU loading the
+//! first's is #GP. The boot CPU's #DF stack keeps its 16 KiB. A secondary's is 8 KiB,
+//! because every CPU the port could start pays for its stack in `.bss` whether or not it
+//! is started, and what the #DF handler needs is a report and a bounded backtrace, a few
+//! hundred bytes of frames. The IDT stays shared: every CPU loads the same one.
 //!
 //! Reference: Intel SDM Vol. 3A, §7.7 (64-bit TSS format), §6.14.5 (the interrupt
 //! stack table), and §3.5.2 / figure 8-4 (the system-segment descriptor, and why it is
@@ -93,6 +91,8 @@
 
 use core::cell::UnsafeCell;
 use core::mem::size_of;
+
+use crate::smp::MAX_CPUS;
 
 /// The 64-bit code segment descriptor, identical to the one `boot.rs` loads.
 ///
@@ -152,6 +152,9 @@ pub const DF_IST_INDEX: u8 = (DF_IST_SLOT as u8) + 1;
 /// to diagnose.
 const DF_STACK_BYTES: usize = 16 * 1024;
 
+/// A secondary CPU's #DF stack; see the module documentation for why it is smaller.
+const SECONDARY_DF_STACK_BYTES: usize = 8 * 1024;
+
 /// A stack, aligned so the CPU's 16-byte alignment of RSP on IST entry never has to
 /// move the pointer out of the object.
 ///
@@ -165,12 +168,13 @@ const DF_STACK_BYTES: usize = 16 * 1024;
 /// which is a triple fault, in the handler whose entire purpose is to not triple-fault.
 /// Interior mutability puts it in `.bss`, which is what it is.
 #[repr(C, align(16))]
-struct Stack(UnsafeCell<[u8; DF_STACK_BYTES]>);
+struct Stack<const N: usize>(UnsafeCell<[u8; N]>);
 
 // SAFETY: this static is never read or written by Rust code — only its address is
 // taken, and only to be handed to the CPU as a stack pointer. The CPU is the sole
-// writer, one delivery at a time, and #DF does not return.
-unsafe impl Sync for Stack {}
+// writer, one delivery at a time on the one CPU whose TSS names it, and #DF does not
+// return.
+unsafe impl<const N: usize> Sync for Stack<N> {}
 
 /// Backing store for the double-fault stack.
 ///
@@ -181,7 +185,20 @@ unsafe impl Sync for Stack {}
 /// anyway. Overflowing the double-fault stack is a triple fault either way; a guard
 /// page would turn it into a #PF the handler cannot service, which is not obviously
 /// better. Revisit when there is more than one CPU and stacks stop being statics.
-static DF_STACK: Stack = Stack(UnsafeCell::new([0; DF_STACK_BYTES]));
+static DF_STACK: Stack<DF_STACK_BYTES> = Stack(UnsafeCell::new([0; DF_STACK_BYTES]));
+
+/// The secondaries' #DF stacks, CPU 1 in slot 0.
+static SECONDARY_DF_STACKS: [Stack<SECONDARY_DF_STACK_BYTES>; MAX_CPUS - 1] =
+    [const { Stack(UnsafeCell::new([0; SECONDARY_DF_STACK_BYTES])) }; MAX_CPUS - 1];
+
+/// The top of CPU `cpu`'s #DF stack, or `None` past [`MAX_CPUS`].
+fn df_stack_top_for(cpu: usize) -> Option<u64> {
+    if cpu == 0 {
+        return Some(DF_STACK.0.get() as usize as u64 + DF_STACK_BYTES as u64);
+    }
+    let stack = SECONDARY_DF_STACKS.get(cpu - 1)?;
+    Some(stack.0.get() as usize as u64 + SECONDARY_DF_STACK_BYTES as u64)
+}
 
 /// The 64-bit task state segment.
 ///
@@ -214,23 +231,25 @@ struct Tss {
 /// The TSS as a static with interior mutability, on the same invariant as the IDT.
 struct TssCell(UnsafeCell<Tss>);
 
-// SAFETY: single-writer-then-frozen. `init` is the only writer, runs once during early
-// initialisation with interrupts masked and before `ltr` makes the CPU care what is in
-// here, and no second CPU exists yet. After that the structure is read by hardware
-// only — the CPU reads an IST slot when it delivers #DF.
+// SAFETY: single-writer-then-frozen, per CPU. `init_cpu` is the only writer of CPU `n`'s
+// cell, runs once on CPU `n` with interrupts masked and before `ltr` makes that CPU care
+// what is in here, and no other CPU ever touches that cell. After that the structure is
+// read by hardware only — the CPU reads an IST slot when it delivers #DF.
 unsafe impl Sync for TssCell {}
 
-static TSS: TssCell = TssCell(UnsafeCell::new(Tss {
-    reserved0: 0,
-    rsp: [0; 3],
-    reserved1: 0,
-    ist: [0; 7],
-    reserved2: 0,
-    reserved3: 0,
-    // Cannot be `size_of::<Tss>()` in a const initialiser without naming the type
-    // twice; the assertion below checks the two agree.
-    iomap_base: 104,
-}));
+static TSS: [TssCell; MAX_CPUS] = [const {
+    TssCell(UnsafeCell::new(Tss {
+        reserved0: 0,
+        rsp: [0; 3],
+        reserved1: 0,
+        ist: [0; 7],
+        reserved2: 0,
+        reserved3: 0,
+        // Cannot be `size_of::<Tss>()` in a const initialiser without naming the type
+        // twice; the assertion below checks the two agree.
+        iomap_base: 104,
+    }))
+}; MAX_CPUS];
 
 const _: () = assert!(
     size_of::<Tss>() == 104,
@@ -250,7 +269,7 @@ struct GdtCell(UnsafeCell<Gdt>);
 // afterwards, and no concurrency exists at that point in boot.
 unsafe impl Sync for GdtCell {}
 
-static GDT: GdtCell = GdtCell(UnsafeCell::new(Gdt([0; 7])));
+static GDT: [GdtCell; MAX_CPUS] = [const { GdtCell(UnsafeCell::new(Gdt([0; 7]))) }; MAX_CPUS];
 
 /// The operand of `lgdt`: a 16-bit limit followed by a 64-bit base, unpadded.
 #[repr(C, packed(2))]
@@ -281,43 +300,57 @@ fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
     (low, high)
 }
 
-/// Install the GDT and the TSS, and point the task register at it.
-///
-/// After this returns, a gate with IST index [`DF_IST_INDEX`] will switch to the
-/// dedicated stack on delivery. `CS` is not reloaded and does not need to be: the code
-/// descriptor at index 1 is the one it already refers to.
+/// Install the boot CPU's GDT and TSS, and point its task register at them.
 ///
 /// # Safety
-/// Must be called once, with interrupts masked, before any gate that names an IST
-/// index can be delivered. Replacing the GDT out from under running code is otherwise
-/// undefined: the CPU keeps the descriptors it has already loaded in its hidden
-/// registers, so a mismatched table is not detected until the next `iret` or far
-/// transfer, at which point the failure is a #GP inside the fault path.
+/// As [`init_cpu`], on the boot CPU.
 pub unsafe fn init() {
+    // SAFETY: forwarded.
+    let _ = unsafe { init_cpu(0) };
+}
+
+/// Install CPU `cpu`'s GDT and TSS, and point its task register at them. `false` past
+/// [`MAX_CPUS`].
+///
+/// After this returns, a gate with IST index [`DF_IST_INDEX`] will switch to this CPU's
+/// dedicated stack on delivery. `CS` is not reloaded and does not need to be: the code
+/// descriptor at index 1 is the one it already refers to, on the boot CPU from `boot.rs`
+/// and on a secondary from its trampoline.
+///
+/// # Safety
+/// Must be called once per CPU, on that CPU, with interrupts masked, before any gate that
+/// names an IST index can be delivered to it. Replacing the GDT out from under running
+/// code is otherwise undefined: the CPU keeps the descriptors it has already loaded in its
+/// hidden registers, so a mismatched table is not detected until the next `iret` or far
+/// transfer, at which point the failure is a #GP inside the fault path.
+pub unsafe fn init_cpu(cpu: usize) -> bool {
     // The stack grows down, so the IST slot holds the address one past the end of the
     // buffer. The raw pointer is never dereferenced here: this address is deliberately
     // out of bounds and only ever used by hardware as a starting point to subtract
     // from.
-    let stack_top = DF_STACK.0.get() as usize as u64 + DF_STACK_BYTES as u64;
+    let (Some(stack_top), Some(tss_cell), Some(gdt_cell)) =
+        (df_stack_top_for(cpu), TSS.get(cpu), GDT.get(cpu))
+    else {
+        return false;
+    };
 
-    // SAFETY: upholds the TssCell invariant — the caller guarantees this runs once,
-    // during early initialisation, with interrupts masked and before `ltr` below, so
-    // this `&mut` is the only live reference and no hardware is reading the structure
-    // yet.
-    let tss = unsafe { &mut *TSS.0.get() };
+    // SAFETY: upholds the TssCell invariant — the caller guarantees this runs once, on
+    // this CPU, with interrupts masked and before `ltr` below, so this `&mut` is the only
+    // live reference and no hardware is reading the structure yet.
+    let tss = unsafe { &mut *tss_cell.0.get() };
     let mut ist = [0u64; 7];
     ist[DF_IST_SLOT] = stack_top;
     tss.ist = ist;
     tss.iomap_base = size_of::<Tss>() as u16;
 
-    let tss_base = TSS.0.get() as u64;
+    let tss_base = tss_cell.0.get() as u64;
     // The limit is inclusive, and must cover the whole structure: a TSS whose limit is
     // shorter than 104 bytes is #TS on the first access the CPU makes past it.
     let (tss_low, tss_high) = tss_descriptor(tss_base, (size_of::<Tss>() - 1) as u32);
 
     // SAFETY: upholds the GdtCell invariant, for the same reasons as the TSS above —
     // written before the `lgdt` that makes the CPU care.
-    let gdt = unsafe { &mut *GDT.0.get() };
+    let gdt = unsafe { &mut *gdt_cell.0.get() };
     let mut table = [0u64; 7];
     table[CODE_INDEX] = CODE64;
     table[KDATA_INDEX] = KDATA;
@@ -329,7 +362,7 @@ pub unsafe fn init() {
 
     let gdtr = Gdtr {
         limit: (size_of::<Gdt>() - 1) as u16,
-        base: GDT.0.get() as u64,
+        base: gdt_cell.0.get() as u64,
     };
 
     // SAFETY: `lgdt` copies ten bytes from a live, correctly shaped local into GDTR,
@@ -347,6 +380,42 @@ pub unsafe fn init() {
             options(readonly, nostack, preserves_flags),
         );
     }
+    true
+}
+
+/// Whether the running CPU has CPU `cpu`'s own tables loaded: its GDTR names `cpu`'s GDT,
+/// and that GDT's task descriptor names `cpu`'s TSS, whose #DF slot is `cpu`'s stack.
+///
+/// Read from the CPU with `sgdt`, so a CPU that loaded another CPU's tables, which `ltr`
+/// does not refuse once the descriptor is rewritten as available, is caught: the two would
+/// share one #DF stack, and the second double fault would overwrite the first's frame.
+pub fn owns_tables(cpu: usize) -> bool {
+    let (Some(gdt_cell), Some(tss_cell), Some(top)) =
+        (GDT.get(cpu), TSS.get(cpu), df_stack_top_for(cpu))
+    else {
+        return false;
+    };
+    let mut gdtr = Gdtr { limit: 0, base: 0 };
+    // SAFETY: `sgdt` stores ten bytes into its operand, which is a live, correctly shaped
+    // local; it has no other effect and is unprivileged.
+    unsafe {
+        core::arch::asm!(
+            "sgdt [{}]",
+            in(reg) &mut gdtr,
+            options(nostack, preserves_flags),
+        );
+    }
+    // SAFETY: shared reads of structures written only by `init_cpu`, which has returned.
+    let (gdt, tss) = unsafe { (&*gdt_cell.0.get(), &*tss_cell.0.get()) };
+    let low = gdt.0[TSS_INDEX];
+    let high = gdt.0[TSS_INDEX + 1];
+    let base = (low >> 16) & 0xff_ffff | ((low >> 56) << 24) | (high << 32);
+    let ist = tss.ist;
+    let loaded = gdtr.base;
+    loaded == gdt_cell.0.get() as u64
+        && base == tss_cell.0.get() as u64
+        && ist[DF_IST_SLOT] == top
+        && task_register() == TSS_SELECTOR
 }
 
 /// The selector currently in the task register.
@@ -369,21 +438,36 @@ pub fn task_register() -> u16 {
 /// on every switch to a user thread, so a fault from ring 3 lands on that thread's kernel
 /// stack rather than the last one set.
 ///
+/// Per CPU: the running CPU's TSS, since that is the one its task register names and so
+/// the one the CPU reads on a trap from ring 3. A thread that migrates carries its kernel
+/// stack in its context, and the switch into it installs that stack on the CPU it lands on
+/// (`context.rs`), so no CPU's `rsp0` names another CPU's running thread.
+///
 /// # Safety
-/// The TSS is loaded and the caller is the boot CPU with interrupts masked, so no trap
-/// can read `rsp0` mid-write. `top` must be the top of a valid, mapped kernel stack.
+/// The TSS is loaded on the running CPU, and interrupts are masked, so no trap can read
+/// `rsp0` mid-write and no migration can move the caller between the index and the write.
+/// `top` must be the top of a valid, mapped kernel stack.
 pub unsafe fn set_kernel_stack(top: u64) {
-    // SAFETY: a single aligned 8-byte write into the loaded TSS; see the TssCell invariant
-    // and the caller's obligation above.
-    let tss = unsafe { &mut *TSS.0.get() };
-    tss.rsp[0] = top;
+    let Some(cell) = TSS.get(crate::smp::cpu_index()) else {
+        return;
+    };
+    // SAFETY: a write into the running CPU's loaded TSS, which only this CPU touches after
+    // `init_cpu`; see the TssCell invariant and the caller's obligation above. The field
+    // is `packed`, so the array is written whole rather than through a reference.
+    let tss = unsafe { &mut *cell.0.get() };
+    let mut rsp = tss.rsp;
+    rsp[0] = top;
+    tss.rsp = rsp;
 }
 
-/// The value of `TSS.rsp[0]`, for the selftest to observe.
+/// The value of CPU `cpu`'s `TSS.rsp[0]`, for the selftest to observe.
 #[allow(dead_code)] // read by the userspace selftest
-pub fn kernel_stack() -> u64 {
+pub fn kernel_stack_of(cpu: usize) -> u64 {
+    let Some(cell) = TSS.get(cpu) else {
+        return 0;
+    };
     // SAFETY: a shared read of a `packed` field, copied out whole.
-    let tss = unsafe { &*TSS.0.get() };
+    let tss = unsafe { &*cell.0.get() };
     let rsp = tss.rsp;
     rsp[0]
 }
@@ -393,10 +477,19 @@ pub fn kernel_stack() -> u64 {
 /// Read back out of the TSS for the same reason as [`task_register`]: the selftest
 /// reports what the hardware will actually do, not what this module intended.
 pub fn df_stack_top() -> u64 {
+    df_stack_top_of(0)
+}
+
+/// The address CPU `cpu`'s TSS says the CPU will load into RSP when it delivers #DF. Zero
+/// for a CPU whose TSS was never built.
+pub fn df_stack_top_of(cpu: usize) -> u64 {
+    let Some(cell) = TSS.get(cpu) else {
+        return 0;
+    };
     // SAFETY: a shared read of a structure that, by the TssCell invariant, is written
-    // only by `init` and afterwards never again. No `&mut` can be live here, because
-    // `init` does not return while holding one.
-    let tss = unsafe { &*TSS.0.get() };
+    // only by `init_cpu` and afterwards never again. No `&mut` can be live here, because
+    // `init_cpu` does not return while holding one.
+    let tss = unsafe { &*cell.0.get() };
     // Copied out whole: the field is in a `packed` structure, so indexing it in place
     // would form a reference the alignment rules forbid.
     let ist = tss.ist;

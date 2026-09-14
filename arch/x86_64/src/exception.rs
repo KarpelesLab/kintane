@@ -58,18 +58,27 @@ pub const ERROR_CODE_VECTORS: u32 = (1 << 8)      // #DF
     | (1 << 29)                                    // #VC
     | (1 << 30); // #SX
 
+// Every handler below starts with `smp::gs_enter`, so a trap from ring 3 reads per-CPU
+// state through the kernel's `GS`; see that function. The diverging ones never swap back:
+// they either end the user thread, whose CPU goes on in the kernel arrangement, or halt.
+
 /// #DE, vector 0. Fatal: the faulting `div` would re-execute on return.
 pub extern "x86-interrupt" fn divide_error(frame: InterruptFrame) -> ! {
+    crate::smp::gs_enter(frame.cs);
     fatal(Some(0), None, &frame)
 }
 
 /// #BP, vector 3. Counted and resumed — see the module comment.
+///
+/// No `GS` swap: it touches no per-CPU state, and a handler that swaps nothing on entry
+/// and nothing on exit keeps the discipline.
 pub extern "x86-interrupt" fn breakpoint(_frame: InterruptFrame) {
     BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// #UD, vector 6. Fatal: the undefined instruction would re-execute on return.
 pub extern "x86-interrupt" fn invalid_opcode(frame: InterruptFrame) -> ! {
+    crate::smp::gs_enter(frame.cs);
     fatal(Some(6), None, &frame)
 }
 
@@ -85,11 +94,13 @@ pub extern "x86-interrupt" fn invalid_opcode(frame: InterruptFrame) -> ! {
 /// the report is therefore the *interrupted* stack pointer, and a value that is not
 /// inside the kernel stack is the diagnosis.
 pub extern "x86-interrupt" fn double_fault(frame: InterruptFrame, code: u64) -> ! {
+    crate::smp::gs_enter(frame.cs);
     fatal(Some(8), Some(code), &frame)
 }
 
 /// #GP, vector 13. The error code is the selector at fault, or zero.
 pub extern "x86-interrupt" fn general_protection(frame: InterruptFrame, code: u64) -> ! {
+    crate::smp::gs_enter(frame.cs);
     fatal(Some(13), Some(code), &frame)
 }
 
@@ -104,11 +115,15 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptFrame, code: u6
 /// Everything else still ends at [`fatal`], so an unexpected #PF is as fatal as it was
 /// before this path existed.
 pub extern "x86-interrupt" fn page_fault(frame: InterruptFrame, code: u64) {
+    let user = crate::smp::gs_enter(frame.cs);
     if crate::paging::on_page_fault(cr2(), code) || crate::fault::route(cr2(), code) {
+        crate::smp::gs_leave(user);
         return;
     }
     if from_user(&frame) {
+        // Returns only when the fault was resolved; a kill does not come back.
         user_page_fault(cr2(), code, frame.rip);
+        crate::smp::gs_leave(user);
         return;
     }
     fatal(Some(14), Some(code), &frame)
@@ -168,6 +183,7 @@ fn kill_if_user(_vector: Option<u8>, _frame: &InterruptFrame) {}
 /// Generic over the vector so each one gets its own entry point and can name itself
 /// in the report, without hand-writing thirty near-identical functions.
 pub extern "x86-interrupt" fn reserved<const V: u8>(frame: InterruptFrame) -> ! {
+    crate::smp::gs_enter(frame.cs);
     fatal(Some(V), None, &frame)
 }
 
@@ -176,12 +192,14 @@ pub extern "x86-interrupt" fn reserved_with_code<const V: u8>(
     frame: InterruptFrame,
     code: u64,
 ) -> ! {
+    crate::smp::gs_enter(frame.cs);
     fatal(Some(V), Some(code), &frame)
 }
 
 /// Vectors 48..256: nothing is wired to raise them, so delivery means either stray
 /// hardware or a software `int` the kernel did not intend.
 pub extern "x86-interrupt" fn unexpected(frame: InterruptFrame) -> ! {
+    crate::smp::gs_enter(frame.cs);
     fatal(None, None, &frame)
 }
 

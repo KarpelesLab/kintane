@@ -17,6 +17,7 @@ pub mod context;
 pub mod fault;
 pub mod ipi;
 pub mod paging;
+pub mod timer;
 pub mod user;
 
 // Mock architectures for host-side testing. Gated at the module boundary, which is
@@ -30,6 +31,7 @@ pub use context::{HasContextSwitch, ThreadEntry};
 pub use fault::{Access, PageFault, PageFaultHook};
 pub use ipi::{HasIpi, Ipi};
 pub use paging::{HasPageTables, ImageSections, MapError, PageFlags, PageTableEntry, StackArray};
+pub use timer::EventTimer;
 pub use user::{CopyFault, HasUserMode, SyscallFrame, UserHooks, UserTrap};
 
 /// Byte order of the target.
