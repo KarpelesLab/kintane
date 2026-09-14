@@ -1,12 +1,15 @@
-//! What every virtio driver shares.
+//! What every virtio driver shares, for every place a driver runs.
 //!
-//! virtio-blk was the first driver whose device reads and writes memory, and it grew a split
-//! virtqueue, the status handshake, the memory-mapped and PCI transports and the DMA types
-//! to do it. None of that is about blocks, so when virtio-net arrived as the second virtio
-//! driver it moved here unchanged: [`mem`], [`queue`], [`transport`], [`mmio`] and [`pci`]
-//! are the modules virtio-blk had, and virtio-blk re-exports them under their old names.
-//! [`bind`] is virtio-blk's probe, parameterised by device type, and [`AnyTransport`] is its
-//! transport enum.
+//! The split virtqueue ([`queue`]), the status handshake and feature negotiation
+//! ([`transport`]), the memory-mapped and PCI transports ([`mmio`], [`pci`]) and the memory a
+//! device reads and writes ([`mem`]). The transports are generic over [`hwproxy::Regs`], so
+//! the kernel drives them over its mapping of a claimed window and a driver domain over its
+//! grant. None of it is about blocks or frames: `virtio-blk-core` builds the block protocol on
+//! it, and `virtio-net` the network card.
+//!
+//! The kernel's glue — binding a device from a probe, the MSI-X table claim, a transport over
+//! the claimed window — is `virtio-bind`, because it needs the device model, which a
+//! `user`-layer crate may not reach.
 //!
 //! Reference: Virtual I/O Device (VIRTIO) Version 1.1, §2 (basic facilities), §4.1 (PCI),
 //! §4.2 (MMIO).
@@ -19,7 +22,6 @@
 #[cfg(all(CONFIG_MOCK_ARCH, not(test)))]
 extern crate std;
 
-pub mod bind;
 pub mod mem;
 pub mod mmio;
 pub mod pci;
@@ -29,13 +31,14 @@ pub mod transport;
 #[cfg(any(test, CONFIG_MOCK_ARCH))]
 pub mod fake;
 
-pub use bind::Claims;
+use hwproxy::Direct;
 use transport::Transport;
 
-/// A virtio transport, of whichever kind this machine has.
+/// A virtio transport, of whichever kind this machine has, over the kernel's mapping of the
+/// claimed window.
 pub enum AnyTransport {
-    Mmio(mmio::Mmio),
-    Pci(pci::Pci),
+    Mmio(mmio::Mmio<Direct>),
+    Pci(pci::Pci<Direct>),
 }
 
 impl Transport for AnyTransport {

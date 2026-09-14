@@ -531,6 +531,35 @@ offsets, an empty slot, non-virtio memory, a window too small to read, and the r
 wire format round trip. The falsifications above were run by hand; nothing in CI mutates
 the code.
 
+### 2c-bis. DMA confinement with the IOMMU
+
+On x86_64 with `IOMMU` (the `x86_64-iommu` preset), the disk runs behind an Intel VT-d IOMMU:
+a translation domain that maps *exactly* its DMA grant. The `iommu` line gates the boot:
+
+```
+  iommu      in-grant DMA served behind VT-d; out-of-grant DMA stopped at 0x000000000023d000 from 0x0000000000000018; restarted and served a read ok
+```
+
+The `block` line first shows the device brought up behind the IOMMU (`VT-d on, 48-bit; disk
+00:03.0 mapped to its grant only`) and passes every functional check with its DMA translated —
+that is the in-grant DMA working. Then the `iommu` line requires all of:
+
+- the domain maps the grant and does **not** map the canary frame beside it (map exactly the grant);
+- a deliberate out-of-grant DMA (a read into the canary) is stopped, and the unit's fault log names
+  the canary's address and the disk's own source id `00:03.0`;
+- the canary still holds its sentinel — the blocked write never landed;
+- the faulted device is reset, brought up again over the same grant, and serves a read.
+
+| Mutation | Result |
+|---|---|
+| Grant one extra page, so the canary is inside the grant | `THE DOMAIN DOES NOT MAP EXACTLY THE GRANT` |
+| Skip mapping the grant into the domain | the device faults reading its own ring; the block check fails |
+| Drop the restart | the device is not re-stored; `restarted and served a read` never prints and the boot fails |
+
+`drivers/iommu/vtd` and `boot/acpi::dmar` are host-tested under every preset: the DMAR fixture
+(`q35-iommu.bin`) and the register programming, page tables, attach and fault decode against
+models of the hardware. The live falsifications above were run by hand.
+
 ### 2d. Fuzzing
 
 Every parser that reads bytes the kernel did not write is fuzzed on the host, and so is
@@ -676,7 +705,84 @@ writer and the new one as standalone programs over the same files. The two image
 byte-identical, and a copy of the new writer with one boot-sector field changed is not, so the
 comparison can see a difference.
 
-### 2f. Network
+### 2f. The Linux personality
+
+On the x86_64 presets with userspace and the test disk, where `ABI_LINUX` defaults on, every boot
+runs a `linux` check right after `fs`
+([userspace-abi.md](userspace-abi.md#as-built--one-static-program-x86_64)). It reads
+`/KINTANE/LINUX.ELF` from the volume. That file is `user/linux-hello`, a static program that makes
+Linux's system calls by Linux's numbers and knows nothing of KinTane. The check runs it unmodified
+and requires:
+
+- the file loads and is tagged `linux`: it has no KinTane ABI note and a System V `EI_OSABI`;
+- it exits with 42. It returns 42 only if every step behaved; otherwise its exit code is the
+  number of the first step that went wrong:
+
+  | Step | What it checks |
+  |---|---|
+  | 10 | `argc` and `argv[0]` |
+  | 11 | `AT_PAGESZ` |
+  | 12 | `AT_ENTRY` |
+  | 13 | `AT_RANDOM` |
+  | 14 | `write(1)` |
+  | 15 | `getpid` |
+  | 16 | `uname` |
+  | 17–18 | `brk`, and the memory behind it |
+  | 19–20 | anonymous `mmap` and `munmap` |
+  | 21–22 | `arch_prctl(ARCH_SET_FS)`, read back through `fs:0` |
+  | 23–26 | `openat`, `fstat`, `read` and `close` on `/HELLO.TXT` |
+  | 27 | `ENOENT` for a missing file |
+  | 28 | `EBADF` for a descriptor that names nothing |
+  | 29 | `ENOSYS` for `getrandom` |
+
+- what it wrote to standard output, as the kernel captured it, is exactly `hello from linux\n`;
+- the kernel logged the unimplemented call, and the number it recorded is the one the table names
+  `getrandom`;
+- `init` then runs natively on the same kernel, to its success code;
+- no file is left open in the namespace, and no frame is leaked.
+
+With `LINUX_ENOSYS_FATAL=y` the check expects the process to be killed at `getrandom` instead, and
+the log line says so.
+
+On `x86_64-qemu` the line reads:
+
+```
+  linux      /KINTANE/LINUX.ELF (13424 bytes, tagged linux):
+             hello from linux
+linux: getrandom (318) is not implemented
+             exit 0x000000000000002a ok, output ok, getrandom logged as unimplemented; init after it:
+             hello from userspace
+             native init unaffected
+```
+
+`kernel/linux` is host-tested (7 tests), covering:
+
+- every dispatched number against its name in the table;
+- the errno encoding and its range;
+- the start-up stack, read back the way start-up code reads it, at 40 string lengths for its
+  alignment;
+- the `struct stat` and `struct utsname` offsets.
+
+`kernel/elf` has 4 more tests for the note walk: the KinTane note found, a prefix of its owner not
+matching, notes truncated at every length and with an oversized name never panicking, and
+`AT_PHDR`'s address.
+
+Each property was falsified: the mutation was applied and checked, the check failed, and the file
+was restored and compared byte for byte.
+
+| Mutation | What caught it |
+|---|---|
+| `Failure::NotFound` mapped to `EIO` | the `linux` host test `errors_travel_as_negated_linux_numbers`; boot: `exit 0x1b WRONG`, step 27 |
+| `AT_ENTRY` left out of the auxiliary vector | boot: `exit 0xc WRONG, OUTPUT WRONG`, step 12, before the program writes anything |
+| A Linux process given the native table | boot: `exit 0x1 WRONG, OUTPUT WRONG`. The program's first system call reached the native table |
+| A native process given the Linux table | boot: the `userspace` check logs `linux: stat (4) is not implemented` for `init`'s native calls, and the boot fails |
+| The unimplemented call logged but not recorded | boot: `THE UNIMPLEMENTED CALL WAS NOT LOGGED` |
+| Every program tagged native, the note test reading `true` | boot: `/KINTANE/LINUX.ELF IS NOT TAGGED linux` |
+
+`LINUX_ENOSYS_FATAL=y` was booted as well. The boot passes, with `exit 0xffffffffffffffff ok` and
+the log line `linux: getrandom (318) is not implemented, and LINUX_ENOSYS_FATAL ends the process`.
+
+### 2g. Network
 
 With `QEMU_NET_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild attaches
 a virtio-net card to QEMU's user-mode network: a `virtio-net-device` in a memory-mapped slot
@@ -819,7 +925,7 @@ threads at mixed priorities (`kernel/main/src/stress.rs`):
 - **vm** — demand paging, copy-on-write sharing and 2 MiB pages on a kernel `Vm`;
 - **pages** — buddy allocator churn on a pool of its own;
 - **net** — echo requests to the gateway and UDP round trips with kbuild, on a machine with a
-  network card ([2f](#2f-network)).
+  network card ([2g](#2g-network)).
 
 Every second of guest time the auditor stops every workload at a checkpoint, where it
 holds nothing that would make the books inexact, and checks them:

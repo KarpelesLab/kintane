@@ -167,6 +167,35 @@ config USERSPACE
         space is its own page tables. A kernel without it is tasks in the
         kernel, which is what docs/userspace-abi.md says a small build is.
 
+config ABI_LINUX
+    bool "Linux system call compatibility"
+    depends on USERSPACE && ARCH_X86_64
+    default y
+    help
+        Run unmodified static Linux programs. The loader tags a program with no
+        KinTane ABI note as a Linux one, and its system calls go to the Linux
+        table in kernel/main/src/personality.rs: Linux's numbers, Linux's
+        start-up stack and auxiliary vector, errno values, and a file descriptor
+        table kept as a view over the process's handles and the filesystem.
+
+        x86_64 only for now: the table is x86_64's. docs/userspace-abi.md
+        designs this as a tristate for a loadable module; it is a bool until the
+        personality can be built as one.
+
+        Off, a program with no KinTane note is refused at load time rather than
+        run under an ABI it was not built for.
+
+config LINUX_ENOSYS_FATAL
+    bool "An unimplemented Linux system call kills the process"
+    depends on ABI_LINUX
+    default n
+    help
+        By default an unimplemented Linux call returns -ENOSYS and the kernel
+        logs its name, which is what lets a program with a fallback carry on.
+        On, the process is killed at the call instead, still named in the log,
+        so a CI run over a corpus of programs cannot pass while quietly
+        depending on calls the personality does not have.
+
 config EARLY_CONSOLE
     bool "Early console"
     default y
@@ -698,14 +727,32 @@ config QEMU_NET_TEST
         the guest's port 5555 and answers each datagram the guest sends
         back. Every stack buffer must be back in its pool and every receive
         buffer back with the card or holding a frame. Where the platform
-        wired the card's interrupt (aarch64, and i686 through the 8259A),
-        every frame must be collected by the interrupt handler and none by
-        polling; on x86_64, where no PCI interrupt route is trusted, the
-        card is polled and the check says so.
+        wired the card's interrupt (aarch64, i686 through the 8259A, x86_64
+        by MSI-X), every frame must be collected by the interrupt handler
+        and none by polling.
 
         A memory-mapped virtio slot on aarch64, a modern-only PCI function
         on the PCs. Needs MM_PAGED, because the driver's DMA region is
         mapped through the kernel's direct map.
+
+config IOMMU
+    bool "Confine device DMA with an Intel VT-d IOMMU"
+    depends on QEMU_BLOCK_TEST && ARCH_X86_64
+    help
+        Discover the machine's DMA remapping hardware from the ACPI DMAR
+        (`boot/acpi::dmar`), program it (`drivers/iommu/vtd`), and put the
+        virtio-blk device behind it: a translation domain that maps exactly the
+        device's granted DMA buffer, and nothing else.
+
+        The block check then runs with the device's DMA translated by the
+        IOMMU, which proves an in-grant DMA still works. A deliberate DMA to a
+        canary frame outside the grant is stopped by the hardware, and the boot
+        reads the fault back from the unit's log -- the faulting address and the
+        device's own source id -- and confirms the canary is untouched.
+
+        x86_64 only, and off by default: QEMU must be started with
+        `-device intel-iommu` and the disk with `iommu_platform=on`, which the
+        `x86_64-iommu` preset does. See docs/isolation.md.
 
 config SERIAL_IRQ_TEST
     bool "Prove the console UART receives on interrupt under QEMU"

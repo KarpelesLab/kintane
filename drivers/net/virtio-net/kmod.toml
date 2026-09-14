@@ -12,4 +12,4 @@ host-tests = true
 layer = "device"
 
 [deps]
-units = ["hal", "device", "sync", "virtio", "net"]
+units = ["hal", "device", "sync", "virtio", "virtio-bind", "net"]

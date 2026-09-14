@@ -15,11 +15,12 @@
 //! what is there; drivers drive what they were bound to. The platform then binds this
 //! driver to the one slot that answered "block device".
 
-// `identify` reads a window nobody has claimed yet, and `Mmio::new` is the promise a
-// claimed window is mapped: both are the caller's contract, stated where they are made.
+// `identify` reads a window nobody has claimed yet: the caller's contract, stated where it
+// is made.
 #![allow(unsafe_code)]
 
-use crate::mem::Window;
+use hwproxy::{Direct, Regs};
+
 use crate::transport::Transport;
 
 /// Register offsets (virtio 1.1 §4.2.2).
@@ -73,7 +74,7 @@ pub enum Slot {
 /// `[base, base + len)` must be the device's register window, mapped as device memory.
 pub unsafe fn identify(base: usize, len: usize) -> Slot {
     // SAFETY: the caller's contract is this function's.
-    let w = unsafe { Window::new(base, len) };
+    let w = unsafe { Direct::new(base, len) };
     if w.read32(reg::MAGIC) != MAGIC {
         return Slot::NotVirtio;
     }
@@ -87,20 +88,29 @@ pub unsafe fn identify(base: usize, len: usize) -> Slot {
 }
 
 /// A virtio device behind a memory-mapped register window.
-pub struct Mmio {
-    window: Window,
+///
+/// Over any [`Regs`]: the kernel's mapping of the window and a domain's are the same
+/// transport. The promise that the registers are really there is made where the window is
+/// built, which is where the `unsafe` is.
+pub struct Mmio<R: Regs> {
+    window: R,
 }
 
-impl Mmio {
-    /// # Safety
-    /// `window` must be the device's register window, mapped as device memory, and this
-    /// must be the only transport for that device.
-    pub const unsafe fn new(window: Window) -> Mmio {
+impl<R: Regs> Mmio<R> {
+    /// The transport over `window`, which must be the one transport for the device.
+    pub const fn new(window: R) -> Mmio<R> {
         Mmio { window }
+    }
+
+    /// A 64-bit field, written as two 32-bit halves: the layout defines each half as its own
+    /// register, and a window need not accept a 64-bit access at all.
+    fn write64(&self, low: usize, value: u64) {
+        self.window.write32(low, value as u32);
+        self.window.write32(low + 4, (value >> 32) as u32);
     }
 }
 
-impl Transport for Mmio {
+impl<R: Regs> Transport for Mmio<R> {
     fn device_id(&self) -> u32 {
         self.window.read32(reg::DEVICE_ID)
     }
@@ -133,9 +143,9 @@ impl Transport for Mmio {
     fn setup_queue(&self, index: u16, size: u16, desc: u64, avail: u64, used: u64) {
         self.window.write32(reg::QUEUE_SEL, u32::from(index));
         self.window.write32(reg::QUEUE_NUM, u32::from(size));
-        self.window.write64(reg::QUEUE_DESC_LOW, desc);
-        self.window.write64(reg::QUEUE_DRIVER_LOW, avail);
-        self.window.write64(reg::QUEUE_DEVICE_LOW, used);
+        self.write64(reg::QUEUE_DESC_LOW, desc);
+        self.write64(reg::QUEUE_DRIVER_LOW, avail);
+        self.write64(reg::QUEUE_DEVICE_LOW, used);
         self.window.write32(reg::QUEUE_READY, 1);
     }
 

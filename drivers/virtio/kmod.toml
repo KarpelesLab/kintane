@@ -1,17 +1,18 @@
 # virtio: what every virtio driver shares — the split virtqueue, the status handshake and
-# feature negotiation, the memory-mapped and PCI transports, DMA regions, and what a probe
-# claims.
+# feature negotiation, the memory-mapped and PCI transports, and DMA regions — over the
+# proxy layer's register traits and nothing else.
 #
-# Factored out of virtio-blk when virtio-net became the second driver, mechanically: the
-# modules moved unchanged, and virtio-blk re-exports them under their old names. The fake
-# device the host tests drive is here too, compiled only when MOCK_ARCH is set, so each
-# driver's tests can use it and no image carries it.
+# Layer `user`, with `hwproxy`, so a driver's protocol core can build into an unprivileged
+# driver domain as well as the kernel: `virtio-blk-core` is one, and an isolated virtio-net
+# would be another. What only the kernel has — binding through the device model, claiming an
+# MSI-X table, building a transport over a claimed window — is `virtio-bind`, a layer up.
+# The fake device the host tests drive is here too, compiled only when MOCK_ARCH is set.
 [unit]
 name = "virtio"
 kind = "lib"
 root = "src/lib.rs"
 host-tests = true
-layer = "device"
+layer = "user"
 
 [deps]
-units = ["hal", "device"]
+units = ["hwproxy"]

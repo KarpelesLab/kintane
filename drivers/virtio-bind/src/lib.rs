@@ -7,12 +7,17 @@
 //! [`Claims::transport`] builds the transport later, once the kernel has mapped the window.
 //!
 //! This was virtio-blk's probe, moved unchanged apart from taking the device type and the
-//! claims' names as arguments.
+//! claims' names as arguments, with `layout_of` from virtio-blk's PCI glue.
 
+#![no_std]
+#![deny(unsafe_code)]
+
+use device::pci::{self as dpci, Function};
 use device::{IrqLine, Mmio as MmioClaim, Probe, ProbeError};
-
-use crate::mem::Window;
-use crate::{AnyTransport, mmio, pci};
+use hwproxy::Direct;
+use virtio::pci::{Layout, Place, VendorCapability, cap};
+use virtio::transport::Error;
+use virtio::{AnyTransport, mmio, pci};
 
 /// What the probe claimed, kept for bring-up.
 ///
@@ -33,7 +38,7 @@ pub struct Claims {
 enum Bus {
     Mmio,
     Pci {
-        layout: pci::Layout,
+        layout: Layout,
         bar: u8,
         device_id: u32,
     },
@@ -56,19 +61,16 @@ impl Claims {
         };
         let (mmio, bus) = match function {
             Some(f) => {
-                let layout = pci::Layout::read(f).map_err(|_| {
+                let layout = layout_of(f).map_err(|_| {
                     ProbeError::Declined("no modern virtio structures in the capability list")
                 })?;
                 // Every structure must be in one BAR, because one window is what a probe
                 // claims and therefore what the kernel maps. QEMU's virtio-pci puts all
                 // four in the same BAR; a device that spreads them is refused rather than
                 // half-driven.
-                let bar = layout.common.bar;
-                if layout.bars().iter().any(|b| *b != bar) {
-                    return Err(ProbeError::Declined(
-                        "the device's structures are spread over several BARs",
-                    ));
-                }
+                let bar = layout.single_bar().ok_or(ProbeError::Declined(
+                    "the device's structures are spread over several BARs",
+                ))?;
                 let index = f
                     .memory_bar_index(bar)
                     .ok_or(ProbeError::Declined("the structures' BAR decodes no memory"))?;
@@ -163,23 +165,39 @@ impl Claims {
         let (phys, len) = self.window();
         let base = hal::paging::device_virt(phys)?;
         let len = usize::try_from(len).ok()?;
+        // SAFETY: the caller's contract; the window is the one the probe claimed.
+        let window = unsafe { Direct::new(base, len) };
         match &self.bus {
-            Bus::Mmio => {
-                // SAFETY: the caller's contract.
-                let window = unsafe { Window::new(base, len) };
-                // SAFETY: as above; one transport for the one device the driver bound.
-                Some(AnyTransport::Mmio(unsafe { mmio::Mmio::new(window) }))
-            }
+            Bus::Mmio => Some(AnyTransport::Mmio(mmio::Mmio::new(window))),
+            // Every structure the layout names is checked to be inside the BAR.
             Bus::Pci {
                 layout,
                 bar,
                 device_id,
-            } => {
-                // SAFETY: the caller's contract; the window is the BAR the probe claimed, and
-                // every structure the layout names was checked to be inside it.
-                let t = unsafe { pci::Pci::new(layout, *bar, base, len, *device_id) };
-                t.ok().map(AnyTransport::Pci)
-            }
+            } => pci::Pci::new(layout, *bar, window, *device_id)
+                .ok()
+                .map(AnyTransport::Pci),
         }
     }
+}
+
+/// Where `f`'s structures are, from its vendor capabilities.
+///
+/// `Err(Legacy)` when the device offers no modern structures at all, which is what a
+/// pre-1.0 device looks like from here.
+pub fn layout_of(f: &Function) -> Result<Layout, Error> {
+    Layout::from_capabilities(
+        f.capabilities()
+            .into_iter()
+            .filter(|c| c.id == dpci::CAP_VENDOR)
+            .map(|c| VendorCapability {
+                cfg_type: c.byte(cap::CFG_TYPE_BYTE),
+                place: Place {
+                    bar: c.byte(cap::BAR_BYTE),
+                    offset: c.word(cap::OFFSET_WORD),
+                    length: c.word(cap::LENGTH_WORD),
+                },
+                notify_multiplier: c.word(cap::NOTIFY_MULTIPLIER_WORD),
+            }),
+    )
 }

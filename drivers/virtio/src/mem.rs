@@ -1,123 +1,30 @@
-//! The two kinds of memory a device driver touches, and the only `unsafe` in the crate.
+//! Memory the device reads and writes, and most of the `unsafe` in the crate.
 //!
-//! * [`Window`] — the device's registers. A claimed MMIO window, accessed at the widths the
-//!   register layout uses, with every access checked against the window's bounds.
-//!   `device::Registers` does this for 32-bit registers; virtio's PCI common configuration is 8,
-//!   16, 32 and 64 bits wide, so this is the same idea with the other widths.
+//! The device's *registers* are not here: they are reached through [`hwproxy::Regs`], so the
+//! same transports run over the kernel's mapping of a window and over a domain's. What is
+//! here is the other kind of memory a driver touches:
+//!
 //! * [`Dma`] — memory *the device* reads and writes: the virtqueue rings, request headers, and the
 //!   bounce buffer. What makes it different from ordinary kernel memory is that the driver must
-//!   know its **physical** address, because that is the only address the device has. Both addresses
-//!   are carried, and the type keeps them apart: [`Dma::phys`] is what goes into a descriptor, and
-//!   [`Dma::virt`] is what the CPU dereferences.
+//!   know the address **the device** uses, because that is the only address the device has. Both
+//!   addresses are carried, and the type keeps them apart: [`Dma::phys`] is what goes into a
+//!   descriptor, and [`Dma::virt`] is what the CPU dereferences.
 //!
-//! # No IOMMU yet
+//! # With and without an IOMMU
 //!
-//! The device is given physical addresses and can read and write every byte of them — and,
-//! without an IOMMU, every other byte of memory too. That is the status quo for a kernel
-//! driver, and it is what Phase 5's driver isolation is for: with an IOMMU, [`Dma`] becomes
-//! a grant of a specific range to a specific device, [`Dma::phys`] becomes a device address
-//! rather than a physical one, and a driver that names memory outside its grant faults in
-//! the IOMMU instead of corrupting the kernel. Nothing above this module would change,
-//! which is why the distinction is in the type today rather than the day it starts to bite.
+//! Without an IOMMU the device is given physical addresses and can read and write every byte
+//! of them — and every other byte of memory too. That is the status quo for a kernel driver.
+//! Behind an IOMMU, [`Dma::phys`] is a device address the IOMMU translates, a grant of a
+//! specific range to a specific device, and a driver that names memory outside its grant
+//! faults in the IOMMU instead of corrupting the kernel (`docs/isolation.md`). Nothing above
+//! this module changes between the two, which is why the distinction has been in the type
+//! since before it started to bite.
 
 #![allow(unsafe_code)]
 
 use core::ptr::{
     read_volatile, with_exposed_provenance, with_exposed_provenance_mut, write_volatile,
 };
-
-/// A mapped register window, read and written at 8, 16, 32 and 64 bits.
-///
-/// An access outside the window reads all-ones and writes nothing, as an absent device
-/// does on most buses, rather than reaching whatever is mapped next to it.
-#[derive(Clone, Copy, Debug)]
-pub struct Window {
-    base: usize,
-    len: usize,
-}
-
-macro_rules! accessors {
-    ($($read:ident, $write:ident, $ty:ty;)*) => {$(
-        /// Read the register at `offset`. Outside the window, all-ones.
-        pub fn $read(&self, offset: usize) -> $ty {
-            match self.at::<$ty>(offset) {
-                Some(addr) => {
-                    // SAFETY: `at` checked that a whole, naturally aligned value lies inside
-                    // the window, and the constructor's contract is that the window is mapped
-                    // as device memory. Volatile, because a device distinguishes accesses the
-                    // compiler would merge or drop.
-                    unsafe { read_volatile(with_exposed_provenance::<$ty>(addr)) }
-                }
-                None => {
-                    debug_assert!(false, "register read outside the window");
-                    <$ty>::MAX
-                }
-            }
-        }
-
-        /// Write the register at `offset`. Outside the window, nothing.
-        pub fn $write(&self, offset: usize, value: $ty) {
-            match self.at::<$ty>(offset) {
-                // SAFETY: as the reader above.
-                Some(addr) => unsafe {
-                    write_volatile(with_exposed_provenance_mut::<$ty>(addr), value)
-                },
-                None => debug_assert!(false, "register write outside the window"),
-            }
-        }
-    )*};
-}
-
-impl Window {
-    /// # Safety
-    /// `[base, base + len)` must be mapped at that virtual address, as device memory that
-    /// neither caches nor reorders accesses, for as long as the window is used.
-    pub const unsafe fn new(base: usize, len: usize) -> Window {
-        Window { base, len }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// A window over part of this one, or `None` if it does not fit.
-    pub fn sub(&self, offset: usize, len: usize) -> Option<Window> {
-        let end = offset.checked_add(len)?;
-        (end <= self.len).then(|| Window {
-            base: self.base.checked_add(offset).unwrap_or(0),
-            len,
-        })
-    }
-
-    /// The address of a naturally aligned `T` at `offset`, if it lies inside the window.
-    fn at<T>(&self, offset: usize) -> Option<usize> {
-        let size = size_of::<T>();
-        let end = offset.checked_add(size)?;
-        let addr = self.base.checked_add(offset)?;
-        (end <= self.len && addr % size == 0).then_some(addr)
-    }
-
-    accessors! {
-        read8, write8, u8;
-        read16, write16, u16;
-        read32, write32, u32;
-    }
-
-    /// A 64-bit register, read as two halves.
-    ///
-    /// virtio's own rule: a 64-bit field of the common configuration may be accessed as two
-    /// 32-bit halves (virtio 1.1 §4.1.3.1), and a device whose window is not 64-bit capable
-    /// must be. Every 64-bit field this driver touches is written before the device is told
-    /// to look at it, so a torn value is never observed.
-    pub fn read64(&self, offset: usize) -> u64 {
-        u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32)
-    }
-
-    pub fn write64(&self, offset: usize, value: u64) {
-        self.write32(offset, value as u32);
-        self.write32(offset + 4, (value >> 32) as u32);
-    }
-}
 
 /// Memory the device reads and writes, addressed both ways.
 ///
@@ -132,11 +39,24 @@ pub struct Dma {
 
 impl Dma {
     /// # Safety
-    /// `[virt, virt + len)` must be mapped, writable, and exactly the memory at physical
-    /// `[phys, phys + len)`, for as long as the region is used; and no other reference to
-    /// it may exist, because the device writes into it.
+    /// `[virt, virt + len)` must be mapped, writable, and exactly the memory the device
+    /// reaches at `[phys, phys + len)`, for as long as the region is used; and no other
+    /// reference to it may exist, because the device writes into it.
     pub const unsafe fn new(virt: usize, phys: u64, len: usize) -> Dma {
         Dma { virt, phys, len }
+    }
+
+    /// A region over a buffer a host granted, as the proxy layer describes it: how a driver
+    /// domain turns the memory the kernel gave it into the rings and buffers it runs on.
+    ///
+    /// # Safety
+    /// As [`Dma::new`], for `d`'s addresses.
+    pub unsafe fn from_proxy(d: &impl hwproxy::Dma) -> Dma {
+        Dma {
+            virt: d.virt(),
+            phys: d.phys(),
+            len: d.len(),
+        }
     }
 
     /// The address the device uses.

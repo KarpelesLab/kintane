@@ -1,0 +1,18 @@
+# virtio-blk's protocol — the virtqueue, the status handshake, feature negotiation and the
+# block requests — written once, over the proxy layer's traits and nothing else.
+#
+# Layer `user`, with `hwproxy`, because this is the driver that has to compile into the
+# kernel image *and* into an unprivileged driver domain. `drivers/block/virtio-blk` wraps it
+# for the kernel: binding through the device model, the block layer's request tickets, a
+# lock across CPUs and the platform's interrupt handler. `user/hwdomain` wraps it for a
+# domain: its grant. Neither wrapper speaks the protocol; this does, and layering is what
+# guarantees the domain's copy drags no kernel code in with it.
+[unit]
+name = "virtio-blk-core"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "user"
+
+[deps]
+units = ["hwproxy", "virtio"]

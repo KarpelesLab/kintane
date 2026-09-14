@@ -44,10 +44,11 @@ mod tests;
 use device::{BootCell, Bound, Driver, IrqLine, Probe, ProbeError};
 use sync::LockFamily;
 use sync::lockdep::LockClass;
+use virtio::AnyTransport;
 use virtio::mem::Dma;
 use virtio::queue::{Buf, Ring};
 use virtio::transport::{self, Error, Transport};
-use virtio::{AnyTransport, Claims};
+use virtio_bind::Claims;
 
 /// What this driver binds to: a memory-mapped virtio slot, or a PCI function whose vendor
 /// and device ID say it is a virtio network card (modern `1041`, transitional `1000`).
