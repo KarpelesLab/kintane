@@ -17,10 +17,15 @@ pub const HEARTBEAT: &[u8] = b"stress heartbeat ";
 /// the first audit. The UEFI preset spends most of it in firmware.
 const FIRST_HEARTBEAT_WITHIN: u64 = 180;
 
-/// Seconds allowed between heartbeats. The guest prints one per second of its own time,
-/// which under TCG tracks the host's, so this is thirty missed heartbeats: slack for a
-/// loaded CI machine descheduling QEMU, and still a short wait on a real hang.
-const HEARTBEAT_EVERY_WITHIN: u64 = 30;
+/// Seconds allowed between heartbeats. The guest prints one per second of its own time, and
+/// under TCG that time is the host's to give: on a machine running several eight-CPU guests
+/// at load 18, a healthy soak went more than thirty seconds of wall time between heartbeats
+/// and was killed as hung, with its counters still climbing and no audit failed.
+///
+/// A guest that has really hung never prints again, so a longer allowance costs only how soon
+/// that is noticed, never whether it is. Two minutes is four times the worst gap measured on a
+/// loaded host, and still a short wait beside a run of hours.
+const HEARTBEAT_EVERY_WITHIN: u64 = 120;
 
 pub fn watch() -> Watch {
     Watch {
