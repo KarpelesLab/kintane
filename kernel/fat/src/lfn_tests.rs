@@ -324,6 +324,14 @@ fn an_alias_never_takes_a_name_something_else_answers_to() {
         let n = ns.read_all("/a long name two.txt", &mut buf).unwrap();
         assert_eq!(&buf[..n], b"third");
 
+        // Each file answers to an alias of its own. Reaching all three by their long names
+        // proves nothing about the aliases: three files sharing one short name would pass
+        // that, and the listing, and the walk. The aliases themselves are what must differ.
+        let n = ns.read_all("/ALONGN~2.TXT", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"second", "the second name took the next alias");
+        let n = ns.read_all("/ALONGN~3.TXT", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"third", "and the third the one after that");
+
         let names = listing(&mut ns);
         assert_eq!(names.len(), 3, "three names, each its own: {names:?}");
         ns.sync().unwrap();
