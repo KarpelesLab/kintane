@@ -6,7 +6,7 @@ section .rodata 57304
 section .stack 16384
 section .text 311296
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 19072 data 0 bss 0
+crate (anonymous) text 0 rodata 19119 data 0 bss 0
 crate (unmangled) text 1253 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 4214 rodata 0 data 0 bss 0
@@ -24,7 +24,7 @@ crate elf text 2383 rodata 0 data 0 bss 0
 crate hal text 531 rodata 0 data 0 bss 0
 crate ipc text 1513 rodata 16 data 0 bss 0
 crate kalloc text 13961 rodata 0 data 0 bss 0
-crate kintane text 94735 rodata 80 data 15244 bss 78707
+crate kintane text 95899 rodata 80 data 15244 bss 78707
 crate kobject text 4953 rodata 16 data 0 bss 0
 crate mm text 33117 rodata 0 data 0 bss 0
 crate platform text 22939 rodata 64 data 94848 bss 2005

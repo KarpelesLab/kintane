@@ -2,11 +2,11 @@
 section .bss 278528
 section .data 130688
 section .note.kintane 36
-section .rodata 65496
+section .rodata 69592
 section .stack 16384
 section .text 364544
 section .thread_stacks 491520
-crate (anonymous) text 0 rodata 18779 data 0 bss 0
+crate (anonymous) text 0 rodata 18826 data 0 bss 0
 crate (unmangled) text 3580 rodata 0 data 1024 bss 32
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 4194 rodata 0 data 0 bss 0
@@ -23,7 +23,7 @@ crate elf text 2383 rodata 0 data 0 bss 0
 crate hal text 531 rodata 0 data 0 bss 0
 crate ipc text 1215 rodata 16 data 0 bss 0
 crate kalloc text 13838 rodata 0 data 0 bss 0
-crate kintane text 108460 rodata 112 data 31932 bss 86558
+crate kintane text 107925 rodata 112 data 31932 bss 86558
 crate kobject text 3259 rodata 16 data 0 bss 0
 crate mm text 36544 rodata 0 data 0 bss 0
 crate module text 18869 rodata 0 data 0 bss 0
@@ -32,9 +32,9 @@ crate platform text 28370 rodata 96 data 94896 bss 2069
 crate sched text 3932 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
 crate sync text 12339 rodata 32 data 1088 bss 2176
-crate thread text 9106 rodata 0 data 0 bss 0
+crate thread text 11508 rodata 0 data 0 bss 0
 crate time text 2782 rodata 0 data 0 bss 0
 crate uart16550 text 2152 rodata 0 data 256 bss 88
 crate unwind text 3206 rodata 0 data 0 bss 0
 crate virtio_blk text 7734 rodata 16 data 72 bss 0
-total 1347196
+total 1351292
