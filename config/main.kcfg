@@ -135,7 +135,7 @@ config NR_CPUS
 config KERNEL_THREAD_SLOTS
     int "Guarded stack slots for kernel threads"
     range 2 256
-    default 18 if STRESS_TEST && BLOCK_DOMAIN
+    default 19 if STRESS_TEST && BLOCK_DOMAIN
     default 17 if STRESS_TEST && DRIVER_ISOLATION
     default 16 if STRESS_TEST
     default 8
