@@ -996,11 +996,13 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     }
 
     // SAFETY: the only write to `SCHED`, before the timer starts and before any other
-    // thread exists (see its invariant).
+    // thread exists (see its invariant). `Sched` is its one field, so initialising the
+    // table in place initialises the whole `Sched`. In place, not by value: the table
+    // grows with stack slots and CPUs, and building it on the boot stack first overflowed
+    // that stack into its guard page on an eight-CPU aarch64 stress build.
     unsafe {
-        SCHED.get().write(MaybeUninit::new(Sched {
-            threads: Threads::new(priority(BOOT_PRIORITY)),
-        }));
+        let sched = SCHED.get().cast::<Sched>();
+        Threads::init_in_place(core::ptr::addr_of_mut!((*sched).threads), priority(BOOT_PRIORITY));
     }
     JOINED[0].store(true, Ordering::Release);
 

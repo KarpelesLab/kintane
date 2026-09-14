@@ -184,6 +184,53 @@ impl<A: HasContextSwitch, const N: usize, const CPUS: usize> Threads<A, N, CPUS>
         }
     }
 
+    /// [`Threads::new`], built directly where it will live.
+    ///
+    /// `new` returns the table by value, so it exists once on the caller's stack before it
+    /// is moved into place, and the table grows with its slot and CPU counts. A kernel
+    /// builds its table on a boot stack of a few KiB: an aarch64 stress build with eleven
+    /// stack slots at eight CPUs overflowed its 16 KiB boot stack into the guard page
+    /// doing exactly that. This writes every element through the pointer, so nothing the
+    /// size of the table is ever on a stack.
+    ///
+    /// # Safety
+    /// `slot` must be valid for writes of a whole `Threads` and properly aligned. Whatever
+    /// it held is overwritten without being dropped.
+    #[allow(unsafe_code)]
+    pub unsafe fn init_in_place(slot: *mut Self, boot_priority: Priority) {
+        assert!(N > 0, "a thread table must hold at least the running thread");
+        assert!(CPUS > 0 && CPUS <= 64, "a thread table has between 1 and 64 run queues");
+        // SAFETY: the caller guarantees `slot` is valid for writes of a `Threads`. Every
+        // field is written exactly once, element by element through raw field pointers, so
+        // no reference to the uninitialised table is formed and no array is built on the
+        // stack first.
+        unsafe {
+            let meta = core::ptr::addr_of_mut!((*slot).meta).cast::<Option<Meta>>();
+            let contexts = core::ptr::addr_of_mut!((*slot).contexts).cast::<A::Context>();
+            for i in 0..N {
+                meta.add(i).write(None);
+                contexts.add(i).write(A::Context::default());
+            }
+            meta.write(Some(Meta {
+                id: ThreadId::new(0),
+                priority: boot_priority,
+                state: State::Running,
+                cpu: 0,
+                affinity: CpuSet::all(CPUS),
+                idle: false,
+            }));
+            let runq = core::ptr::addr_of_mut!((*slot).runq).cast::<RunQueue<N>>();
+            let current = core::ptr::addr_of_mut!((*slot).current).cast::<Option<usize>>();
+            for cpu in 0..CPUS {
+                runq.add(cpu).write(RunQueue::new());
+                current.add(cpu).write(None);
+            }
+            current.write(Some(0));
+            core::ptr::addr_of_mut!((*slot).next_id).write(1);
+            core::ptr::addr_of_mut!((*slot).migrations).write(0);
+        }
+    }
+
     /// The thread on CPU 0.
     pub fn current(&self) -> ThreadId {
         self.current_on(0).unwrap_or(ThreadId::new(0))
@@ -1075,6 +1122,36 @@ mod tests {
         );
         assert_eq!(t.context_mut(ThreadId::new(99)).map(|_| ()), Err(Error::NoSuchThread));
         t.check().unwrap();
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_table_built_in_place_is_the_table_new_builds() {
+        let _serial = serial();
+
+        // Two CPUs, so the per-CPU arrays are written in place too.
+        let mut two = Box::<Threads<MockFull, 8, 2>>::new_uninit();
+        // SAFETY: a fresh, aligned heap allocation the size of the table. `MaybeUninit`'s
+        // `as_mut_ptr` named explicitly: through the `Box`, method resolution would pick
+        // `Box`'s own, a pointer to the `MaybeUninit` itself.
+        unsafe { Threads::init_in_place(core::mem::MaybeUninit::as_mut_ptr(&mut *two), p(5)) };
+        // SAFETY: `init_in_place` wrote every field.
+        let two: Box<Threads<MockFull, 8, 2>> = unsafe { two.assume_init() };
+        let fresh: Threads<MockFull, 8, 2> = Threads::new(p(5));
+        two.check().unwrap();
+        assert_eq!(two.current(), fresh.current(), "the same thread runs on CPU 0");
+        assert_eq!(two.current_on(1), None, "and CPU 1 has not joined, as in `new`");
+        assert_eq!(two.state(ThreadId::new(0)), Some(State::Running));
+
+        // One CPU, to use it: an in-place table spawns like any other.
+        let mut one = Box::<Threads<MockFull, 8>>::new_uninit();
+        // SAFETY: as above.
+        unsafe { Threads::init_in_place(core::mem::MaybeUninit::as_mut_ptr(&mut *one), p(5)) };
+        // SAFETY: as above.
+        let mut one: Box<Threads<MockFull, 8>> = unsafe { one.assume_init() };
+        let a = spawn(&mut one, 11, 4);
+        assert_eq!(one.state(a), Some(State::Ready), "and it spawns like any table");
+        one.check().unwrap();
     }
 
     #[test]
