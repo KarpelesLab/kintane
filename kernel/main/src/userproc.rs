@@ -1532,6 +1532,86 @@ impl abi::Handler for Syscalls {
         )
     }
 
+    /// Wait for any of a set of objects; see `crate::readiness` and the table's entry.
+    ///
+    /// The set is resolved once, here: every handle is looked up and its rights recorded
+    /// before the wait begins, so a wait cannot be started on a handle the caller does not
+    /// hold. A handle closed while the wait runs leaves an object that is gone, which reports
+    /// `ERROR` rather than waiting for something nothing can deliver.
+    fn object_wait_any(
+        &mut self,
+        entries: UserPtr,
+        count: usize,
+        ready: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let mut raw = [0u8; crate::readiness::MAX_SET * crate::readiness::ENTRY_BYTES];
+        let bytes = count
+            .checked_mul(crate::readiness::ENTRY_BYTES)
+            .filter(|n| (1..=raw.len()).contains(n))
+            .ok_or(Error::InvalidArgument)?;
+        // SAFETY: as every call that reads a user array: `copy_from_user` checks the range and
+        // faults its pages in, and answers rather than trapping.
+        unsafe { Cpu::copy_from_user(&mut raw[..bytes], user(entries)) }
+            .map_err(|_| Error::Fault)?;
+        let mut set = [crate::readiness::Watch::NOTHING; crate::readiness::MAX_SET];
+        for (i, watch) in set.iter_mut().enumerate().take(count) {
+            let at = i * crate::readiness::ENTRY_BYTES;
+            let mut handle = [0u8; 4];
+            let mut interest = [0u8; 4];
+            handle.copy_from_slice(&raw[at..at + 4]);
+            interest.copy_from_slice(&raw[at + 4..at + 8]);
+            let interest = u32::from_le_bytes(interest);
+            if interest & !abi::ready::ALL != 0 {
+                return Err(Error::InvalidArgument);
+            }
+            let entry = self
+                .p()
+                .table
+                .get(Handle::from_raw(u32::from_le_bytes(handle)))
+                .map_err(handle_error)?;
+            *watch = crate::readiness::Watch { entry, interest };
+        }
+        let set = &set[..count];
+        // Written first, so the answer cannot fault once the wait has found something.
+        // SAFETY: as above.
+        unsafe {
+            Cpu::copy_to_user(user(ready), &[0u8; crate::readiness::MAX_SET * 4][..count * 4])
+        }
+        .map_err(|_| Error::Fault)?;
+        let has_socket = set.iter().any(crate::readiness::Watch::is_socket);
+        let queues: [Option<ObjectId>; crate::readiness::MAX_SET] = core::array::from_fn(|i| {
+            set.get(i)
+                .filter(|w| w.entry.kind == ObjectType::Completion)
+                .map(|w| w.entry.object)
+        });
+        let mut answers = [0u8; crate::readiness::MAX_SET * 4];
+        self.wait_for(
+            crate::readiness::queue(),
+            timeout_ns,
+            move || crate::readiness::next_look(has_socket, queues.iter().flatten().copied()),
+            move |_| {
+                let mut found = 0;
+                for (i, watch) in set.iter().enumerate() {
+                    let bits = watch.ready();
+                    if bits != 0 {
+                        found += 1;
+                    }
+                    if let Some(slot) = answers.get_mut(4 * i..4 * i + 4) {
+                        slot.copy_from_slice(&bits.to_le_bytes());
+                    }
+                }
+                if found == 0 {
+                    return Ok(None);
+                }
+                // SAFETY: as above; this range was written before the wait began.
+                unsafe { Cpu::copy_to_user(user(ready), &answers[..count * 4]) }
+                    .map_err(|_| Error::Fault)?;
+                Ok(Some(found as u64))
+            },
+        )
+    }
+
     fn completion_wait(
         &mut self,
         completion: AbiHandle,

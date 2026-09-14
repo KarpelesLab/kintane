@@ -84,6 +84,7 @@ use crate::userproc::{self, MAX_PROCS, Personality, Process};
 use crate::wait::WaitQueue;
 use crate::{Check, Live, preempt, spawn, timekeeping, write_hex, write_usize};
 
+mod poll;
 mod signals;
 mod socket;
 
@@ -134,6 +135,8 @@ enum Descriptor {
     PipeWrite(usize),
     /// Socket `n` of [`socket`]'s table.
     Socket(usize),
+    /// The `epoll` set `n` of [`poll`]'s table: descriptors watched, and what for.
+    Epoll(usize),
 }
 
 /// What a Linux process has that a native one does not.
@@ -323,6 +326,15 @@ fn dispatch(
         Call::Mkdirat => mkdirat(slot, a0, a1),
         Call::Rename => renameat(slot, linux::AT_FDCWD as u64, a0, linux::AT_FDCWD as u64, a1),
         Call::Renameat => renameat(slot, a0, a1, a2, a3),
+        Call::Poll => poll::poll_call(slot, a0, a1, a2, false, 0),
+        Call::Ppoll => poll::poll_call(slot, a0, a1, a2, true, a3),
+        Call::Select => poll::select_call(slot, a0, a1, a2, a3, a4, false, 0),
+        // `pselect6` passes the mask as a pointer to (mask, size); the mask is its first word.
+        Call::Pselect6 => poll::select_call(slot, a0, a1, a2, a3, a4, true, a5),
+        Call::EpollCreate1 => poll::epoll_create1(slot, a0),
+        Call::EpollCtl => poll::epoll_ctl(slot, a0, a1, a2, a3),
+        Call::EpollWait => poll::epoll_wait(slot, a0, a1, a2, a3, 0),
+        Call::EpollPwait => poll::epoll_wait(slot, a0, a1, a2, a3, a4),
     }
 }
 
@@ -536,6 +548,7 @@ fn close(slot: usize, fd: u64) -> Result<u64, Failure> {
         Descriptor::PipeRead(pipe) => drop_end(pipe, End::Read),
         Descriptor::PipeWrite(pipe) => drop_end(pipe, End::Write),
         Descriptor::Socket(i) => socket::drop_ref(i),
+        Descriptor::Epoll(i) => poll::drop_ref(i),
         Descriptor::Console(_) | Descriptor::Stdin | Descriptor::Closed => {}
     }
     Ok(0)
@@ -956,6 +969,7 @@ fn drop_end(pipe: usize, end: End) {
             *p = Pipe::EMPTY;
         }
     }
+    crate::readiness::wake();
     PIPE_WAITS[pipe].wake_all();
 }
 
@@ -1002,6 +1016,41 @@ fn pipe(slot: usize, out: u64, flags: u64) -> Result<u64, Failure> {
     fds[4..].copy_from_slice(&(w as u32).to_le_bytes());
     to_user(out, &fds)?;
     Ok(0)
+}
+
+/// What a pipe's read end is ready for, as `poll` events, taking nothing: queued bytes are
+/// readable, and a pipe no writer is left on has hung up — which a reader must be told,
+/// since its read answers the end of the file rather than waiting.
+pub(super) fn pipe_read_ready(pipe: usize) -> u16 {
+    let pipes = PIPE_TABLE.lock_irqsave();
+    let Some(p) = pipes.get(pipe).filter(|p| p.used) else {
+        return linux::poll::POLLNVAL;
+    };
+    let mut bits = 0;
+    if p.len > 0 {
+        bits |= linux::poll::POLLIN;
+    }
+    if p.writers == 0 {
+        bits |= linux::poll::POLLIN | linux::poll::POLLHUP;
+    }
+    bits
+}
+
+/// What a pipe's write end is ready for: room to write, and an error once no reader is left,
+/// which is the write that would raise `SIGPIPE`.
+pub(super) fn pipe_write_ready(pipe: usize) -> u16 {
+    let pipes = PIPE_TABLE.lock_irqsave();
+    let Some(p) = pipes.get(pipe).filter(|p| p.used) else {
+        return linux::poll::POLLNVAL;
+    };
+    let mut bits = 0;
+    if p.len < PIPE_BYTES {
+        bits |= linux::poll::POLLOUT;
+    }
+    if p.readers == 0 {
+        bits |= linux::poll::POLLERR;
+    }
+    bits
 }
 
 fn read_pipe(
@@ -1052,7 +1101,8 @@ fn read_pipe(
     if looks >= 3 && n > 0 {
         PIPE_BLOCKED_READS.fetch_add(1, Ordering::Relaxed);
     }
-    // A writer may be waiting for the room this made.
+    // A writer may be waiting for the room this made, and a waiter over a set for either.
+    crate::readiness::wake();
     PIPE_WAITS[pipe].wake_all();
     to_user(buf, &chunk[..n])?;
     Ok(n as u64)
@@ -1097,6 +1147,7 @@ fn write_pipe(
             Err(_) if done == 0 => return Err(Failure::TryAgain),
             Ok(Err(_)) | Err(_) => break,
         }
+        crate::readiness::wake();
         PIPE_WAITS[pipe].wake_all();
     }
     Ok(done as u64)
@@ -1420,6 +1471,10 @@ fn inherit(parent: usize, child: usize) -> Result<(), Failure> {
                 socket::add_ref(i);
                 Descriptor::Socket(i)
             }
+            Descriptor::Epoll(i) => {
+                poll::add_ref(i);
+                Descriptor::Epoll(i)
+            }
             other => other,
         };
     }
@@ -1677,6 +1732,7 @@ fn close_all(fds: [Descriptor; MAX_FDS]) {
             Descriptor::PipeRead(pipe) => drop_end(pipe, End::Read),
             Descriptor::PipeWrite(pipe) => drop_end(pipe, End::Write),
             Descriptor::Socket(i) => socket::drop_ref(i),
+            Descriptor::Epoll(i) => poll::drop_ref(i),
             Descriptor::Console(_) | Descriptor::Stdin | Descriptor::Closed => {}
         }
     }

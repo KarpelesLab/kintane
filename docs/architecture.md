@@ -562,6 +562,42 @@ allocator every process's `Vm` operations share. Its holder may shoot down TLBs 
 taken with `SpinLock::lock_irqsave_with`, whose spin answers shootdowns on every turn exactly as
 the process locks' does; see [TLB shootdown](#tlb-shootdown).
 
+### Readiness — waiting on many things at once
+
+A wait queue holds a thread for one condition, and a thread registers on one queue at a time. A
+program with two things to wait for therefore had no way to wait for both: whichever it called
+first, it was deaf to the other. `kernel/main/src/readiness.rs` is what a set of objects waits on.
+
+**One queue, woken by every change.** Rather than register on each member's queue, a wait over a
+set registers on a single queue, and every change that could make anything ready wakes that queue
+beside the one it already woke: a channel's message or close, an event's signal, a completion
+posted, a process ended, an object destroyed, the card's interrupt after it has run the network
+stack, and a pipe's ends. Each call sits next to the wake that was already there, so there is one
+place per change rather than a subscription mechanism.
+
+**Why no wake is lost.** `WaitQueue::wait_once` checks, registers, checks again, and only then
+blocks; every waker changes state before it wakes. A wait over a set inherits that exactly,
+because its condition is one closure — "any member is ready" — run at both checks. The dangerous
+moment is between them, and the `readiness` boot check aims wakes at it deliberately
+([testing.md](testing.md#2h-waiting-on-many-things-at-once)).
+
+**Readiness takes nothing.** `READ` means the next receive would not wait; `CLOSED` that the other
+end is gone and it would answer the end of the stream rather than wait. Computing it consumes
+nothing: a readable channel still holds its message, a socket keeps its bytes, an event stays
+signalled. So two threads watching one object are both told, and only the one that then takes it
+consumes anything — which is what level-triggered readiness means here and on Linux. Nothing is
+edge-triggered.
+
+**Rights narrow it.** A handle without `READ` is never reported readable, because a receive on it
+would be refused; `WAIT` is what makes a process's end visible. The set is resolved once, when the
+call is made, so a wait cannot begin on a handle the caller does not hold.
+
+**Two deadlines are floors on looking, not on answering.** A socket in the set means the stack's
+next TCP timer may change readiness with no frame arriving, and a completion queue means a timer
+may fall due — and a timer's expiration reaches its queue only when the queue is looked at, so the
+wait delivers due timers before calling a queue ready. Either way a look that finds nothing waits
+again.
+
 ### `ipc` — channels
 
 A channel is two endpoints with bounded inboxes. Sending moves handles, all or nothing.

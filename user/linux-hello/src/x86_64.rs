@@ -48,6 +48,16 @@ pub const GETPEERNAME: u64 = 52;
 pub const SETSOCKOPT: u64 = 54;
 pub const GETSOCKOPT: u64 = 55;
 pub const ACCEPT4: u64 = 288;
+pub const POLL: Option<u64> = Some(7);
+pub const SELECT: Option<u64> = Some(23);
+pub const PPOLL: u64 = 271;
+pub const PSELECT6: u64 = 270;
+pub const EPOLL_CREATE1: u64 = 291;
+pub const EPOLL_CTL: u64 = 233;
+pub const EPOLL_PWAIT: u64 = 281;
+/// `struct epoll_event` is packed here: four bytes of events, then the data word.
+pub const EPOLL_EVENT_BYTES: usize = 12;
+pub const EPOLL_DATA_AT: usize = 4;
 
 const ARCH_SET_FS: u64 = 0x1002;
 

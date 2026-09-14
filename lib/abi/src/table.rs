@@ -155,4 +155,23 @@ crate::syscalls! {
     /// `timeout_ns` for the peer to acknowledge everything, FIN included. Receiving goes on.
     /// Closing the handle closes the connection in order too, without waiting.
     34 => fn socket_shutdown(socket: Handle, timeout_ns: u64);
+
+    // ---- waiting on several things at once ------------------------------------------------
+
+    /// Wait up to `timeout_ns` for any of `count` objects to be ready.
+    ///
+    /// `entries` names them: eight bytes each, the handle as a little-endian `u32` then a
+    /// little-endian `u32` of the `ready` bits asked about. `ready` is where the answer goes:
+    /// `count` little-endian `u32`s, one per entry, holding what each object is ready for.
+    /// Returns how many entries are ready, which is at least one on success.
+    ///
+    /// Readiness is what the next call would find, and takes nothing: a readable channel still
+    /// holds its message afterwards. `ERROR` and `CLOSED` are answered whether or not they were
+    /// asked about. A handle needs the right the interest implies — `READ` to be told readable,
+    /// `WRITE` writable, `WAIT` for a process's end — and one that lacks it is simply never
+    /// ready, as a call on it would be refused. A handle that names nothing is `BadHandle`: the
+    /// set is refused whole rather than waited on with a hole in it.
+    ///
+    /// At most 8 entries, and an interest outside `ready::ALL` is `InvalidArgument`.
+    35 => fn object_wait_any(entries: UserPtr, count: usize, ready: UserPtr, timeout_ns: u64);
 }

@@ -30,6 +30,9 @@
 //!   first the server has served; see [`files`].
 //! * [`MODE_WRITE`] writes the test disk through the file server on one connection, and is refused
 //!   on another the kernel made read-only; see [`write_files`].
+//! * [`MODE_POLL`] waits on several objects at once — a channel, an event and a completion queue —
+//!   and asks the kernel, over that channel, to make one of them ready after a delay it chooses;
+//!   see [`poll_wait`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -64,6 +67,8 @@ const MODE_SPINNER: usize = 9;
 const MODE_FILES: usize = 10;
 /// Write files through the kernel's file server; see [`write_files`].
 const MODE_WRITE: usize = 11;
+/// Wait on several objects at once; see the module comment.
+const MODE_POLL: usize = 12;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -109,6 +114,7 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_SPINNER => spinner(handle(a)),
         MODE_FILES => files(handle(a), handle(b)),
         MODE_WRITE => write_files(handle(a), handle(b), handle(c)),
+        MODE_POLL => poll_wait(handle(a), handle(b), handle(c)),
         _ => 0xbad0,
     };
     exit(code)
@@ -987,6 +993,148 @@ fn fault(target: usize) -> u64 {
     // SAFETY: not safe, and not meant to be: this is the access the kernel must refuse.
     unsafe { (target as *mut u8).write_volatile(0x5a) };
     0x300
+}
+
+// ---- waiting on several objects at once ---------------------------------------------------
+
+/// What [`poll_wait`] exits with when every step behaved.
+const POLL_SUCCESS: u64 = 0x70;
+
+/// What the kernel's check is asked to make ready, and how long from now. One byte and a
+/// little-endian `u32` of microseconds; the kernel mirrors these in `kernel/main/src/readiness.rs`.
+const ASK_EVENT: u8 = b'E';
+const ASK_CHANNEL: u8 = b'C';
+
+/// Rounds of the race: each asks for the event after a delay that grows, so some land while the
+/// wait is still looking at its set and some after it has blocked.
+const RACE_ROUNDS: u32 = 16;
+/// How much later each round asks for its wake, in microseconds.
+const RACE_STEP_US: u32 = 120;
+
+/// The longest any wait here may take, and the timeout the one that must run out is given.
+const POLL_PATIENCE_NS: u64 = 5_000_000_000;
+const POLL_TIMEOUT_NS: u64 = 30_000_000;
+
+/// Ask the kernel's check for `what` in `delay_us`, over the channel it holds the other end of.
+fn poll_ask(channel: Handle, what: u8, delay_us: u32) -> bool {
+    let mut message = [0u8; 5];
+    message[0] = what;
+    let bytes = delay_us.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        if let (Some(to), Some(from)) = (message.get_mut(1 + i), bytes.get(i)) {
+            *to = *from;
+        }
+        i += 1;
+    }
+    rt::send(channel, &message).is_ok()
+}
+
+/// Wait on a channel, an event and a completion queue at once; see the module comment. The
+/// kernel makes exactly one of them ready at a time, at a moment this program asks for, so
+/// what comes back says which — and a wake that lands between the wait's two looks at its set
+/// must not be lost.
+fn poll_wait(console: Handle, channel: Handle, event: Handle) -> u64 {
+    let Ok(queue) = rt::completion_queue() else {
+        return 0x700;
+    };
+    let Ok(timer) = rt::Timer::create(queue, 0x7017) else {
+        return 0x701;
+    };
+    let set = [
+        rt::Watch {
+            handle: channel,
+            interest: rt::ready::READ,
+        },
+        rt::Watch {
+            handle: event,
+            interest: rt::ready::READ,
+        },
+        rt::Watch {
+            handle: queue,
+            interest: rt::ready::READ,
+        },
+    ];
+    let mut ready = [0u32; 3];
+
+    // 0x710: nothing is ready, so the wait runs out — and not before its timeout.
+    let start = rt::now_ns();
+    let waited = rt::wait_any(&set, &mut ready, POLL_TIMEOUT_NS);
+    let took = rt::now_ns().wrapping_sub(start);
+    if waited != Err(Error::TimedOut) || took < POLL_TIMEOUT_NS {
+        return 0x710;
+    }
+    // 0x711: a zero timeout answers at once with nothing ready.
+    if rt::wait_any(&set, &mut ready, rt::NO_WAIT) != Err(Error::ShouldWait) {
+        return 0x711;
+    }
+
+    // 0x712-0x714: the event, asked for and then waited on, is the member that comes back.
+    if !poll_ask(channel, ASK_EVENT, 0) {
+        return 0x712;
+    }
+    match rt::wait_any(&set, &mut ready, POLL_PATIENCE_NS) {
+        Ok(1) => {}
+        _ => return 0x713,
+    }
+    if ready[1] & rt::ready::READ == 0 || ready[0] != 0 || ready[2] != 0 {
+        return 0x714;
+    }
+    // Consuming it makes it unready again, which is what the next rounds rely on.
+    let signalled = rt::Event { handle: event };
+    if signalled.wait(rt::NO_WAIT).is_err() {
+        return 0x715;
+    }
+
+    // 0x716-0x718: the channel, the same way. Its message is read, so it is unready after.
+    if !poll_ask(channel, ASK_CHANNEL, 0) {
+        return 0x716;
+    }
+    match rt::wait_any(&set, &mut ready, POLL_PATIENCE_NS) {
+        Ok(1) => {}
+        _ => return 0x717,
+    }
+    if ready[0] & rt::ready::READ == 0 {
+        return 0x718;
+    }
+    let mut buf = [0u8; 8];
+    if rt::try_recv(channel, &mut buf).is_err() {
+        return 0x719;
+    }
+
+    // 0x71a-0x71b: a timer's completion, which nothing wakes the queue for: the wait must look
+    // again when the timer falls due, or it would sleep through it.
+    if timer.set(POLL_TIMEOUT_NS, 0).is_err() {
+        return 0x71a;
+    }
+    match rt::wait_any(&set, &mut ready, POLL_PATIENCE_NS) {
+        Ok(1) if ready[2] & rt::ready::READ != 0 => {}
+        _ => return 0x71b,
+    }
+    if rt::try_completion(queue).is_err() {
+        return 0x71c;
+    }
+
+    // 0x720: the race. Each round asks for the event a little later than the last, so the wake
+    // lands at every stage of the wait: before it looks, between its two looks, and after it has
+    // blocked. A lost wake is a round that never ends.
+    let mut round = 0;
+    while round < RACE_ROUNDS {
+        if !poll_ask(channel, ASK_EVENT, round * RACE_STEP_US) {
+            return 0x720;
+        }
+        match rt::wait_any(&set, &mut ready, POLL_PATIENCE_NS) {
+            Ok(n) if n >= 1 && ready[1] & rt::ready::READ != 0 => {}
+            _ => return 0x721 + round as u64,
+        }
+        if signalled.wait(rt::NO_WAIT).is_err() {
+            return 0x740 + round as u64;
+        }
+        round += 1;
+    }
+
+    let _ = rt::print(console, b"init: waited on a channel, an event and a timer at once\n");
+    POLL_SUCCESS
 }
 
 #[panic_handler]

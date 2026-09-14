@@ -334,6 +334,12 @@ impl Stack {
         self.st.tcp.listen(port)
     }
 
+    /// Whether a connection is waiting on `listener`, without taking it: what a readiness
+    /// wait asks about a listening socket.
+    pub fn tcp_pending(&self, listener: Conn) -> bool {
+        self.st.tcp.pending(listener)
+    }
+
     /// A connection that arrived on `listener`, or [`TcpError::WouldBlock`].
     pub fn tcp_accept(&mut self, listener: Conn) -> Result<Conn, TcpError> {
         self.st.tcp.accept(listener)

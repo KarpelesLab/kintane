@@ -273,6 +273,25 @@ fn end_by(slot: usize, signo: u64) {
     userproc::end_process(slot, sig::exit_code(signo));
 }
 
+/// Wear `mask` until the wait ends, returning the mask to put back: what `ppoll`, `pselect6`
+/// and `epoll_pwait` do, so a signal the program blocks outside the wait can still end it.
+/// `None` for a thread with no signal state, which has nothing to swap.
+///
+/// The two unblockable signals stay unblocked, as they do for `rt_sigprocmask`.
+pub(super) fn wear_mask(slot: usize, mask: u64) -> Option<u64> {
+    let t = mine(slot)?;
+    let old = t.mask.load(Ordering::Acquire);
+    t.mask.store(mask & !sig::UNBLOCKABLE, Ordering::Release);
+    Some(old)
+}
+
+/// Put back the mask [`wear_mask`] took off, once the wait is over.
+pub(super) fn restore_mask(slot: usize, old: u64) {
+    if let Some(t) = mine(slot) {
+        t.mask.store(old & !sig::UNBLOCKABLE, Ordering::Release);
+    }
+}
+
 /// Whether every thread of `slot` masks `bit`, so a process-wide signal must wait.
 fn masked_everywhere(slot: usize, bit: u64) -> bool {
     let mut any = false;

@@ -203,6 +203,31 @@ pub mod socket {
     }
 }
 
+/// What `object_wait_any` asks about, and answers with: the bits of an interest and of a
+/// readiness.
+///
+/// Readiness is a promise about the next call on that handle, not a promise that it will
+/// succeed for ever: `READ` means a receive would not have to wait *now*, and only the thread
+/// that then takes the message consumes it. Two threads told the same channel is readable will
+/// both be told, and one of them will find it empty — which is what any level-triggered
+/// readiness means, here as on Linux.
+///
+/// `ERROR` and `CLOSED` are reported whether or not they were asked for: a set with a dead
+/// member must not wait for it.
+pub mod ready {
+    /// A receive, a read or an accept would not wait.
+    pub const READ: u32 = 1 << 0;
+    /// A send or a write would not wait: there is room for at least one byte.
+    pub const WRITE: u32 = 1 << 1;
+    /// The object failed: a connection reset, or a handle whose object is gone.
+    pub const ERROR: u32 = 1 << 2;
+    /// The other end is gone. A receive reports the end of the stream rather than waiting.
+    pub const CLOSED: u32 = 1 << 3;
+    /// Every bit a program may ask about. An interest outside it is refused, rather than
+    /// waited on and never answered.
+    pub const ALL: u32 = READ | WRITE | ERROR | CLOSED;
+}
+
 /// A handle value as a program holds it: an opaque number the kernel issued. Only the
 /// kernel's table knows what, if anything, it names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

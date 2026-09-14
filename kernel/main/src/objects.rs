@@ -182,6 +182,7 @@ static IDS: ObjectIds = ObjectIds::new();
 /// Give a destroyed object's cell back. Called by the store when the last reference to an
 /// object is gone, with no store lock held.
 fn destroy(_id: ObjectId, cell: &'static Cell) {
+    crate::readiness::wake();
     let (endpoint_of, connection) = cell.with(|o| {
         let taken = match o {
             Object::Endpoint { channel } => (Some(*channel), None),
@@ -304,6 +305,7 @@ pub fn retire(id: ObjectId) {
 
 /// Post `(key, value)` to the completion queue `queue` names. `Full` if the queue is.
 pub fn post(queue: ObjectId, key: u64, value: u64) -> Result<(), ()> {
+    crate::readiness::wake();
     let posted = with(queue, |o| match o {
         Object::Completion { ring, head, len } => {
             if *len >= QUEUE_DEPTH {
@@ -345,6 +347,7 @@ pub fn take(object: &mut Object) -> Option<(u64, u64)> {
 /// the process's own lock, which is then dropped before the queue's is taken: see the
 /// module documentation.
 pub fn on_process_exit(slot: usize, code: u64) {
+    crate::readiness::wake();
     let mut post_to = None;
     let mut waiting = None;
     for cell in CELLS.iter() {
@@ -428,6 +431,7 @@ struct ChannelSlot {
 impl ChannelSlot {
     /// Wake this channel's waiters, and its relay's.
     fn wake(&self) {
+        crate::readiness::wake();
         self.waits.wake_all();
         // SAFETY: see `relay`: null, or a `'static` queue.
         if let Some(relay) = unsafe { self.relay.load(Ordering::Acquire).as_ref() } {
@@ -613,6 +617,7 @@ static WAITS: [WaitQueue; MAX_OBJECTS] = [const { WaitQueue::new() }; MAX_OBJECT
 /// Wake every thread waiting on any object. For a process ending while some of its threads
 /// wait: each checks again, finds its process ending, and ends too.
 pub fn wake_all_waiters() {
+    crate::readiness::wake();
     for waiters in &WAITS {
         waiters.wake_all();
     }
@@ -629,6 +634,7 @@ pub fn waiters(id: ObjectId) -> Option<&'static WaitQueue> {
 
 /// Signal the event `id` names and wake whoever waits on it. `false` if it is not an event.
 pub fn signal_event(id: ObjectId) -> bool {
+    crate::readiness::wake();
     let signalled = with(id, |o| match o {
         Object::Event { signalled } => {
             *signalled = true;
@@ -706,6 +712,27 @@ pub fn set_timer(id: ObjectId, deadline: u64, period: u64) -> bool {
 /// Each delivery's value is how many expirations it reports: one for a one-shot timer, and
 /// every period that elapsed for a periodic one. A full queue leaves the timer due, so its
 /// expirations are delivered once there is room rather than lost.
+/// When the soonest armed timer delivering to `queue` falls due, in kernel-clock nanoseconds.
+///
+/// Delivers nothing and changes nothing: a wait over a set of objects asks this to know when it
+/// must look again, since a timer's completion appears without anything waking a queue
+/// (`crate::readiness`).
+pub fn next_timer_for(queue: ObjectId) -> Option<u64> {
+    let mut earliest: Option<u64> = None;
+    for cell in CELLS.iter() {
+        let due = cell.with(|o| match o {
+            Object::Timer {
+                queue: q, deadline, ..
+            } if *q == queue && *deadline != DISARMED => Some(*deadline),
+            _ => None,
+        });
+        if let Some(due) = due {
+            earliest = Some(earliest.map_or(due, |e: u64| e.min(due)));
+        }
+    }
+    earliest
+}
+
 pub fn deliver_due_timers(queue: ObjectId, now: u64) -> Option<u64> {
     let _serial = DELIVERY.lock_irqsave();
     let mut earliest: Option<u64> = None;

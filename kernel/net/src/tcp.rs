@@ -713,6 +713,18 @@ impl Tcp {
         ))
     }
 
+    /// Whether `listener` has a connection [`Tcp::accept`] would take. Nothing is taken: this
+    /// is what a readiness wait asks, which must not consume what it reports.
+    pub fn pending(&self, listener: Conn) -> bool {
+        self.get(listener).is_ok_and(|l| l.state == State::Listen)
+            && self.tcbs.iter().any(|t| {
+                t.active
+                    && t.parent == Some(listener.index)
+                    && !t.accepted
+                    && t.state.synchronized()
+            })
+    }
+
     /// A connection `listener` has completed the handshake for, taken off its backlog.
     pub fn accept(&mut self, listener: Conn) -> Result<Conn, TcpError> {
         if self.get(listener)?.state != State::Listen {

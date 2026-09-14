@@ -30,6 +30,7 @@
 #[cfg(test)]
 mod tests;
 
+pub mod poll;
 pub mod signal;
 
 /// The x86_64 system call table, in the format of Linux's `syscall_64.tbl`.
@@ -146,11 +147,19 @@ pub enum Call {
     Mkdirat,
     Rename,
     Renameat,
+    Poll,
+    Ppoll,
+    Select,
+    Pselect6,
+    EpollCreate1,
+    EpollCtl,
+    EpollWait,
+    EpollPwait,
 }
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 53] = [
+    pub const ALL: [Call; 61] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -204,6 +213,14 @@ impl Call {
         Call::Mkdirat,
         Call::Rename,
         Call::Renameat,
+        Call::Poll,
+        Call::Ppoll,
+        Call::Select,
+        Call::Pselect6,
+        Call::EpollCreate1,
+        Call::EpollCtl,
+        Call::EpollWait,
+        Call::EpollPwait,
     ];
 
     /// The name the tables give it.
@@ -262,6 +279,14 @@ impl Call {
             Call::Mkdirat => "mkdirat",
             Call::Rename => "rename",
             Call::Renameat => "renameat",
+            Call::Poll => "poll",
+            Call::Ppoll => "ppoll",
+            Call::Select => "select",
+            Call::Pselect6 => "pselect6",
+            Call::EpollCreate1 => "epoll_create1",
+            Call::EpollCtl => "epoll_ctl",
+            Call::EpollWait => "epoll_wait",
+            Call::EpollPwait => "epoll_pwait",
         }
     }
 
@@ -322,6 +347,14 @@ impl Call {
             Call::Mkdirat => (258, 34),
             Call::Rename => (82, NONE),
             Call::Renameat => (264, 38),
+            Call::Poll => (7, NONE),
+            Call::Ppoll => (271, 73),
+            Call::Select => (23, NONE),
+            Call::Pselect6 => (270, 72),
+            Call::EpollCreate1 => (291, 20),
+            Call::EpollCtl => (233, 21),
+            Call::EpollWait => (232, NONE),
+            Call::EpollPwait => (281, 22),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,

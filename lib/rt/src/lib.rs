@@ -27,7 +27,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 
-pub use abi::{Error, Handle, UserPtr, call};
+pub use abi::{Error, Handle, UserPtr, call, ready};
 
 /// A timeout that never runs out.
 pub const FOREVER: u64 = u64::MAX;
@@ -355,6 +355,55 @@ impl Process {
     pub fn join(&self, timeout_ns: u64) -> Result<u64, Error> {
         call::process_wait(self.handle, Handle(0), 0, timeout_ns)
     }
+}
+
+// ---- waiting on several things at once ------------------------------------------------------
+
+/// One member of a wait over a set: a handle, and the `ready` bits to be told about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Watch {
+    pub handle: Handle,
+    pub interest: u32,
+}
+
+/// Members one wait may name: the kernel's own limit, so a set built here is never refused
+/// for its size.
+pub const WATCH_MAX: usize = 8;
+
+/// Wait up to `timeout_ns` for any of `set` to be ready, and write what each is ready for into
+/// `ready`. Returns how many are ready, which is at least one unless the wait ran out.
+///
+/// The answer is what the next call on that handle would find, and nothing is consumed: a
+/// channel reported readable still holds its message, and it is the receive that takes it.
+pub fn wait_any(set: &[Watch], ready: &mut [u32], timeout_ns: u64) -> Result<usize, Error> {
+    let count = set.len();
+    if count == 0 || count > WATCH_MAX || ready.len() < count {
+        return Err(Error::InvalidArgument);
+    }
+    let mut entries = [0u8; WATCH_MAX * 8];
+    let mut i = 0;
+    while i < count {
+        if let Some(watch) = set.get(i) {
+            put_u32(&mut entries, 8 * i, watch.handle.0);
+            put_u32(&mut entries, 8 * i + 4, watch.interest);
+        }
+        i += 1;
+    }
+    let mut answers = [0u8; WATCH_MAX * 4];
+    let n = call::object_wait_any(
+        UserPtr(entries.as_ptr() as u64),
+        count,
+        UserPtr(answers.as_mut_ptr() as u64),
+        timeout_ns,
+    )?;
+    let mut i = 0;
+    while i < count {
+        if let (Some(slot), Some(value)) = (ready.get_mut(i), u32_at(&answers, 4 * i)) {
+            *slot = value;
+        }
+        i += 1;
+    }
+    Ok(n as usize)
 }
 
 // ---- sockets ------------------------------------------------------------------------------

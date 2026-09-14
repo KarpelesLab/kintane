@@ -238,6 +238,17 @@ impl Handler for Recorder {
             .push(("socket_shutdown", vec![u64::from(socket.0), timeout_ns]));
         Ok(0)
     }
+    fn object_wait_any(
+        &mut self,
+        entries: UserPtr,
+        count: usize,
+        ready: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls
+            .push(("object_wait_any", vec![entries.0, count as u64, ready.0, timeout_ns]));
+        Ok(0)
+    }
 }
 
 #[test]
