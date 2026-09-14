@@ -50,6 +50,18 @@ pub fn shootdown_stats() -> (usize, usize, usize) {
     (0, 0, 0)
 }
 
+/// The mean and the worst wait for a shootdown's answers: none, so zero.
+#[cfg_attr(
+    not(CONFIG_MM_PAGED),
+    expect(
+        dead_code,
+        reason = "read only by the stress run, which needs MM_PAGED"
+    )
+)]
+pub fn shootdown_latency_us() -> (u64, u64) {
+    (0, 0)
+}
+
 /// Answer TLB shootdowns while spinning on a lock: on one CPU there are none to answer.
 #[cfg_attr(
     not(CONFIG_USERSPACE),

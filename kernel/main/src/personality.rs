@@ -1808,8 +1808,15 @@ pub fn stress_cycles() -> u64 {
     PAIRS.load(Ordering::Relaxed)
 }
 
-/// Run one pair; see the section comment. On the auditor's thread, after the waiting process.
+/// Run this audit interval's Linux processes: a churning pair or a thread-pointer pair, each
+/// in its turn. On the auditor's thread, after the waiting process.
 pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
+    churn_cycle(round)?;
+    pair_cycle(round)
+}
+
+/// Run one pair; see the section comment.
+fn pair_cycle(round: u64) -> Result<(), &'static str> {
     if round % PAIR_EVERY != 0 {
         return Ok(());
     }
@@ -1829,12 +1836,7 @@ pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
     let frames_before = free_frames();
     let cpu = (pair as usize) % preempt::stats().cpus.max(1);
 
-    // Both built and installed before either starts: installing shoots down TLBs holding
-    // the frame lock, which a thread already running on another CPU could be waiting for
-    // with interrupts masked. On eight CPUs, starting one before installing the other hung.
-    let prepared =
-        [0, 1].map(|slot| userproc::prepare_linux(slot, &program, start_with(&TLS_ARGV)));
-    let [a, b] = prepared.map(|start| start.and_then(spawn::start_thread));
+    let [a, b] = [0, 1].map(|slot| userproc::start_linux(slot, &program, start_with(&TLS_ARGV)));
     for id in [a, b].into_iter().flatten() {
         preempt::set_affinity(id, 1 << cpu);
     }
@@ -1859,5 +1861,78 @@ pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
         return Err("a Linux process's frames did not all come back");
     }
     PAIRS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+// ---- the stress run: mappings churned on two CPUs at once -------------------------------
+//
+// Halfway between pairs, the auditor starts the program in its churn mode pinned to one CPU,
+// lets it begin, and only then builds and starts a second pinned to the next CPU. Each maps
+// anonymous pages, faults every one in by writing it, and unmaps them, two hundred times over.
+// Every fault takes the frame lock, and every unmap shoots down the other CPUs' translations
+// while holding it; so does installing the second program while the first faults. A CPU that
+// waits for the frame lock without answering the shootdown its holder is waiting for stops
+// them both, and then every CPU that needs either; see `userproc::with_frames`.
+
+/// Churning pairs the stress run has run to completion.
+static CHURNS: AtomicU64 = AtomicU64::new(0);
+const CHURN_ARGV: [&[u8]; 2] = [b"hello", b"churn"];
+/// Mirrors `CHURN_SUCCESS` in `user/linux-hello/src/main.rs`.
+const CHURN_SUCCESS: u64 = 46;
+/// How long the first churning process runs alone before the second is built and installed:
+/// long enough for it to be faulting on its CPU when the install shoots down.
+const CHURN_HEAD_START: Duration = Duration::from_nanos(20_000_000);
+
+pub fn churn_cycles() -> u64 {
+    CHURNS.load(Ordering::Relaxed)
+}
+
+/// Run one churning pair; see the section comment.
+fn churn_cycle(round: u64) -> Result<(), &'static str> {
+    let cpus = preempt::stats().cpus;
+    if round % PAIR_EVERY != PAIR_EVERY / 2 || cpus < 2 {
+        return Ok(());
+    }
+    let Some(program) = kept_program() else {
+        return Ok(());
+    };
+    let (first, second) = (crate::procs::stress_stack(), crate::waits::stress_stack());
+    if first == usize::MAX || second == usize::MAX {
+        return Err("the churning processes' stacks were never claimed");
+    }
+    if !crate::procs::use_pool() {
+        return Err("no frames were reserved for processes");
+    }
+    spawn::use_stacks(&[first, second]);
+    let frames_before = free_frames();
+    let cpu = (round / PAIR_EVERY) as usize % cpus;
+    let start_on = |slot: usize, cpu: usize| {
+        let id = userproc::start_linux(slot, &program, start_with(&CHURN_ARGV))?;
+        preempt::set_affinity(id, 1 << cpu);
+        Some(id)
+    };
+    let a = start_on(0, cpu);
+    preempt::sleep_until(timekeeping::now().saturating_add(CHURN_HEAD_START));
+    let b = start_on(1, (cpu + 1) % cpus);
+    let give_up = timekeeping::now().saturating_add(PAIR_PATIENCE);
+    while [a, b].into_iter().flatten().any(preempt::alive) && timekeeping::now() < give_up {
+        preempt::sleep_until(timekeeping::now().saturating_add(POLL));
+    }
+    if !spawn::end_threads() {
+        return Err("a churning process's thread did not end");
+    }
+    let codes = [0, 1].map(|slot| userproc::slot(slot).and_then(|p| p.exit));
+    userproc::teardown(0);
+    userproc::teardown(1);
+    if a.is_none() || b.is_none() {
+        return Err("a churning process did not start");
+    }
+    if codes != [Some(CHURN_SUCCESS); 2] {
+        return Err("a churning process could not map, fault in or unmap its pages");
+    }
+    if free_frames() != frames_before {
+        return Err("a churning process's frames did not all come back");
+    }
+    CHURNS.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }

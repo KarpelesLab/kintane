@@ -258,6 +258,11 @@ pub fn wait_stress_heartbeat(c: &dyn EarlyConsole) {
         c.write_str(", linux pairs ");
         crate::write_usize(c, linux as usize);
     }
+    let churns = crate::personality::churn_cycles();
+    if churns != 0 {
+        c.write_str(", churning pairs ");
+        crate::write_usize(c, churns as usize);
+    }
 }
 
 #[cfg(not(CONFIG_USERSPACE))]

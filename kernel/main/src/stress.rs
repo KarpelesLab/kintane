@@ -702,6 +702,12 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         c.write_str(")");
         c.write_str(", shootdowns ");
         write_usize(c, shootdowns);
+        let (mean_us, worst_us) = mp::shootdown_latency_us();
+        c.write_str(" (answered in mean ");
+        write_usize(c, mean_us as usize);
+        c.write_str(" us, worst ");
+        write_usize(c, worst_us as usize);
+        c.write_str(" us)");
     }
     let processes = crate::model::process_stress_cycles();
     if processes != 0 {
