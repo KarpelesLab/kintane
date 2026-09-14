@@ -376,8 +376,9 @@ request that times out, which fails the check rather than hanging it.
 
 The driver's protocol is host-tested without QEMU:
 
-- `test_support::FakeDevice` walks the rings from the device's side, at a different memory
-  offset, and answers virtio-blk requests against a RAM disk.
+- `virtio::fake::FakeDevice`, shared with virtio-net, walks the rings from the device's side
+  at a different memory offset, and virtio-blk's `test_support::serve_block` answers
+  virtio-blk requests against a RAM disk.
 - The tests cover the handshake and every refusal in it, reads, writes, splits, a device
   error, a device that never answers, and a thousand requests with no descriptor lost.
 
@@ -483,6 +484,7 @@ lists, the nightly job iterates, and the smoke run replays:
 | `menu` | the boot menu's entry list, and the menu it drives | built valid, then one mistake a person makes |
 | `pci` | configuration space, as devices answer enumeration | a machine with bridges and buses laid out on purpose |
 | `virtio-ring` | a used ring, as a hostile device writes it | a device script: heads, lengths, index jumps |
+| `net` | Ethernet frames carrying ARP, IPv4, ICMP and UDP, and the stack given one | seeded: an ARP reply, an echo request and a datagram with correct checksums; or built with the stack's own writers; then mutated |
 | `syscall` | numbers and argument registers | drawn from `abi::TABLE`, so a new call is fuzzed without a new target |
 
 A target's `run` must answer every input: a value or an error, never a panic, never a
@@ -552,8 +554,8 @@ failing input is uploaded so it can be committed.
 **Not covered.** In-guest system call fuzzing: the host target proves dispatch refuses
 unknown numbers and decodes arguments before a handler runs, but "never faults the kernel"
 and "never leaks kernel memory" depend on the real copy-in and copy-out paths, which only a
-fuzzing user program against a booted kernel can exercise. Filesystem metadata and network
-packets join the table when those parsers exist.
+fuzzing user program against a booted kernel can exercise. Filesystem metadata joins the
+table when that parser exists. Network frames are the `net` target.
 
 ### 2e. Files
 
@@ -611,6 +613,87 @@ writer and the new one as standalone programs over the same files. The two image
 byte-identical, and a copy of the new writer with one boot-sector field changed is not, so the
 comparison can see a difference.
 
+### 2f. Network
+
+With `QEMU_NET_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild attaches
+a virtio-net card to QEMU's user-mode network: a `virtio-net-device` in a memory-mapped slot
+on aarch64, and a modern-only `virtio-net-pci` function on the PCs, at slot `0x1e` on `pc`.
+The network is
+
+```
+-netdev user,id=kt_net,hostfwd=udp:127.0.0.1:<port>-:5555
+```
+
+where `<port>` is a free loopback UDP port kbuild picks for the run. Nothing leaves the host.
+QEMU's user-mode stack answers ARP and echo requests for its gateway, 10.0.2.2, itself, and
+the only other party is kbuild. For the length of the run a thread in `kbuild/src/qemu.rs`
+(`udp_peer`) sends `kintane-udp-probe` to the forwarded port four times a second, and
+answers every `kintane-udp-echo <n>` the guest sends back with `kintane-udp-ack <n>`. Like
+the serial probes it answers and never judges: the verdict is the exit code. The resolver at
+10.0.2.3 is not used, because it forwards to the host's, which an offline machine lacks.
+
+The boot gates on two lines ([architecture.md](architecture.md#net--the-network-stack-and-virtio-net)):
+
+```
+  nic        virtio-net 52:54:00:12:34:56, 8 receive buffers posted ok
+  net        line 78; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555, 3 round trips;
+             9 frames in, 8 out, 12 interrupts, 0 polled, 0 stack buffers held ok
+```
+
+That is aarch64, where every frame arrives by interrupt; i686 reads the same on line 10.
+x86_64 has no trusted PCI interrupt route, so its line starts `polled: no interrupt route on
+this port` and counts `0 interrupts, 9 polled`. The interrupt half of the check does not
+apply there, and the rest does. Every wait is bounded by the clock: 5 s for the gateway, 3 s
+for each reply, 15 s for kbuild's first probe. A broken path fails the boot rather than
+timing it out.
+
+Host tests, without QEMU:
+
+- `kernel/net`: 20 tests against a simulated gateway. They cover RFC 1071 checksums, IPv4
+  lengths, fragments and bad checksums refused and counted, and the UDP pseudo-header. For
+  ARP: resolution through the gateway and its retry limit, a reply with the wrong operation
+  ignored, and expiry followed by a new request. Then echo replies matched by sequence
+  number, a UDP round trip, the stack answering ARP and pings addressed to it and ignoring
+  frames for other hosts, a refused send holding no buffer, a full inbox counted, a flood
+  handled in bounded polls, and the pool refusing a second give.
+- `drivers/net/virtio-net`: 13 tests against the shared fake device on both queues. They cover
+  the handshake, the address and its fallback, a legacy or block device refused, a frame
+  sent behind a zero header, bad lengths refused, a full transmit queue recovering, frames
+  received in order with their buffers posted again, a short completion and one naming a
+  buffer never posted, interrupt-driven collection, and the stack resolving its gateway
+  through the card.
+- `drivers/virtio`: the virtqueue and fake-device tests that were virtio-blk's, unchanged.
+
+Fuzzing is the `net` target ([2d](#2d-fuzzing)). 200,000 inputs from a random seed ran
+clean, and 21.9% of them parsed past Ethernet to a protocol the stack speaks.
+
+In a stress run one `net` workload pings the gateway and makes a UDP round trip with kbuild,
+over and over, interrupt-driven where the card's line is wired. A lost reply is retried
+twice, a third loss fails the run, and the heartbeat counts retries. At every audit the
+stack's pool must be full and every receive buffer with the card or holding a frame, while
+kbuild's probes keep arriving. 60 s on `aarch64-virt-smp`, four CPUs, passed all 60 audits
+with 8,547 echo replies, 8,547 round trips and 3 retries.
+
+The first two such runs hung at about 40 s: in one a workload missed its checkpoint, and the
+watchdog killed the other. The network workload took the stack's spinlock without masking
+interrupts, so a timer interrupt could preempt the holder in the middle of a poll and move
+it to another CPU, and kernel spinlocks are held with preemption off. Taken with
+`lock_irqsave`, the same run passed.
+
+Falsified, each mutation confirmed applied, then restored:
+
+| Mutation | Preset | What caught it |
+|---|---|---|
+| The IPv4 header checksum written one too high | `aarch64-virt`, `x86_64-qemu` | the gateway resolved, then `AN ECHO REQUEST WAS NEVER ANSWERED`: QEMU drops a packet whose header does not verify. Seven host tests fail too |
+| ARP requests sent with operation 3 | `aarch64-virt`, `i686-qemu` | **not caught at first**: both passed. QEMU asks for the guest's address before it forwards kbuild's first probe, and the stack learned the gateway from that request. The check now forgets the gateway and requires a reply to its own request, and fails with `THE GATEWAY NEVER ANSWERED AN ARP REQUEST`. Eight host tests fail too |
+| The first received frame's buffer never given back to the pool | `aarch64-virt`, `x86_64-qemu` | every exchange passed, then `1 stack buffers held, A STACK BUFFER WAS NOT GIVEN BACK`. Seven host tests fail too |
+| The 500th received frame's buffer never given back | `aarch64-virt-smp` stress | the boot check passed, then `stress AUDIT FAILED at 3 s: network: a stack buffer is out of its pool with nothing using it (a leak)` |
+| The card's interrupt handler acknowledges but never drains the receive queue | `aarch64-virt`, `i686-qemu` | `0 frames in, 28 interrupts`, then `THE GATEWAY NEVER ANSWERED AN ARP REQUEST`. The host test `in_interrupt_mode_only_the_handler_collects` fails too. **Not observable on x86_64**, where the card is polled and the handler never runs: that boot passed |
+| `recv` drains the receive queue even in interrupt-driven mode | host test | `in_interrupt_mode_only_the_handler_collects` fails. **Not observable under QEMU**: `aarch64-virt` and `i686-qemu` both passed with `0 polled`, because the card completes and interrupts before the waiter first looks, so the handler always collects first. The check is sound, but QEMU cannot make the waiter win |
+
+**Not covered.** TCP, fragment reassembly, IPv6, DHCP and a socket API do not exist. The
+only network card driver is virtio-net, and it has run only under QEMU.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once
@@ -654,7 +737,9 @@ threads at mixed priorities (`kernel/main/src/stress.rs`):
 - **ipc** — a channel ping-pong that moves a handle there and back on every round trip;
 - **sleep** — sleeps to random deadlines, which must never wake early;
 - **vm** — demand paging, copy-on-write sharing and 2 MiB pages on a kernel `Vm`;
-- **pages** — buddy allocator churn on a pool of its own.
+- **pages** — buddy allocator churn on a pool of its own;
+- **net** — echo requests to the gateway and UDP round trips with kbuild, on a machine with a
+  network card ([2f](#2f-network)).
 
 Every second of guest time the auditor stops every workload at a checkpoint, where it
 holds nothing that would make the books inexact, and checks them:
@@ -664,6 +749,8 @@ holds nothing that would make the books inexact, and checks them:
 - channel handle counts are exact and nothing is queued;
 - `Vm::audit` passes, and the vm frame pool is full when nothing is mapped;
 - `Buddy::check` passes, with every page free;
+- the network stack's pool is full, and every receive buffer is with the card or holding a
+  frame;
 - `Threads::check` passes, and nothing was recorded as broken;
 - no lock-order violation;
 - every workload made progress since the last audit.
@@ -1237,8 +1324,8 @@ is hard-capped by the 440 bytes the MBR allows.
 - **Model checking** for lock-free data structures on the host, since this is the one
   mitigation that genuinely substitutes for the weak-memory testing QEMU cannot do.
 - **Fuzzing** of every parser that reads untrusted input, and of system call dispatch:
-  see [2c. Fuzzing](#2c-fuzzing). Filesystem metadata and network packets join the table
-  the day those parsers exist.
+  see [2c. Fuzzing](#2c-fuzzing). Network frames are fuzzed (`net`); filesystem metadata
+  joins the table the day that parser exists.
 
 ## Debugging
 
