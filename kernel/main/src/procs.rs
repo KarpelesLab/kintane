@@ -490,6 +490,25 @@ pub fn stress_cycles() -> u64 {
     CYCLES.load(Ordering::Relaxed)
 }
 
+/// The stack [`stress_setup`] claimed, or `usize::MAX`. Free between cycles, which is when
+/// `crate::waits`' stress cycle borrows it.
+pub fn stress_stack() -> usize {
+    STRESS_STACK.load(Ordering::Relaxed)
+}
+
+/// Point process frame operations at this module's pool. `false` if no pool was reserved.
+/// For another stress cycle that builds processes, on the auditor's thread between cycles.
+pub fn use_pool() -> bool {
+    // SAFETY: see `POOL`; the auditor is the only thread building processes.
+    match unsafe { (*POOL.get()).as_mut() } {
+        Some(pool) => {
+            userproc::set_frames(pool);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Create, move and destroy one process; see the section comment. On the auditor's thread,
 /// between audits. `round` picks which CPUs this cycle moves the thread between.
 pub fn stress_cycle(round: u64) -> Result<(), &'static str> {

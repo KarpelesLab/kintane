@@ -91,6 +91,129 @@ impl Handler for Recorder {
             .push(("vm_map_in", vec![u64::from(process.0), u64::from(region.0)]));
         Ok(0x2000)
     }
+    fn channel_send(
+        &mut self,
+        channel: Handle,
+        bytes: UserPtr,
+        len: usize,
+        handles: UserPtr,
+        count: usize,
+    ) -> Result<u64, Error> {
+        self.calls.push((
+            "channel_send",
+            vec![
+                u64::from(channel.0),
+                bytes.0,
+                len as u64,
+                handles.0,
+                count as u64,
+            ],
+        ));
+        Ok(0)
+    }
+    fn channel_recv(
+        &mut self,
+        channel: Handle,
+        buf: UserPtr,
+        cap: usize,
+        handles: UserPtr,
+        hcap: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls.push((
+            "channel_recv",
+            vec![
+                u64::from(channel.0),
+                buf.0,
+                cap as u64,
+                handles.0,
+                hcap as u64,
+                timeout_ns,
+            ],
+        ));
+        Err(Error::TimedOut)
+    }
+    fn completion_wait(
+        &mut self,
+        completion: Handle,
+        out: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls
+            .push(("completion_wait", vec![u64::from(completion.0), out.0, timeout_ns]));
+        Err(Error::TimedOut)
+    }
+    fn event_create(&mut self) -> Result<u64, Error> {
+        self.calls.push(("event_create", vec![]));
+        Ok(0)
+    }
+    fn event_signal(&mut self, event: Handle) -> Result<u64, Error> {
+        self.calls.push(("event_signal", vec![u64::from(event.0)]));
+        Ok(0)
+    }
+    fn event_wait(&mut self, event: Handle, timeout_ns: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("event_wait", vec![u64::from(event.0), timeout_ns]));
+        Ok(0)
+    }
+    fn timer_create(&mut self, completion: Handle, key: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("timer_create", vec![u64::from(completion.0), key]));
+        Ok(0)
+    }
+    fn timer_set(&mut self, timer: Handle, delay_ns: u64, period_ns: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("timer_set", vec![u64::from(timer.0), delay_ns, period_ns]));
+        Ok(0)
+    }
+    fn timer_cancel(&mut self, timer: Handle) -> Result<u64, Error> {
+        self.calls.push(("timer_cancel", vec![u64::from(timer.0)]));
+        Ok(0)
+    }
+    fn clock_now(&mut self) -> Result<u64, Error> {
+        self.calls.push(("clock_now", vec![]));
+        Ok(1)
+    }
+}
+
+#[test]
+fn the_waiting_calls_take_all_six_registers_where_they_need_them() {
+    // `channel_recv` is the one call that uses every argument register: the byte buffer,
+    // the handle buffer, and the timeout last.
+    assert!(TABLE.contains(&(number::channel_send, "channel_send", 5)));
+    assert!(TABLE.contains(&(number::channel_recv, "channel_recv", 6)));
+    assert!(TABLE.contains(&(number::completion_wait, "completion_wait", 3)));
+    assert!(TABLE.contains(&(number::event_wait, "event_wait", 2)));
+    assert!(TABLE.contains(&(number::timer_set, "timer_set", 3)));
+    assert!(TABLE.contains(&(number::clock_now, "clock_now", 0)));
+
+    let mut r = Recorder::default();
+    let out = dispatch(&mut r, number::channel_recv, [5, 0x10, 64, 0x20, 2, u64::MAX]);
+    assert_eq!(out, Err(Error::TimedOut));
+    assert_eq!(r.calls, vec![("channel_recv", vec![5, 0x10, 64, 0x20, 2, u64::MAX])]);
+}
+
+#[test]
+fn the_rights_a_program_names_are_bits_of_one_mask() {
+    let all = [
+        rights::READ,
+        rights::WRITE,
+        rights::EXECUTE,
+        rights::DUPLICATE,
+        rights::TRANSFER,
+        rights::WAIT,
+        rights::SIGNAL,
+        rights::MAP,
+        rights::DESTROY,
+        rights::INSPECT,
+    ];
+    let mut union = 0;
+    for r in all {
+        assert_eq!(r.count_ones(), 1, "{r:#x} is not one right");
+        assert_eq!(union & r, 0, "{r:#x} is named twice");
+        union |= r;
+    }
+    assert_eq!(union, rights::ALL);
 }
 
 #[test]

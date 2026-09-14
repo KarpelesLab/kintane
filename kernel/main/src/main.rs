@@ -73,6 +73,10 @@ mod procs;
 mod spawn;
 #[cfg(CONFIG_USERSPACE)]
 mod userproc;
+#[cfg(CONFIG_USERSPACE)]
+mod wait;
+#[cfg(CONFIG_USERSPACE)]
+mod waits;
 // ABI_LINUX depends on USERSPACE, so the personality is only ever built on a process.
 #[cfg(CONFIG_ABI_LINUX)]
 mod personality;

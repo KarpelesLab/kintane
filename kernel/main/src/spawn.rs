@@ -31,10 +31,19 @@
 //!   `init` reports and this check requires.
 //! * **Accounting.** Every object and every frame is back when both processes are gone. An object
 //!   outliving its last handle is a leak the store's count reports.
+//!
+//! # Starting a thread in a process
+//!
+//! This module also starts every thread a program asks for, and every thread the kernel starts
+//! in a process built this way ([`start_thread`]). Each runs on one of a few scheduler stack
+//! slots the running check hands over ([`use_stacks`]), and enters user mode from a record of
+//! its own: where, on which user stack, with which arguments. A process's first thread installs
+//! its program on the way; a later one finds it installed, and waits if the first is still
+//! copying it.
 
 #![allow(unsafe_code)]
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arch::Cpu;
 use hal::{Arch, EarlyConsole, HasUserMode, KernAddr, PhysAddr};
@@ -55,107 +64,171 @@ static CHILD_ELF: &[u8] = include_bytes!(env!("KINTANE_USER_USERCHILD"));
 const MODE_SPAWN: usize = 4;
 const SPAWN_SUCCESS: u64 = 0x5a;
 
-/// The process slots this check uses: `init`, and the child it creates. `procs` has torn
-/// its own down by the time this runs.
+/// The process slot `init` runs in. `procs` has torn its own down by the time this runs.
 const PARENT: usize = 0;
 
-/// The scheduler stack slots the two threads run on. The boot check and `procs` have reaped
-/// the threads that held these, and `preempt::spawn` requires exactly that.
-const PARENT_STACK: usize = 1;
-const CHILD_STACK: usize = 2;
+/// The scheduler stack slots this check's threads run on: `init`'s, its child's, and one to
+/// spare. The boot check and `procs` have reaped the threads that held these, and
+/// `preempt::spawn` requires exactly that.
+const STACKS: [usize; 3] = [1, 2, 3];
 
-/// Priority of both threads: below boot, so boot's wake-ups preempt them.
+/// Priority of process threads: below boot, so boot's wake-ups preempt them.
 const PRIORITY: u8 = 4;
 
-/// The longest this check waits for `init` to finish the whole sequence.
+/// The longest this check waits for `init` to finish the whole sequence, and the longest a
+/// thread waits for its process's program to be installed.
 const PATIENCE: Duration = Duration::from_nanos(3_000_000_000);
 /// How often it looks.
 const POLL: Duration = Duration::from_nanos(5_000_000);
 
-/// What each process's thread enters user mode with, by slot: entry, arguments, and the
-/// kernel stack its traps land on.
-static ENTRY: [AtomicUsize; userproc::MAX_PROCS] =
-    [const { AtomicUsize::new(0) }; userproc::MAX_PROCS];
-static ARGS: [[AtomicUsize; 4]; userproc::MAX_PROCS] =
-    [const { [const { AtomicUsize::new(0) }; 4] }; userproc::MAX_PROCS];
-static STACK_TOP: [AtomicUsize; userproc::MAX_PROCS] =
-    [const { AtomicUsize::new(0) }; userproc::MAX_PROCS];
-/// Which scheduler stack slot each process's thread took, so a second thread for a slot
-/// reuses it rather than claiming another.
-static STACK_OF: [AtomicUsize; userproc::MAX_PROCS] =
-    [const { AtomicUsize::new(usize::MAX) }; userproc::MAX_PROCS];
-/// The threads started here, to reap.
-static THREADS: [AtomicU64; userproc::MAX_PROCS] =
-    [const { AtomicU64::new(u64::MAX) }; userproc::MAX_PROCS];
+// ---- starting threads in processes ------------------------------------------------------
 
-/// A process thread's kernel entry: install its program, then enter user mode.
+/// Threads of processes that can exist at once: as many as the stack slots a check hands
+/// over, at most.
+pub const POOL: usize = 3;
+
+/// A pool entry no thread holds.
+const FREE: u64 = u64::MAX;
+/// A pool entry being claimed, between choosing it and the spawn that fills it.
+const CLAIMING: u64 = u64::MAX - 1;
+
+/// How a thread enters its process, worked out by `userproc` under the process's lock.
+pub struct Start {
+    pub slot: usize,
+    pub root: PhysAddr,
+    pub entry: usize,
+    pub user_sp: usize,
+    /// Whether this is the process's first thread, which installs its program.
+    pub install: bool,
+    pub args: [usize; 4],
+}
+
+/// The scheduler stack slot each pool entry runs on, or `usize::MAX`.
+static STACK: [AtomicUsize; POOL] = [const { AtomicUsize::new(usize::MAX) }; POOL];
+/// The thread on each pool entry, [`FREE`], or [`CLAIMING`]. An entry is free again only
+/// once its thread has been reaped: `preempt::spawn_prepared` reuses the stack.
+static THREAD: [AtomicU64; POOL] = [const { AtomicU64::new(FREE) }; POOL];
+/// Each entry's [`Start`], read by [`user_entry`] on the new thread.
+static SLOT: [AtomicUsize; POOL] = [const { AtomicUsize::new(0) }; POOL];
+static ENTRY: [AtomicUsize; POOL] = [const { AtomicUsize::new(0) }; POOL];
+static USER_SP: [AtomicUsize; POOL] = [const { AtomicUsize::new(0) }; POOL];
+static INSTALL: [AtomicBool; POOL] = [const { AtomicBool::new(false) }; POOL];
+static ARGS: [[AtomicUsize; 4]; POOL] = [const { [const { AtomicUsize::new(0) }; 4] }; POOL];
+/// The kernel stack each entry's traps land on.
+static TOP: [AtomicUsize; POOL] = [const { AtomicUsize::new(0) }; POOL];
+
+/// Hand this module the scheduler stack slots process threads run on, for the check now
+/// running. Every thread started on the previous ones must have ended: see [`end_threads`].
+pub fn use_stacks(stacks: &[usize]) {
+    for (i, cell) in STACK.iter().enumerate() {
+        cell.store(stacks.get(i).copied().unwrap_or(usize::MAX), Ordering::Relaxed);
+    }
+}
+
+/// A process thread's kernel entry: install the program if this is the first thread, then
+/// enter user mode.
 ///
 /// The program is copied here, on the process's own thread, for the reason
 /// [`crate::procs`] gives: the switch into this thread loaded this process's address
 /// space, so the copy lands in the right space and may be preempted freely.
-extern "C" fn user_entry(slot: usize) -> ! {
+extern "C" fn user_entry(index: usize) -> ! {
     preempt::begin();
-    let filled = userproc::slot(slot)
-        .and_then(|p| p.image)
-        .and_then(userproc::parse)
-        .and_then(|program| userproc::install_program(&program));
-    if filled.is_none() {
-        if let Some(p) = userproc::slot(slot) {
-            userproc::record_exit(p, NOT_LOADED);
-        }
-        preempt::exit_thread()
+    let slot = SLOT[index].load(Ordering::Relaxed);
+    let ready = if INSTALL[index].load(Ordering::Relaxed) {
+        userproc::install_image(slot).is_some()
+    } else {
+        installed_soon(slot)
+    };
+    if !ready {
+        userproc::abandon(slot, NOT_LOADED)
     }
-    let args = ARGS[slot].each_ref().map(|a| a.load(Ordering::Relaxed));
-    let top = STACK_TOP[slot].load(Ordering::Relaxed);
+    let args = ARGS[index].each_ref().map(|a| a.load(Ordering::Relaxed));
+    let top = TOP[index].load(Ordering::Relaxed);
     // `enter_user` wants interrupts masked until its `iretq`/`eret` unmasks them.
     let _ = Cpu::irq_save();
     // SAFETY: `spawn_prepared` bound this thread to `top` and its process's root before any
-    // CPU could switch to it; the program is installed and the stack is mapped; masked.
+    // CPU could switch to it; the program is installed, and the stack `USER_SP` points into
+    // is reserved in the process; masked.
     unsafe {
         Cpu::enter_user(
-            ENTRY[slot].load(Ordering::Relaxed),
-            userproc::user_stack_pointer(),
+            ENTRY[index].load(Ordering::Relaxed),
+            USER_SP[index].load(Ordering::Relaxed),
             args,
             KernAddr::new(top),
         )
     }
 }
 
+/// Wait for process `slot`'s first thread to install its program. A thread started straight
+/// after the first can otherwise run ahead of the copy, into memory that is still zero.
+fn installed_soon(slot: usize) -> bool {
+    let give_up = timekeeping::now().saturating_add(PATIENCE);
+    while !userproc::installed(slot) {
+        if timekeeping::now() >= give_up {
+            return false;
+        }
+        sleep_until(timekeeping::now().saturating_add(Duration::from_nanos(1_000_000)));
+    }
+    true
+}
+
 /// The exit code recorded for a process whose thread could not install its program.
 const NOT_LOADED: u64 = 0x10ad;
 
-/// Start a thread in process `slot`, at `entry` or its program's entry point, with `arg` in
-/// its first argument register. This is what `thread_create` reaches.
-pub fn start_thread(slot: usize, entry: usize, arg: usize) -> Option<ThreadId> {
-    let p = userproc::slot(slot)?;
-    let root = p.vm.space().root();
-    let program_entry = p.image.and_then(userproc::parse)?.entry as usize;
-    // One thread per process, which is what `userproc::current`'s soundness rests on.
-    if THREADS[slot].load(Ordering::Relaxed) != u64::MAX {
-        return None;
-    }
-    ENTRY[slot].store(if entry == 0 { program_entry } else { entry }, Ordering::Relaxed);
-    for (cell, value) in ARGS[slot].iter().zip([arg, 0, 0, 0]) {
+/// Start the thread `start` describes, on a free pool entry. This is what `thread_create`
+/// reaches, and what the kernel uses to start a thread in a process it built.
+pub fn start_thread(start: Start) -> Option<ThreadId> {
+    let index = (0..POOL).find(|&i| {
+        STACK[i].load(Ordering::Relaxed) != usize::MAX
+            && THREAD[i]
+                .compare_exchange(FREE, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    })?;
+    SLOT[index].store(start.slot, Ordering::Relaxed);
+    ENTRY[index].store(start.entry, Ordering::Relaxed);
+    USER_SP[index].store(start.user_sp, Ordering::Relaxed);
+    INSTALL[index].store(start.install, Ordering::Relaxed);
+    for (cell, value) in ARGS[index].iter().zip(start.args) {
         cell.store(value, Ordering::Relaxed);
     }
-    let stack = match STACK_OF[slot].load(Ordering::Relaxed) {
-        usize::MAX => CHILD_STACK,
-        held => held,
-    };
-    STACK_OF[slot].store(stack, Ordering::Relaxed);
-    let id = spawn_on(slot, root, stack)?;
-    THREADS[slot].store(u64::from(id.raw()), Ordering::Relaxed);
-    Some(id)
+    let stack = STACK[index].load(Ordering::Relaxed);
+    let spawned = preempt::spawn_prepared(stack, user_entry, index, PRIORITY, |ctx, top| {
+        TOP[index].store(top.raw(), Ordering::Relaxed);
+        userproc::bind(start.slot, ctx, top, start.root);
+    });
+    match spawned {
+        Some(id) => {
+            THREAD[index].store(u64::from(id.raw()), Ordering::Release);
+            Some(id)
+        }
+        None => {
+            THREAD[index].store(FREE, Ordering::Release);
+            None
+        }
+    }
 }
 
-/// Spawn `slot`'s thread on scheduler stack `stack`, bound to its address space before any
-/// CPU can pick it up.
-fn spawn_on(slot: usize, root: PhysAddr, stack: usize) -> Option<ThreadId> {
-    preempt::spawn_prepared(stack, user_entry, slot, PRIORITY, |ctx, top| {
-        STACK_TOP[slot].store(top.raw(), Ordering::Relaxed);
-        <Cpu as HasUserMode>::bind(ctx, top, root);
-    })
+/// Wait for every thread this module started to end, and reap it. Returns whether they all
+/// did. A thread that did not is left where it is, and so must its process be: its tables
+/// cannot be freed while it may still run on them.
+pub fn end_threads() -> bool {
+    let mut all = true;
+    for thread in &THREAD {
+        let raw = thread.load(Ordering::Acquire);
+        if raw >= CLAIMING {
+            continue;
+        }
+        let id = ThreadId::new(raw as u32);
+        if wait_exit(id) && preempt::reap(id) {
+            thread.store(FREE, Ordering::Release);
+        } else {
+            all = false;
+        }
+    }
+    all
 }
+
+// ---- the check ---------------------------------------------------------------------------
 
 /// Run the check. On the boot thread, with the scheduler running.
 pub fn check(c: &dyn EarlyConsole) -> Check {
@@ -169,21 +242,29 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         c.write_str("the embedded init program does not load");
         return Check::Failed;
     };
+    use_stacks(&STACKS);
     let frames_before = free_frames();
     let objects_before = objects::live();
 
     let outcome = run(c, &program);
 
-    teardown();
+    let ended = end_threads();
+    if ended {
+        for slot in 0..userproc::MAX_PROCS {
+            userproc::teardown(slot);
+        }
+    }
     let leaked_frames = frames_before.saturating_sub(free_frames());
     let leaked_objects = objects::live().saturating_sub(objects_before);
-    report(c, outcome, leaked_frames, leaked_objects);
-    Check::from_ok(outcome == Some(SPAWN_SUCCESS) && leaked_frames == 0 && leaked_objects == 0)
+    report(c, outcome, ended, leaked_frames, leaked_objects);
+    Check::from_ok(
+        outcome == Some(SPAWN_SUCCESS) && ended && leaked_frames == 0 && leaked_objects == 0,
+    )
 }
 
 /// Build `init`, give it the two handles the sequence starts from, and wait for its exit.
 fn run(c: &dyn EarlyConsole, program: &elf::Program) -> Option<u64> {
-    let root = userproc::build(PARENT, program)?;
+    userproc::build(PARENT, program)?;
     let parent = userproc::slot(PARENT)?;
     parent.image = Some(userproc::init_elf());
 
@@ -194,18 +275,13 @@ fn run(c: &dyn EarlyConsole, program: &elf::Program) -> Option<u64> {
     let image_handle = parent.grant(image, ObjectType::MemoryRegion, Rights::READ)?;
     let console = parent.console_handle()?;
 
-    for (cell, value) in ARGS[PARENT].iter().zip([
+    let args = [
         MODE_SPAWN,
         usize::try_from(image_handle.raw()).ok()?,
         usize::try_from(console.raw()).ok()?,
         0,
-    ]) {
-        cell.store(value, Ordering::Relaxed);
-    }
-    ENTRY[PARENT].store(program.entry as usize, Ordering::Relaxed);
-    STACK_OF[PARENT].store(PARENT_STACK, Ordering::Relaxed);
-    let id = spawn_on(PARENT, root, PARENT_STACK)?;
-    THREADS[PARENT].store(u64::from(id.raw()), Ordering::Relaxed);
+    ];
+    let id = userproc::start(PARENT, 0, args)?;
 
     if !wait_exit(id) {
         c.write_str("init did not finish: ");
@@ -230,31 +306,7 @@ fn free_frames() -> usize {
     userproc::with_frames(|f| f.alloc.stats().free).unwrap_or(0)
 }
 
-/// Reap both threads and tear both processes down, whatever state they reached.
-fn teardown() {
-    // Threads a program created, as the objects record them. The kernel's own record
-    // covers the two this check knows about; this covers any other a program made, which
-    // would otherwise stay in the scheduler's table after its process is gone.
-    let mut ids = [ThreadId::new(0); objects::MAX_OBJECTS];
-    let found = objects::thread_ids(&mut ids);
-    for id in ids.iter().take(found) {
-        if !preempt::alive(*id) {
-            let _ = preempt::reap(*id);
-        }
-    }
-    for slot in 0..userproc::MAX_PROCS {
-        let raw = THREADS[slot].swap(u64::MAX, Ordering::Relaxed);
-        if raw != u64::MAX {
-            let id = ThreadId::new(raw as u32);
-            let _ = wait_exit(id);
-            let _ = preempt::reap(id);
-        }
-        STACK_OF[slot].store(usize::MAX, Ordering::Relaxed);
-        userproc::teardown(slot);
-    }
-}
-
-fn report(c: &dyn EarlyConsole, outcome: Option<u64>, frames: usize, objects: usize) {
+fn report(c: &dyn EarlyConsole, outcome: Option<u64>, ended: bool, frames: usize, objects: usize) {
     match outcome {
         Some(SPAWN_SUCCESS) => {
             c.write_str("init created a process, gave it a channel, and waited for it")
@@ -265,6 +317,9 @@ fn report(c: &dyn EarlyConsole, outcome: Option<u64>, frames: usize, objects: us
             c.write_str(", WRONG");
         }
         None => c.write_str("init never exited"),
+    }
+    if !ended {
+        c.write_str("; A THREAD NEVER ENDED, its process left in place");
     }
     c.write_str("; ");
     write_usize(c, objects);

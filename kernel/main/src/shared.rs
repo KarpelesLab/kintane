@@ -515,7 +515,10 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `processes`, whose process slots and stack slots it reuses once that phase has
     // torn its own down.
     let spawn = crate::model::spawn_check(c);
-    // After `spawn`, which has torn its processes down by now: this borrows the process
+    // After `spawn`, whose process slot and stack slots it reuses once that phase has
+    // reaped its threads.
+    let waits = crate::model::waits_check(c);
+    // After `waits`, which has torn its process down by now: this borrows the process
     // check's frame pool and reuses its process slot and stack. Before tickless, which
     // wants everything but idle gone.
     c.write_str("\n  isolation  ");
@@ -531,6 +534,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(heap)
         .and(processes)
         .and(spawn)
+        .and(waits)
         .and(isolation)
         .and(tickless)
         .and(abba)

@@ -1,0 +1,12 @@
+# The VFS service's protocol: the messages a program exchanges with the kernel's file
+# service over a channel. Layer `user`, like `abi`, because both sides link it: the kernel
+# thread that serves the filesystem and every program that asks it for a file.
+[unit]
+name = "vfsproto"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "user"
+
+[deps]
+units = []

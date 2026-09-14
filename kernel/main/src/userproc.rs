@@ -14,11 +14,25 @@
 //! # What a process is here
 //!
 //! A [`Process`] is an address space ([`mm::vm::Vm`] over its own page tables, sharing the
-//! kernel half), a handle table, and at most one channel it made for itself, in one slot
-//! of a small fixed table. It has exactly one thread. A system call or a fault finds its
-//! process by the address space loaded on the CPU that took it ([`current`]). The context
-//! switch loads a thread's space wherever the thread runs, so that answer follows a thread
-//! that migrates.
+//! kernel half) and a handle table, in one slot of a small fixed table. A system call or a
+//! fault finds its process by the address space loaded on the CPU that took it
+//! ([`current_slot`]). The context switch loads a thread's space wherever the thread runs, so
+//! that answer follows a thread that migrates.
+//!
+//! # Threads, and the process lock
+//!
+//! A process may have several threads, each started by `thread_create` with a user stack of
+//! its own, and two of them may be in the kernel on two CPUs at once. So a system call does
+//! not simply borrow its process: it takes the process's lock ([`lock`]), and releases it
+//! before anything that blocks or yields, taking it again when it next needs the process.
+//! A fault taken while the lock is held — a user copy faulting a page in — finds the lock
+//! already held by its own CPU and uses it rather than waiting for itself.
+//!
+//! A process ends when one thread calls `process_exit` or is killed, and its other threads
+//! end at their next system call, or at once if they are waiting: the exit wakes every wait,
+//! and a waiter whose process is ending ends. Whoever asked for the exit is told when the
+//! last thread has gone ([`finish_thread`]), not when the first one leaves, because a
+//! process whose threads are still running is not over.
 //!
 //! # The boot-time slice, without the scheduler
 //!
@@ -53,10 +67,13 @@ use mm::DirectMap;
 use mm::paged::{AddressSpace, FrameSource};
 use mm::phys::FrameAllocator;
 use mm::vm::{Backing, Region, ShareSlot, Shares, Vm};
+use sched::ThreadId;
+use time::Instant;
 
 use crate::demand::KernelFrames;
 use crate::objects::{self, Object};
-use crate::{Check, Live, Locks, write_hex, write_usize};
+use crate::wait::{self, WaitQueue};
+use crate::{Check, Live, Locks, mp, preempt, timekeeping, write_hex, write_usize};
 
 /// The embedded program. `kbuild` links `user/init` for this target and sets the variable
 /// to its path; see the `user` unit kind in `kbuild/src/build.rs`.
@@ -81,6 +98,23 @@ const USER_STACK_PAGES: usize = 16;
 /// A channel, for `channel_create`.
 type Chan = ipc::Channel<Locks, 4, 64, 2>;
 
+/// A program names rights by `abi::rights`' bits, and the kernel checks them as
+/// `kobject::Rights`. They are one numbering, and a build where they are not fails here.
+const _: () = assert!(
+    abi::rights::READ == Rights::READ.bits()
+        && abi::rights::WRITE == Rights::WRITE.bits()
+        && abi::rights::EXECUTE == Rights::EXECUTE.bits()
+        && abi::rights::DUPLICATE == Rights::DUPLICATE.bits()
+        && abi::rights::TRANSFER == Rights::TRANSFER.bits()
+        && abi::rights::WAIT == Rights::WAIT.bits()
+        && abi::rights::SIGNAL == Rights::SIGNAL.bits()
+        && abi::rights::MAP == Rights::MAP.bits()
+        && abi::rights::DESTROY == Rights::DESTROY.bits()
+        && abi::rights::INSPECT == Rights::INSPECT.bits()
+        && abi::rights::ALL == Rights::ALL.bits(),
+    "lib/abi's rights disagree with kobject::Rights"
+);
+
 /// Channels that exist, and who made each.
 ///
 /// Not a field of [`Process`], which is where this began. An endpoint given to another
@@ -93,9 +127,36 @@ type Chan = ipc::Channel<Locks, 4, 64, 2>;
 /// reference into it, and cleared by [`free_channels_of`] when its owner is torn down and
 /// no process can name either endpoint. Readers take `&'static Chan` and change it only
 /// through `Chan`'s own locks.
-const MAX_CHANNELS: usize = MAX_PROCS;
+const MAX_CHANNELS: usize = 8;
 static CHANNELS: [SyncUnsafeCell<Option<ChannelSlot>>; MAX_CHANNELS] =
     [const { SyncUnsafeCell::new(None) }; MAX_CHANNELS];
+
+/// The threads waiting to receive on each channel, by its slot in [`CHANNELS`]: one queue
+/// for both ends, since a wake that finds nothing for its end costs only a second look.
+/// Woken by every send, by an endpoint closing, and by a channel being freed.
+static CHANNEL_WAITS: [WaitQueue; MAX_CHANNELS] = [const { WaitQueue::new() }; MAX_CHANNELS];
+
+/// The wait queue of the channel the endpoint `object` belongs to.
+fn channel_queue(object: ObjectId) -> Option<&'static WaitQueue> {
+    CHANNELS.iter().zip(&CHANNEL_WAITS).find_map(|(c, queue)| {
+        // SAFETY: see `CHANNELS`.
+        let slot = unsafe { (*c.get()).as_ref() }?;
+        slot.ends.contains(&object).then_some(queue)
+    })
+}
+
+/// Wake whoever waits on the channel the endpoint `object` belongs to.
+fn wake_channel(object: ObjectId) {
+    if let Some(queue) = channel_queue(object) {
+        queue.wake_all();
+    }
+}
+
+fn wake_all_channel_waiters() {
+    for queue in &CHANNEL_WAITS {
+        queue.wake_all();
+    }
+}
 
 struct ChannelSlot {
     chan: Chan,
@@ -130,12 +191,15 @@ fn keep_channel(chan: Chan, ends: [ObjectId; 2], owner: usize) -> Option<()> {
 
 /// Drop every channel process `slot` created. Called from [`teardown`].
 fn free_channels_of(slot: usize) {
-    for cell in CHANNELS.iter() {
-        // SAFETY: see `CHANNELS`; the owner's thread has exited, and no handle to either
+    for (cell, queue) in CHANNELS.iter().zip(&CHANNEL_WAITS) {
+        // SAFETY: see `CHANNELS`; the owner's threads have exited, and no handle to either
         // endpoint can be used once its table is gone.
         let held = unsafe { &mut *cell.get() };
         if held.as_ref().is_some_and(|c| c.owner == slot) {
             *held = None;
+            // A thread of another process waiting on the far end looks again and finds the
+            // channel gone.
+            queue.wake_all();
         }
     }
 }
@@ -158,6 +222,11 @@ pub(crate) struct Process {
     pub(crate) root: PhysAddr,
     /// Which slot of [`PROCS`] this is, for the per-slot records kept outside it.
     pub(crate) slot: usize,
+    /// Whether a thread has been started in it: the first installs the program, and
+    /// every later one is given a stack of its own.
+    started: bool,
+    /// User stacks given to threads after the first, each reserved once.
+    stacks: usize,
     /// The system call ABI it speaks, decided once from its program at [`build`].
     pub(crate) personality: Personality,
     /// Its system call table, chosen with `personality`. [`on_syscall`] calls through it and
@@ -179,9 +248,12 @@ pub(crate) enum Personality {
     Linux,
 }
 
-/// A process's system call table: one call, given the frame to read the arguments from and
-/// to write the result into, in that ABI's own convention.
-pub(crate) type SyscallTable = fn(&mut Process, &mut <Cpu as HasUserMode>::SyscallFrame);
+/// A process's system call table: one call, given the calling process's slot and the frame
+/// to read the arguments from and to write the result into, in that ABI's own convention.
+///
+/// The slot, not the process: a table takes the process's lock itself, so that the native
+/// one can let go of it around a call that blocks ([`Syscalls::wait_for`]).
+pub(crate) type SyscallTable = fn(usize, &mut <Cpu as HasUserMode>::SyscallFrame);
 
 /// The personality `program` runs under, or `None` for a program the kernel refuses.
 ///
@@ -207,7 +279,7 @@ pub(crate) fn personality_of(program: &Program) -> Option<Personality> {
 fn table_for(personality: Personality) -> SyscallTable {
     match personality {
         Personality::Native => native_syscalls,
-        Personality::Linux => crate::personality::syscalls,
+        Personality::Linux => linux_syscalls,
     }
 }
 
@@ -218,15 +290,118 @@ pub(crate) const MAX_PROCS: usize = 4;
 /// Every process, by slot.
 ///
 /// SAFETY INVARIANT: a slot is `Some` only between [`build`] and [`teardown`], and is
-/// reached in exactly two ways. [`current`] finds the slot whose address space is the one
-/// loaded on this CPU, from the system-call handler and the fault hook, both of which run
-/// with interrupts masked (`SFMASK` clears IF on a `syscall`; a fault handler runs
-/// masked); and boot reaches a slot by index while that process's thread is not running.
-/// **Each process has exactly one thread**, so only one CPU can ever be running in a given
-/// slot, and the mutable borrow each path takes is unique. Two *different* processes on
-/// two CPUs borrow two different slots.
+/// borrowed in one of two ways:
+///
+/// * **Under its lock** ([`lock`]), by anything a running process can reach: the system-call
+///   handler, the fault hook, and a thread installing its program. The lock is held by one CPU at a
+///   time with interrupts masked, and a CPU that already holds it reuses it only from a fault
+///   inside a system call, while the call holds no borrow of the process. So the borrow is unique
+///   however many threads the process has.
+/// * **By index, from boot or a check**, while no thread of that process runs: before its first
+///   thread starts, or after its last has ended ([`slot`], [`current`]).
 static PROCS: [SyncUnsafeCell<Option<Process>>; MAX_PROCS] =
     [const { SyncUnsafeCell::new(None) }; MAX_PROCS];
+
+/// Each slot's address-space root, or zero: what [`current_slot`] matches the loaded root
+/// against, without touching [`PROCS`].
+static ROOTS: [crate::AtomicU64; MAX_PROCS] = [const { crate::AtomicU64::new(0) }; MAX_PROCS];
+/// Whether each slot is claimed, from the start of [`build`] to the end of [`teardown`].
+static USED: [crate::AtomicBool; MAX_PROCS] = [const { crate::AtomicBool::new(false) }; MAX_PROCS];
+/// The CPU holding each process's lock, plus one; zero when nobody does.
+static OWNER: [crate::AtomicUsize; MAX_PROCS] = [const { crate::AtomicUsize::new(0) }; MAX_PROCS];
+/// Threads each process has that have not ended; see [`bind`] and [`leave`].
+static LIVE: [crate::AtomicUsize; MAX_PROCS] = [const { crate::AtomicUsize::new(0) }; MAX_PROCS];
+/// Set once a process is ending, so its other threads end too.
+static EXITING: [crate::AtomicBool; MAX_PROCS] =
+    [const { crate::AtomicBool::new(false) }; MAX_PROCS];
+/// Set once a process's first thread has installed its program, which a thread started
+/// after it waits for.
+static INSTALLED: [crate::AtomicBool; MAX_PROCS] =
+    [const { crate::AtomicBool::new(false) }; MAX_PROCS];
+
+/// A process's lock, held; released when dropped.
+struct Held {
+    slot: usize,
+    process: *mut Process,
+    /// Taken by a fault inside a system call that already held it: dropping this one leaves
+    /// the lock with the call.
+    reentrant: bool,
+    irq: <Cpu as Arch>::IrqState,
+}
+
+impl Held {
+    fn process(&mut self) -> &mut Process {
+        // SAFETY: see `PROCS`: the lock is held by this CPU, masked, and the slot was `Some`
+        // when it was taken; a slot is emptied only by `teardown`, after every thread ended.
+        unsafe { &mut *self.process }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if !self.reentrant {
+            OWNER[self.slot].store(0, Ordering::Release);
+        }
+        // SAFETY: pairs with the `irq_save` in `try_lock`, on this CPU.
+        unsafe { Cpu::irq_restore(self.irq) };
+    }
+}
+
+enum Attempt {
+    Held(Held),
+    /// Another CPU holds it.
+    Busy,
+    /// No process in that slot.
+    Empty,
+}
+
+/// Take process `slot`'s lock if nobody else holds it. Masks interrupts while held.
+fn try_lock(slot: usize) -> Attempt {
+    let Some(owner) = OWNER.get(slot) else {
+        return Attempt::Empty;
+    };
+    let irq = Cpu::irq_save();
+    let me = Cpu::cpu_index() + 1;
+    let reentrant = match owner.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => false,
+        Err(holder) if holder == me => true,
+        Err(_) => {
+            // SAFETY: pairs with the `irq_save` above.
+            unsafe { Cpu::irq_restore(irq) };
+            return Attempt::Busy;
+        }
+    };
+    // SAFETY: see `PROCS`; the lock is held, so this is the only borrow, and it is turned
+    // into a raw pointer at once.
+    let process = unsafe { (*PROCS[slot].get()).as_mut() }.map(|p| p as *mut Process);
+    let held = Held {
+        slot,
+        process: process.unwrap_or(core::ptr::null_mut()),
+        reentrant,
+        irq,
+    };
+    match process {
+        Some(_) => Attempt::Held(held),
+        None => Attempt::Empty,
+    }
+}
+
+/// Take process `slot`'s lock, waiting for it. `None` if there is no such process.
+///
+/// The wait answers TLB shootdowns: the holder may be changing the process's mappings and
+/// waiting, masked, for every CPU to flush — this one included.
+fn lock(slot: usize) -> Option<Held> {
+    loop {
+        match try_lock(slot) {
+            Attempt::Held(held) => return Some(held),
+            Attempt::Empty => return None,
+            Attempt::Busy => {
+                mp::answer_shootdowns();
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
 /// SAFETY INVARIANT: the boot frame allocator, valid while a process exists. Reached only
 /// through [`with_frames`], which holds [`FRAME_LOCK`], because two processes can fault on
 /// two CPUs at once and the allocator is one shared structure.
@@ -295,16 +470,19 @@ pub(crate) fn direct_ptr(frame: PhysAddr) -> Option<*mut u8> {
 /// user thread loads that thread's space, so this cannot go stale when a thread migrates —
 /// and a kernel that failed to load the space would be found serving the wrong process,
 /// which is what the isolation checks in [`crate::procs`] measure.
-pub(crate) fn current() -> Option<&'static mut Process> {
-    let root = <Cpu as HasPageTables>::root();
-    slots().find(|p| p.root == root)
+fn current_slot() -> Option<usize> {
+    let root = <Cpu as HasPageTables>::root().raw();
+    ROOTS.iter().position(|r| {
+        let r = r.load(Ordering::Acquire);
+        r != 0 && r == root
+    })
 }
 
-/// Every live process. Boot only: a running thread reaches its own process through
-/// [`current`].
-fn slots() -> impl Iterator<Item = &'static mut Process> {
-    // SAFETY: see `PROCS`.
-    PROCS.iter().filter_map(|p| unsafe { (*p.get()).as_mut() })
+/// The process [`current_slot`] names, borrowed without its lock: for a kernel thread of a
+/// process no other thread of which is running, as [`slot`] is. Everything a running process
+/// can reach takes the lock instead; see [`PROCS`].
+pub(crate) fn current() -> Option<&'static mut Process> {
+    current_slot().and_then(slot)
 }
 
 impl Process {
@@ -444,21 +622,50 @@ pub(crate) fn with_frames<R>(f: impl FnOnce(&mut KernelFrames<'static>) -> R) ->
 
 /// Resolve a user page fault, or a fault in a user copy, against the process `Vm`.
 fn on_user_fault(fault: PageFault) -> bool {
-    let Some(p) = current() else { return false };
+    let Some(mut held) = current_slot().and_then(lock) else {
+        return false;
+    };
+    let p = held.process();
     with_frames(|f| p.vm.fault(fault, f).is_ok()).unwrap_or(false)
 }
 
-/// End the running user thread, recording why. Switches back to the boot thread and does
-/// not return.
+/// End the running user thread, and the process it belongs to, recording why. Does not
+/// return.
 fn on_kill(trap: UserTrap) -> ! {
-    if let Some(p) = current() {
-        // A fault before the program set an exit code is the process being killed. If it
-        // had already exited, keep that.
-        if p.exit.is_none() {
-            record_exit(p, KILLED);
-        }
-    }
     let _ = trap;
+    let Some(slot) = current_slot() else {
+        end_thread()
+    };
+    let (last, exit) = match lock(slot) {
+        Some(mut held) => {
+            let p = held.process();
+            // A fault before the program set an exit code is the process being killed. If
+            // it had already exited, `record_exit` keeps that.
+            record_exit(p, KILLED);
+            (leave(slot), p.exit)
+        }
+        None => (leave(slot), Some(KILLED)),
+    };
+    finish_thread(slot, last, exit)
+}
+
+/// Count one thread of process `slot` as ended, and say whether it was the last.
+///
+/// A process whose threads were never counted — the boot-time slice starts its one thread
+/// without [`bind`] — has its only thread end as its last.
+fn leave(slot: usize) -> bool {
+    LIVE.get(slot).is_none_or(|live| {
+        live.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .map_or(true, |before| before == 1)
+    })
+}
+
+/// End the running thread of process `slot`, telling whoever waits for the process if it
+/// was the last. Called with no process lock held. Never returns.
+fn finish_thread(slot: usize, last: bool, exit: Option<u64>) -> ! {
+    if last {
+        crate::objects::on_process_exit(slot, exit.unwrap_or(KILLED));
+    }
     end_thread()
 }
 
@@ -476,13 +683,23 @@ pub(crate) fn end_thread() -> ! {
     Cpu::halt()
 }
 
-/// Record a process's exit, and tell whoever asked to be told.
+/// Record that a process is ending, with `code` unless it already had one, and wake its
+/// other threads so they end too.
 ///
-/// Every path that ends a process goes through here — the program's own exit, and the
-/// kernel killing it — so a waiter cannot miss an exit depending on how it happened.
-pub(crate) fn record_exit(p: &mut Process, code: u64) {
-    p.exit = Some(code);
-    crate::objects::on_process_exit(p.slot, code);
+/// Every path that ends a process goes through here — the program's own exit, its last
+/// thread ending, and the kernel killing it — so no thread of it is left waiting on
+/// something that will never come. Whoever asked to be told of the exit is told by
+/// [`finish_thread`], once the last thread has gone.
+fn record_exit(p: &mut Process, code: u64) {
+    if p.exit.is_none() {
+        p.exit = Some(code);
+    }
+    EXITING[p.slot].store(true, Ordering::Release);
+    // Its other threads may be waiting on anything. Each wakes, finds its process ending,
+    // and ends at the call it was waiting in. Other processes' waiters wake for nothing and
+    // wait again.
+    objects::wake_all_waiters();
+    wake_all_channel_waiters();
 }
 
 /// End the running process with `code`, from its own system call. Never returns.
@@ -491,55 +708,118 @@ pub(crate) fn record_exit(p: &mut Process, code: u64) {
     expect(dead_code, reason = "the native ABI's exits go through its handler")
 )]
 pub(crate) fn exit_current(p: &mut Process, code: u64) -> ! {
+    let slot = p.slot;
     record_exit(p, code);
-    end_thread()
+    let exit = p.exit;
+    let last = leave(slot);
+    // The call ending here holds the process's lock ([`linux_syscalls`]) and never returns to
+    // drop it, so it is let go of now, as the native exits do.
+    if let Some(owner) = OWNER.get(slot) {
+        let _ =
+            owner.compare_exchange(Cpu::cpu_index() + 1, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+    finish_thread(slot, last, exit)
 }
 
 /// Recorded as the exit code when the kernel kills a process rather than the program
 /// choosing its own code.
 pub(crate) const KILLED: u64 = 0xffff_ffff_ffff_ffff;
 
+/// Fail the call in `frame` the native way: the only ABI a call with no process can have.
+fn unsupported(frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
+    use hal::user::SyscallFrame;
+    let (status, value) = abi::encode(Err(Error::Unsupported));
+    frame.set_result(status, value);
+}
+
 /// Run one system call, through the calling process's own table.
 fn on_syscall(frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
-    let Some(p) = current() else {
-        // No process owns this space: fail it the native way, the only ABI with no process.
-        use hal::user::SyscallFrame;
-        let (status, value) = abi::encode(Err(Error::Unsupported));
-        frame.set_result(status, value);
+    let Some(slot) = current_slot() else {
+        unsupported(frame);
         return;
     };
     // Where the call was served. The only record of a user thread having run on a CPU, and
     // what makes a migration observable.
-    CPUS_SEEN[p.slot].fetch_or(1 << (Cpu::cpu_index() & 63), Ordering::Relaxed);
-    (p.syscalls)(p, frame)
+    CPUS_SEEN[slot].fetch_or(1 << (Cpu::cpu_index() & 63), Ordering::Relaxed);
+    // The table is read under the lock and called without it: each table takes the lock
+    // itself, for as long as it needs it.
+    let Some(table) = lock(slot).map(|mut held| held.process().syscalls) else {
+        unsupported(frame);
+        return;
+    };
+    table(slot, frame)
 }
 
 /// The native table: decode and perform the call in `frame` by `lib/abi`'s numbers.
-fn native_syscalls(p: &mut Process, frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
+fn native_syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
     use hal::user::SyscallFrame;
-    let result = abi::dispatch(&mut Syscalls { p }, frame.number(), frame.args());
+    let Some(held) = lock(slot) else {
+        unsupported(frame);
+        return;
+    };
+    let mut calls = Syscalls {
+        slot,
+        held: Some(held),
+    };
+    // A thread whose process another thread has ended ends at its next call...
+    calls.end_if_exiting();
+    let result = abi::dispatch(&mut calls, frame.number(), frame.args());
+    // ...or on its way out of the one it was in, which the ending woke.
+    calls.end_if_exiting();
+    drop(calls);
     let (status, value) = abi::encode(result);
     frame.set_result(status, value);
 }
 
-/// The kernel's implementation of the native ABI, over one process.
-struct Syscalls<'a> {
-    p: &'a mut Process,
+/// The Linux table: [`crate::personality::syscalls`], over the process borrowed under its lock
+/// for the whole call. A Linux process has one thread and no call that blocks yet; one that
+/// does will wait through [`crate::wait`] and let go of the lock around it, as the native
+/// calls do.
+fn linux_syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
+    let Some(mut held) = lock(slot) else {
+        unsupported(frame);
+        return;
+    };
+    crate::personality::syscalls(held.process(), frame)
 }
 
-impl abi::Handler for Syscalls<'_> {
+/// The kernel's implementation of the native ABI, over one process.
+struct Syscalls {
+    slot: usize,
+    /// The process's lock, while held. Released around anything that blocks or yields, and
+    /// taken again by [`Syscalls::p`] when the call next needs the process.
+    held: Option<Held>,
+}
+
+impl abi::Handler for Syscalls {
     fn process_exit(&mut self, code: u64) -> Result<u64, Error> {
-        self.thread_exit(code)
+        let slot = self.slot;
+        let p = self.p();
+        record_exit(p, code);
+        let exit = p.exit;
+        let last = leave(slot);
+        self.unlock();
+        finish_thread(slot, last, exit)
     }
 
     fn thread_exit(&mut self, code: u64) -> Result<u64, Error> {
-        record_exit(self.p, code);
-        end_thread()
+        let slot = self.slot;
+        // Counted under the process's lock, so two threads ending at once cannot each take
+        // the other for the last. The last thread's code is the process's.
+        let last = leave(slot);
+        let p = self.p();
+        if last {
+            record_exit(p, code);
+        }
+        let exit = p.exit;
+        self.unlock();
+        finish_thread(slot, last, exit)
     }
 
     fn thread_yield(&mut self) -> Result<u64, Error> {
         // Under the scheduler, give up the rest of the slice; in the boot-time slice there
-        // is nothing else to run, and the call returns.
+        // is nothing else to run, and the call returns. Never while holding the process.
+        self.unlock();
         if crate::preempt::scheduled() {
             crate::preempt::yield_now();
         }
@@ -553,11 +833,11 @@ impl abi::Handler for Syscalls<'_> {
         len: usize,
     ) -> Result<u64, Error> {
         let entry = self
-            .p
+            .p()
             .table
             .get_checked(handle(console), ObjectType::DeviceResource, Rights::WRITE)
             .map_err(handle_error)?;
-        if entry.object != self.p.console {
+        if entry.object != self.p().console {
             return Err(Error::WrongType);
         }
         if len > 256 {
@@ -574,24 +854,24 @@ impl abi::Handler for Syscalls<'_> {
     fn vm_map(&mut self, len: usize) -> Result<u64, Error> {
         let page = Cpu::PAGE_SIZE;
         let pages = len.div_ceil(page).max(1);
-        self.p
+        self.p()
             .reserve_next(pages * page, user_rw())
             .map(|start| start as u64)
     }
 
     fn channel_create(&mut self, out: UserPtr) -> Result<u64, Error> {
-        let (ch, [a, b]) = Chan::new(&self.p.ids, ipc::ENDPOINT_RIGHTS);
+        let (ch, [a, b]) = Chan::new(objects::ids(), ipc::ENDPOINT_RIGHTS);
         let ha = self
-            .p
+            .p()
             .table
             .insert(a.object, a.kind, a.rights)
             .map_err(handle_error)?;
         let hb = self
-            .p
+            .p()
             .table
             .insert(b.object, b.kind, b.rights)
             .map_err(handle_error)?;
-        keep_channel(ch, [a.object, b.object], self.p.slot).ok_or(Error::Full)?;
+        keep_channel(ch, [a.object, b.object], self.slot).ok_or(Error::Full)?;
         let mut pair = [0u8; 8];
         pair[0..4].copy_from_slice(&ha.raw().to_le_bytes());
         pair[4..8].copy_from_slice(&hb.raw().to_le_bytes());
@@ -612,21 +892,22 @@ impl abi::Handler for Syscalls<'_> {
         let mut buf = [0u8; 64];
         // SAFETY: as `debug_write`.
         unsafe { Cpu::copy_from_user(&mut buf[..len], user(bytes)) }.map_err(|_| Error::Fault)?;
-        let entry = self.p.table.get(handle(channel)).map_err(handle_error)?;
+        let entry = self.p().table.get(handle(channel)).map_err(handle_error)?;
         let ch = channel_of(entry.object).ok_or(Error::BadHandle)?;
-        ch.send(&mut self.p.table, handle(channel), &buf[..len], &[])
+        ch.send(&mut self.p().table, handle(channel), &buf[..len], &[])
             .map_err(channel_error)?;
+        wake_channel(entry.object);
         Ok(0)
     }
 
     fn channel_read(&mut self, channel: AbiHandle, buf: UserPtr, cap: usize) -> Result<u64, Error> {
-        let entry = self.p.table.get(handle(channel)).map_err(handle_error)?;
+        let entry = self.p().table.get(handle(channel)).map_err(handle_error)?;
         let ch = channel_of(entry.object).ok_or(Error::BadHandle)?;
         let mut bytes = [0u8; 64];
         let mut handles = [Handle::from_raw(0); 2];
         let cap = cap.min(bytes.len());
         let got = ch
-            .receive(&mut self.p.table, handle(channel), &mut bytes[..cap], &mut handles)
+            .receive(&mut self.p().table, handle(channel), &mut bytes[..cap], &mut handles)
             .map_err(channel_error)?;
         // SAFETY: as `channel_create`.
         unsafe { Cpu::copy_to_user(user(buf), &bytes[..got.bytes]) }.map_err(|_| Error::Fault)?;
@@ -634,7 +915,17 @@ impl abi::Handler for Syscalls<'_> {
     }
 
     fn handle_close(&mut self, h: AbiHandle) -> Result<u64, Error> {
-        let entry = self.p.table.close(handle(h)).map_err(handle_error)?;
+        let entry = self.p().table.get(handle(h)).map_err(handle_error)?;
+        if let Some(ch) = channel_of(entry.object) {
+            // Through the channel, so that its peer sees this end close: a thread waiting to
+            // receive there is told `PeerClosed` rather than waiting for a message that
+            // cannot come. Handles still queued for this end are retired with it.
+            ch.close(&mut self.p().table, handle(h), |e| objects::retire(e.object))
+                .map_err(channel_error)?;
+            wake_channel(entry.object);
+            return Ok(0);
+        }
+        let entry = self.p().table.close(handle(h)).map_err(handle_error)?;
         // The handle was this process's only name for the object. Retiring here is what
         // brings the object count back to its baseline once a program has cleaned up.
         objects::retire(entry.object);
@@ -643,7 +934,7 @@ impl abi::Handler for Syscalls<'_> {
 
     fn process_create(&mut self, image: AbiHandle) -> Result<u64, Error> {
         let bytes = objects::with_handle(
-            &self.p.table,
+            &self.p().table,
             handle(image),
             ObjectType::MemoryRegion,
             Rights::READ,
@@ -672,7 +963,7 @@ impl abi::Handler for Syscalls<'_> {
             waiter: None,
         })
         .ok_or(Error::Full)?;
-        match self.p.table.insert(id, ObjectType::Process, Rights::ALL) {
+        match self.p().table.insert(id, ObjectType::Process, Rights::ALL) {
             Ok(h) => Ok(u64::from(h.raw())),
             Err(e) => {
                 // Nothing could name the process, so nothing could ever tear it down.
@@ -687,32 +978,33 @@ impl abi::Handler for Syscalls<'_> {
         let slot = self.target_slot(process)?;
         // Moving a handle into the table it is already in would put it there twice, under
         // two values.
-        if slot == self.p.slot {
+        if slot == self.slot {
             return Err(Error::InvalidArgument);
         }
-        let entry = self.p.table.transfer_out(handle(h)).map_err(handle_error)?;
-        // A different slot than the caller's, checked above, so this borrow and the
-        // caller's are of two different processes; see `PROCS`.
-        let Some(child) = self::slot(slot) else {
-            let _ = self.p.table.insert(entry.object, entry.kind, entry.rights);
-            return Err(Error::BadHandle);
-        };
-        match child.table.insert(entry.object, entry.kind, entry.rights) {
-            Ok(new) => Ok(u64::from(new.raw())),
-            Err(e) => {
-                // Give it back rather than destroy authority the caller still owns.
-                let _ = self.p.table.insert(entry.object, entry.kind, entry.rights);
-                Err(handle_error(e))
+        self.with_other(slot, |mine, child| {
+            let entry = mine.table.transfer_out(handle(h)).map_err(handle_error)?;
+            match child.table.insert(entry.object, entry.kind, entry.rights) {
+                Ok(new) => Ok(u64::from(new.raw())),
+                Err(e) => {
+                    // Give it back rather than destroy authority the caller still owns.
+                    let _ = mine.table.insert(entry.object, entry.kind, entry.rights);
+                    Err(handle_error(e))
+                }
             }
-        }
+        })?
     }
 
     fn thread_create(&mut self, process: AbiHandle, entry: u64, arg: u64) -> Result<u64, Error> {
         let slot = self.target_slot(process)?;
-        let id = crate::spawn::start_thread(slot, entry as usize, arg as usize)
-            .ok_or(Error::NoMemory)?;
+        let args = [arg as usize, 0, 0, 0];
+        let start = if slot == self.slot {
+            prepare_thread(self.p(), entry, args)
+        } else {
+            self.with_other(slot, |_, target| prepare_thread(target, entry, args))?
+        }?;
+        let id = crate::spawn::start_thread(start).ok_or(Error::NoMemory)?;
         let object = objects::create(Object::Thread { id }).ok_or(Error::Full)?;
-        self.p
+        self.p()
             .table
             .insert(object, ObjectType::Thread, Rights::ALL)
             .map(|h| u64::from(h.raw()))
@@ -726,7 +1018,7 @@ impl abi::Handler for Syscalls<'_> {
         key: u64,
     ) -> Result<u64, Error> {
         let queue = self
-            .p
+            .p()
             .table
             .get_checked(handle(completion), ObjectType::Completion, Rights::WRITE)
             .map_err(handle_error)?
@@ -734,7 +1026,7 @@ impl abi::Handler for Syscalls<'_> {
         // Arm, or answer now: a process that has already ended must not leave its waiter
         // waiting for something that has been and gone.
         let ended = objects::with_handle(
-            &self.p.table,
+            &self.p().table,
             handle(process),
             ObjectType::Process,
             Rights::WAIT,
@@ -766,7 +1058,7 @@ impl abi::Handler for Syscalls<'_> {
 
     fn completion_create(&mut self) -> Result<u64, Error> {
         let id = objects::create(Object::new_completion()).ok_or(Error::Full)?;
-        self.p
+        self.p()
             .table
             .insert(id, ObjectType::Completion, Rights::ALL)
             .map(|h| u64::from(h.raw()))
@@ -774,8 +1066,16 @@ impl abi::Handler for Syscalls<'_> {
     }
 
     fn completion_poll(&mut self, completion: AbiHandle, out: UserPtr) -> Result<u64, Error> {
+        let queue = self
+            .p()
+            .table
+            .get_checked(handle(completion), ObjectType::Completion, Rights::READ)
+            .map_err(handle_error)?
+            .object;
+        // Timers deliver when their queue is looked at; see `objects::deliver_due_timers`.
+        let _ = objects::deliver_due_timers(queue, timekeeping::now().as_nanos());
         let taken = objects::with_handle(
-            &self.p.table,
+            &self.p().table,
             handle(completion),
             ObjectType::Completion,
             Rights::READ,
@@ -796,7 +1096,7 @@ impl abi::Handler for Syscalls<'_> {
         let page = Cpu::PAGE_SIZE;
         let bytes = len.div_ceil(page).max(1) * page;
         let id = objects::create(Object::Region { len: bytes }).ok_or(Error::Full)?;
-        self.p
+        self.p()
             .table
             .insert(id, ObjectType::MemoryRegion, Rights::ALL)
             .map(|h| u64::from(h.raw()))
@@ -805,7 +1105,7 @@ impl abi::Handler for Syscalls<'_> {
 
     fn vm_map_in(&mut self, process: AbiHandle, region: AbiHandle) -> Result<u64, Error> {
         let len = objects::with_handle(
-            &self.p.table,
+            &self.p().table,
             handle(region),
             ObjectType::MemoryRegion,
             Rights::MAP,
@@ -819,30 +1119,371 @@ impl abi::Handler for Syscalls<'_> {
         .map_err(store_error)?
         .ok_or(Error::WrongType)?;
         let slot = self.target_slot(process)?;
-        let target = if slot == self.p.slot {
-            &mut *self.p
+        let mapped = if slot == self.slot {
+            self.p().reserve_next(len, user_rw())
         } else {
-            self::slot(slot).ok_or(Error::BadHandle)?
+            self.with_other(slot, |_, target| target.reserve_next(len, user_rw()))?
         };
-        let start = target.next_map;
-        let end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
-        if end > <Cpu as HasUserMode>::USER_END {
-            return Err(Error::NoMemory);
+        mapped.map(|start| start as u64)
+    }
+
+    fn channel_send(
+        &mut self,
+        channel: AbiHandle,
+        bytes: UserPtr,
+        len: usize,
+        handles: UserPtr,
+        count: usize,
+    ) -> Result<u64, Error> {
+        if len > 64 || count > 2 {
+            return Err(Error::TooLarge);
         }
-        target
-            .vm
-            .reserve(anon(start, len))
-            .map_err(|_| Error::NoMemory)?;
-        target.next_map = end + Cpu::PAGE_SIZE;
-        Ok(start as u64)
+        let mut buf = [0u8; 64];
+        // SAFETY: as `debug_write`.
+        unsafe { Cpu::copy_from_user(&mut buf[..len], user(bytes)) }.map_err(|_| Error::Fault)?;
+        let mut raw = [0u8; 16];
+        if count > 0 {
+            // SAFETY: as above.
+            unsafe { Cpu::copy_from_user(&mut raw[..count * 8], user(handles)) }
+                .map_err(|_| Error::Fault)?;
+        }
+        let word = |at: usize| u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        let mut transfers = [ipc::Transfer::whole(Handle::from_raw(0)); 2];
+        for (i, t) in transfers.iter_mut().enumerate().take(count) {
+            // The mask only ever narrows: `ipc` gives the receiver what the sender held,
+            // intersected with it.
+            *t = ipc::Transfer::narrowed(
+                Handle::from_raw(word(8 * i)),
+                Rights::from_bits_truncate(word(8 * i + 4)),
+            );
+        }
+        let entry = self.p().table.get(handle(channel)).map_err(handle_error)?;
+        let ch = channel_of(entry.object).ok_or(Error::BadHandle)?;
+        ch.send(&mut self.p().table, handle(channel), &buf[..len], &transfers[..count])
+            .map_err(channel_error)?;
+        wake_channel(entry.object);
+        Ok(0)
+    }
+
+    fn channel_recv(
+        &mut self,
+        channel: AbiHandle,
+        buf: UserPtr,
+        cap: usize,
+        handles: UserPtr,
+        hcap: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let cap = cap.min(64);
+        let hcap = hcap.min(2);
+        let entry = self.p().table.get(handle(channel)).map_err(handle_error)?;
+        let queue = channel_queue(entry.object).ok_or(Error::BadHandle)?;
+        // Both buffers are written before anything is received, so their pages are present:
+        // a message taken off the queue and then refused its copy would be lost, and the
+        // handles it carried with it.
+        // SAFETY: as `channel_create`.
+        unsafe { Cpu::copy_to_user(user(buf), &[0u8; 64][..cap]) }.map_err(|_| Error::Fault)?;
+        if hcap > 0 {
+            // SAFETY: as above.
+            unsafe { Cpu::copy_to_user(user(handles), &[0u8; 8][..hcap * 4]) }
+                .map_err(|_| Error::Fault)?;
+        }
+        let (object, endpoint) = (entry.object, handle(channel));
+        self.wait_for(
+            queue,
+            timeout_ns,
+            || None,
+            move |p| {
+                let ch = channel_of(object).ok_or(Error::PeerClosed)?;
+                let mut bytes = [0u8; 64];
+                let mut got_handles = [Handle::from_raw(0); 2];
+                let got = match ch.receive(
+                    &mut p.table,
+                    endpoint,
+                    &mut bytes[..cap],
+                    &mut got_handles[..hcap],
+                ) {
+                    Ok(got) => got,
+                    Err(ipc::Error::Empty) => return Ok(None),
+                    Err(e) => return Err(channel_error(e)),
+                };
+                let mut raw = [0u8; 8];
+                for (i, h) in got_handles.iter().take(got.handles).enumerate() {
+                    raw[4 * i..4 * i + 4].copy_from_slice(&h.raw().to_le_bytes());
+                }
+                // SAFETY: as `channel_create`; both ranges were written above.
+                unsafe { Cpu::copy_to_user(user(buf), &bytes[..got.bytes]) }
+                    .map_err(|_| Error::Fault)?;
+                if got.handles > 0 {
+                    // SAFETY: as above.
+                    unsafe { Cpu::copy_to_user(user(handles), &raw[..4 * got.handles]) }
+                        .map_err(|_| Error::Fault)?;
+                }
+                Ok(Some(got.bytes as u64 | (got.handles as u64) << 32))
+            },
+        )
+    }
+
+    fn completion_wait(
+        &mut self,
+        completion: AbiHandle,
+        out: UserPtr,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let queue = self
+            .p()
+            .table
+            .get_checked(handle(completion), ObjectType::Completion, Rights::READ)
+            .map_err(handle_error)?
+            .object;
+        let waiters = objects::waiters(queue).ok_or(Error::BadHandle)?;
+        // SAFETY: as `completion_poll`; written first for the reason `channel_recv` gives.
+        unsafe { Cpu::copy_to_user(user(out), &[0u8; 16]) }.map_err(|_| Error::Fault)?;
+        let now = || timekeeping::now().as_nanos();
+        self.wait_for(
+            waiters,
+            timeout_ns,
+            // A timer on this queue ends the wait when it is due, which is when its
+            // completion can be delivered.
+            move || objects::deliver_due_timers(queue, now()),
+            move |_| {
+                let _ = objects::deliver_due_timers(queue, now());
+                let (key, value) = match objects::with(queue, objects::take) {
+                    None => return Err(Error::BadHandle),
+                    Some(None) => return Ok(None),
+                    Some(Some(entry)) => entry,
+                };
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&key.to_le_bytes());
+                bytes[8..].copy_from_slice(&value.to_le_bytes());
+                // SAFETY: as above.
+                unsafe { Cpu::copy_to_user(user(out), &bytes) }.map_err(|_| Error::Fault)?;
+                Ok(Some(1))
+            },
+        )
+    }
+
+    fn event_create(&mut self) -> Result<u64, Error> {
+        let id = objects::create(Object::Event { signalled: false }).ok_or(Error::Full)?;
+        self.insert_new(id, ObjectType::Event)
+    }
+
+    fn event_signal(&mut self, event: AbiHandle) -> Result<u64, Error> {
+        let id = self
+            .p()
+            .table
+            .get_checked(handle(event), ObjectType::Event, Rights::SIGNAL)
+            .map_err(handle_error)?
+            .object;
+        if objects::signal_event(id) {
+            Ok(0)
+        } else {
+            Err(Error::BadHandle)
+        }
+    }
+
+    fn event_wait(&mut self, event: AbiHandle, timeout_ns: u64) -> Result<u64, Error> {
+        let id = self
+            .p()
+            .table
+            .get_checked(handle(event), ObjectType::Event, Rights::WAIT)
+            .map_err(handle_error)?
+            .object;
+        let waiters = objects::waiters(id).ok_or(Error::BadHandle)?;
+        self.wait_for(
+            waiters,
+            timeout_ns,
+            || None,
+            move |_| match objects::consume_event(id) {
+                Some(true) => Ok(Some(0)),
+                Some(false) => Ok(None),
+                None => Err(Error::BadHandle),
+            },
+        )
+    }
+
+    fn timer_create(&mut self, completion: AbiHandle, key: u64) -> Result<u64, Error> {
+        let queue = self
+            .p()
+            .table
+            .get_checked(handle(completion), ObjectType::Completion, Rights::WRITE)
+            .map_err(handle_error)?
+            .object;
+        let id = objects::create(Object::Timer {
+            queue,
+            key,
+            deadline: objects::DISARMED,
+            period: 0,
+            fires: 0,
+        })
+        .ok_or(Error::Full)?;
+        self.insert_new(id, ObjectType::Timer)
+    }
+
+    fn timer_set(&mut self, timer: AbiHandle, delay_ns: u64, period_ns: u64) -> Result<u64, Error> {
+        let id = self
+            .p()
+            .table
+            .get_checked(handle(timer), ObjectType::Timer, Rights::WRITE)
+            .map_err(handle_error)?
+            .object;
+        // `DISARMED` is the one deadline a timer cannot be armed for; a delay that would
+        // reach it waits one nanosecond less, which is to say for ever.
+        let deadline = timekeeping::now()
+            .as_nanos()
+            .saturating_add(delay_ns)
+            .min(objects::DISARMED - 1);
+        if objects::set_timer(id, deadline, period_ns) {
+            Ok(0)
+        } else {
+            Err(Error::BadHandle)
+        }
+    }
+
+    fn timer_cancel(&mut self, timer: AbiHandle) -> Result<u64, Error> {
+        let id = self
+            .p()
+            .table
+            .get_checked(handle(timer), ObjectType::Timer, Rights::WRITE)
+            .map_err(handle_error)?
+            .object;
+        if objects::set_timer(id, objects::DISARMED, 0) {
+            Ok(0)
+        } else {
+            Err(Error::BadHandle)
+        }
+    }
+
+    fn clock_now(&mut self) -> Result<u64, Error> {
+        Ok(timekeeping::now().as_nanos())
     }
 }
 
-impl Syscalls<'_> {
+impl Syscalls {
+    /// The caller's process, taking its lock again if the call let go of it.
+    fn p(&mut self) -> &mut Process {
+        let slot = self.slot;
+        self.held
+            .get_or_insert_with(|| lock(slot).expect("a process outlives its threads"))
+            .process()
+    }
+
+    /// Let go of the caller's process. [`Syscalls::p`] takes it again.
+    fn unlock(&mut self) {
+        self.held = None;
+    }
+
+    /// Give the caller a handle with every right to the new object `id`, or retire it.
+    fn insert_new(&mut self, id: ObjectId, kind: ObjectType) -> Result<u64, Error> {
+        match self.p().table.insert(id, kind, Rights::ALL) {
+            Ok(h) => Ok(u64::from(h.raw())),
+            Err(e) => {
+                // Nothing names it, so nothing could ever close it.
+                objects::retire(id);
+                Err(handle_error(e))
+            }
+        }
+    }
+
+    /// End the calling thread if its process is ending. See the module documentation.
+    fn end_if_exiting(&mut self) {
+        if !EXITING[self.slot].load(Ordering::Acquire) {
+            return;
+        }
+        let slot = self.slot;
+        let last = leave(slot);
+        let exit = self.p().exit;
+        self.unlock();
+        finish_thread(slot, last, exit)
+    }
+
+    /// Run `f` on the caller's process and the process in `slot`, a different one, holding
+    /// both locks.
+    ///
+    /// Two locks are taken in slot order, whoever asks first: a caller in a higher slot that
+    /// finds the other lock taken lets go of its own and tries again, so two processes acting
+    /// on each other at once cannot each hold one lock and wait for the other.
+    fn with_other<R>(
+        &mut self,
+        slot: usize,
+        f: impl FnOnce(&mut Process, &mut Process) -> R,
+    ) -> Result<R, Error> {
+        if slot == self.slot {
+            return Err(Error::InvalidArgument);
+        }
+        loop {
+            let _ = self.p();
+            match try_lock(slot) {
+                Attempt::Held(mut other) => {
+                    let mine: *mut Process = self.p();
+                    // SAFETY: two different slots, both locked by this CPU, so these are
+                    // borrows of two different processes, and each is unique; see `PROCS`.
+                    return Ok(f(unsafe { &mut *mine }, other.process()));
+                }
+                Attempt::Empty => return Err(Error::BadHandle),
+                Attempt::Busy => {
+                    if self.slot > slot {
+                        self.unlock();
+                    }
+                    mp::answer_shootdowns();
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Wait on `queue` until `attempt` produces a result, up to `timeout_ns`, as the ABI
+    /// defines a timeout; see `lib/abi/src/table.rs`.
+    ///
+    /// `attempt` runs with the process's lock held and the process's space loaded. It must
+    /// not fault: whatever it copies to the program was written once already, before the wait.
+    /// `next_deadline` names an instant, in kernel-clock nanoseconds, at which the wait must
+    /// look again even if nothing wakes it — a timer on the queue falling due.
+    fn wait_for<R>(
+        &mut self,
+        queue: &'static WaitQueue,
+        timeout_ns: u64,
+        mut next_deadline: impl FnMut() -> Option<u64>,
+        mut attempt: impl FnMut(&mut Process) -> Result<Option<R>, Error>,
+    ) -> Result<R, Error> {
+        if let Some(r) = attempt(self.p())? {
+            return Ok(r);
+        }
+        if timeout_ns == 0 {
+            return Err(Error::ShouldWait);
+        }
+        let until = wait::deadline_after(timeout_ns);
+        let slot = self.slot;
+        // Never blocked holding the process: its other threads need it, and so does the
+        // thread that ends it.
+        self.unlock();
+        loop {
+            let soonest = match (until, next_deadline().map(Instant::from_nanos)) {
+                (Some(until), Some(due)) => Some(until.min(due)),
+                (until, due) => until.or(due),
+            };
+            let got = queue.wait_once(soonest, || {
+                if EXITING[slot].load(Ordering::Acquire) {
+                    return Some(Err(Error::PeerClosed));
+                }
+                let Some(mut held) = lock(slot) else {
+                    return Some(Err(Error::BadHandle));
+                };
+                attempt(held.process()).transpose()
+            });
+            if let Some(result) = got {
+                return result;
+            }
+            if !preempt::scheduled() || until.is_some_and(|u| timekeeping::now() >= u) {
+                return Err(Error::TimedOut);
+            }
+        }
+    }
+
     /// The process slot `process` names: live, and writable by the caller.
-    fn target_slot(&self, process: AbiHandle) -> Result<usize, Error> {
+    fn target_slot(&mut self, process: AbiHandle) -> Result<usize, Error> {
         objects::with_handle(
-            &self.p.table,
+            &self.p().table,
             handle(process),
             ObjectType::Process,
             Rights::WRITE,
@@ -1009,7 +1650,19 @@ fn build_as(slot: usize, program: &Program, personality: Personality) -> Option<
     if personality_of(program) != Some(personality) {
         return None;
     }
-    if slot >= MAX_PROCS || self::slot(slot).is_some() {
+    if slot >= MAX_PROCS || USED[slot].swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let built = build_claimed(slot, program, personality);
+    if built.is_none() {
+        USED[slot].store(false, Ordering::Release);
+    }
+    built
+}
+
+/// [`build_as`], in a slot it has claimed.
+fn build_claimed(slot: usize, program: &Program, personality: Personality) -> Option<PhysAddr> {
+    if self::slot(slot).is_some() {
         return None;
     }
     let direct = direct();
@@ -1053,10 +1706,16 @@ fn build_as(slot: usize, program: &Program, personality: Personality) -> Option<
             exit: None,
             root,
             slot,
+            started: false,
+            stacks: 0,
             personality,
             syscalls: table_for(personality),
         });
     }
+    LIVE[slot].store(0, Ordering::Release);
+    EXITING[slot].store(false, Ordering::Release);
+    INSTALLED[slot].store(false, Ordering::Release);
+    ROOTS[slot].store(root.raw(), Ordering::Release);
     Some(root)
 }
 
@@ -1070,6 +1729,212 @@ pub(crate) fn user_stack_top() -> usize {
 /// room for the ABI's alignment and the initial frame.
 pub(crate) fn user_stack_pointer() -> usize {
     user_stack_top() - 16
+}
+
+/// Pages of stack each thread after a process's first is given.
+const THREAD_STACK_PAGES: usize = 4;
+/// Threads after the first a process may start in its life. Each one's stack is reserved
+/// when it starts and stays until the process is torn down, so this bounds threads started,
+/// not threads at once.
+const MAX_EXTRA_THREADS: usize = 3;
+
+/// The top of the `k`th extra thread's stack: below the first thread's, each with a page of
+/// unmapped space beneath it so an overflow faults rather than running into the next.
+fn thread_stack_top(k: usize) -> usize {
+    let first_bottom =
+        <Cpu as HasUserMode>::USER_END - Cpu::PAGE_SIZE - USER_STACK_PAGES * Cpu::PAGE_SIZE;
+    first_bottom - Cpu::PAGE_SIZE - k * (THREAD_STACK_PAGES + 1) * Cpu::PAGE_SIZE
+}
+
+/// Work out how a new thread of `p` starts, reserving its stack if it is not the first: at
+/// `entry`, or the program's entry point for zero, with `args` in its argument registers.
+fn prepare_thread(
+    p: &mut Process,
+    entry: u64,
+    args: [usize; 4],
+) -> Result<crate::spawn::Start, Error> {
+    let user = <Cpu as HasUserMode>::USER_START as u64..<Cpu as HasUserMode>::USER_END as u64;
+    let entry = if entry == 0 {
+        p.image.and_then(parse).ok_or(Error::InvalidArgument)?.entry
+    } else if user.contains(&entry) {
+        entry
+    } else {
+        return Err(Error::InvalidArgument);
+    };
+    let (user_sp, install) = if !p.started {
+        (user_stack_pointer(), true)
+    } else {
+        if p.stacks >= MAX_EXTRA_THREADS {
+            return Err(Error::Full);
+        }
+        let top = thread_stack_top(p.stacks);
+        let len = THREAD_STACK_PAGES * Cpu::PAGE_SIZE;
+        p.vm.reserve(anon(top - len, len))
+            .map_err(|_| Error::NoMemory)?;
+        p.stacks += 1;
+        (top - 16, false)
+    };
+    p.started = true;
+    Ok(crate::spawn::Start {
+        slot: p.slot,
+        root: p.root,
+        entry: entry as usize,
+        user_sp,
+        install,
+        args,
+    })
+}
+
+/// Start a thread in process `slot` from the kernel, as `thread_create` would: at `entry`
+/// (zero for the program's entry point), with `args`. The first thread of a process installs
+/// its program; see [`crate::spawn`].
+pub(crate) fn start(slot: usize, entry: u64, args: [usize; 4]) -> Option<ThreadId> {
+    let start = {
+        let mut held = lock(slot)?;
+        prepare_thread(held.process(), entry, args).ok()?
+    };
+    crate::spawn::start_thread(start)
+}
+
+/// Bind a new thread of process `slot` to its kernel stack and address space, and count
+/// it. What `preempt::spawn_prepared`'s preparation does for a thread [`crate::spawn`] starts.
+pub(crate) fn bind(
+    slot: usize,
+    ctx: &mut <Cpu as hal::HasContextSwitch>::Context,
+    top: KernAddr,
+    root: PhysAddr,
+) {
+    if let Some(live) = LIVE.get(slot) {
+        live.fetch_add(1, Ordering::AcqRel);
+    }
+    <Cpu as HasUserMode>::bind(ctx, top, root);
+}
+
+/// Threads of process `slot` that have not ended.
+pub(crate) fn threads_live(slot: usize) -> usize {
+    LIVE.get(slot).map_or(0, |l| l.load(Ordering::Acquire))
+}
+
+/// Whether process `slot`'s first thread has installed its program.
+pub(crate) fn installed(slot: usize) -> bool {
+    INSTALLED
+        .get(slot)
+        .is_some_and(|i| i.load(Ordering::Acquire))
+}
+
+/// Install process `slot`'s program from its image, on the process's first thread.
+pub(crate) fn install_image(slot: usize) -> Option<()> {
+    let image = lock(slot)?.process().image?;
+    install_program(&parse(image)?)
+}
+
+/// End the running thread of process `slot` before it reached user mode, ending the process
+/// with `code`. Never returns.
+pub(crate) fn abandon(slot: usize, code: u64) -> ! {
+    let (last, exit) = match lock(slot) {
+        Some(mut held) => {
+            let p = held.process();
+            record_exit(p, code);
+            (leave(slot), p.exit)
+        }
+        None => (leave(slot), Some(code)),
+    };
+    finish_thread(slot, last, exit)
+}
+
+/// Give process `slot` a handle with every right to itself, so a program can start threads
+/// in its own process. Before any thread of it runs.
+pub(crate) fn process_handle(slot: usize) -> Option<Handle> {
+    let id = objects::create(Object::Process {
+        slot,
+        exited: false,
+        code: 0,
+        waiter: None,
+    })?;
+    match self::slot(slot).and_then(|p| p.grant(id, ObjectType::Process, Rights::ALL)) {
+        Some(h) => Some(h),
+        None => {
+            objects::retire(id);
+            None
+        }
+    }
+}
+
+/// Make a channel with both endpoints in process `slot`'s table. Before any thread of it
+/// runs.
+pub(crate) fn channel_pair(slot: usize) -> Option<(Handle, Handle)> {
+    let p = self::slot(slot)?;
+    let (ch, [a, b]) = Chan::new(objects::ids(), ipc::ENDPOINT_RIGHTS);
+    let ha = p.table.insert(a.object, a.kind, a.rights).ok()?;
+    let hb = p.table.insert(b.object, b.kind, b.rights).ok()?;
+    keep_channel(ch, [a.object, b.object], slot)?;
+    Some((ha, hb))
+}
+
+/// One end of a channel the kernel holds itself, for a service a program talks to: the
+/// other end is in the program's table, and this one in a small table of the kernel's own.
+/// `crate::waits`' file service is the first.
+pub(crate) struct KernelEnd {
+    table: HandleTable<2>,
+    handle: Handle,
+    object: ObjectId,
+}
+
+/// Make a channel between process `slot` and the kernel. Returns the program's handle and
+/// the kernel's end. Before any thread of the process runs; the channel is freed with the
+/// process.
+pub(crate) fn kernel_channel(slot: usize) -> Option<(Handle, KernelEnd)> {
+    let p = self::slot(slot)?;
+    let (ch, [theirs, ours]) = Chan::new(objects::ids(), ipc::ENDPOINT_RIGHTS);
+    let given = p
+        .table
+        .insert(theirs.object, theirs.kind, theirs.rights)
+        .ok()?;
+    let mut table = HandleTable::new();
+    let handle = table.insert(ours.object, ours.kind, ours.rights).ok()?;
+    keep_channel(ch, [theirs.object, ours.object], slot)?;
+    Some((
+        given,
+        KernelEnd {
+            table,
+            handle,
+            object: ours.object,
+        },
+    ))
+}
+
+impl KernelEnd {
+    /// Receive one message into `buf`, waiting until `deadline` for it. On a kernel thread.
+    pub(crate) fn recv(
+        &mut self,
+        buf: &mut [u8],
+        deadline: Option<Instant>,
+    ) -> Result<usize, Error> {
+        let queue = channel_queue(self.object).ok_or(Error::PeerClosed)?;
+        let (table, endpoint, object) = (&mut self.table, self.handle, self.object);
+        let mut handles = [Handle::from_raw(0); 2];
+        queue
+            .wait_until(deadline, || {
+                let Some(ch) = channel_of(object) else {
+                    return Some(Err(Error::PeerClosed));
+                };
+                match ch.receive(table, endpoint, buf, &mut handles) {
+                    Ok(got) => Some(Ok(got.bytes)),
+                    Err(ipc::Error::Empty) => None,
+                    Err(e) => Some(Err(channel_error(e))),
+                }
+            })
+            .unwrap_or(Err(Error::TimedOut))
+    }
+
+    /// Send `bytes` to the program, waking it if it waits.
+    pub(crate) fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let ch = channel_of(self.object).ok_or(Error::PeerClosed)?;
+        ch.send(&mut self.table, self.handle, bytes, &[])
+            .map_err(channel_error)?;
+        wake_channel(self.object);
+        Ok(())
+    }
 }
 
 /// Point every process's frame operations at `frames`: the boot allocator for the slice
@@ -1187,8 +2052,10 @@ pub(crate) fn install_program(program: &Program) -> Option<()> {
         // `copy_to_user` faults its pages in.
         unsafe { Cpu::copy_to_user(UserAddr::new(seg.vaddr as usize), seg.file) }.ok()?;
     }
-    let p = current()?;
-    with_frames(|f| {
+    let slot = current_slot()?;
+    let mut held = lock(slot)?;
+    let p = held.process();
+    let protected = with_frames(|f| {
         for seg in program.segments() {
             let seg = seg.ok()?;
             if seg.mem_size == 0 || seg.access.write {
@@ -1199,7 +2066,12 @@ pub(crate) fn install_program(program: &Program) -> Option<()> {
                 .ok()?;
         }
         Some(())
-    })?
+    })?;
+    drop(held);
+    if protected.is_some() {
+        INSTALLED[slot].store(true, Ordering::Release);
+    }
+    protected
 }
 
 /// Install the handles `mode` starts with, and record the argument handle values the
@@ -1299,6 +2171,8 @@ extern "C" fn trampoline(_: usize) -> ! {
 /// been reaped, and the switch away from it loaded the kernel root on its CPU.
 pub(crate) fn teardown(slot: usize) {
     let Some(p) = self::slot(slot) else { return };
+    // First, so nothing matches a root about to be freed.
+    ROOTS[slot].store(0, Ordering::Release);
     with_frames(|f| {
         // Collect region starts first: `release` mutates the map as it goes.
         let mut starts = [0usize; REGIONS];
@@ -1326,9 +2200,11 @@ pub(crate) fn teardown(slot: usize) {
     if p.personality == Personality::Linux {
         crate::personality::release(slot);
     }
-    // SAFETY: see `PROCS`; the thread has exited and been reaped, so nothing else holds
+    // SAFETY: see `PROCS`; the threads have exited and been reaped, so nothing else holds
     // this slot.
     unsafe { *PROCS[slot].get() = None };
+    LIVE[slot].store(0, Ordering::Release);
+    USED[slot].store(false, Ordering::Release);
 }
 
 // ---- thread plumbing ------------------------------------------------------------------
@@ -1410,7 +2286,13 @@ pub(crate) fn user_rw() -> hal::PageFlags {
 
 /// A free process slot, or `None` when as many processes exist as this kernel allows.
 fn free_slot() -> Option<usize> {
-    (0..MAX_PROCS).find(|&i| self::slot(i).is_none())
+    // The claim flags, not the slots: another CPU may be building or tearing one down.
+    (0..MAX_PROCS).find(|&i| !USED[i].load(Ordering::Acquire))
+}
+
+/// The bytes [`program`] parses, for a process built from them to name as its image.
+pub(crate) fn program_image() -> &'static [u8] {
+    program_bytes()
 }
 
 /// Parse `bytes` as a program for this port's user half.
@@ -1455,6 +2337,7 @@ fn channel_error(e: ipc::Error) -> Error {
         ipc::Error::Full => Error::Full,
         ipc::Error::PeerClosed | ipc::Error::Closed => Error::PeerClosed,
         ipc::Error::BufferTooSmall { .. } | ipc::Error::TooLarge { .. } => Error::TooLarge,
+        ipc::Error::Endpoint(e) | ipc::Error::Transfer { error: e, .. } => handle_error(e),
         _ => Error::BadHandle,
     }
 }

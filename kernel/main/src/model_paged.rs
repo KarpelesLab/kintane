@@ -100,6 +100,68 @@ pub fn processes_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// Blocking waits, events, timers, two threads in one process, and a file read through a
+/// service over a channel. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn waits_check(c: &dyn EarlyConsole) -> Check {
+    crate::waits::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn waits_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
+/// The stress run's waiting-process cycle: claim the second stack its threads run on.
+/// Nothing to do, and `Ok`, without USERSPACE.
+#[cfg(CONFIG_USERSPACE)]
+pub fn wait_stress_setup() -> Result<(), &'static str> {
+    crate::waits::stress_setup()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn wait_stress_setup() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Run a two-threaded process whose threads wake each other across CPUs, and destroy it.
+/// `Ok` without USERSPACE.
+#[cfg(CONFIG_USERSPACE)]
+pub fn wait_stress_cycle(round: u64) -> Result<(), &'static str> {
+    crate::waits::stress_cycle(round)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn wait_stress_cycle(round: u64) -> Result<(), &'static str> {
+    let _ = round;
+    Ok(())
+}
+
+/// The waiting-process part of the stress heartbeat. Nothing without USERSPACE.
+#[cfg(CONFIG_USERSPACE)]
+pub fn wait_stress_heartbeat(c: &dyn EarlyConsole) {
+    let cycles = crate::waits::stress_cycles();
+    if cycles == 0 {
+        return;
+    }
+    let s = crate::wait::stats();
+    c.write_str(", waiting processes ");
+    crate::write_usize(c, cycles as usize);
+    c.write_str(" (blocks ");
+    crate::write_usize(c, s.blocks as usize);
+    c.write_str(", cross-CPU wakes ");
+    crate::write_usize(c, s.cross_cpu_wakes as usize);
+    c.write_str(", timeouts ");
+    crate::write_usize(c, s.timeouts as usize);
+    c.write_str(")");
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn wait_stress_heartbeat(c: &dyn EarlyConsole) {
+    let _ = c;
+}
+
 /// The stress run's user-process cycle: claim the stack its process thread runs on.
 /// Nothing to do, and `Ok`, without USERSPACE.
 #[cfg(CONFIG_USERSPACE)]

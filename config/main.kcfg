@@ -128,8 +128,8 @@ config NR_CPUS
 config KERNEL_THREAD_SLOTS
     int "Guarded stack slots for kernel threads"
     range 2 256
-    default 13 if STRESS_TEST && DRIVER_ISOLATION
-    default 12 if STRESS_TEST
+    default 14 if STRESS_TEST && DRIVER_ISOLATION
+    default 13 if STRESS_TEST
     default 8
     help
         How many kernel threads may hold a guarded stack at once, not

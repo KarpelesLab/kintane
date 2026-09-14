@@ -8,4 +8,4 @@ layer = "kernel"
 # each, and the configuration selects one. The image names the role, never the machine or
 # the loader.
 [deps]
-units = ["hal", "arch", "boot_protocol", "bootinfo", "mm", "kalloc", "selftest", "time", "sched", "thread", "unwind", "sync", "buildid", "platform", "cmdline", "kobject", "ipc", "module", "abi", "elf", "userinit", "userchild", "block", "virtio-blk", "hwproxy", "virtio-probe", "hwdomain", "vfs", "bcache", "fat", "lastgood", "linux"]
+units = ["hal", "arch", "boot_protocol", "bootinfo", "mm", "kalloc", "selftest", "time", "sched", "thread", "unwind", "sync", "buildid", "platform", "cmdline", "kobject", "ipc", "module", "abi", "elf", "userinit", "userchild", "block", "virtio-blk", "hwproxy", "virtio-probe", "hwdomain", "vfs", "vfsproto", "bcache", "fat", "lastgood", "linux"]

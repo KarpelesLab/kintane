@@ -63,16 +63,18 @@ static PROBE: SyncUnsafeCell<Storage<4, SECTOR>> = SyncUnsafeCell::new(Storage::
 /// SAFETY INVARIANT: borrowed only by [`contents`], on the boot path.
 static CHUNK: SyncUnsafeCell<[u8; 4096]> = SyncUnsafeCell::new([0; 4096]);
 
-/// The mounted volume, kept for the stress run.
+/// The mounted volume, kept for the boot-time file service and the stress run.
 ///
 /// Not a `SyncUnsafeCell`: a volume holds a `&dyn BlockDevice`, which is not `Sync`, so the
 /// compiler cannot vouch for sharing it and the invariant below is what does.
 struct Volume(UnsafeCell<Option<Fat16<'static, 'static>>>);
 
 // SAFETY: written once, by `check`, before `MOUNTED` is set. After that it is reached
-// only through `volume`, by the stress run's filesystem workload thread — of which there is
-// one — or by the auditor while that thread is parked at a checkpoint. So no two borrows are
-// ever live at once, and the device it holds is itself shared-safe (its driver locks).
+// only through `volume`: at boot, by `crate::waits`' file service on the boot thread, which
+// gives it up before the check returns; then by the stress run's filesystem workload thread
+// — of which there is one — or by the auditor while that thread is parked at a checkpoint.
+// So no two borrows are ever live at once, and the device it holds is itself shared-safe
+// (its driver locks).
 unsafe impl Sync for Volume {}
 
 static VOLUME: Volume = Volume(UnsafeCell::new(None));
@@ -87,8 +89,9 @@ pub fn mounted() -> bool {
 /// The mounted volume, once the check has mounted it.
 ///
 /// # Safety
-/// The caller is the one thread allowed to use the volume: the stress run's filesystem
-/// workload, or the auditor while that workload is parked. See [`Volume`]'s invariant.
+/// The caller is the one thread allowed to use the volume: the boot-time file service before
+/// the stress run starts, the stress run's filesystem workload, or the auditor while that
+/// workload is parked. See [`Volume`]'s invariant.
 pub unsafe fn volume() -> Option<&'static mut Fat16<'static, 'static>> {
     if !MOUNTED.load(Ordering::Acquire) {
         return None;

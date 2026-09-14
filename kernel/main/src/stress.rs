@@ -100,8 +100,9 @@ const NAMES: [&str; WORKLOADS] = [
 /// `preempt` asserts at compile time that `KERNEL_THREAD_SLOTS` covers both.
 pub const EXTRA_STACKS: usize = if kconfig::STRESS_TEST {
     // The four named workloads; the three disk workloads (two block, one filesystem) when the
-    // disk is attached; and the user process the auditor drives when there is userspace.
-    EXTRA_NAMES.len() + 3 * kconfig::QEMU_BLOCK_TEST as usize + kconfig::USERSPACE as usize
+    // disk is attached; and, when there is userspace, the user process the auditor drives and
+    // the second thread of the waiting process it drives after it.
+    EXTRA_NAMES.len() + 3 * kconfig::QEMU_BLOCK_TEST as usize + 2 * kconfig::USERSPACE as usize
 } else {
     0
 };
@@ -336,6 +337,15 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
                 / 1_000_000_000;
             audit_failed(c, seconds, "user process", what);
         }
+        // Then a process whose two threads, pinned to two CPUs, block on each other: a lost
+        // wake-up is a receive that times out, and fails the run.
+        if let Err(what) = crate::model::wait_stress_cycle(audits) {
+            let seconds = timekeeping::now()
+                .saturating_duration_since(start)
+                .as_nanos()
+                / 1_000_000_000;
+            audit_failed(c, seconds, "waiting process", what);
+        }
         sleep_until(next.min(end));
         let now = timekeeping::now();
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;
@@ -390,6 +400,7 @@ fn start() -> Result<(), &'static str> {
     // After the workloads' own, so their slot numbers are what they were: the stack the
     // user process the auditor drives runs on, in an image with userspace.
     crate::model::process_stress_setup()?;
+    crate::model::wait_stress_setup()?;
     // Every workload but the three that need the disk, which are spawned below only if it
     // exists.
     let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 3] = [
@@ -621,6 +632,7 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         write_usize(c, crate::model::process_stress_serve_worst_us() as usize);
         c.write_str(" us)");
     }
+    crate::model::wait_stress_heartbeat(c);
     c.write_str(", audits ");
     write_usize(c, audits as usize);
     c.write_str(" ok\n");
