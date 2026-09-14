@@ -1986,6 +1986,33 @@ which is the half of the check an emulator cannot forge.
 The second is the point of the change: on a host running two soaks and five other jobs, three
 quarters of a second of lateness was reported and not one wake-up was the scheduler's doing.
 
+#### A wait charged nothing at all is the host, not a starved thread
+
+`await_slices` ends in `Starved` when neither count reached its bound, and the caller reads the
+thread's state to say why. One of those states — ready on the CPU it was pinned to — was
+reported as `never served: ready on the right CPU, never scheduled`. Another fork hit exactly
+that on unmodified master, at eight CPUs, while this branch's soaks had the host at load 20 to
+35.
+
+`Starved` now carries what the thread was given. Both counts zero means not one timer interrupt
+on that CPU saw the thread in five seconds, ready or running: nothing ran there at all, which is
+the host and not the scheduler. That case is counted and printed in the heartbeat as
+`none charged`. A thread that was charged something and still made no progress fails as before —
+dropping the process threads' priority below every workload, so they are ready and passed over,
+still fails a run at 7 s.
+
+#### The watchdog was measuring the host too
+
+`kbuild stress` kills a guest that stops printing its heartbeat, which is the only way to catch
+a run that hangs with interrupts masked. Its allowance was thirty seconds of wall time, and the
+guest prints one heartbeat per second of *its* time — so on a machine running several eight-CPU
+guests at load 18, a healthy soak was killed as hung with its counters still climbing, no audit
+failed, and heartbeats still arriving.
+
+A guest that has really hung never prints again, so a longer allowance costs only how soon that
+is noticed, never whether it is. It is two minutes now: four times the worst gap measured on a
+loaded host, and still a short wait beside a run of hours.
+
 #### A message that arrived late is not a wake-up that was lost
 
 The waiting-pair program's `recv_promptly` returned `TimedOut` for two different facts: nothing
@@ -2069,6 +2096,7 @@ evidence for that fix, not against it.
 | `aarch64-virt-smp`, 8 CPUs | 676 s | the same | the same, and the longest any attempt ran before its fix landed |
 | `aarch64-virt-smp`, 8 CPUs | 141 s | `spinning sibling: a spinning thread was never stopped: its process's exit did not reach it` | `spawn::PATIENCE` again: the spinner's CPU was not run, so no interrupt reached it |
 | `aarch64-virt-smp`, 8 CPUs | 49 s | `waiting process: a waiting process did not finish: a wake-up was lost` | `waits::PAIR_PATIENCE`, 5 s, over two threads passing a counter |
+| `aarch64-virt-smp`, 8 CPUs | 64 s | `killed by the heartbeat watchdog: the guest is hung` | kbuild's own 30 s allowance between heartbeats, with the guest still printing them |
 
 Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
 
