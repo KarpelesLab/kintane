@@ -158,3 +158,99 @@ fn garbage_never_panics() {
         let _ = parse(&bytes).map(|p| p.segments().count());
     }
 }
+
+/// A program with a text segment and one `PT_NOTE` segment holding `notes`.
+fn with_notes(os_abi: u8, notes: &[u8]) -> Vec<u8> {
+    let mut out = build(EM_X86_64, ET_EXEC, BASE, &[text(BASE)]);
+    out[7] = os_abi;
+    // Grow the program header table by one entry, after the existing one, moving the
+    // text's bytes along.
+    let phnum = u16::from_le_bytes([out[56], out[57]]) as usize;
+    let table_end = EHDR_SIZE + phnum * PHDR_SIZE;
+    out.splice(table_end..table_end, core::iter::repeat_n(0u8, PHDR_SIZE));
+    for i in 0..phnum {
+        let off_at = EHDR_SIZE + i * PHDR_SIZE + 8;
+        let off = u64::from_le_bytes(out[off_at..off_at + 8].try_into().unwrap());
+        out[off_at..off_at + 8].copy_from_slice(&(off + PHDR_SIZE as u64).to_le_bytes());
+    }
+    out[56..58].copy_from_slice(&((phnum + 1) as u16).to_le_bytes());
+    let note_off = out.len() as u64;
+    out.extend_from_slice(notes);
+    let ph = table_end;
+    out[ph..ph + 4].copy_from_slice(&PT_NOTE.to_le_bytes());
+    out[ph + 8..ph + 16].copy_from_slice(&note_off.to_le_bytes());
+    out[ph + 32..ph + 40].copy_from_slice(&(notes.len() as u64).to_le_bytes());
+    out
+}
+
+fn note(name: &[u8], ty: u32, desc: &[u8]) -> Vec<u8> {
+    let mut n = Vec::new();
+    n.extend_from_slice(&((name.len() + 1) as u32).to_le_bytes());
+    n.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+    n.extend_from_slice(&ty.to_le_bytes());
+    n.extend_from_slice(name);
+    n.push(0);
+    while n.len() % 4 != 0 {
+        n.push(0);
+    }
+    n.extend_from_slice(desc);
+    while n.len() % 4 != 0 {
+        n.push(0);
+    }
+    n
+}
+
+#[test]
+fn a_kintane_note_is_found_and_another_owners_is_not() {
+    let mut notes = note(b"GNU", 3, &[1, 2, 3, 4]);
+    notes.extend(note(NOTE_KINTANE, NT_KINTANE_ABI, &1u32.to_le_bytes()));
+    let bytes = with_notes(ELFOSABI_SYSV, &notes);
+    let p = parse(&bytes).unwrap();
+    assert!(p.has_note(NOTE_KINTANE, NT_KINTANE_ABI), "the second note is the KinTane one");
+    assert!(!p.has_note(NOTE_KINTANE, 1), "the owner matches but the type does not");
+    assert_eq!(p.os_abi(), ELFOSABI_SYSV);
+
+    let linux = with_notes(ELFOSABI_LINUX, &note(b"GNU", 3, &[0; 4]));
+    let p = parse(&linux).unwrap();
+    assert!(!p.has_note(NOTE_KINTANE, NT_KINTANE_ABI));
+    assert_eq!(p.os_abi(), ELFOSABI_LINUX);
+}
+
+#[test]
+fn a_note_that_is_a_prefix_of_the_name_does_not_match() {
+    let bytes = with_notes(ELFOSABI_SYSV, &note(b"KinTan", NT_KINTANE_ABI, &[0; 4]));
+    assert!(
+        !parse(&bytes)
+            .unwrap()
+            .has_note(NOTE_KINTANE, NT_KINTANE_ABI)
+    );
+}
+
+#[test]
+fn corrupt_notes_never_panic_and_never_match() {
+    let good = note(NOTE_KINTANE, NT_KINTANE_ABI, &[0; 4]);
+    for cut in 0..good.len() {
+        let bytes = with_notes(ELFOSABI_SYSV, &good[..cut]);
+        if let Ok(p) = parse(&bytes) {
+            let _ = p.has_note(NOTE_KINTANE, NT_KINTANE_ABI);
+        }
+    }
+    let mut huge = good.clone();
+    huge[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let bytes = with_notes(ELFOSABI_SYSV, &huge);
+    assert!(
+        !parse(&bytes)
+            .unwrap()
+            .has_note(NOTE_KINTANE, NT_KINTANE_ABI)
+    );
+}
+
+#[test]
+fn the_program_headers_address_follows_linuxs_rule() {
+    let bytes = build(EM_X86_64, ET_EXEC, BASE, &[text(BASE)]);
+    let p = parse(&bytes).unwrap();
+    // One header: the text's bytes start right after it, at file offset 64 + 56.
+    let first_off = (EHDR_SIZE + PHDR_SIZE) as u64;
+    assert_eq!(p.phdr_vaddr(), Some(BASE - first_off + EHDR_SIZE as u64));
+    assert_eq!(p.phnum(), 1);
+}
