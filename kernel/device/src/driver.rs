@@ -75,17 +75,22 @@ pub trait Driver: Sync {
     /// Forget the device. Its claims are released by [`remove`] after this returns.
     fn remove(&self, _bound: &Bound) {}
 
-    /// The interrupt this driver wants dispatched to it: the line it claimed during
-    /// probe, and the function to run when it fires.
+    /// The interrupt `bound` raises: the line claimed for that device during probe, and
+    /// the function to run when it fires.
     ///
     /// The platform wires it up after [`Driver::start`] — translate the specifier with the
     /// machine's controller, register the handler, enable it, unmask the line — because
     /// only the platform knows the controller and owns the table. A driver that polls, or
     /// whose device has no interrupt, says `None` and is never dispatched to.
     ///
+    /// It takes the device because a driver may bind several: the line and the handler
+    /// belong to one device, not to the driver. A driver that binds one device ignores the
+    /// argument, and one that binds several keys its claims on `bound`.
+    ///
     /// The returned reference is `'static` because a bound driver's claims live as long as
     /// the machine: they are in the driver's own boot cell.
-    fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
+    fn interrupt(&self, bound: &Bound) -> Option<(&'static IrqLine, fn())> {
+        let _ = bound;
         None
     }
 }

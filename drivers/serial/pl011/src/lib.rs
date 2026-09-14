@@ -240,7 +240,8 @@ impl Driver for Pl011Driver {
     }
 
     #[cfg(all(target_has_atomic = "8", target_has_atomic = "32"))]
-    fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
+    fn interrupt(&self, _bound: &Bound) -> Option<(&'static IrqLine, fn())> {
+        // One UART: the probe declines a second, so the claims are this device's.
         let line = CLAIMS.get()?.irq.as_ref()?;
         Some((line, on_interrupt))
     }

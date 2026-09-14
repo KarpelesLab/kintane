@@ -1278,7 +1278,7 @@ fn wire(
     function: Option<&Function>,
     messages: Option<&Messages<'_, '_>>,
 ) -> Wired {
-    let Some((line, handler)) = drv.interrupt() else {
+    let Some((line, handler)) = drv.interrupt(started.bound()) else {
         return Wired::Nothing;
     };
     // A message-signalled vector has no route to trust or distrust: the function is told

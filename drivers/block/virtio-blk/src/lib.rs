@@ -68,7 +68,7 @@ mod test_support;
 mod tests;
 
 use block::{BlockDevice, Error as BlockError, Geometry, Op, Queue as RequestQueue, Ticket};
-use device::{BootCell, Bound, Driver, IrqLine, Probe, ProbeError};
+use device::{BootCell, Bound, Driver, IrqLine, NodeId, Probe, ProbeError};
 use mem::Dma;
 use sync::LockFamily;
 use sync::lockdep::LockClass;
@@ -468,47 +468,79 @@ impl<L: LockFamily, T: Transport> BlockDevice for VirtioBlk<L, T> {
     }
 }
 
-static CLAIMS: BootCell<Claims> = BootCell::new();
+/// How many virtio-blk devices one kernel binds.
+///
+/// Two, because that is what a machine with a second drive has. A third is declined at
+/// probe rather than silently ignored, the way `uart16550` declines a binding too many.
+pub const MAX_DISKS: usize = 2;
 
-/// The window the bound device claimed, as a physical `(address, length)`.
-pub fn window() -> Option<(u64, u64)> {
-    CLAIMS.get().map(Claims::window)
+/// One bound disk: the node it was probed from, what that probe claimed, and the handler
+/// the kernel installs once it has brought the device up.
+///
+/// The node is what ties a slot to a device: [`Driver::interrupt`] is asked about a
+/// [`Bound`], and the line it must answer with is the one claimed for *that* device.
+struct Disk {
+    node: BootCell<NodeId>,
+    claims: BootCell<Claims>,
+    handler: BootCell<fn()>,
 }
 
-/// Whether an interrupt line was claimed for the device.
-pub fn has_irq() -> bool {
-    CLAIMS.get().is_some_and(|c| c.irq().is_some())
+impl Disk {
+    const fn new() -> Self {
+        Disk {
+            node: BootCell::new(),
+            claims: BootCell::new(),
+            handler: BootCell::new(),
+        }
+    }
 }
 
-/// The MSI-X table entry the device's interrupt was claimed as, if it was one: what
+static DISKS: [Disk; MAX_DISKS] = [const { Disk::new() }; MAX_DISKS];
+
+/// The slot a probe claimed for `node`, if one did.
+fn slot_of(node: NodeId) -> Option<usize> {
+    DISKS.iter().position(|d| d.node.get() == Some(&node))
+}
+
+/// How many disks this boot bound, in probe order: `disk`, then the second drive.
+pub fn bound() -> usize {
+    DISKS.iter().filter(|d| d.claims.get().is_some()).count()
+}
+
+/// The window disk `i` claimed, as a physical `(address, length)`.
+pub fn window(i: usize) -> Option<(u64, u64)> {
+    DISKS.get(i)?.claims.get().map(Claims::window)
+}
+
+/// The MSI-X table entry disk `i`'s interrupt was claimed as, if it was one: what
 /// [`VirtioBlk::bring_up_with_vector`] is given once the platform has wired it.
-pub fn msix_entry() -> Option<u16> {
-    CLAIMS.get()?.msix_entry()
+pub fn msix_entry(i: usize) -> Option<u16> {
+    DISKS.get(i)?.claims.get()?.msix_entry()
 }
 
-/// The window claimed for the MSI-X table, as a physical `(address, length)`, when it is
-/// not the registers' window.
-pub fn msix_table_window() -> Option<(u64, u64)> {
-    CLAIMS.get()?.msix_table_window()
+/// The window claimed for disk `i`'s MSI-X table, as a physical `(address, length)`, when
+/// it is not the registers' window.
+pub fn msix_table_window(i: usize) -> Option<(u64, u64)> {
+    DISKS.get(i)?.claims.get()?.msix_table_window()
 }
 
-/// The bound PCI function's structure layout, BAR and device ID: what a driver domain is
+/// Disk `i`'s PCI function's structure layout, BAR and device ID: what a driver domain is
 /// told so it can build its own transport over its grant. `None` for a memory-mapped slot.
-pub fn pci_layout() -> Option<(virtio::pci::Layout, u8, u32)> {
-    CLAIMS.get()?.pci_layout()
+pub fn pci_layout(i: usize) -> Option<(virtio::pci::Layout, u8, u32)> {
+    DISKS.get(i)?.claims.get()?.pci_layout()
 }
 
-/// The transport for the bound device, of whichever kind its bus is.
+/// The transport for disk `i`, of whichever kind its bus is.
 ///
 /// # Safety
 /// The claimed window must be mapped, as device memory, at
 /// [`hal::paging::DEVICE_WINDOW_BASE`] above its physical address — the kernel's address
-/// space maps every claimed window there — and this must be called once,
+/// space maps every claimed window there — and this must be called once per disk,
 /// because two transports for one device would be two drivers for one device.
 #[allow(unsafe_code)]
-pub unsafe fn transport() -> Option<AnyTransport> {
+pub unsafe fn transport(i: usize) -> Option<AnyTransport> {
     // SAFETY: the caller's contract is `Claims::transport`'s.
-    unsafe { CLAIMS.get()?.transport() }
+    unsafe { DISKS.get(i)?.claims.get()?.transport() }
 }
 
 pub struct VirtioBlkDriver;
@@ -536,10 +568,20 @@ impl Driver for VirtioBlkDriver {
             "virtio-blk MSI-X table",
             transport::DEVICE_ID_BLOCK,
         )?;
+        // The first free slot, so a second drive binds beside the first rather than being
+        // turned away. Which slot a device took is what `interrupt` answers by.
+        let node = p.node();
+        let slot = DISKS
+            .iter()
+            .find(|d| d.claims.get().is_none())
+            .ok_or(ProbeError::Declined("more virtio-blk devices than slots"))?;
         // SAFETY: probe runs during single-threaded boot.
-        unsafe { CLAIMS.set(claims) }
+        unsafe { slot.node.set(node) }
+            .map_err(|_| ProbeError::Declined("the disk slot was taken"))?;
+        // SAFETY: as above.
+        unsafe { slot.claims.set(claims) }
             .map(|_| ())
-            .map_err(|_| ProbeError::Declined("one virtio-blk device is supported"))
+            .map_err(|_| ProbeError::Declined("the disk slot was taken"))
     }
 
     fn start(&self, _bound: &Bound) -> Result<(), &'static str> {
@@ -553,33 +595,48 @@ impl Driver for VirtioBlkDriver {
     /// The platform registers and enables it after `start`. The device raises nothing
     /// until `bring_up` writes `DRIVER_OK`, which happens later still, so a handler
     /// registered here cannot run before the driver exists to serve it.
-    fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
-        let irq = CLAIMS.get()?.irq()?;
-        Some((irq, on_device_interrupt))
+    fn interrupt(&self, bound: &Bound) -> Option<(&'static IrqLine, fn())> {
+        // The line claimed for *this* device, and the trampoline that dispatches to it.
+        let i = slot_of(bound.node())?;
+        let irq = DISKS[i].claims.get()?.irq()?;
+        Some((irq, TRAMPOLINES[i]))
     }
 }
 
-/// The registered handler: drain whichever device this kernel brought up.
+/// One registered handler per disk: drain whichever device raised the interrupt.
 ///
-/// A free function because that is what the device model's table holds. It reaches the
-/// started device through the kernel's own hook, since the driver does not own it: the
-/// kernel brings the device up with memory it provides, and keeps it.
-fn on_device_interrupt() {
-    if let Some(handler) = HANDLER.get() {
+/// The device model's table holds a bare `fn()`, with nothing to say which device it is
+/// for, so each slot needs a function of its own. They reach the started device through
+/// the kernel's hook, since the driver does not own it: the kernel brings the device up
+/// with memory it provides, and keeps it.
+fn on_disk_0() {
+    dispatch(0);
+}
+
+fn on_disk_1() {
+    dispatch(1);
+}
+
+/// A trampoline per slot, indexed the way [`DISKS`] is. A compile error here means
+/// [`MAX_DISKS`] grew without a function to dispatch the new slot's interrupt.
+static TRAMPOLINES: [fn(); MAX_DISKS] = [on_disk_0, on_disk_1];
+
+/// Run disk `i`'s handler, if the kernel has installed one.
+fn dispatch(i: usize) {
+    if let Some(handler) = DISKS[i].handler.get() {
         handler();
     }
 }
 
-/// What [`on_device_interrupt`] calls. The kernel installs this once it has brought the
-/// device up, because only it holds the started `VirtioBlk`.
-static HANDLER: BootCell<fn()> = BootCell::new();
-
-/// Install the function the device's interrupt runs.
+/// Install the function disk `i`'s interrupt runs.
 ///
 /// # Safety
-/// Once, on the boot path, before the line is enabled.
+/// Once per disk, on the boot path, before its line is enabled.
 #[allow(unsafe_code)]
-pub unsafe fn set_handler(handler: fn()) -> bool {
+pub unsafe fn set_handler(i: usize, handler: fn()) -> bool {
+    let Some(disk) = DISKS.get(i) else {
+        return false;
+    };
     // SAFETY: the caller's contract.
-    unsafe { HANDLER.set(handler) }.is_ok()
+    unsafe { disk.handler.set(handler) }.is_ok()
 }

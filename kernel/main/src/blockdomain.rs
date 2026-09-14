@@ -291,18 +291,18 @@ fn grant(c: &dyn EarlyConsole) -> Result<Setup, Check> {
         c.write_str("skipped: no disk to hand to a domain");
         return Err(Check::Skipped);
     };
-    let (_window_phys, window_len) = match virtio_blk::window() {
+    let (_window_phys, window_len) = match virtio_blk::window(0) {
         Some(w) => w,
         None => {
             c.write_str("NO DISK WINDOW TO GRANT");
             return Err(Check::Failed);
         }
     };
-    let Some((layout, bar, device_id)) = virtio_blk::pci_layout() else {
+    let Some((layout, bar, device_id)) = virtio_blk::pci_layout(0) else {
         c.write_str("THE DISK IS NOT ON PCI");
         return Err(Check::Failed);
     };
-    let vector = match virtio_blk::msix_entry()
+    let vector = match virtio_blk::msix_entry(0)
         .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi))
     {
         Some(v) => v,
@@ -1061,7 +1061,7 @@ fn map_grant(setup: &Setup) -> Result<usize, &'static str> {
 /// The disk's register window, physical: what [`map_grant`] maps and what `Setup::window` was
 /// derived from.
 fn window_phys() -> u64 {
-    virtio_blk::window().map_or(0, |(phys, _)| phys)
+    virtio_blk::window(0).map_or(0, |(phys, _)| phys)
 }
 
 /// Set or clear the interrupt channel's kernel end the handler forwards on.
