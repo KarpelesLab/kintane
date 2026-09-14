@@ -2061,6 +2061,7 @@ evidence for that fix, not against it.
 | `x86_64-qemu-smp`, 8 CPUs | 159 s | `user process: a process ran its slices after it moved and made no progress` | `RAN_SLICES`, 16, below what healthy runs measure |
 | `x86_64-qemu-smp`, 8 CPUs | 42 s | `waiting process: a waiting process's receive timed out: a wake-up was lost` | a message that arrived a second late, reported as one that never came |
 | `aarch64-virt-smp`, 8 CPUs | 676 s | the same | the same, and the longest any attempt ran before its fix landed |
+| `aarch64-virt-smp`, 8 CPUs | 141 s | `spinning sibling: a spinning thread was never stopped: its process's exit did not reach it` | `spawn::PATIENCE` again: the spinner's CPU was not run, so no interrupt reached it |
 
 Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
 
@@ -2071,7 +2072,12 @@ slices cannot judge: threads the scheduler is not running at all. Each thread is
 against its own start, because a thread that has ended is reaped and reports no slices.
 
 What the wait does *not* decide is the message: `end_threads` waits `spawn::PATIENCE` for each
-thread afterwards, and that 3 s is what reports `a ... process's thread did not end`. It is
+thread afterwards, and that 3 s is what reports `a ... process's thread did not end` — and, from
+the spinning-sibling cycle, `a spinning thread was never stopped`. It is the one bound of this
+family still measured in wall time, and at load 28 it has failed a run at 141 s. Fixing it means
+judging the thread by whether interrupts reached it: a spinner that took slices and was not
+stopped is the kernel's fault, and one whose CPU was never run is the host's. That needs the
+thread's id plumbed out of the cycles that call `end_threads`, which is left undone here. It is
 shared with the boot checks, so it is left alone and listed above. This is also why a mutation
 that makes the pair wait give up at once does not fail the run — `end_threads` still waits,
 and the pair still finishes — so the bound is falsified by a pair that cannot finish rather
