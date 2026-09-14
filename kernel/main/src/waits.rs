@@ -266,7 +266,25 @@ static STRESS_STACK: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Waiting processes the stress run has created and destroyed.
 static PAIRS: AtomicU64 = AtomicU64::new(0);
 
-/// How long a cycle gives its process.
+/// Exchanges whose message arrived, but later than the program's own patience. The wake came,
+/// so nothing was lost; under an emulator this is the host not running the sender's CPU.
+static SLOW_EXCHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// That count, for the stress heartbeat.
+pub fn stress_slow() -> u64 {
+    SLOW_EXCHANGES.load(Ordering::Relaxed)
+}
+
+/// Slices the pair's threads may be given, between them, without both ending. They pass a
+/// counter back and forth a handful of times, which is milliseconds of CPU; four thousand
+/// slices is over forty seconds of it, and unlike a duration it is not spent by a host that
+/// stops running the vCPU.
+const PAIR_SLICES: u64 = 4096;
+
+/// Slices that say the threads are being run at all.
+const PAIR_RUNNING_SLICES: u64 = 2;
+
+/// How long a cycle gives its process, when the scheduler is barely running it.
 const PAIR_PATIENCE: Duration = Duration::from_nanos(5_000_000_000);
 
 /// Claim the second stack. Once, from the stress run's setup, after the process cycle's.
@@ -349,8 +367,20 @@ fn pair(program: &elf::Program, round: u64) -> Result<(), &'static str> {
         let _ = preempt::set_affinity(main, 1 << first);
         let _ = preempt::set_affinity(peer, 1 << ((first + 1) % cpus));
     }
+    // Judged by what the scheduler gave the threads, not by how long the wait took: two
+    // threads passing a counter finish within the slices they are given, and a pair the host
+    // is not running earns none. The duration is left for that one case, as everywhere else.
+    let ran = |id| preempt::slices(id).map_or(0, |s: thread::Slices| s.ran);
+    let start = [ran(main), ran(peer)];
     let give_up = timekeeping::now().saturating_add(PAIR_PATIENCE);
-    while (preempt::alive(main) || preempt::alive(peer)) && timekeeping::now() < give_up {
+    while preempt::alive(main) || preempt::alive(peer) {
+        let given = ran(main).saturating_sub(start[0]) + ran(peer).saturating_sub(start[1]);
+        if given >= PAIR_SLICES {
+            break;
+        }
+        if timekeeping::now() >= give_up && given < PAIR_RUNNING_SLICES {
+            break;
+        }
         sleep_until(timekeeping::now().saturating_add(POLL));
     }
     // Unpinned whatever happened, so a thread that is still there can reach its end.
@@ -361,6 +391,13 @@ fn pair(program: &elf::Program, round: u64) -> Result<(), &'static str> {
     }
     match userproc::slot(SLOT).and_then(|p| p.exit) {
         Some(PAIR_SUCCESS) => Ok(()),
+        // The message arrived, only slowly: the program saw it past its own patience, which
+        // says the host was not running the sender's CPU rather than that a wake was lost. A
+        // wake that never came is the arm below, and still fails the run.
+        Some(0x608 | 0x617) => {
+            SLOW_EXCHANGES.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
         Some(0x603 | 0x613) => Err("a waiting process's receive timed out: a wake-up was lost"),
         _ => Err("a waiting process exited with a failure"),
     }

@@ -68,6 +68,16 @@ pub fn shootdown_stats() -> (usize, usize, usize) {
     crate::shootdown::stats()
 }
 
+/// Shootdowns answered by the wrong CPUs, and waits that spun far longer than an IPI
+/// should. The first is the kernel's fault; the second may be the host's.
+pub fn shootdown_mismatches() -> usize {
+    crate::shootdown::mismatches()
+}
+
+pub fn shootdown_stalls() -> usize {
+    crate::shootdown::stalls()
+}
+
 /// The mean and the worst wait for a shootdown's answers since boot, in microseconds.
 pub fn shootdown_latency_us() -> (u64, u64) {
     crate::shootdown::latency_us()

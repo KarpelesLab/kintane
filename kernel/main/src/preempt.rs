@@ -901,10 +901,10 @@ pub fn where_is(id: ThreadId) -> Option<(thread::State, Option<usize>)> {
 /// The slices `id` has run and been passed over for since it was created, as the timer
 /// interrupt charges them ([`Threads::charge`]). `None` when the table has never heard of it.
 #[cfg_attr(
-    not(CONFIG_USERSPACE),
+    not(CONFIG_MM_PAGED),
     expect(
         dead_code,
-        reason = "used only by the process checks, which need USERSPACE"
+        reason = "read by the process, waiting-pair and stress checks, which all need MM_PAGED"
     )
 )]
 pub fn slices(id: ThreadId) -> Option<thread::Slices> {

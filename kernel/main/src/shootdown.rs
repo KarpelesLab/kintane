@@ -96,6 +96,20 @@ pub fn stats() -> (usize, usize, usize) {
     )
 }
 
+/// Requests whose answers were not exactly the online CPUs other than the initiator, or
+/// whose books did not balance. A correctness fact, whatever the host was doing.
+pub fn mismatches() -> usize {
+    MISMATCHES.load(Ordering::Relaxed)
+}
+
+/// Waits that spun [`STALL_SPINS`] before their answers arrived. The count is the waiting
+/// CPU's own spins, so a host that stops running the CPU being waited for lengthens a wait
+/// without anything in the kernel going wrong. A shootdown that is never answered does not
+/// end here: it never returns, and the run's heartbeat stops.
+pub fn stalls() -> usize {
+    STALLS.load(Ordering::Relaxed)
+}
+
 /// The mean and the worst wait for a request's answers since boot, in microseconds.
 pub fn latency_us() -> (u64, u64) {
     let total = TOTAL_NS.load(Ordering::Relaxed);

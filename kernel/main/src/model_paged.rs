@@ -356,6 +356,8 @@ pub fn wait_stress_heartbeat(c: &dyn EarlyConsole) {
     crate::write_usize(c, s.cross_cpu_wakes as usize);
     c.write_str(", timeouts ");
     crate::write_usize(c, s.timeouts as usize);
+    c.write_str(", slow exchanges ");
+    crate::write_usize(c, crate::waits::stress_slow() as usize);
     c.write_str(")");
     let siblings = crate::sibling::stress_cycles();
     if siblings > 0 {
@@ -434,6 +436,18 @@ pub fn process_stress_slices_worst() -> (u64, u64) {
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn process_stress_slices_worst() -> (u64, u64) {
     (0, 0)
+}
+
+/// Waits of the process cycles that ran out with their thread charged nothing at all: no
+/// interrupt on its CPU saw it, so nothing ran there.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_stress_starved_elsewhere() -> u64 {
+    crate::procs::stress_starved_elsewhere()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_stress_starved_elsewhere() -> u64 {
+    0
 }
 
 #[cfg(not(CONFIG_USERSPACE))]

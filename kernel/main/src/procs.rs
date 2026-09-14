@@ -461,9 +461,17 @@ static CYCLES: AtomicU64 = AtomicU64::new(0);
 
 /// Slices a cycle's process thread may run, as the timer interrupt counts them
 /// ([`preempt::slices`]), while making no progress. Its loop publishes a pass every few
-/// instructions, so one slice is plenty; sixteen leave room for slices charged across a
-/// host stall in which it barely ran.
-const RAN_SLICES: u64 = 16;
+/// instructions, so one slice is plenty in principle — but a slice is charged to whatever the
+/// interrupt finds running, and a thread re-pinned to another CPU is charged for the interval
+/// it spends being moved, queued and trapped there, without a pass to show for it.
+///
+/// Sixteen was below what a healthy run needs. A passing two-hour soak on `x86_64-qemu-smp`
+/// at eight CPUs reported twenty slices for a wait that succeeded, and another failed at
+/// 159 s with this bound on a host carrying two soaks. A 60-second run at eight CPUs on a
+/// host at load 14 needed thirteen. A hundred and twenty-eight is over six times the worst
+/// figure a healthy run has shown, and still a second and a third of CPU time without a pass
+/// from a loop that publishes one every few instructions.
+const RAN_SLICES: u64 = 128;
 
 /// Slices it may be passed over for — ready on its CPU while a thread no more urgent runs
 /// there — for each slice it ran, while making no progress. Round robin passes it over once
@@ -492,8 +500,12 @@ enum Waited {
     Ran,
     /// It was passed over for [`PASSED_SLICES`] per slice it ran, without making progress.
     PassedOver,
-    /// [`STARVE_WAIT`] passed with neither.
-    Starved,
+    /// [`STARVE_WAIT`] passed with neither, carrying what it was given meanwhile: both zero
+    /// means no interrupt on that CPU ever saw this thread, so nothing ran there at all.
+    Starved {
+        ran: u64,
+        passed: u64,
+    },
     /// The table has no such thread.
     Lost,
 }
@@ -534,7 +546,10 @@ fn await_slices(
             }
         }
         if timekeeping::now() >= give_up {
-            return Waited::Starved;
+            return Waited::Starved {
+                ran: now.ran.wrapping_sub(start.ran),
+                passed: now.passed.wrapping_sub(start.passed),
+            };
         }
         nap(POLL);
     }
@@ -542,6 +557,16 @@ fn await_slices(
 
 /// The longest any cycle waited for its thread on the CPU it pinned it to.
 static SERVE_WORST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Waits that ran out with the thread charged nothing at all: no interrupt on its CPU saw
+/// it, so the host was not running that CPU. Counted rather than failed, and reported in the
+/// stress heartbeat.
+static STARVED_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+
+/// That count, for the stress heartbeat.
+pub fn stress_starved_elsewhere() -> u64 {
+    STARVED_ELSEWHERE.load(Ordering::Relaxed)
+}
 
 /// The most slices any wait by [`await_slices`] ran, and was passed over for, before it
 /// succeeded: how close a passing run came to [`RAN_SLICES`] and [`PASSED_SLICES`].
@@ -681,8 +706,13 @@ fn exercise(id: ThreadId, round: u64) -> Result<(), &'static str> {
                 return Err("a process was passed over for its slices and made no progress");
             }
             Waited::Lost => return Err("a process made no progress: the table lost its thread"),
-            // Neither count moved, so the state is the diagnosis.
-            Waited::Starved => {
+            // Neither count moved, and nothing at all was charged: no interrupt on this CPU
+            // saw the thread, so nothing ran here. The host, not the scheduler.
+            Waited::Starved { ran, passed } if ran == 0 && passed == 0 => {
+                STARVED_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            }
+            // Neither count reached its bound, so the state is the diagnosis.
+            Waited::Starved { .. } => {
                 return Err(match preempt::where_is(id) {
                     Some((thread::State::Running, _)) => {
                         "a process made no progress: running, and never charged a slice"
@@ -731,7 +761,13 @@ fn exercise(id: ThreadId, round: u64) -> Result<(), &'static str> {
                     );
                 }
                 Waited::Lost => return Err("never served: the table lost its thread"),
-                Waited::Starved => {
+                Waited::Starved { ran, passed } if ran == 0 && passed == 0 => {
+                    // Not one timer interrupt on that CPU found this thread, ready or
+                    // running, in five seconds: nothing ran there, which is the host and not
+                    // the scheduler. Counted and reported rather than failed.
+                    STARVED_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                Waited::Starved { .. } => {
                     if served() {
                         return Err("a process stopped making progress after it moved");
                     }

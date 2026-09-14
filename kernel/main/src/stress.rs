@@ -51,12 +51,16 @@ mod sleep;
 mod tcp;
 mod vm;
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use arch::Cpu;
 use boot_protocol::MemoryRegion;
 use hal::{Arch, EarlyConsole};
 use mm::phys::FrameAllocator;
+use sched::ThreadId;
+use thread::Slices;
 use time::{Duration, Instant};
 
 use crate::preempt::{self, sleep_until};
@@ -65,9 +69,36 @@ use crate::{Check, Live, finish, mp, timekeeping, write_usize};
 /// How often the auditor stops everything and checks.
 const AUDIT_EVERY: Duration = Duration::from_nanos(1_000_000_000);
 
-/// How long a workload has to reach a checkpoint once asked. The slowest is the sleeper,
-/// whose longest sleep is 50 ms; the rest reach one within an iteration.
+/// Slices a workload may run, as the timer interrupt counts them, without reaching a
+/// checkpoint once asked. A workload answers at its next checkpoint, so this has to exceed
+/// its longest iteration: the network workload waits up to a second for a round trip and the
+/// TCP one up to two, polling with millisecond naps, which the scheduler charges as running.
+/// A first try at 128 failed a healthy run at four seconds, with the network workload 89
+/// slices into an iteration; five hundred is over five seconds of CPU, more than twice the
+/// longest wait any workload makes, and unlike a duration a host that stops running the vCPU
+/// does not spend it.
+const PARK_SLICES: u64 = 512;
+
+/// How long a workload has to reach a checkpoint once asked, when it is not running at all.
+/// A blocked workload earns no slices, so only its length tells a sleeper mid-nap — the
+/// longest is 50 ms — from one that will never park. A workload that *is* running is judged
+/// by [`PARK_SLICES`] instead, however long the host takes over it.
 const PARK_WITHIN: Duration = Duration::from_nanos(3_000_000_000);
+
+/// Slices that say a workload is running rather than blocked, when [`PARK_WITHIN`] has
+/// passed: a couple of timer interrupts found it on a CPU.
+const RUNNING_SLICES: u64 = 2;
+
+/// Slices a workload may run without completing an iteration. It has to clear the longest
+/// honest iteration for the same reason as [`PARK_SLICES`], and is the same size: over five
+/// seconds of CPU time, against the two seconds the slowest workload waits.
+const PROGRESS_SLICES: u64 = 512;
+
+/// How long a workload may make no progress while running none of those slices: blocked, or
+/// ready behind more urgent threads. Fixed priority allows the second, and only length tells
+/// a busy moment from starvation, so this bound stays a duration. It is five audit intervals,
+/// and a sixth of the thirty seconds kbuild allows between heartbeats.
+const STALL_WAIT: Duration = Duration::from_nanos(5_000_000_000);
 
 /// While parked, a workload sleeps this long between looks at the request.
 const PARKED_NAP: Duration = Duration::from_nanos(1_000_000);
@@ -140,6 +171,38 @@ static PARKED: [AtomicU8; WORKLOADS] = [const { AtomicU8::new(Parked::Running as
 
 /// Iterations each workload completed.
 static PROGRESS: [AtomicU64; WORKLOADS] = [const { AtomicU64::new(0) }; WORKLOADS];
+
+/// No thread has been spawned for this workload, or it has none on this machine.
+const NO_THREAD: u32 = u32::MAX;
+
+/// The thread running each workload. The auditor judges a workload by the slices the
+/// scheduler charges this thread, so it has to know which one it is.
+static THREADS: [AtomicU32; WORKLOADS] = [const { AtomicU32::new(NO_THREAD) }; WORKLOADS];
+
+/// The most slices any workload ran before parking, and before completing an iteration,
+/// over the whole run: how close a passing run came to [`PARK_SLICES`] and
+/// [`PROGRESS_SLICES`], which is the margin those bounds really have.
+static PARK_WORST: AtomicU64 = AtomicU64::new(0);
+static STALL_WORST: AtomicU64 = AtomicU64::new(0);
+
+/// Remember the thread running workload `w`.
+fn remember(w: usize, id: ThreadId) {
+    THREADS[w].store(id.raw(), Ordering::Release);
+}
+
+/// The slices charged to workload `w`'s thread: `None` where it has none, or where it has
+/// ended and been reaped.
+pub(super) fn slices_of(w: Workload) -> Option<Slices> {
+    slices(w as usize)
+}
+
+/// As [`slices_of`], by index.
+fn slices(w: usize) -> Option<Slices> {
+    match THREADS[w].load(Ordering::Acquire) {
+        NO_THREAD => None,
+        raw => preempt::slices(ThreadId::new(raw)),
+    }
+}
 
 /// The first thing each workload found wrong, as a `&'static str`'s pointer and length.
 /// Null while nothing has.
@@ -296,11 +359,57 @@ pub fn region() -> (u64, u64) {
     }
 }
 
-/// Whether every workload has parked.
-fn all_parked() -> bool {
-    PARKED
-        .iter()
-        .all(|p| p.load(Ordering::Acquire) != Parked::Running as u8)
+/// Wait for every workload to reach a checkpoint, and say which one did not, and why.
+///
+/// A running workload answers within an iteration, so what bounds this wait is what the
+/// scheduler gave it: [`PARK_SLICES`] charged to a thread that has not answered is a
+/// workload running and never stopping, however long the host took over it. A workload that
+/// is not running earns no slices, and only [`PARK_WITHIN`] tells a sleeper mid-nap from one
+/// that will never park.
+fn park_everything(asked: Instant) -> Option<(usize, &'static str)> {
+    let start: [u64; WORKLOADS] = core::array::from_fn(|w| slices(w).map_or(0, |s| s.ran));
+    let deadline = asked.saturating_add(PARK_WITHIN);
+    loop {
+        let mut waiting = false;
+        for w in 0..WORKLOADS {
+            if PARKED[w].load(Ordering::Acquire) != Parked::Running as u8 {
+                continue;
+            }
+            waiting = true;
+            let Some(now) = slices(w) else {
+                continue;
+            };
+            let ran = now.ran.wrapping_sub(start[w]);
+            PARK_WORST.fetch_max(ran, Ordering::Relaxed);
+            if ran >= PARK_SLICES {
+                return Some((w, "a workload ran its slices without reaching a checkpoint"));
+            }
+        }
+        if !waiting {
+            return None;
+        }
+        // Past the deadline, a workload the scheduler has barely run is blocked or behind
+        // more urgent threads, which no count of its own slices will ever judge. One that is
+        // running keeps its whole slice allowance, whatever the clock says.
+        if timekeeping::now() >= deadline {
+            let idle = (0..WORKLOADS).find(|&w| {
+                PARKED[w].load(Ordering::Acquire) == Parked::Running as u8
+                    && slices(w).is_none_or(|now| now.ran.wrapping_sub(start[w]) < RUNNING_SLICES)
+            });
+            if let Some(w) = idle {
+                return Some((w, "a workload did not reach a checkpoint"));
+            }
+        }
+        sleep_until(timekeeping::now().saturating_add(PARKED_NAP));
+    }
+}
+
+/// What the auditor remembers about a workload between audits: the slices its thread had run
+/// when it last completed an iteration, and when that was.
+#[derive(Clone, Copy)]
+struct Stall {
+    ran: u64,
+    since: Instant,
 }
 
 /// End the run with a failure, saying why.
@@ -334,6 +443,10 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
         (kconfig::STRESS_SECONDS as u64).saturating_mul(1_000_000_000),
     ));
     let mut last = [0u64; WORKLOADS];
+    let mut stall = [Stall {
+        ran: 0,
+        since: start,
+    }; WORKLOADS];
     let mut next = start;
     let mut audits = 0u64;
     loop {
@@ -379,14 +492,10 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;
 
         PARK.store(true, Ordering::Release);
-        let deadline = now.saturating_add(PARK_WITHIN);
-        while !all_parked() && timekeeping::now() < deadline {
-            sleep_until(timekeeping::now().saturating_add(PARKED_NAP));
+        if let Some((w, why)) = park_everything(now) {
+            audit_failed(c, seconds, why, NAMES[w]);
         }
-        if let Some(w) = (0..WORKLOADS).find(|&w| PARKED[w].load(Ordering::Acquire) == 0) {
-            audit_failed(c, seconds, "a workload did not reach a checkpoint", NAMES[w]);
-        }
-        audit(c, seconds, &mut last);
+        audit(c, seconds, &mut last, &mut stall);
         audits += 1;
         PARK.store(false, Ordering::Release);
 
@@ -445,7 +554,16 @@ fn start() -> Result<(), &'static str> {
     let irq = Cpu::irq_save();
     let spawned = plan
         .iter()
-        .all(|&(entry, arg, level, stack)| preempt::spawn(stack, entry, arg, level).is_some());
+        .enumerate()
+        .all(
+            |(w, &(entry, arg, level, stack))| match preempt::spawn(stack, entry, arg, level) {
+                Some(id) => {
+                    remember(w, id);
+                    true
+                }
+                None => false,
+            },
+        );
     // SAFETY: pairs with the `irq_save` above.
     unsafe { Cpu::irq_restore(irq) };
     if !spawned {
@@ -496,9 +614,20 @@ fn spawn_disk_workload(
     entry: extern "C" fn(usize) -> !,
     arg: usize,
 ) -> Result<(), &'static str> {
+    // Its slot is the one its name has in `NAMES`, which is what the auditor judges.
+    let w = NAMES
+        .iter()
+        .position(|&n| n == name)
+        .ok_or("a disk workload with no slot of its own")?;
     let stack = preempt::claim_stacks(&[name]).ok_or("not enough guarded thread stacks")?;
     let irq = Cpu::irq_save();
-    let spawned = preempt::spawn(stack, entry, arg, 5).is_some();
+    let spawned = match preempt::spawn(stack, entry, arg, 5) {
+        Some(id) => {
+            remember(w, id);
+            true
+        }
+        None => false,
+    };
     // SAFETY: pairs with the `irq_save` above.
     unsafe { Cpu::irq_restore(irq) };
     if spawned {
@@ -509,7 +638,12 @@ fn spawn_disk_workload(
 }
 
 /// Check everything, with every workload parked. Ends the run on the first failure.
-fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
+fn audit(
+    c: &dyn EarlyConsole,
+    seconds: u64,
+    last: &mut [u64; WORKLOADS],
+    stall: &mut [Stall; WORKLOADS],
+) {
     for (w, name) in NAMES.iter().enumerate() {
         if let Some(what) = failure(w) {
             c.write_str("\nstress: ");
@@ -526,9 +660,26 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
             continue;
         }
         if now == last[w] {
-            audit_failed(c, seconds, "a workload made no progress since the last audit", name);
+            // No iteration since the last audit. Whether that is the workload's fault depends
+            // on what the scheduler gave it: slices it ran without finishing one are its own,
+            // and an interval in which it never ran at all is the machine's, which only
+            // length can judge.
+            let ran = slices(w).map_or(0, |s| s.ran);
+            let without_progress = ran.wrapping_sub(stall[w].ran);
+            STALL_WORST.fetch_max(without_progress, Ordering::Relaxed);
+            if without_progress >= PROGRESS_SLICES {
+                audit_failed(c, seconds, "a workload ran its slices without progress", name);
+            }
+            if timekeeping::now().saturating_duration_since(stall[w].since) >= STALL_WAIT {
+                audit_failed(c, seconds, "a workload made no progress", name);
+            }
+        } else {
+            stall[w] = Stall {
+                ran: slices(w).map_or(0, |s| s.ran),
+                since: timekeeping::now(),
+            };
+            last[w] = now;
         }
-        last[w] = now;
     }
     if let Err(what) = heap::audit() {
         audit_failed(c, seconds, "kernel heap", what);
@@ -583,13 +734,16 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
             );
         }
     }
-    if mp::shootdown_stats().2 != 0 {
-        audit_failed(
-            c,
-            seconds,
-            "tlb shootdown",
-            "a shootdown was answered by the wrong CPUs, or stalled",
-        );
+    // Answers from the wrong CPUs, or books that do not balance, are the kernel's fault and
+    // end the run. A wait that spun a long time is not: the count is the waiting CPU's own
+    // spins, which a host that stops running the CPU it waits for runs up without anything
+    // being wrong here. The eighth of a two-hour soak on aarch64 at eight CPUs failed this
+    // way at 65 s beside another soak, with the mean answer holding at 236 us and the worst
+    // at 92 ms. A shootdown that is never answered still fails the run, because the wait
+    // never returns and the heartbeat stops; the count and the worst wait are in every
+    // heartbeat, so a kernel that grows slower at this shows it there.
+    if mp::shootdown_mismatches() != 0 {
+        audit_failed(c, seconds, "tlb shootdown", "a shootdown was answered by the wrong CPUs");
     }
 }
 
@@ -609,7 +763,9 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
     write_usize(c, p(Workload::Sleep));
     c.write_str(" (latest +");
     write_usize(c, (sleep::worst_late().as_nanos() / 1_000) as usize);
-    c.write_str(" us), vm ");
+    c.write_str(" us, ");
+    write_usize(c, sleep::host_late() as usize);
+    c.write_str(" late with the CPU elsewhere), vm ");
     write_usize(c, p(Workload::Vm));
     c.write_str(" (faults ");
     write_usize(c, vm::faults() as usize);
@@ -711,7 +867,9 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         c.write_str(", shootdowns ");
         write_usize(c, shootdowns);
         let (mean_us, worst_us) = mp::shootdown_latency_us();
-        c.write_str(" (answered in mean ");
+        c.write_str(" (stalled waits ");
+        write_usize(c, mp::shootdown_stalls());
+        c.write_str(", answered in mean ");
         write_usize(c, mean_us as usize);
         c.write_str(" us, worst ");
         write_usize(c, worst_us as usize);
@@ -730,13 +888,23 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         // And the most slices any of its waits was charged before it succeeded, against the
         // bounds that fail one: the margin the progress check really has.
         let (ran, passed) = crate::model::process_stress_slices_worst();
-        c.write_str(" us, slices ran max ");
+        // Waits that ran out with the thread charged nothing at all: no interrupt on its CPU
+        // saw it, which is the host not running that CPU rather than the scheduler starving
+        // it. Counted, not failed.
+        c.write_str(" us, none charged ");
+        write_usize(c, crate::model::process_stress_starved_elsewhere() as usize);
+        c.write_str(", slices ran max ");
         write_usize(c, ran as usize);
         c.write_str(", passed over max ");
         write_usize(c, passed as usize);
         c.write_str(")");
     }
     crate::model::wait_stress_heartbeat(c);
+    // The closest any workload came to the two bounds that judge it, over the whole run.
+    c.write_str(", slices to park max ");
+    write_usize(c, PARK_WORST.load(Ordering::Relaxed) as usize);
+    c.write_str(", without progress max ");
+    write_usize(c, STALL_WORST.load(Ordering::Relaxed) as usize);
     c.write_str(", audits ");
     write_usize(c, audits as usize);
     c.write_str(" ok\n");

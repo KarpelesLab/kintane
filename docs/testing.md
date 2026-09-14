@@ -1844,14 +1844,19 @@ The heartbeat reports the most slices of each kind any passing wait needed. Unlo
 
 With only other agents' work loading the host, the old window also failed 2 runs in 20.
 
-**Other wall-clock bounds**, and why each stays:
+**Other bounds that are still durations**, and why each stays:
 
-- the stress audit's *progress since the last audit* (1 s): a workload that blocks on every
-  iteration needs one slice a second, and a real starvation must still fail it;
-- `sleep`'s 500 ms lateness and the boot `sleep` check's three slices: lateness *is* wall
-  time, and what they check;
-- `waits`' 10 s and 5 s patience, `procs::wait_exit`'s 1 s drain in the boot check, and
-  `PARK_WITHIN`'s 3 s: generous bounds on something that normally takes milliseconds;
+- the boot `sleep` check's three slices: lateness *is* wall time, and what it checks. The
+  stress run's sleeper no longer fails on lateness alone — see
+  [a late wake-up](#a-late-wake-up-is-the-schedulers-only-if-it-passed-the-sleeper-over);
+- `waits`' 10 s and 5 s patience and `procs::wait_exit`'s 1 s drain in the boot check:
+  generous bounds on something that normally takes milliseconds;
+- `PARK_WITHIN`'s 3 s and the audit's `STALL_WAIT`: these now judge only a workload the
+  scheduler has barely run, which is the one case no count of its own slices can judge. See
+  [the workloads' bounds](#the-workloads-are-judged-by-their-slices-too) below;
+- `spawn::PATIENCE`'s 3 s, which `end_threads` waits for each of a process's threads to
+  exit. It is shared with the boot checks and left alone here; it is what says `a ... process's
+  thread did not end` when a pair is still running as the wait gives up;
 - none in the boot `preempt` check any more; see below.
 
 **The boot `preempt` check is judged in interrupts and slices too.** It used to require 12
@@ -2089,6 +2094,262 @@ timer and the console, and fault injection outside the kernel heap. The heap inj
 also leaves out the buddy-page site, because a refused page block falls back to an arena
 that reclaims only in last-in-first-out order. Injecting there would exhaust the arena by
 design (`kernel/main/src/stress/heap.rs`).
+
+#### The workloads are judged by their slices too
+
+The auditor's two per-workload bounds were durations of guest time: three seconds to reach a
+checkpoint once asked, and an iteration in every one-second audit interval. Under an emulator
+that measures the host, for the reason above, and it is the same fault the process cycle was
+cured of — left in the workloads.
+
+Each workload's thread is remembered when it is spawned, and both bounds are now read from the
+slices the timer interrupt charges it:
+
+- **`PARK_SLICES`, 512:** a workload that runs this long without reaching a checkpoint fails,
+  however long the host took over it. The bound has to clear the longest honest iteration:
+  the network workload waits up to a second for a round trip and the TCP one up to two,
+  polling with millisecond naps, which the scheduler charges as running. A first try at 128
+  failed a healthy run at four seconds with the network workload 89 slices into an iteration.
+  Five hundred is over five seconds of CPU, more than twice the longest wait any workload
+  makes.
+- **`PROGRESS_SLICES`, 512:** the same, for slices run without completing an iteration.
+- **`PARK_WITHIN`, 3 s, and `STALL_WAIT`, 5 s:** a workload that is *not* running earns no
+  slices, and only a duration tells a sleeper mid-nap, or a thread behind more urgent ones,
+  from one that will never answer. These two apply only where the scheduler has charged the
+  workload fewer than `RUNNING_SLICES` since the request; a workload that is running keeps its
+  whole slice allowance.
+
+The heartbeat carries how close a passing run came to each slice bound — `slices to park max`
+and `without progress max` — so the margin is a number somebody can read rather than a guess.
+Unloaded, a 45-second run on `x86_64-qemu-smp` at eight CPUs needed 176 slices to park; beside
+a second soak, a two-hour run on the same preset needed 304 of the 512 allowed, and never
+missed an iteration in an audit interval at all.
+
+| Mutation | Result |
+|---|---|
+| No workload is ever asked to park | `a workload ran its slices without reaching a checkpoint: block B`, at 1 s |
+| heap A runs but never records an iteration, with `STALL_WAIT` raised so only the slice bound can fire | `a workload ran its slices without progress: heap A`, at 6 s |
+| The sleeper blocks for ten seconds, so it cannot answer a park request | `a workload did not reach a checkpoint: sleep`, at 1 s |
+| The sleeper parks and sleeps as usual but never records an iteration | `a workload made no progress: sleep`, at 4 s |
+
+#### A late wake-up is the scheduler's only if it passed the sleeper over
+
+The sleep workload failed the run on any wake more than half a second after its deadline.
+That is wall time, and under an emulator the guest's clock follows the host's: a vCPU the host
+stops running wakes late with nothing wrong in the kernel. A two-hour soak on
+`aarch64-virt-smp` at eight CPUs died this way at 453 seconds, beside a second soak, with the
+host at load 19 — the run's worst lateness was 437 ms by then, against a 500 ms bound.
+
+What the kernel answers for is what it did with the interrupts it took. The sleeper is the
+most urgent workload, so an interrupt that found it ready and ran something no more urgent is
+the scheduler failing to reach it. A wake-up past `MAX_LATE` is now looked into rather than
+failed outright: with `LATE_PASSES` slices passed over while ready, it fails and says so; with
+none, nobody ran on that CPU at all, which is the host, and it is counted and printed in the
+heartbeat as `late with the CPU elsewhere`. Waking *before* a deadline still fails outright,
+which is the half of the check an emulator cannot forge.
+
+| Mutation | Result |
+|---|---|
+| Every wake over a millisecond late, and all of it blamed on the scheduler (`LATE_PASSES` 0) | `a sleep woke late after the scheduler passed it over while ready`, at 1 s |
+| Every wake over a millisecond late, judged as built | the run **passes**: 453 late wakes, worst 733 ms, every one counted as the CPU being elsewhere and none blamed on the scheduler |
+
+The second is the point of the change: on a host running two soaks and five other jobs, three
+quarters of a second of lateness was reported and not one wake-up was the scheduler's doing.
+
+#### A wait charged nothing at all is the host, not a starved thread
+
+`await_slices` ends in `Starved` when neither count reached its bound, and the caller reads the
+thread's state to say why. One of those states — ready on the CPU it was pinned to — was
+reported as `never served: ready on the right CPU, never scheduled`. Another fork hit exactly
+that on unmodified master, at eight CPUs, while this branch's soaks had the host at load 20 to
+35.
+
+`Starved` now carries what the thread was given. Both counts zero means not one timer interrupt
+on that CPU saw the thread in five seconds, ready or running: nothing ran there at all, which is
+the host and not the scheduler. That case is counted and printed in the heartbeat as
+`none charged`. A thread that was charged something and still made no progress fails as before —
+dropping the process threads' priority below every workload, so they are ready and passed over,
+still fails a run at 7 s.
+
+#### The watchdog was measuring the host too
+
+`kbuild stress` kills a guest that stops printing its heartbeat, which is the only way to catch
+a run that hangs with interrupts masked. Its allowance was thirty seconds of wall time, and the
+guest prints one heartbeat per second of *its* time — so on a machine running several eight-CPU
+guests at load 18, a healthy soak was killed as hung with its counters still climbing, no audit
+failed, and heartbeats still arriving.
+
+A guest that has really hung never prints again, so a longer allowance costs only how soon that
+is noticed, never whether it is. It is two minutes now: four times the worst gap measured on a
+loaded host, and still a short wait beside a run of hours.
+
+#### A message that arrived late is not a wake-up that was lost
+
+The waiting-pair program's `recv_promptly` returned `TimedOut` for two different facts: nothing
+received inside `WAKE_NS`, which is a wake that never came, and a message that *did* arrive but
+took longer than `LOST_NS`. Both exited 0x603 or 0x613, and the auditor called either one a lost
+wake-up. A two-hour soak on `x86_64-qemu-smp` at eight CPUs died that way at 42 seconds beside a
+second soak: the message arrived, a second late, because the host was not running the sender's
+CPU.
+
+A message that arrived is proof the wake was not lost. So the slow case exits 0x608 or 0x617 and
+is counted as a *slow exchange*, printed in the heartbeat beside the wait counters; a receive
+that saw nothing at all still exits 0x603 or 0x613 and still fails the run.
+
+Seeing nothing inside the timeout has the same ambiguity one level down: a wake that was lost
+and a sender the host never ran are indistinguishable from inside the program. So a timed-out
+receive now asks once more without waiting. A message already queued was sent and merely not
+collected in time, which is the slow case; an empty channel is a wake that never came. That
+question is the guest's own, and needs no clock to answer.
+
+The wait around that exchange had the same fault: the cycle gave its two threads
+`PAIR_PATIENCE` to finish and called them still alive a lost wake-up, which a 30-minute soak
+hit at 49 s. It is now judged like every other pair wait — `PAIR_SLICES` between the two
+threads, with the duration kept only for a pair the scheduler is barely running.
+
+| Mutation | Result |
+|---|---|
+| The peer never sends, so the wake really is lost | `a waiting process's receive timed out: a wake-up was lost`, at 2 s |
+| The pair reports a slow exchange on a receive that did arrive | the run **passes**, with `slow exchanges 23` in the heartbeat |
+| The pair never stops exchanging, so its threads cannot finish | `a waiting process did not finish: a wake-up was lost`, at 36 s — the wait's own slice bound, not its patience |
+| The peer never sends, so the retry finds an empty channel | `a waiting process's receive timed out: a wake-up was lost`, at 2 s |
+| `LOST_NS` cut to a millisecond | the *boot* `waits` check fails and bring-up stops; it proves nothing about the stress cycle |
+
+#### A slow shootdown is not a broken one
+
+The audit failed on `mismatches + stalls` together. They are not the same kind of fact. A
+mismatch is the kernel's: the answers were not the online CPUs, or the books did not balance.
+A stall is a wait that spun `STALL_SPINS` before its answers arrived — and that count is the
+*waiting* CPU's own spins, which a host that stops running the CPU being waited for runs up
+without anything here going wrong.
+
+A two-hour soak on `aarch64-virt-smp` at eight CPUs, running beside a second soak, failed this
+way at 65 seconds, with the mean answer holding at 236 µs and the worst at 92 ms; a 90-second
+rerun passed with a worse worst-case wait of 219 ms. So the audit fails on mismatches alone,
+and every heartbeat carries the stalled-wait count beside the mean and worst answer, where a
+kernel that grows slower at this shows it. A shootdown that is never answered still fails the
+run: the wait never returns, the heartbeat stops, and kbuild kills the guest.
+
+| Mutation | Result |
+|---|---|
+| Every request recorded as answered by the wrong CPUs | the *boot* shootdown check catches it first: `bring-up failed; not starting the scheduler`, and the audit never runs |
+| The same, but only after the boot check's first requests | `tlb shootdown: a shootdown was answered by the wrong CPUs`, at 9 s |
+
+The first mutation is why the second exists: a check that fails at boot proves nothing about
+the one in the audit, so the mutation has to let bring-up through to reach it.
+
+### 3a-bis. The soak
+
+`kbuild soak --duration <len>` is a stress run nobody watches. It builds and runs the stress
+image exactly as `stress` does — the verdict is still the guest's exit status — and adds the
+two things a long run needs.
+
+**The trail.** Every heartbeat, the verdict, and the failed audit when there is one are written
+to `build/<target>/soak-<len>.trail`, whatever the outcome, because a run that failed at the
+ninth hour is exactly the one whose trail is worth reading after the scrollback is gone.
+
+**The drift.** The trail is compared with itself: every counter's rate over the first window
+against the same counter's rate over the last, where the window is a sixth of the run between
+ten seconds and ten minutes. A run can pass every audit and still be leaking, and a rate that
+climbs or falls away is what a long run is for. Counters whose rate moved by more than a
+quarter are marked. The comparison is arithmetic on the guest's own numbers; nothing in it
+decides whether the run passed.
+
+#### What the gates showed
+
+A soak gates a branch at thirty minutes per SMP preset: long enough for every bound above to
+be exercised thousands of times under load, and to compare the first five minutes with the
+last five. The two-hour and twenty-four-hour runs are for leaks a shorter run cannot show,
+and are run on a quiet machine.
+
+`aarch64-virt-smp` at eight CPUs, thirty minutes, on a host carrying other work at load 12 to
+25 throughout: **1,800 heartbeats of 1,800, no audit failed**. Its drift, the first five
+minutes against the last five, is the shape of a machine doing more work as its caches warm
+and nothing else: heap +8%, channels +13%, page faults and copy-on-write +16%, pages +11%,
+block +13%, filesystem +13%, datagrams +11%, TCP +3%. No counter ran away, and the retry
+counts fell slightly.
+
+What the bounds had left at the end of that run, against what would have failed it:
+
+| Margin | Reached | Bound |
+|---|---|---|
+| Slices to park | 44 | 512 |
+| Slices without progress | 0 | 512 |
+| Late wakes blamed on the scheduler | 0 | any |
+| Late wakes charged to the host | 1, worst 581 ms | reported, not fatal |
+| Slow exchanges | 0 | reported, not fatal |
+| Waits charged nothing at all | 0 | reported, not fatal |
+| Stalled shootdown waits | 0 of 4,397,954, mean 186 µs | reported, not fatal |
+
+`x86_64-qemu-smp` at eight CPUs, thirty minutes, on the same busy host: **1,800 heartbeats of
+1,800, no audit failed**. Its drift runs the other way — heap −7%, channels −12%, faults −8%,
+pages −5% — because the host grew busier as the run went on rather than because anything in
+the kernel slowed. That is what the comparison is for: the direction says where the work went,
+and neither run has a counter that ran away. Its margins at the end were 244 slices to park of
+512, no interval without progress, and zero for every reportable count: no late wake charged to
+the host (the worst was 214 ms), no slow exchange, no wait charged nothing, no stalled
+shootdown wait.
+
+The counts that are *reported rather than fatal* are the point of this round's work: on a
+loaded host they stay near zero on a healthy kernel, and every one of them used to end a run.
+
+#### What the soaks found
+
+Seven attempts at a two-hour soak died, six of them inside the first ten minutes, on six
+distinct bounds — and none on anything the kernel did wrong. They are why the bounds above
+changed. Each attempt ran on the tree as it stood, so a run that died on a bound fixed later is
+evidence for that fix, not against it.
+
+| Run | Died at | On | What it was |
+|---|---|---|---|
+| `aarch64-virt-smp`, 8 CPUs | 65 s | `tlb shootdown: ... wrong CPUs, or stalled` | a stall is the *waiting* CPU's own spins; split from mismatches |
+| `aarch64-virt-smp`, 8 CPUs | 453 s | `a sleep woke more than half a second after its deadline` | lateness the host caused; now judged by slices passed over |
+| `aarch64-virt-smp`, 8 CPUs | 108 s | `linux processes: a churning process's thread did not end` | `PAIR_PATIENCE`, 10 s, over two Linux processes each faulting 1,600 pages |
+| `aarch64-virt-smp`, 8 CPUs | 77 s | the same | the same, on final code: which is what settled it |
+| `x86_64-qemu-smp`, 8 CPUs | 159 s | `user process: a process ran its slices after it moved and made no progress` | `RAN_SLICES`, 16, below what healthy runs measure |
+| `x86_64-qemu-smp`, 8 CPUs | 42 s | `waiting process: a waiting process's receive timed out: a wake-up was lost` | a message that arrived a second late, reported as one that never came |
+| `aarch64-virt-smp`, 8 CPUs | 676 s | the same | the same, and the longest any attempt ran before its fix landed |
+| `aarch64-virt-smp`, 8 CPUs | 141 s | `spinning sibling: a spinning thread was never stopped: its process's exit did not reach it` | `spawn::PATIENCE` again: the spinner's CPU was not run, so no interrupt reached it |
+| `aarch64-virt-smp`, 8 CPUs | 49 s | `waiting process: a waiting process did not finish: a wake-up was lost` | `waits::PAIR_PATIENCE`, 5 s, over two threads passing a counter |
+| `aarch64-virt-smp`, 8 CPUs | 64 s | `killed by the heartbeat watchdog: the guest is hung` | kbuild's own 30 s allowance between heartbeats, with the guest still printing them |
+| `aarch64-virt-smp`, 8 CPUs | 39 s | `waiting process's receive timed out: a wake-up was lost` | `WAKE_NS`: from inside the program, a sender the host never ran looks like a lost wake |
+
+Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
+
+**The pair waits are now judged the same way.** Two processes mapping, faulting and unmapping
+1,600 pages between them take as long as the host lets them, so both cycles wait until their
+threads have been given `PAIR_SLICES` between them, with `PAIR_PATIENCE` left for the one case
+slices cannot judge: threads the scheduler is not running at all. Each thread is counted
+against its own start, because a thread that has ended is reaped and reports no slices.
+
+What the wait does *not* decide is the message: `end_threads` waits `spawn::PATIENCE` for each
+thread afterwards, and that 3 s is what reports `a ... process's thread did not end` — and, from
+the spinning-sibling cycle, `a spinning thread was never stopped`. It is the one bound of this
+family still measured in wall time, and at load 28 it has failed a run at 141 s. Fixing it means
+judging the thread by whether interrupts reached it: a spinner that took slices and was not
+stopped is the kernel's fault, and one whose CPU was never run is the host's. That needs the
+thread's id plumbed out of the cycles that call `end_threads`, which is left undone here. It is
+shared with the boot checks, so it is left alone and listed above. This is also why a mutation
+that makes the pair wait give up at once does not fail the run — `end_threads` still waits,
+and the pair still finishes — so the bound is falsified by a pair that cannot finish rather
+than by a wait that gives up early.
+
+**The last one is the process cycle's own slice bound.** `RAN_SLICES` allowed sixteen slices
+without a pass after a thread was re-pinned; a passing soak had already reported twenty for a
+wait that succeeded, and a 60-second run at eight CPUs needed thirteen. It is now a hundred and
+twenty-eight, derived from those measurements rather than from what looked generous.
+
+| Mutation | Result |
+|---|---|
+| `passes` reports nothing at all | the *boot* process check fails first: `bring-up failed; not starting the scheduler`, and the stress cycle never runs |
+| The stress cycle's own wait never sees progress, leaving the boot check intact | `user process: a process ran its slices after it moved and made no progress`, at 0 s |
+
+The first mutation is the lesson, not the test: a check that dies during bring-up says nothing
+about the bound in the stress run, so the mutation has to be scoped to the cycle's own wait.
+Three of this round's mutations failed that way before they were scoped — the pass counter, the
+shootdown mismatch and the receive patience each kill bring-up when changed wholesale, because
+the boot checks use the same code the stress run does. A mutation that stops the guest before
+the audit runs is not a falsification of the audit.
 
 ### 4. Hardware — deferred
 

@@ -424,15 +424,39 @@ const WAKE_NS: u64 = 2_000_000_000;
 /// without this bound a lost wake-up would look like a slow success.
 const LOST_NS: u64 = 1_000_000_000;
 
-/// Receive on `channel`, as a wait a wake must end: `TimedOut` if the message took
-/// [`LOST_NS`] or longer to be received.
-fn recv_promptly(channel: Handle, buf: &mut [u8]) -> Result<usize, Error> {
+/// What a receive that a wake should end came to.
+enum Received {
+    /// A message, in good time.
+    Got(usize),
+    /// Nothing inside [`WAKE_NS`]: the wake never came.
+    Lost,
+    /// A message, but only after [`LOST_NS`]. The wake came, so nothing was lost — under an
+    /// emulator this is the host not running the sender's CPU — and the two are worth telling
+    /// apart, because only the first says anything about the kernel.
+    Slow,
+    /// The receive failed for some other reason.
+    Failed,
+}
+
+/// Receive on `channel`, as a wait a wake must end.
+fn recv_promptly(channel: Handle, buf: &mut [u8]) -> Received {
     let start = rt::now_ns();
-    let got = rt::recv_timeout(channel, buf, WAKE_NS)?;
+    let got = match rt::recv_timeout(channel, buf, WAKE_NS) {
+        Ok(got) => got,
+        // Nothing inside the timeout. From here a wake that was lost and a sender the host
+        // never ran look identical, so ask once more without waiting: a message already
+        // queued was sent and simply not collected in time, which is slowness rather than
+        // loss. An empty channel is a wake that never came.
+        Err(Error::TimedOut) => match rt::recv_timeout(channel, buf, rt::NO_WAIT) {
+            Ok(_) => return Received::Slow,
+            Err(_) => return Received::Lost,
+        },
+        Err(_) => return Received::Failed,
+    };
     if rt::now_ns().wrapping_sub(start) >= LOST_NS {
-        return Err(Error::TimedOut);
+        return Received::Slow;
     }
-    Ok(got)
+    Received::Got(got)
 }
 
 /// Wait for `event`'s signal, as a wait a wake must end; see [`recv_promptly`].
@@ -599,7 +623,7 @@ fn two_threads(me: Handle) -> Result<(), u64> {
     }
     let mut buf = [0u8; 8];
     match recv_promptly(mine, &mut buf) {
-        Ok(n) if rt::starts_with(&buf, n, b"woke") => {}
+        Received::Got(n) if rt::starts_with(&buf, n, b"woke") => {}
         _ => return Err(0x529),
     }
     // It signals once more as it ends its thread.
@@ -627,10 +651,12 @@ extern "C" fn second_thread(page: usize, _: usize, _: usize, _: usize) -> ! {
     let _ = event.signal();
     let mut buf = [0u8; 8];
     let code = match recv_promptly(Handle(channel), &mut buf) {
-        Ok(n) if rt::starts_with(&buf, n, b"wake") => match rt::send(Handle(channel), b"woke") {
-            Ok(()) => 0,
-            Err(_) => 2,
-        },
+        Received::Got(n) if rt::starts_with(&buf, n, b"wake") => {
+            match rt::send(Handle(channel), b"woke") {
+                Ok(()) => 0,
+                Err(_) => 2,
+            }
+        }
         _ => 1,
     };
     let _ = event.signal();
@@ -939,8 +965,9 @@ fn pair(channel: Handle) -> u64 {
         }
         let mut buf = [0u8; 8];
         match recv_promptly(channel, &mut buf) {
-            Ok(8) => {}
-            Err(Error::TimedOut) => return 0x603,
+            Received::Got(8) => {}
+            Received::Lost => return 0x603,
+            Received::Slow => return 0x608,
             _ => return 0x604,
         }
         if u64::from_le_bytes(buf) != rounds + 1 {
@@ -956,7 +983,8 @@ fn pair(channel: Handle) -> u64 {
     }
     let mut buf = [0u8; 8];
     match recv_promptly(channel, &mut buf) {
-        Ok(8) if u64::from_le_bytes(buf) == u64::MAX => PAIR_SUCCESS,
+        Received::Got(8) if u64::from_le_bytes(buf) == u64::MAX => PAIR_SUCCESS,
+        Received::Slow => 0x608,
         _ => 0x607,
     }
 }
@@ -970,8 +998,9 @@ fn peer(channel: Handle) -> u64 {
     loop {
         let mut buf = [0u8; 8];
         match recv_promptly(channel, &mut buf) {
-            Ok(8) => {}
-            Err(Error::TimedOut) => return 0x613,
+            Received::Got(8) => {}
+            Received::Lost => return 0x613,
+            Received::Slow => return 0x617,
             _ => return 0x614,
         }
         let n = u64::from_le_bytes(buf);

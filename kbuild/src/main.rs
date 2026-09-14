@@ -32,6 +32,7 @@ mod randconfig;
 mod release;
 mod sha256;
 mod size;
+mod soak;
 mod stress;
 mod symbolize;
 mod testdisk;
@@ -79,6 +80,10 @@ COMMANDS:
     stress --duration <len>
                          build a stress image and run it for <len> of guest time
                          (e.g. 90s, 10m, 24h), failing if its heartbeat stops
+    soak --duration <len>
+                         a stress run long enough to show drift: the audit trail is
+                         kept in build/<target>/, and the counters of the first
+                         minutes are reported against those of the last
     crashtest [--count <n>] [--seed <s>]
                          build with FS_CRASH_TEST, kill the guest <n> times (default
                          20) at random points while it writes its test disk, and
@@ -468,6 +473,56 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                     "stress failed: guest exited {c}, expected {}\n  \
                      the failed audit is in the console output above",
                     m.success_code
+                )),
+                None => Err("QEMU was terminated by a signal".into()),
+            }
+        }
+        "soak" => {
+            let seconds = opts
+                .duration
+                .ok_or("soak needs --duration, e.g. --duration 2h")?;
+            let mut sopts = opts.clone();
+            sopts.sets.push(("QEMU_EXIT".into(), "y".into()));
+            sopts.sets.push(("STRESS_TEST".into(), "y".into()));
+            sopts
+                .sets
+                .push(("STRESS_SECONDS".into(), seconds.to_string()));
+            let (image, res) = do_build(&root, &sopts)?;
+            let dir = root.join("build").join(res.str("TARGET"));
+            let log = dir.join("qemu.log");
+            let m = stress::quiet(qemu::machine_for(&res, &image, &log)?);
+            println!("\n\x1b[36msoak\x1b[0m {seconds}s: {} {}\n", m.binary, m.args.join(" "));
+            let outcome = boot(&root, &res, &m, stress::timeout(seconds), Some(stress::watch()))?;
+            // Written whatever the verdict: a run that failed at the ninth hour is exactly
+            // the one whose trail is worth reading.
+            let trail = soak::trail(&outcome.console);
+            let path = dir.join(format!("soak-{seconds}s.trail"));
+            std::fs::write(&path, soak::trail_text(&trail))
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let window = (seconds / 6).clamp(10, 600);
+            let drifts = soak::drift(&trail, window);
+            println!(
+                "\n\x1b[36msoak\x1b[0m {} heartbeats, trail in {}",
+                trail.heartbeats.len(),
+                path.display()
+            );
+            if !drifts.is_empty() {
+                println!("\nthe first {window} s against the last {window} s:");
+                print!("{}", soak::drift_report(&drifts, 0.25));
+            }
+            match outcome.code {
+                Some(c) if outcome.passed => {
+                    println!("\n\x1b[32msoak passed\x1b[0m (qemu exit {c})");
+                    Ok(())
+                }
+                Some(c) => Err(format!(
+                    "soak failed: guest exited {c}, expected {}\n  {}\n  the trail is in {}",
+                    m.success_code,
+                    trail
+                        .failure
+                        .as_deref()
+                        .unwrap_or("no failed audit was printed"),
+                    path.display()
                 )),
                 None => Err("QEMU was terminated by a signal".into()),
             }
