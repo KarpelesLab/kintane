@@ -355,6 +355,9 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // while this waits, before the tick's hook is installed.
     c.write_str("\n  block irq  ");
     let block_irq = block::interrupt_check(c);
+    // After it, and for the same reason: the remapped interrupt is taken while this waits.
+    c.write_str("\n  remap      ");
+    let remap = block::remap_check(c);
     // For the same reason again: the card's receive interrupt is taken while this waits.
     c.write_str("\n  net        ");
     let net = net::check(c);
@@ -401,6 +404,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(clock)
         .and(serial)
         .and(block_irq)
+        .and(remap)
         .and(net)
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))

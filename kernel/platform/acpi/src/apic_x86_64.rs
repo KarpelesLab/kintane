@@ -295,6 +295,14 @@ pub(crate) const MSI_LINES: core::ops::Range<u32> = arch::interrupt::MSI_LINES;
 /// APIC, on the line's vector. `None` for a line that is not a message-signalled one, a CPU
 /// that has not reported its APIC ID, or an ID the message format cannot carry.
 pub(crate) fn msi_message(line: u32, cpu: usize) -> Option<(u64, u32)> {
+    let (vector, apic_id) = message_target(line, cpu)?;
+    apic::msi::message(apic_id, vector)
+}
+
+/// The vector device line `line` is dispatched on and the APIC ID of CPU `cpu`, whatever the
+/// ID: what a message names, or what an IOMMU remapping table entry names in its place. `None`
+/// for a line that is not a message-signalled one, or a CPU that has not reported its ID.
+pub(crate) fn message_target(line: u32, cpu: usize) -> Option<(u8, u32)> {
     let vector = arch::interrupt::msi_vector(line)?;
     // The boot CPU's ID is the controller's to know; a secondary's is recorded when it
     // reports in.
@@ -303,7 +311,7 @@ pub(crate) fn msi_message(line: u32, cpu: usize) -> Option<(u64, u32)> {
     } else {
         arch::smp::apic_id(cpu)?
     };
-    apic::msi::message(apic_id, vector)
+    Some((vector, apic_id))
 }
 
 /// Every driver this image carries.

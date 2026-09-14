@@ -165,7 +165,13 @@ enum LineRoute {
     /// is what moving the interrupt rewrites; `None` for MSI, whose message is in
     /// configuration space and so is programmed only during discovery, the one time
     /// configuration space is reachable.
-    Message { entry: Option<(MsixTable, u16)> },
+    ///
+    /// `remapped` once an IOMMU's remapping table, not the message, says where it goes; see
+    /// [`set_line_message`].
+    Message {
+        entry: Option<(MsixTable, u16)>,
+        remapped: bool,
+    },
     /// A PCI interrupt pin, through the I/O APIC entry its route names.
     Pin(PinRoute),
 }
@@ -1199,6 +1205,7 @@ fn wire_msi(
         write_usize(c, usize::from(entry));
         LineRoute::Message {
             entry: Some((table, entry)),
+            remapped: false,
         }
     } else if let Some(cap) = msi::msi(f) {
         let Ok(data) = u16::try_from(data) else {
@@ -1210,7 +1217,10 @@ fn wire_msi(
         c.write_str("; ");
         c.write_str(drv.name());
         c.write_str(" receives MSI");
-        LineRoute::Message { entry: None }
+        LineRoute::Message {
+            entry: None,
+            remapped: false,
+        }
     } else {
         return failed("CLAIMED A VECTOR ITS FUNCTION DOES NOT HAVE");
     };
@@ -1384,9 +1394,12 @@ pub fn route_interrupt(line: u32, cpu: usize) -> Result<(), &'static str> {
     let route = routes[slot]
         .as_ref()
         .ok_or("nothing is wired to that line")?;
-    let LineRoute::Message { entry } = route else {
+    let LineRoute::Message { entry, remapped } = route else {
         return Err("a PCI pin, whose I/O APIC entry delivers to the boot CPU");
     };
+    if *remapped {
+        return Err("a remapped interrupt, whose CPU its IOMMU table entry names");
+    }
     let Some((table, entry)) = entry else {
         return Err("an MSI route, which only discovery can program");
     };
@@ -1396,6 +1409,45 @@ pub fn route_interrupt(line: u32, cpu: usize) -> Result<(), &'static str> {
         return Err("the MSI-X entry did not take the message");
     }
     Ok(())
+}
+
+/// The vector device line `line` is dispatched on, and the APIC ID of CPU `cpu`: what a
+/// message for the line names, and what an IOMMU remapping table entry names in its place.
+pub fn message_target(line: u32, cpu: usize) -> Option<(u8, u32)> {
+    controller::message_target(line, cpu)
+}
+
+/// Write `address` and `data` into message-signalled `line`'s MSI-X entry, masked while it
+/// is written, and keep them there: the message of an interrupt remapped through an IOMMU,
+/// which names a table entry rather than a CPU. [`route_interrupt`] refuses to move the line
+/// from then on, since the table entry is what says where it goes.
+pub fn set_line_message(line: u32, address: u64, data: u32) -> Result<(), &'static str> {
+    let slot = msi_slot(line).ok_or("not a message-signalled line")?;
+    let mut routes = LINE_ROUTES.lock_irqsave();
+    let Some(LineRoute::Message {
+        entry: Some((table, index)),
+        remapped,
+    }) = &mut routes[slot]
+    else {
+        return Err("not a line on an MSI-X entry");
+    };
+    if !table.retarget(*index, address, data) {
+        return Err("the MSI-X entry did not take the message");
+    }
+    *remapped = true;
+    Ok(())
+}
+
+/// The message message-signalled `line`'s MSI-X entry holds, read back from the table.
+pub fn line_message(line: u32) -> Option<(u64, u32)> {
+    let slot = msi_slot(line)?;
+    match &LINE_ROUTES.lock_irqsave()[slot] {
+        Some(LineRoute::Message {
+            entry: Some((table, index)),
+            ..
+        }) => table.message(*index),
+        _ => None,
+    }
 }
 
 /// The route of the PCI pin wired to `line`, if a pin is what is wired to it.

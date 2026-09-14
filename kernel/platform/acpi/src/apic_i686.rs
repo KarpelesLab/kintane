@@ -67,6 +67,11 @@ pub(crate) fn msi_message(_line: u32, _cpu: usize) -> Option<(u64, u32)> {
     None
 }
 
+/// No message reaches a CPU on this port, so no vector or APIC ID is named for one.
+pub(crate) fn message_target(_line: u32, _cpu: usize) -> Option<(u8, u32)> {
+    None
+}
+
 /// Every driver this image carries.
 pub(crate) const DRIVERS: &[&dyn Driver] = &[
     &LOCAL_APIC,

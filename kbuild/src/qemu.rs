@@ -375,9 +375,14 @@ fn x86_platform(
 ) -> Vec<String> {
     let mut args = vec!["-smp".to_string(), res.int("QEMU_CPUS").max(1).to_string()];
     // The IOMMU device must be created before the PCI devices it governs, so it goes first.
-    // `intremap=on` needs the split irqchip the machine line asks for.
+    // `intremap=on` needs the split irqchip the machine line asks for. `eim=on`: extended
+    // interrupt mode, whose remapping entries carry a 32-bit x2APIC ID. Left on `auto`, QEMU
+    // turns it on only with an in-kernel irqchip, which TCG does not have.
     if res.is_on("IOMMU") {
-        args.extend(["-device".to_string(), "intel-iommu,intremap=on".to_string()]);
+        args.extend([
+            "-device".to_string(),
+            "intel-iommu,intremap=on,eim=on".to_string(),
+        ]);
     }
     // On x86_64-bios the disk has no MSI-X table (`vectors=0`), so its interrupt is its pin,
     // which only `_PRT` routes: that preset proves INTx through the ACPI namespace while the
