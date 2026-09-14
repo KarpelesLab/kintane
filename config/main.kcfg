@@ -701,3 +701,26 @@ config SERIAL_IRQ_TEST
         its line given back -- and bound again, and a second string must
         arrive the same way. Test builds only: nobody types at a production
         kernel's console on its way up.
+
+config DEVICE_WINDOW_BASE
+    hex
+    default 0x0 if MOCK_ARCH
+    default 0x10000000000 if MM_PAGED && (ARCH_X86_64 || ARCH_AARCH64)
+    default 0x0
+    help
+        The virtual address at which physical device memory is visible: a
+        register at physical address P is reached at DEVICE_WINDOW_BASE + P, on
+        the boot tables and in the kernel's own address space alike. Every
+        driver reaches its registers through `hal::paging::device_virt`, never
+        at the physical address.
+
+        1 TiB on x86_64 and aarch64, which is the end of their user half,
+        `[512 GiB, 1 TiB)`. Device windows were once mapped at their physical
+        address, and firmware put a PCI BAR at 768 GiB, inside that half: a
+        top-level entry every process mirrors, so every process built its pages
+        into one shared table. Above the user half no physical address can land
+        there.
+
+        Zero, meaning identity, on i686, which has no user half and no room in
+        a 32-bit address space for a linear window over a 36-bit bus; on the
+        ports without an MMU; and in host builds, which have no page tables.

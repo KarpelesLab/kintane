@@ -117,6 +117,21 @@ inputs, verifies them, installs them, and checks them again through the live roo
   no page table governs; its windows are the I/O APIC, the local APIC and, on q35, the
   256 MiB PCI Express configuration window.
 
+  Every window is mapped in the **device window**: at `DEVICE_WINDOW_BASE` above its
+  physical address, never at the physical address itself, and never executable. The base is
+  1 TiB on x86_64 and aarch64, which is where their user half, `[512 GiB, 1 TiB)`, ends; it
+  is zero, meaning identity, on i686, which has no user half and no room in 32 bits for a
+  linear window over a 36-bit bus, and on the ports without an MMU. Drivers never add the
+  base themselves: `hal::paging::device_virt` is the one way from a device's physical
+  address to one that can be dereferenced, and `Registers::new`, the virtio transports, the
+  ECAM configuration space and the aarch64 early console all go through it. The boot tables
+  alias the low device memory at the same base — x86_64's PML4 entry 2 points at the boot
+  PDPT's 4 GiB identity map, and aarch64's root entry 2 at a table holding the 1 GiB Device
+  block — so a driver that starts during discovery, before the kernel's own space exists,
+  already holds its final addresses. After the switch the live tables are checked for an
+  empty user half on every boot (the `live` line), and on aarch64 the UART is probed writable
+  in the window and unmapped at its physical address.
+
 Nothing is installed unless every mapping reads back with the intended permissions, the
 guard page reads back unmapped, and the loader's boot data is reachable. After the switch
 each port shows that the hardware enforces the tables, not only that they are written
@@ -910,16 +925,16 @@ whose BAR 0 decodes I/O, and `Function::memory_bar_index` is the translation. Te
 attach the device with `disable-legacy=on`, for the same reason the memory-mapped transport
 needs `force-legacy=false`.
 
-**A BAR in the user half.** The kernel maps every claimed window at its physical address,
-and OVMF puts a 64-bit BAR near the top of the CPU's address width — at 768 GiB under TCG,
-which is inside x86_64's user half, `[512 GiB, 1 TiB)`. A process root mirrors every
-top-level entry of the kernel's, so that entry became one table all processes built their
-pages into, and two workers read each other's memory. `userproc::user_half_clear` now
-refuses to build a process while the kernel maps anything there, and the boot says so. The
-EFI test machine runs with `phys-bits=36`, which puts OVMF's window below 64 GiB. The fix
-this stands in for is mapping device windows outside the user half rather than at their
-physical address, which every driver's "mapped at its physical address" contract assumes
-today; a real machine with a BAR there gets the refusal, not a shared page.
+**A BAR in the user half, and the device window that fixed it.** OVMF puts a 64-bit BAR
+near the top of the CPU's address width — at 768 GiB under TCG, which is inside x86_64's
+user half, `[512 GiB, 1 TiB)`. While the kernel mapped every claimed window at its physical
+address, that BAR landed in a top-level entry every process root mirrors, so all processes
+built their pages into one table and two workers read each other's memory. For a round the
+boot refused to build processes over such a mapping and the EFI test machine ran with
+`phys-bits=36` to keep the BAR low. Device windows are now mapped in the device window above
+the user half (see [the kernel's own address space](#the-kernels-own-address-space-as-built-today)),
+the EFI machine runs at TCG's full 40 bits with the BAR at 768 GiB on purpose, and
+`userproc::user_half_clear` stays only as a backstop behind the post-install check.
 
 **The check** (`kernel/main/src/block.rs`, on presets with `QEMU_BLOCK_TEST`) brings the
 device up on eight frames and gates the boot on the following:

@@ -1348,6 +1348,10 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
         c.write_str("skipped: no kernel address space");
         return Check::Skipped;
     };
+    // A last line of defence, not the check: `model::kernel_space` fails the boot on these
+    // same tables before any process exists, and with device windows mapped above the user
+    // half nothing the kernel maps can land here. Kept because the cost of it being wrong
+    // is every process sharing pages.
     if !user_half_clear(direct, <Cpu as HasPageTables>::root()) {
         c.write_str(
             "REFUSED: the kernel maps something in the user half, which every process would share",
@@ -1457,7 +1461,8 @@ fn run(
 ///
 /// A process root mirrors every top-level entry of the kernel's, and fills its user half in
 /// on top of the zero it expects there. If the kernel maps anything in that half — a device
-/// window firmware placed there, mapped at its physical address as every window is — the
+/// window firmware placed there, as happened while windows were mapped at their physical
+/// address, before the device window — the
 /// entry is not zero: every process then builds its pages into one shared table, and two
 /// processes see each other's memory. That is refused, rather than a process built on it.
 pub(crate) fn user_half_clear(direct: DirectMap, kernel_root: PhysAddr) -> bool {

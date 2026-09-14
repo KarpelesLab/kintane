@@ -181,15 +181,16 @@ fn measure_in_kernel(phys: u64, len: u64) -> u64 {
 
 /// The kernel's view of the granted window.
 ///
-/// Identity, not through the direct map: `space::map_devices` maps every window the
-/// platform recorded at its own physical address, as device memory, because the direct map
-/// describes RAM and a device window is not RAM. The domain's mapping of the same registers
-/// is at an address the kernel chose for it instead, which is the difference between the
-/// two runs and the reason both are worth making.
+/// Through the device window, not the direct map: `space::map_devices` maps every window the
+/// platform recorded at `DEVICE_WINDOW_BASE` above its physical address, as device memory,
+/// because the direct map describes RAM and a device window is not RAM. The domain's mapping of the
+/// same registers is at an address the kernel chose for it instead, which is the difference between
+/// the two runs and the reason both are worth making.
 fn kernel_hw(phys: u64, len: u64) -> Option<Parts<Direct, hwproxy::Buffer, NoIrq>> {
-    let base = usize::try_from(phys).ok()?;
+    let base = hal::paging::device_virt(phys)?;
     let len = usize::try_from(len).ok()?;
-    // SAFETY: the kernel address space maps this window identity as device memory; it is
+    // SAFETY: the kernel address space maps this window in the device window, as device
+    // memory; it is
     // one of `platform::device_windows`, which is what that space is built from.
     // Identification registers are read-only, so this run and the domain's do not disturb
     // each other.

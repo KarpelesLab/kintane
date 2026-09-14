@@ -203,7 +203,11 @@ pub fn build_and_verify<A: HasPageTables>(
     ok.then_some(Verified { space, tables })
 }
 
-/// Map each device window at its own physical address, never executable.
+/// Map each device window in the device window, at `DEVICE_WINDOW_BASE` above its physical
+/// address, never executable.
+///
+/// Never at the physical address itself: on x86_64 firmware put a PCI BAR at 768 GiB, inside
+/// the user half, where a mapping lands in a top-level entry every process mirrors.
 ///
 /// Rounded outward to whole pages: a register block that starts mid-page still needs
 /// the whole page mapped, and a device window is not a place where rounding can grant
@@ -218,7 +222,8 @@ fn map_devices<A: HasPageTables>(
     for d in devices {
         let start = d.phys & !mask;
         let end = d.phys.saturating_add(d.len).saturating_add(mask) & !mask;
-        let (Ok(virt), Ok(len)) = (usize::try_from(start), usize::try_from(end - start)) else {
+        let (Some(virt), Ok(len)) = (hal::paging::device_virt(start), usize::try_from(end - start))
+        else {
             c.write_str("\n             device ");
             c.write_str(d.what);
             c.write_str(" is not addressable");
@@ -236,7 +241,8 @@ fn map_devices<A: HasPageTables>(
     true
 }
 
-/// Every device window reads back as device memory, writable and not executable.
+/// Every device window reads back, in the device window, as device memory at its physical
+/// address, writable and not executable.
 fn check_devices<A: HasPageTables>(
     c: &dyn EarlyConsole,
     space: &AddressSpace<A>,
@@ -246,7 +252,7 @@ fn check_devices<A: HasPageTables>(
     for d in devices {
         let last = d.phys + d.len.max(1) - 1;
         for probe in [d.phys, last] {
-            let seen = usize::try_from(probe).ok().and_then(|v| space.translate(v));
+            let seen = hal::paging::device_virt(probe).and_then(|v| space.translate(v));
             let right = match seen {
                 Some((p, f)) => {
                     // Execute is only demanded off where the CPU can express it, for the

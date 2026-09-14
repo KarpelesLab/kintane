@@ -375,8 +375,8 @@ impl ImageSections {
 /// is MMIO is a fault with nowhere to print. So each port states its windows, and the
 /// builder maps them.
 ///
-/// Mapped at the same virtual address as the physical one while the kernel is
-/// identity-mapped, and never executable.
+/// Mapped at [`DEVICE_WINDOW_BASE`] above its physical address, never at the physical
+/// address itself, and never executable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DeviceWindow {
     /// First byte of the window. Need not be page-aligned; the builder rounds outward.
@@ -385,6 +385,25 @@ pub struct DeviceWindow {
     pub len: u64,
     /// What lives there, for the report when mapping it fails.
     pub what: &'static str,
+}
+
+/// Where device memory is visible: a register at physical address `p` is reached at
+/// `DEVICE_WINDOW_BASE + p`.
+///
+/// The same on the boot tables and in the kernel's own address space, so a driver that
+/// starts during discovery, before that space exists, already holds its final addresses.
+/// 1 TiB on x86_64 and aarch64, the end of their user half; zero (identity) where there is
+/// no user half to keep clear. See `DEVICE_WINDOW_BASE` in `config/main.kcfg`.
+pub const DEVICE_WINDOW_BASE: u64 = kconfig::DEVICE_WINDOW_BASE;
+
+/// The virtual address device memory at physical address `phys` is reached through.
+///
+/// `None` when that address does not fit this machine's pointers: a window above 4 GiB on a
+/// 32-bit kernel, which firmware can describe and the CPU cannot reach. This is the only
+/// sanctioned way from a device's physical address to an address to dereference; a
+/// [`crate::PhysAddr`] is never one.
+pub fn device_virt(phys: u64) -> Option<usize> {
+    usize::try_from(DEVICE_WINDOW_BASE.checked_add(phys)?).ok()
 }
 
 /// An architecture with page tables.
