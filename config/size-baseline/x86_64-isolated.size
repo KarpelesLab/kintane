@@ -1,18 +1,18 @@
 # kbuild size report for preset x86_64-isolated. Rewrite with `kbuild size --preset x86_64-isolated --update-baseline`.
 section .bss 241664
-section .data 269568
+section .data 269632
 section .note.kintane 36
 section .rodata 192472
 section .stack 32768
 section .text 819200
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 43088 data 0 bss 0
-crate (unmangled) text 2886 rodata 0 data 1024 bss 0
+crate (anonymous) text 0 rodata 43450 data 0 bss 0
+crate (unmangled) text 2919 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 6064 rodata 0 data 0 bss 0
 crate acpi text 57173 rodata 0 data 0 bss 0
 crate apic text 6406 rodata 0 data 304 bss 232
-crate arch text 38689 rodata 0 data 961 bss 91049
+crate arch text 38780 rodata 0 data 961 bss 91049
 crate bcache text 5555 rodata 0 data 0 bss 0
 crate block text 2052 rodata 0 data 0 bss 0
 crate bootinfo text 2574 rodata 0 data 0 bss 0
@@ -25,8 +25,8 @@ crate fat text 24147 rodata 0 data 0 bss 0
 crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
 crate ipc text 3007 rodata 16 data 0 bss 0
-crate kalloc text 12848 rodata 0 data 0 bss 0
-crate kintane text 368183 rodata 240 data 84572 bss 108797
+crate kalloc text 13961 rodata 0 data 0 bss 0
+crate kintane text 370440 rodata 240 data 84632 bss 108823
 crate kobject text 6354 rodata 16 data 0 bss 0
 crate linux text 8767 rodata 0 data 0 bss 0
 crate map text 174 rodata 0 data 0 bss 0
@@ -38,7 +38,7 @@ crate platform text 34701 rodata 80 data 180961 bss 2863
 crate rfind text 296 rodata 0 data 0 bss 0
 crate sched text 3385 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
-crate sync text 22346 rodata 32 data 1088 bss 272
+crate sync text 21346 rodata 32 data 1088 bss 272
 crate thread text 7343 rodata 0 data 0 bss 0
 crate time text 3222 rodata 0 data 0 bss 0
 crate trim_matches text 903 rodata 0 data 0 bss 0
@@ -52,4 +52,4 @@ crate virtio_blk text 3447 rodata 16 data 176 bss 8
 crate virtio_blk_core text 4992 rodata 0 data 0 bss 0
 crate virtio_net text 4314 rodata 16 data 176 bss 8
 crate vtd text 7044 rodata 0 data 0 bss 0
-total 1817852
+total 1817916

@@ -1,18 +1,18 @@
 # kbuild size report for preset x86_64-efi. Rewrite with `kbuild size --preset x86_64-efi --update-baseline`.
 section .bss 241664
-section .data 252768
+section .data 252832
 section .note.kintane 36
 section .rodata 139224
 section .stack 16384
-section .text 741376
+section .text 745472
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 43589 data 0 bss 0
-crate (unmangled) text 2205 rodata 0 data 1024 bss 0
+crate (anonymous) text 0 rodata 43462 data 0 bss 0
+crate (unmangled) text 12176 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 6039 rodata 0 data 0 bss 0
 crate acpi text 56552 rodata 0 data 0 bss 0
 crate apic text 6406 rodata 0 data 304 bss 232
-crate arch text 38689 rodata 0 data 961 bss 91049
+crate arch text 38780 rodata 0 data 961 bss 91049
 crate bcache text 5555 rodata 0 data 0 bss 0
 crate block text 2052 rodata 0 data 0 bss 0
 crate boot_protocol text 2143 rodata 0 data 0 bss 0
@@ -26,18 +26,18 @@ crate fat text 24147 rodata 0 data 0 bss 0
 crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
 crate ipc text 3007 rodata 16 data 0 bss 0
-crate kalloc text 13891 rodata 0 data 0 bss 0
-crate kintane text 327256 rodata 224 data 67772 bss 108544
+crate kalloc text 13897 rodata 0 data 0 bss 0
+crate kintane text 321222 rodata 224 data 67832 bss 108570
 crate kobject text 6354 rodata 16 data 0 bss 0
 crate linux text 8767 rodata 0 data 0 bss 0
 crate map text 174 rodata 0 data 0 bss 0
 crate mm text 34866 rodata 0 data 0 bss 0
-crate net text 32545 rodata 0 data 0 bss 0
+crate net text 31775 rodata 0 data 0 bss 0
 crate platform text 33262 rodata 80 data 180961 bss 2839
 crate rfind text 296 rodata 0 data 0 bss 0
 crate sched text 1858 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
-crate sync text 17197 rodata 32 data 1088 bss 272
+crate sync text 20275 rodata 32 data 1088 bss 272
 crate thread text 9795 rodata 0 data 0 bss 0
 crate time text 3222 rodata 0 data 0 bss 0
 crate trim_matches text 903 rodata 0 data 0 bss 0
@@ -47,7 +47,7 @@ crate vfs text 9390 rodata 0 data 0 bss 0
 crate vfsproto text 2087 rodata 0 data 0 bss 0
 crate virtio text 6217 rodata 0 data 0 bss 0
 crate virtio_bind text 2044 rodata 0 data 0 bss 0
-crate virtio_blk text 5895 rodata 16 data 176 bss 8
-crate virtio_blk_core text 2702 rodata 0 data 0 bss 0
-crate virtio_net text 4314 rodata 16 data 176 bss 8
-total 1653596
+crate virtio_blk text 4933 rodata 16 data 176 bss 8
+crate virtio_blk_core text 1053 rodata 0 data 0 bss 0
+crate virtio_net text 4393 rodata 16 data 176 bss 8
+total 1657756
