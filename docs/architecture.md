@@ -1365,9 +1365,11 @@ compiled by `kbuild portability` for the machines with no atomics:
   volume during bring-up. A handle carries a generation, as an object handle does, so a closed one
   cannot name the file that takes its slot, and what it was opened for: `open_with` takes
   `OpenFlags` (write, create, exclusive, truncate, append), and a handle opened to read refuses
-  writes. `mkdir`, `unlink` and `rename` work by path; a rename between two directories is refused,
-  because no filesystem here can do one atomically. `.` and empty components resolve; `..` does not
-  yet. `vfs::memfs` is the in-memory reference filesystem the namespace's own tests run against.
+  writes. `mkdir`, `unlink` and `rename` work by path; a rename moves a name between two directories of one
+  filesystem, and across two filesystems it is `Error::CrossDevice` — Linux's `EXDEV`, which a
+  program handles by copying. `statfs` is read-side like `stat`, so every filesystem answers what it
+  allocates in, how many units it has, how many are free and the longest name it holds. `.` and
+  empty components resolve; `..` does not yet. `vfs::memfs` is the in-memory reference filesystem the namespace's own tests run against.
 - **`bcache`** caches whole blocks between a filesystem and a device: fixed slots from the caller,
   least-recently-used replacement, and two ways to write. `write_block` writes **through**: the
   device takes the block first and the cached copy changes only if it did. `write_at` writes
@@ -1381,15 +1383,19 @@ compiled by `kbuild portability` for the machines with no atomics:
   writing out the oldest generation. A write-through never overtakes a dirty block. The cache's
   books — every miss read the device exactly once, no block held by two slots, no slot dirty without
   a block or from a generation not yet begun — are checked by `Cache::check`.
-- **`fat`** is FAT16, read and written. FAT rather than a format of our own because the tree already
+- **`fat`** is FAT16 and FAT32, read and written. FAT rather than a format of our own because the tree already
   writes it twice — the ESP and the test disk, both through `kbuild/src/fat16.rs` — and
-  `kinboot-efi` already reads it. The type is decided by the cluster count, as the specification
-  says, and a volume outside FAT16's range is refused by name; FAT32 is not implemented. Every
+  `kinboot-efi` already reads it. The format is decided by the cluster count, as the specification
+  says, and a volume whose count falls in FAT12's range is refused by name. The two differ in three
+  places and nowhere else: a table entry is 16 or 28 bits, the root is a fixed region or a cluster
+  chain that grows like any other directory's, and FAT32 keeps a free count in an FSInfo sector,
+  which this driver counts at mount and rewrites at every sync rather than trusting what a crash
+  left. `statfs` reports that count, and the consistency walk counts it again independently. Every
   boot-sector field, every cluster number and every chain step is checked before it is used, and a
   chain walk is bounded, so a corrupt volume is an error rather than a hang. Names are 8.3, stored
   in upper case, and one that is not is refused rather than shortened.
 
-**The order FAT16 writes in.** Every operation is a sequence of steps with a barrier after each,
+**The order FAT writes in.** Every operation is a sequence of steps with a barrier after each,
 chosen so that the volume is consistent after any prefix of them and after any subset of the
 blocks of the step in progress:
 
@@ -1403,11 +1409,15 @@ blocks of the step in progress:
 Steps 2 and 3 are written to the first table copy and then, as a step of their own, to the second,
 so a crash leaves the copies at most one step apart with the first ahead. Freeing runs the other way:
 the entry first (a smaller size, or deleted), then the chain's new end, then the freed clusters. A
-rename that replaces a file deletes the target's entry, renames, then frees; a directory grows by a
+rename that replaces a file deletes the target's entry, renames, then frees. A rename that crosses
+directories has no entry to overwrite, so the old entry goes first and the new one second: a crash
+between them leaves the file unreachable, which is lost clusters, where the other order would leave
+two names on one chain, which the walk calls corrupt. A moved directory's `..` is written last, and a
+crash before it leaves `..` naming the old parent, which nothing here resolves. A a directory grows by a
 zeroed cluster marked and linked before a name is written into it. So whatever a crash leaves, no
 chain runs through a free cluster, no cluster is claimed twice and no entry names more bytes than its
 chain holds. The damage a crash may do is lost clusters and table copies apart, and it does not make
-an overwrite inside a file atomic or keep an extension that was never synced. `Fat16::check_consistency`
+an overwrite inside a file atomic or keep an extension that was never synced. `Fat::check_consistency`
 walks a volume for exactly those properties, into a bitmap its caller lends, so it runs in the kernel —
 the boot checks and the stress audit — as well as on a host; kbuild's own reader walks the disk image
 the same way after every run (see [testing](testing.md#2e-files)).

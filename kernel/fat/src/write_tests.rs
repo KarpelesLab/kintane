@@ -402,6 +402,11 @@ fn workload(fat: &mut Fat<'_, '_>) {
     ns.rename("/two.bin", "/three.bin").unwrap();
     write_file(&mut ns, "/four.bin", &pattern(4, 1000));
     ns.rename("/four.bin", "/three.bin").unwrap();
+    // Out of a directory and into the root, and a directory moved with its `..`: a crash
+    // between the two entries of a move must leave the file lost, never named twice.
+    ns.rename("/dir/n1", "/moved.bin").unwrap();
+    ns.mkdir("/dir/inner").unwrap();
+    ns.rename("/dir/inner", "/inner").unwrap();
     for i in (0..18).step_by(2) {
         ns.unlink(&format!("/dir/n{i}")).unwrap();
     }
