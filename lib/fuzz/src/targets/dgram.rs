@@ -2,13 +2,13 @@
 //!
 //! Two things read bytes nobody in the kernel wrote, and both are here:
 //!
-//! * **The receive path.** The input becomes a UDP datagram addressed to the stack, which polls
-//!   it in and holds it in its inbox. Taking it back out must not panic, whatever the length
-//!   was: what is copied never passes the buffer it is copied into, the length reported is the
-//!   length the datagram had, and every pool buffer is back afterwards.
-//! * **`struct sockaddr_in`.** The Linux personality parses one from whatever a program passes
-//!   it. A parse that succeeds must round-trip: writing the address and port back out gives the
-//!   bytes' own address and port again, so no address is quietly changed on its way through.
+//! * **The receive path.** The input becomes a UDP datagram addressed to the stack, which polls it
+//!   in and holds it in its inbox. Taking it back out must not panic, whatever the length was: what
+//!   is copied never passes the buffer it is copied into, the length reported is the length the
+//!   datagram had, and every pool buffer is back afterwards.
+//! * **`struct sockaddr_in`.** The Linux personality parses one from whatever a program passes it.
+//!   A parse that succeeds must round-trip: writing the address and port back out gives the bytes'
+//!   own address and port again, so no address is quietly changed on its way through.
 //!
 //! Seeded from `corpus/dgram/`: one valid `sockaddr_in`, since a family field random bytes
 //! rarely hit is exactly what the parser checks first.

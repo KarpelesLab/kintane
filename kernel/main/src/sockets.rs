@@ -1,4 +1,4 @@
-//! Sockets: the network stack's TCP, as objects a program names with handles.
+//! Sockets: the network stack's TCP and UDP, as objects a program names with handles.
 //!
 //! # The object
 //!
@@ -14,6 +14,12 @@
 //! the object, and its connection is closed in order ([`release`]): a FIN after whatever is still
 //! queued, and the connection's buffers back in the stack's pool once the close completes. A
 //! connection with unread data is reset instead, as TCP asks.
+//!
+//! A datagram socket is an [`Object::Datagram`] instead, and holds no connection, because UDP
+//! has none. What it holds is a local port — bound, or given to it by its first send — and,
+//! once connected, the one address it sends to and takes datagrams from. Its port goes back
+//! when the object is destroyed ([`release_port`]), together with anything still waiting for
+//! that port in the stack's inbox, which nothing else would ever take.
 //!
 //! # Waiting
 //!
@@ -35,8 +41,8 @@
 //!
 //! The Linux personality's socket calls (`personality::socket`) are a layer over the functions
 //! here, as the native calls are: a Linux socket descriptor names a socket object like the one
-//! a handle names, and waits on the same queue. Datagram sockets, `SHUT_RD`, and readiness
-//! through `poll` or `epoll` need more than exists.
+//! a handle names, and waits on the same queue, datagram sockets included. `SHUT_RD` and
+//! readiness through `poll` or `epoll` need more than exists.
 //!
 //! # The check
 //!
@@ -52,6 +58,12 @@
 //! * once it has exited, the connection it let go of finishes closing, and every stack buffer is
 //!   back in the pool;
 //! * every object and frame is back.
+//!
+//! Then [`datagram_run`] runs `user/udp-client` on the same slot and stacks, against kbuild's
+//! datagram service and the port kbuild leaves unbound. It must report a reply from the service,
+//! a truncated datagram whose reported length is the length it had, a datagram from anywhere but
+//! its peer refused, and nothing at all from the unbound port — which is a timeout, because this
+//! stack turns no ICMP message into an error on a socket.
 
 use core::sync::atomic::Ordering;
 
@@ -419,7 +431,11 @@ const EPHEMERAL_LAST: u32 = 65535;
 /// Claim `port` for a datagram socket. `false` if another already holds it, or if no entry is
 /// free.
 fn claim_port(port: u16) -> bool {
-    if port == 0 || PORTS.iter().any(|p| p.load(Ordering::Acquire) == u32::from(port)) {
+    if port == 0
+        || PORTS
+            .iter()
+            .any(|p| p.load(Ordering::Acquire) == u32::from(port))
+    {
         return false;
     }
     PORTS.iter().any(|p| {
@@ -460,7 +476,8 @@ fn ephemeral() -> Option<u16> {
     }
     for _ in 0..=(EPHEMERAL_LAST - EPHEMERAL_FIRST) {
         let next = NEXT_EPHEMERAL.fetch_add(1, Ordering::AcqRel);
-        let port = EPHEMERAL_FIRST + (next.wrapping_sub(EPHEMERAL_FIRST)) % (EPHEMERAL_LAST - EPHEMERAL_FIRST + 1);
+        let port = EPHEMERAL_FIRST
+            + (next.wrapping_sub(EPHEMERAL_FIRST)) % (EPHEMERAL_LAST - EPHEMERAL_FIRST + 1);
         // The kernel's own check and the Linux program's listener own two ports of their own.
         if port == u32::from(crate::net::PORT) || port == 7777 {
             continue;
@@ -943,12 +960,7 @@ fn run(
     let Some(console) = p.console_handle() else {
         return (false, None);
     };
-    let args = [
-        console.raw() as usize,
-        first as usize,
-        second as usize,
-        0,
-    ];
+    let args = [console.raw() as usize, first as usize, second as usize, 0];
     let Some(main) = userproc::start(SLOT, 0, args) else {
         return (false, None);
     };

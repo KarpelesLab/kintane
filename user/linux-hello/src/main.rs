@@ -948,7 +948,14 @@ fn send_to(fd: u64, bytes: &[u8], to: Option<([u8; 4], u16)>, flags: u64) -> i64
     let address = if len == 0 { 0 } else { at.as_ptr() as u64 };
     sys::call(
         sys::SENDTO,
-        [fd, bytes.as_ptr() as u64, bytes.len() as u64, flags, address, len],
+        [
+            fd,
+            bytes.as_ptr() as u64,
+            bytes.len() as u64,
+            flags,
+            address,
+            len,
+        ],
     )
 }
 
@@ -973,11 +980,7 @@ fn recv_from(fd: u64, buf: &mut [u8], flags: u64) -> (i64, Option<([u8; 4], u16)
 }
 
 /// A `struct msghdr` naming one buffer, and `to` when it names an address.
-fn msghdr(
-    address: &[u8; 16],
-    to: bool,
-    vector: &[u8; 16],
-) -> [u8; 56] {
+fn msghdr(address: &[u8; 16], to: bool, vector: &[u8; 16]) -> [u8; 56] {
     let mut h = [0u8; 56];
     let name = if to { address.as_ptr() as u64 } else { 0 };
     let name_len: u64 = if to { 16 } else { 0 };
@@ -1095,7 +1098,8 @@ fn udp(ports: &[u8]) -> ! {
     let out = iovec(UDP_REQUEST.as_ptr() as u64, UDP_REQUEST.len() as u64);
     let header = msghdr(&address, false, &out);
     expect(
-        sys::call(sys::SENDMSG, [c, header.as_ptr() as u64, 0, 0, 0, 0]) == UDP_REQUEST.len() as i64,
+        sys::call(sys::SENDMSG, [c, header.as_ptr() as u64, 0, 0, 0, 0])
+            == UDP_REQUEST.len() as i64,
         179,
     );
     let mut got = [0u8; 128];

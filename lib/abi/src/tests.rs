@@ -248,7 +248,13 @@ impl Handler for Recorder {
     ) -> Result<u64, Error> {
         self.calls.push((
             "socket_send_to",
-            vec![u64::from(socket.0), address, bytes.0, len as u64, timeout_ns],
+            vec![
+                u64::from(socket.0),
+                address,
+                bytes.0,
+                len as u64,
+                timeout_ns,
+            ],
         ));
         Ok(len as u64)
     }

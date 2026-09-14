@@ -437,7 +437,9 @@ fn a_datagram_is_taken_by_the_port_it_was_sent_to() {
         .unwrap();
     s.poll(&link, 4 * MS);
     let mut buf = [0u8; 64];
-    let (_, _, n, _) = s.udp_recv_from(40001, &mut buf).expect("the second arrived");
+    let (_, _, n, _) = s
+        .udp_recv_from(40001, &mut buf)
+        .expect("the second arrived");
     assert_eq!(&buf[..n], b"second", "a port takes its own datagram, not the other's");
     let (_, _, n, _) = s.udp_recv_from(40000, &mut buf).expect("the first waited");
     assert_eq!(&buf[..n], b"first");

@@ -8,9 +8,9 @@
 //!    which must come from the service and name the request;
 //! 2. takes a second reply into a buffer too small for it, which must report the length the
 //!    datagram had rather than the length that fit;
-//! 3. connects a socket to the unbound port, sends from it to the service anyway, and requires
-//!    that the service's reply is *not* delivered: a connected socket takes datagrams from the
-//!    address it connected to and from nowhere else;
+//! 3. connects a socket to the unbound port, sends from it to the service anyway, and requires that
+//!    the service's reply is *not* delivered: a connected socket takes datagrams from the address
+//!    it connected to and from nowhere else;
 //! 4. sends to the unbound port and requires that nothing answers it.
 //!
 //! Every failure exits with a code naming its step, and a call that failed adds what the kernel
@@ -114,8 +114,8 @@ fn run(console: Handle, service: u64, quiet: u64) -> u64 {
         return CLOSE_FAILED;
     }
 
-    // 3. A socket connected to the unbound port, sending to the service anyway: the service
-    //    answers the port it came from, and this socket must not take an answer from it.
+    // 3. A socket connected to the unbound port, sending to the service anyway: the service answers
+    //    the port it came from, and this socket must not take an answer from it.
     let connected = match UdpSocket::bind(0) {
         Ok(s) => s,
         Err(e) => return BIND_FAILED | why(e),

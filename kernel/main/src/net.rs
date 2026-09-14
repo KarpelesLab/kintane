@@ -85,7 +85,21 @@ pub const ACK: &[u8] = b"kintane-udp-ack ";
 /// which is what the check that sends one is about.
 pub const UDP_ANNOUNCE: &[u8] = b"kintane-udp-port ";
 pub const UDP_QUIET: &[u8] = b"kintane-udp-quiet ";
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "the datagram rounds a socket makes are their only users"
+    )
+)]
 pub const UDP_REQUEST: &[u8] = b"kintane-udp-request ";
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "the datagram rounds a socket makes are their only users"
+    )
+)]
 pub const UDP_REPLY: &[u8] = b"kintane-udp-reply ";
 
 /// What kbuild's TCP service is told and answers, and the datagram that tells the kernel which
@@ -237,6 +251,13 @@ pub fn udp_service_port() -> Option<u16> {
 
 /// The port kbuild leaves unbound, once it has announced it: what a datagram sent nowhere is
 /// sent to.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "the datagram checks are its only users, and they need processes"
+    )
+)]
 pub fn quiet_port() -> Option<u16> {
     let port = QUIET_PORT.load(Ordering::Acquire);
     (port != 0).then_some(port as u16)

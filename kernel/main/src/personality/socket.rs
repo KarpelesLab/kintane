@@ -330,10 +330,7 @@ pub(super) fn connect(slot: usize, fd: u64, addr: u64, len: u64) -> Result<u64, 
         (_, Some(_)) => return Ok(0),
         (_, None) => {}
     }
-    wait(slot, false, 0, || {
-        crate::sockets::connected(conn).map_err(connect_failure)
-    })
-    .map(|_| 0)
+    wait(slot, false, 0, || crate::sockets::connected(conn).map_err(connect_failure)).map(|_| 0)
 }
 
 pub(super) fn bind(slot: usize, fd: u64, addr: u64, len: u64) -> Result<u64, Failure> {
@@ -377,9 +374,8 @@ pub(super) fn accept4(
     if addr != 0 {
         write_sockaddr(addr, len_at, [0; 4], 0)?;
     }
-    let accepted = wait(slot, nonblock, 0, || {
-        crate::sockets::accept(listener, port).map_err(failure)
-    })?;
+    let accepted =
+        wait(slot, nonblock, 0, || crate::sockets::accept(listener, port).map_err(failure))?;
     let j = adopt(accepted)?;
     let placed = match locked(slot, |_, s| s.place(Descriptor::Socket(j), flags)) {
         Ok(fd) => fd,
