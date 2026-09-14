@@ -1684,6 +1684,9 @@ With only other agents' work loading the host, the old window also failed 2 runs
 - `PARK_WITHIN`'s 3 s and the audit's `STALL_WAIT`: these now judge only a workload the
   scheduler has barely run, which is the one case no count of its own slices can judge. See
   [the workloads' bounds](#the-workloads-are-judged-by-their-slices-too) below;
+- `personality::PAIR_PATIENCE`'s 10 s, which the Linux pair and churning-pair stress cycles
+  wait for their processes: a duration over work whose speed is the host's to decide, and one
+  a soak has already failed on. It is recorded below rather than changed here;
 - none in the boot `preempt` check any more; see below.
 
 **The boot `preempt` check is judged in interrupts and slices too.** It used to require 12
@@ -2022,6 +2025,29 @@ ten seconds and ten minutes. A run can pass every audit and still be leaking, an
 climbs or falls away is what a long run is for. Counters whose rate moved by more than a
 quarter are marked. The comparison is arithmetic on the guest's own numbers; nothing in it
 decides whether the run passed.
+
+#### What the soaks found
+
+Three attempts at a two-hour soak died before their first ten minutes, each on a different
+bound, and none on anything the kernel did wrong. They are why the bounds above changed.
+
+| Run | Died at | On | What it was |
+|---|---|---|---|
+| `aarch64-virt-smp`, 8 CPUs | 65 s | `tlb shootdown: ... wrong CPUs, or stalled` | a stall is the *waiting* CPU's own spins; split from mismatches |
+| `aarch64-virt-smp`, 8 CPUs | 453 s | `a sleep woke more than half a second after its deadline` | lateness the host caused; now judged by slices passed over |
+| `aarch64-virt-smp`, 8 CPUs | 108 s | `linux processes: a churning process's thread did not end` | `PAIR_PATIENCE`, 10 s, over two Linux processes each faulting 1,600 pages |
+
+Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
+
+**The third is not fixed here.** `PAIR_PATIENCE` bounds the Linux pair and churning-pair
+cycles in `personality.rs`, which belongs to the work that added them; changing it from this
+side would collide. It is the same fault as the rest: two processes mapping, faulting and
+unmapping 1,600 pages between them take as long as the host lets them, and ten seconds of
+guest time is a bet on the host, not a statement about the kernel. **To reproduce:** run
+`kbuild soak --preset aarch64-virt-smp --set QEMU_CPUS=8 --duration 2h` while a second
+eight-CPU soak and several compile jobs run beside it; the churning pair fails within the
+first three minutes. The fix is the one used for the process cycle: judge the pair by the
+slices its threads were given, and keep a duration only for a pair that never runs at all.
 
 ### 4. Hardware — deferred
 
