@@ -897,15 +897,55 @@ pub(crate) fn set_frames(frames: &mut FrameAllocator<'static, Cpu>) {
     FRAMES.store((frames as *mut FrameAllocator<'static, Cpu>).cast(), Ordering::Relaxed);
 }
 
-/// The embedded `init` program, parsed against this port's user half.
+/// The `init` program, parsed against this port's user half: the one read from a disk if
+/// the filesystem check loaded one, and the copy embedded in the image otherwise.
 pub(crate) fn program() -> Option<Program<'static>> {
-    Program::parse(
-        INIT_ELF,
-        <Cpu as HasUserMode>::ELF_MACHINE,
-        (<Cpu as HasUserMode>::USER_START as u64, <Cpu as HasUserMode>::USER_END as u64),
-        Cpu::PAGE_SIZE as u64,
-    )
-    .ok()
+    parse(program_bytes())
+}
+
+/// A program read from a disk, which [`program`] prefers to the embedded one. Its length
+/// is stored before its pointer, so a reader that sees the pointer sees the length too.
+static DISK_PROGRAM: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static DISK_PROGRAM_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Make `bytes` the program later processes run. Called once, by the filesystem check,
+/// after the program has already run from those bytes and exited as it should — so a
+/// program that does not load never replaces one that does.
+pub(crate) fn set_disk_program(bytes: &'static [u8]) {
+    DISK_PROGRAM_LEN.store(bytes.len(), Ordering::Release);
+    DISK_PROGRAM.store(bytes.as_ptr().cast_mut(), Ordering::Release);
+}
+
+fn program_bytes() -> &'static [u8] {
+    let ptr = DISK_PROGRAM.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return INIT_ELF;
+    }
+    let len = DISK_PROGRAM_LEN.load(Ordering::Acquire);
+    // SAFETY: `set_disk_program` stored a `'static` slice's length before its pointer, and
+    // nothing stores either again.
+    unsafe { core::slice::from_raw_parts(ptr, len) }
+}
+
+/// Run a program the kernel read from somewhere other than its own image, once, in the
+/// mode that exercises every system call, and return its exit code and whether that code is
+/// the one a program that saw everything behave returns.
+///
+/// `None` if the program does not parse, or if [`check`] never installed the user-mode
+/// hooks this needs — which it does only once the embedded program has loaded.
+pub(crate) fn run_disk_program(
+    c: &dyn EarlyConsole,
+    frames: &mut FrameAllocator<'static, Cpu>,
+    bytes: &'static [u8],
+) -> Option<(u64, bool)> {
+    if KERNEL_ROOT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let program = parse(bytes)?;
+    set_frames(frames);
+    let exit = run(c, &program, kernel_root(), MODE_MAIN, 0);
+    FRAMES.store(core::ptr::null_mut(), Ordering::Relaxed);
+    exit.map(|code| (code, code == INIT_SUCCESS))
 }
 
 /// Copy each segment into user memory and set its final permissions.

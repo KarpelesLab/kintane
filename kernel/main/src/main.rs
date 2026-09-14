@@ -57,6 +57,12 @@ mod block;
 #[cfg(CONFIG_MM_FLAT)]
 #[path = "block_off.rs"]
 mod block;
+// The filesystem check on a paged kernel; on a flat one, the same call doing nothing.
+#[cfg(CONFIG_MM_PAGED)]
+mod fs;
+#[cfg(CONFIG_MM_FLAT)]
+#[path = "fs_off.rs"]
+mod fs;
 mod timekeeping;
 // The native userspace slice: only on a paged kernel with a userspace port.
 #[cfg(CONFIG_USERSPACE)]
@@ -562,6 +568,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(model::userspace_check(c, &mut frames, live))
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(block::check(c, &mut frames, live))
+        .and(fs::check(c, &mut frames, live))
         .and(stress::reserve(c, &mut frames, &regions[..n], live))
         .and(model::process_reserve(&mut frames, live));
     (space, live)
