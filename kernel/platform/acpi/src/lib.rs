@@ -61,15 +61,17 @@ mod controller;
 mod smp;
 
 use core::cell::SyncUnsafeCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use acpi::{EcamSegment, Madt, MadtEntry, Mcfg, PhysMemory, ProcessorFlags, Rsdp, Tables};
 use apic::Override;
 use device::driver::{self, best_match};
+use device::msi::{self, MsixCapability, MsixTable};
 use device::pci::{self, Address, Bar, ConfigSpace, Function};
 use device::table::Kind;
 use device::{
-    BootCell, Bound, Builder, Described, DeviceTree, Driver, Handlers, IrqClaim, MmioClaim, Node,
-    NodeId, Origin, PortClaim, Probe, ProbeError, Resources, Started,
+    BootCell, Bound, Builder, Described, DeviceTree, Driver, Handlers, IrqClaim, IrqLine,
+    MmioClaim, Node, NodeId, Origin, PortClaim, Probe, ProbeError, Registers, Resources, Started,
 };
 use hal::paging::DeviceWindow;
 use hal::{EarlyConsole, IrqChip, IrqNumber};
@@ -129,6 +131,33 @@ static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
 static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
 /// The block device's interrupt line, once its handler is wired.
 static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
+
+/// Message-signalled lines there can be; `controller::MSI_LINES` is at most this long.
+const MAX_MSI_ROUTES: usize = 16;
+/// CPUs whose interrupts on a message-signalled line are counted apart.
+const MSI_COUNTED_CPUS: usize = 8;
+
+/// Where each message-signalled line is delivered from, indexed from the start of
+/// `controller::MSI_LINES`. `None` for a line nothing was wired to.
+///
+/// Behind a lock because moving an interrupt to another CPU writes the entry after
+/// discovery, from whichever CPU asks; see [`route_interrupt`].
+static MSI_ROUTES: SpinLock<[Option<MsiRoute>; MAX_MSI_ROUTES], arch::Cpu> =
+    SpinLock::with_class([const { None }; MAX_MSI_ROUTES], &MSI_ROUTES_CLASS);
+static MSI_ROUTES_CLASS: LockClass = LockClass::new("platform.msi-routes");
+
+/// Interrupts on each message-signalled line whose handler ran on each CPU, counted by
+/// [`dispatch`], which runs on the CPU that took the interrupt.
+static MSI_TAKEN: [[AtomicU64; MSI_COUNTED_CPUS]; MAX_MSI_ROUTES] =
+    [const { [const { AtomicU64::new(0) }; MSI_COUNTED_CPUS] }; MAX_MSI_ROUTES];
+
+/// One wired message-signalled interrupt.
+struct MsiRoute {
+    /// The MSI-X table and the entry in it, which is what moving the interrupt rewrites.
+    /// `None` for MSI, whose message is in configuration space and so is programmed only
+    /// during discovery, the one time configuration space is reachable.
+    entry: Option<(MsixTable, u16)>,
+}
 
 /// The console's binding, kept after discovery so the serial check can take the device
 /// away and bind it again: the tree it was bound from, the ledger its claims are in, its
@@ -443,7 +472,9 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         c.write_str("; TOO MANY NODES TO MODEL");
         return Some(false);
     };
-    let mut resources = Resources::new(mmio, irqs).with_ports(ports);
+    let mut resources = Resources::new(mmio, irqs)
+        .with_ports(ports)
+        .with_msi(controller::MSI);
     let mut started: [Option<(usize, Started)>; MAX_BOUND] = [const { None }; MAX_BOUND];
     ok &= bind(c, &tree, &mut resources, &mut started);
     if ok {
@@ -453,7 +484,11 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     // After the controller, so the lines are unmasked at the one that will deliver them.
     let console = if ok {
         // SAFETY: the caller's contract: once, masked, on the boot path.
-        let (wired, console) = unsafe { wire_all(c, &tree, &mut started) };
+        let messages = Messages {
+            resources: &resources,
+            cfg: config_space(&access),
+        };
+        let (wired, console) = unsafe { wire_all(c, &tree, &messages, &mut started) };
         ok &= wired;
         console
     } else {
@@ -914,6 +949,7 @@ enum Wired {
 unsafe fn wire_all(
     c: &dyn EarlyConsole,
     tree: &DeviceTree<'_, '_>,
+    messages: &Messages<'_, '_>,
     started: &mut [Option<(usize, Started)>; MAX_BOUND],
 ) -> (bool, Option<(NodeId, Started)>) {
     // Before any line is unmasked: the first `init` remaps and masks the 8259A, and on
@@ -932,8 +968,11 @@ unsafe fn wire_all(
         let Some(&drv) = controller::DRIVERS.get(*d) else {
             continue;
         };
-        let pci = matches!(tree.node(s.bound().node()).origin(), Origin::Pci(_));
-        match wire(c, chip, drv, s, pci) {
+        let function = match tree.node(s.bound().node()).origin() {
+            Origin::Pci(f) => Some(f),
+            _ => None,
+        };
+        match wire(c, chip, drv, s, function, Some(messages)) {
             Wired::Nothing => {}
             Wired::Failed => ok = false,
             Wired::Line(line) => {
@@ -953,6 +992,167 @@ unsafe fn wire_all(
     (ok, console)
 }
 
+/// What wiring a message-signalled interrupt needs beyond the device: the ledger, to find
+/// the window its MSI-X table is in, and configuration space, to turn the capability on.
+struct Messages<'a, 's> {
+    resources: &'a Resources<'s>,
+    cfg: Option<&'a dyn ConfigSpace>,
+}
+
+/// Configuration space as discovery reaches it, if it does.
+fn config_space(access: &Access) -> Option<&dyn ConfigSpace> {
+    match access {
+        Access::Ecam(cfg) => Some(cfg),
+        Access::Ports(cfg) => Some(cfg),
+        Access::None => None,
+    }
+}
+
+/// Whether `line` is one of the message-signalled lines and something was wired to it.
+fn is_msi_line(line: u32) -> bool {
+    msi_slot(line).is_some_and(|slot| MSI_ROUTES.lock_irqsave()[slot].is_some())
+}
+
+/// The index of `line` among the message-signalled lines.
+fn msi_slot(line: u32) -> Option<usize> {
+    if !controller::MSI_LINES.contains(&line) {
+        return None;
+    }
+    let slot = (line - controller::MSI_LINES.start) as usize;
+    (slot < MAX_MSI_ROUTES).then_some(slot)
+}
+
+/// Wire a PCI function's message-signalled vector `entry`, in the same order as a line: a
+/// free line, the handler registered and enabled, then the message written for the boot
+/// CPU, and only then the vector unmasked.
+///
+/// For MSI-X the message goes into the table entry, masked whatever firmware left, through
+/// a window the function's own driver claimed ([`msix_table`]); the capability is enabled,
+/// clearing any function-wide mask firmware left; then the entry is unmasked. A function
+/// with MSI and no MSI-X has its one message programmed in its capability instead.
+#[allow(clippy::too_many_arguments)]
+fn wire_msi(
+    c: &dyn EarlyConsole,
+    drv: &dyn Driver,
+    started: &Started,
+    f: &Function,
+    line: &IrqLine,
+    handler: fn(),
+    entry: u16,
+    messages: &Messages<'_, '_>,
+) -> Wired {
+    let failed = |why: &str| {
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" ");
+        c.write_str(why);
+        Wired::Failed
+    };
+    let Some(cfg) = messages.cfg else {
+        return failed("HAS A VECTOR BUT NO CONFIGURATION SPACE TO ENABLE IT IN");
+    };
+    let mut routes = MSI_ROUTES.lock_irqsave();
+    let free = routes.iter().position(Option::is_none);
+    let Some((slot, number)) = free.and_then(|s| {
+        let line = controller::MSI_LINES
+            .start
+            .checked_add(u32::try_from(s).ok()?)?;
+        controller::MSI_LINES
+            .contains(&line)
+            .then_some((s, IrqNumber(line)))
+    }) else {
+        return failed("FOUND NO FREE LINE FOR A MESSAGE-SIGNALLED INTERRUPT");
+    };
+    let Some((address, data)) = controller::msi_message(number.0, 0) else {
+        return failed("HAS NO MESSAGE THAT REACHES THE BOOT CPU");
+    };
+    let registered = {
+        let mut table = HANDLERS.lock_irqsave();
+        table
+            .register(started.bound(), line, number, handler)
+            .and_then(|()| table.enable(started, number))
+    };
+    if registered.is_err() {
+        return failed("HANDLER NOT REGISTERED");
+    }
+
+    let route = if let Some(cap) = msi::msix(f) {
+        let Some(table) = msix_table(f, &cap, started.bound().node(), messages.resources) else {
+            return failed("MSI-X TABLE IS IN NO WINDOW ITS DRIVER CLAIMED");
+        };
+        if !(table.mask(entry) && table.set_message(entry, address, data)) {
+            return failed("MSI-X ENTRY DID NOT TAKE ITS MESSAGE");
+        }
+        if !msi::set_msix_enabled(cfg, f.address, &cap, true) {
+            return failed("MSI-X DID NOT ENABLE");
+        }
+        if !table.unmask(entry) {
+            return failed("MSI-X ENTRY DID NOT UNMASK");
+        }
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" receives MSI-X entry ");
+        write_usize(c, usize::from(entry));
+        MsiRoute {
+            entry: Some((table, entry)),
+        }
+    } else if let Some(cap) = msi::msi(f) {
+        let Ok(data) = u16::try_from(data) else {
+            return failed("HAS MSI DATA WIDER THAN THE CAPABILITY");
+        };
+        if entry != 0 || !msi::program_msi(cfg, f.address, &cap, address, data) {
+            return failed("MSI DID NOT TAKE ITS MESSAGE");
+        }
+        c.write_str("; ");
+        c.write_str(drv.name());
+        c.write_str(" receives MSI");
+        MsiRoute { entry: None }
+    } else {
+        return failed("CLAIMED A VECTOR ITS FUNCTION DOES NOT HAVE");
+    };
+    c.write_str(" on line ");
+    write_usize(c, number.0 as usize);
+    c.write_str(", vector ");
+    write_usize(c, (data & 0xff) as usize);
+    routes[slot] = Some(route);
+    Wired::Line(number)
+}
+
+/// The MSI-X table `cap` describes, through a window `node` claimed that holds it whole.
+///
+/// `None` when no such window is claimed, or when it is past what discovery can reach. The
+/// one place a table's address comes from, and it comes from the ledger: where a claimed
+/// window is reached is `Registers::for_claim`'s to decide, through the device window, and
+/// nothing here names an address to dereference.
+fn msix_table(
+    f: &Function,
+    cap: &MsixCapability,
+    node: NodeId,
+    resources: &Resources<'_>,
+) -> Option<MsixTable> {
+    let (bar_base, bar_len) = f.bar_by_number(cap.table_bar)?;
+    let bytes = cap.table_bytes() as u64;
+    if u64::from(cap.table_offset).checked_add(bytes)? > bar_len {
+        return None;
+    }
+    let phys = bar_base.checked_add(u64::from(cap.table_offset))?;
+    let claim = resources.mmio_claims().find(|w| {
+        w.node == node && w.phys <= phys && phys + bytes <= w.phys.saturating_add(w.len)
+    })?;
+    // The table is written during discovery, on the boot tables, whose device alias covers
+    // what they identity-map and no more.
+    if claim.phys.checked_add(claim.len)? > arch::pc::BOOT_IDENTITY_END {
+        return None;
+    }
+    // SAFETY: a window the function's driver claimed, which is mapped at the device window
+    // above its physical address both by the boot tables' alias discovery runs on (the window
+    // lies below `BOOT_IDENTITY_END`, checked above) and by the kernel's own space, which maps
+    // every claimed window there. The driver leaves the table to the platform: it claimed
+    // the window for it and never touches the table's registers.
+    let regs = unsafe { Registers::for_claim(claim) }?;
+    MsixTable::new(regs, usize::try_from(phys - claim.phys).ok()?, cap.table_size)
+}
+
 /// Wire a started device's interrupt: its ISA line, the handler registered and enabled in
 /// the table, then the line unmasked at the controller — in that order, so a line is never
 /// live before its handler is.
@@ -961,17 +1161,31 @@ fn wire(
     chip: &'static dyn IrqChip,
     drv: &dyn Driver,
     started: &Started,
-    pci: bool,
+    function: Option<&Function>,
+    messages: Option<&Messages<'_, '_>>,
 ) -> Wired {
     let Some((line, handler)) = drv.interrupt() else {
         return Wired::Nothing;
     };
+    // A message-signalled vector has no route to trust or distrust: the function is told
+    // where to deliver. `function` is the node's PCI record, because only the caller holds
+    // the tree.
+    if let Some(entry) = msi::vector_of(line.specifier().cells()) {
+        return match (function, messages) {
+            (Some(f), Some(m)) => wire_msi(c, drv, started, f, line, handler, entry, m),
+            _ => {
+                c.write_str("; ");
+                c.write_str(drv.name());
+                c.write_str(" CLAIMED A VECTOR THAT CANNOT BE PROGRAMMED HERE");
+                Wired::Failed
+            }
+        };
+    }
     // A PCI function's line is what firmware routed, which is the right answer only on the
     // controller firmware routed for; see `controller::PCI_LINE_TRUSTED`. Where it is not,
     // the device is left unwired and its driver polls, rather than being handed a line its
-    // interrupts never reach — which would look wired and time out instead. `pci` says
-    // which kind of node the device is, because only the caller holds the tree.
-    if pci && !controller::PCI_LINE_TRUSTED {
+    // interrupts never reach — which would look wired and time out instead.
+    if function.is_some() && !controller::PCI_LINE_TRUSTED {
         c.write_str("; ");
         c.write_str(drv.name());
         c.write_str(" polled: no PCI interrupt route on this controller");
@@ -1013,11 +1227,61 @@ fn dispatch(number: IrqNumber) -> bool {
     let handler = HANDLERS.lock_irqsave().lookup(number);
     match handler {
         Some(handler) => {
+            if let Some(taken) = msi_taken(number.0, <arch::Cpu as hal::Arch>::cpu_index()) {
+                taken.fetch_add(1, Ordering::Relaxed);
+            }
             handler();
             true
         }
         None => false,
     }
+}
+
+/// The count of `line`'s interrupts taken on `cpu`, if `line` is message-signalled.
+fn msi_taken(line: u32, cpu: usize) -> Option<&'static AtomicU64> {
+    MSI_TAKEN.get(msi_slot(line)?)?.get(cpu)
+}
+
+/// Whether `line` is a message-signalled interrupt's: one [`route_interrupt`] can move and
+/// [`interrupts_on_cpu`] counts.
+pub fn interrupt_is_msi(line: u32) -> bool {
+    is_msi_line(line)
+}
+
+/// Interrupts on `line` whose handler ran on CPU `cpu`. Counted for message-signalled lines
+/// only, which are the ones whose CPU can be chosen; zero for any other.
+pub fn interrupts_on_cpu(line: u32, cpu: usize) -> u64 {
+    msi_taken(line, cpu).map_or(0, |t| t.load(Ordering::Relaxed))
+}
+
+/// Whether this platform delivers a PCI function's message-signalled interrupts, so that a
+/// function with MSI-X is expected to be wired on it.
+pub fn delivers_msi() -> bool {
+    controller::MSI
+}
+
+/// Deliver message-signalled `line` to CPU `cpu` from its next interrupt on.
+///
+/// Masks the MSI-X entry, writes the message naming that CPU's local APIC, and unmasks it.
+/// A function that has an interrupt to raise while its entry is masked sets the entry's
+/// pending bit and raises it on unmask (PCI 3.0 §6.8.2.9), so none is lost in the move. The
+/// handler table is shared by every CPU, and every CPU loads the same interrupt table, so
+/// nothing else has to change for the handler to run there.
+pub fn route_interrupt(line: u32, cpu: usize) -> Result<(), &'static str> {
+    let slot = msi_slot(line).ok_or("not a message-signalled line")?;
+    let routes = MSI_ROUTES.lock_irqsave();
+    let route = routes[slot]
+        .as_ref()
+        .ok_or("nothing is wired to that line")?;
+    let Some((table, entry)) = &route.entry else {
+        return Err("an MSI route, which only discovery can program");
+    };
+    let (address, data) =
+        controller::msi_message(line, cpu).ok_or("no local APIC a message can name")?;
+    if !table.retarget(*entry, address, data) {
+        return Err("the MSI-X entry did not take the message");
+    }
+    Ok(())
 }
 
 /// The console UART's receive line, once its handler is wired.
@@ -1123,7 +1387,7 @@ pub unsafe fn rebind_console(c: &dyn EarlyConsole) -> Option<bool> {
     c.write_str("binding ");
     write_usize(c, uart16550::bindings());
     // The console is the 16550 a firmware table declares, never a PCI function.
-    let rewired = match wire(c, chip, drv, &started, false) {
+    let rewired = match wire(c, chip, drv, &started, None, None) {
         Wired::Line(again) if again == line => true,
         Wired::Line(_) => {
             c.write_str(", ON A DIFFERENT LINE");

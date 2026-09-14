@@ -39,6 +39,23 @@ static READ_BUF: [SyncUnsafeCell<[u8; MAX_RUN * SECTOR]>; THREADS] =
 /// Requests the workload has made, for the heartbeat.
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 
+/// Completions the driver had collected in its interrupt handler, and by polling, when the
+/// run began. Where the platform wired the disk's interrupt, the run collects none by
+/// polling.
+static BY_INTERRUPT_AT_START: AtomicU64 = AtomicU64::new(0);
+static POLLED_AT_START: AtomicU64 = AtomicU64::new(0);
+
+/// Completions collected in the disk's interrupt handler, and by a waiter polling, since
+/// the run began.
+pub fn completions() -> (u64, u64) {
+    crate::block::disk().map_or((0, 0), |d| {
+        (
+            d.interrupt_counts().1 - BY_INTERRUPT_AT_START.load(Ordering::Relaxed),
+            d.polled_completions() - POLLED_AT_START.load(Ordering::Relaxed),
+        )
+    })
+}
+
 /// Whether the machine has the disk this workload uses.
 pub fn present() -> bool {
     crate::block::disk().is_some()
@@ -62,6 +79,14 @@ pub fn setup() -> Result<(), &'static str> {
     if issued != completed || in_flight != 0 || !clean {
         return Err("the disk has requests outstanding before the run");
     }
+    // Every completion by interrupt, where the disk has one: a waiter then never drains the
+    // ring itself, so a lost interrupt is a request that times out and fails its workload,
+    // instead of one a poll quietly rescues.
+    if platform::block_line().is_some() {
+        disk.set_interrupt_driven(true);
+    }
+    BY_INTERRUPT_AT_START.store(disk.interrupt_counts().1, Ordering::Relaxed);
+    POLLED_AT_START.store(disk.polled_completions(), Ordering::Relaxed);
     Ok(())
 }
 
@@ -76,6 +101,9 @@ pub fn audit() -> Result<(), &'static str> {
     }
     if !clean {
         return Err("descriptors are missing from the ring with nothing in flight (a leak)");
+    }
+    if platform::block_line().is_some() && completions().1 != 0 {
+        return Err("a completion was collected by polling in a run driven by interrupts");
     }
     Ok(())
 }

@@ -22,6 +22,71 @@ fn started(backing: &mut Backing, sectors: u64, bounce: usize) -> Result<Blk, Er
 }
 
 #[test]
+fn a_queue_is_given_its_msix_vector_after_the_reset_and_before_it_is_enabled() {
+    let mut backing = Backing::new(1 << 20);
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    let blk = Blk::bring_up_with_vector(transport, dma, Some(1)).unwrap();
+    assert!(blk.uses_msix());
+    assert_eq!(blk.transport.vector_at_setup.get(), Some(1));
+    assert_eq!(
+        blk.transport.config_vector.get(),
+        transport::NO_VECTOR,
+        "configuration changes are given no vector"
+    );
+
+    // Without a vector the queue keeps none, and the driver says so.
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    let blk = Blk::bring_up(transport, dma).unwrap();
+    assert!(!blk.uses_msix());
+    assert_eq!(blk.transport.vector_at_setup.get(), Some(transport::NO_VECTOR));
+}
+
+#[test]
+fn a_vector_the_device_refuses_fails_bring_up() {
+    let mut backing = Backing::new(1 << 20);
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    match Blk::bring_up_with_vector(transport, dma, Some(2)) {
+        Err(e) => assert_eq!(e, Error::VectorRefused { queue: 0 }),
+        Ok(_) => panic!("a vector past the table was accepted"),
+    }
+}
+
+#[test]
+fn an_msix_interrupt_collects_completions_without_asking_the_status_register() {
+    let mut backing = Backing::new(1 << 20);
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    let blk = Blk::bring_up_with_vector(transport, dma, Some(0))
+        .unwrap()
+        .with_poll_limit(16);
+    blk.set_interrupt_driven(true);
+    // The fake answers at once, but in interrupt-driven mode only the handler may collect
+    // the answer, and there is no interrupt in a host test: the request times out with its
+    // completion on the ring.
+    let mut sector = [0u8; SECTOR];
+    assert_eq!(blk.read_blocks(0, &mut sector), Err(BlockError::Timeout));
+    assert_eq!(blk.interrupt_counts(), (0, 0));
+
+    // The interrupt arrives. The status register would say nothing is pending, and the
+    // handler must not ask it.
+    assert!(blk.on_interrupt());
+    assert_eq!(blk.interrupt_counts(), (1, 1));
+    assert_eq!(blk.transport.isr_reads.get(), 0);
+}
+
+#[test]
+fn a_line_interrupt_with_nothing_pending_is_not_this_devices() {
+    let mut backing = Backing::new(1 << 20);
+    let blk = started(&mut backing, 64, 64 * SECTOR).unwrap();
+    assert!(!blk.on_interrupt(), "a shared line's interrupt with nothing pending");
+    assert_eq!(blk.transport.isr_reads.get(), 1);
+    assert_eq!(blk.interrupt_counts(), (0, 0));
+}
+
+#[test]
 fn bring_up_walks_the_handshake_and_reads_the_geometry() {
     let mut backing = Backing::new(256 * 1024);
     let blk = started(&mut backing, 2048, 8 * SECTOR).unwrap();
