@@ -118,6 +118,8 @@ fn build(rng: &mut Rng) -> Vec<u8> {
                 ]),
                 window: rng.next_u32() as u16,
                 mss: *rng.pick(&[None, Some(1460), Some(1)]),
+                sack_permitted: false,
+                sack: [None; wire::SACK_BLOCKS],
             };
             ip_frame(&mut buf, dst_mac, src, dst, wire::PROTO_TCP, |p| {
                 wire::write_tcp(p, src, dst, &h, &data)
@@ -201,6 +203,11 @@ fn parsers(input: &[u8]) {
         }
         Frame::OtherIpv4(ip) => {
             assert!(inside(eth.payload, ip.payload), "the IPv4 payload is outside the packet");
+        }
+        Frame::Unreachable(ip, un) => {
+            // Parsed as far as the header it quotes: the ports are what names the socket it
+            // belongs to, and reading them must not walk off the end of a hostile message.
+            let _ = (ip.src, ip.dst, un.code, un.protocol, un.src_port, un.dst_port);
         }
         Frame::OtherEthernet(_) => {}
     }

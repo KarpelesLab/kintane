@@ -98,6 +98,18 @@ pub const RING: usize = wire::FRAME_MAX;
 pub const MSS: u16 = (wire::ETH_MTU - wire::IPV4_HEADER - wire::TCP_HEADER) as u16;
 /// The segment size assumed for a peer that announces none (RFC 1122 §4.2.2.6).
 const DEFAULT_MSS: u16 = 536;
+/// The largest payload this stack puts in a segment it sends, whatever the peer announces.
+///
+/// A connection's send ring is one pool buffer, so a ring's worth is all it can ever have
+/// outstanding. Sending [`MSS`] at a time would put one segment in flight, and a peer cannot
+/// send [`DUP_ACK_THRESHOLD`] duplicate acknowledgements for a loss when only one later
+/// segment exists to draw them: the sender's fast retransmit would be unreachable outside a
+/// host test. A quarter of the ring leaves four segments outstanding, which is what it needs.
+///
+/// The cost is header overhead per byte, and it is stated rather than tuned. The alternative
+/// is several pool buffers per send ring, which is memory every port carries whether or not
+/// it has a card; see this module's "Memory".
+pub const SEND_SEG: usize = RING / (DUP_ACK_THRESHOLD as usize + 1);
 /// The retransmission timeout a connection with no round-trip sample yet uses (RFC 6298 §2.1
 /// asks for a second; this stack's checks and its peers are a virtual machine away, and a
 /// second of silence before the first retransmission is most of a check's patience).
@@ -372,6 +384,10 @@ struct Tcb {
     timing: Option<(u32, u64)>,
     rto: u64,
     deadline: Option<u64>,
+    /// The peer offered selective acknowledgement on its SYN, so blocks may be sent to it.
+    /// Nothing is sent to a peer that did not ask, which is every peer this stack has met:
+    /// QEMU's user-mode network offers none. See the module's "What is not".
+    sack_ok: bool,
     /// The peer's window is shut and the timer ran out: send one byte past it.
     probe: bool,
     retries: u32,
@@ -419,6 +435,7 @@ const EMPTY: Tcb = Tcb {
     timing: None,
     rto: RTO_INITIAL_NS,
     deadline: None,
+    sack_ok: false,
     probe: false,
     retries: 0,
     time_wait_until: 0,
@@ -438,6 +455,7 @@ pub struct Syn {
     irs: u32,
     window: u16,
     mss: u16,
+    sack_ok: bool,
 }
 
 /// `a` comes before `b` in sequence space.
@@ -492,9 +510,11 @@ fn take_two(pool: &mut Pool) -> Option<(usize, usize)> {
 }
 
 impl Tcb {
-    /// The segment size as a width: every congestion computation is in bytes.
+    /// The segment size as a width: every congestion computation is in bytes, and in terms of
+    /// what this stack actually sends ([`SEND_SEG`]) rather than what the peer would take, so
+    /// a window of four segments is four segments that go on the wire.
     fn seg(&self) -> u32 {
-        u32::from(self.mss).max(1)
+        u32::from(self.mss).min(SEND_SEG as u32).max(1)
     }
 
     /// Sequence space sent and not yet acknowledged: RFC 5681's FlightSize.
@@ -1271,6 +1291,7 @@ impl Tcp {
                     irs: seg.seq,
                     window: seg.window,
                     mss: seg.mss.unwrap_or(DEFAULT_MSS),
+                    sack_ok: seg.sack_permitted,
                 };
                 let repeat = self.syns.iter().flatten().any(|s| {
                     (s.remote_ip, s.remote_port, s.local_port)
@@ -1311,6 +1332,8 @@ impl Tcp {
                 flags,
                 window: 0,
                 mss: None,
+                sack_permitted: false,
+                sack: [None; wire::SACK_BLOCKS],
             },
             data: None,
         };
@@ -1370,6 +1393,7 @@ impl Tcp {
                 snd_max: iss,
                 snd_wnd: syn.window,
                 mss: syn.mss.clamp(1, MSS),
+                sack_ok: syn.sack_ok,
                 rcv_nxt: syn.irs.wrapping_add(1),
                 tx_seq: iss.wrapping_add(1),
                 rx: Ring::on(rx),
@@ -1395,7 +1419,31 @@ impl Tcp {
             flags: TCP_ACK,
             window,
             mss: None,
+            sack_permitted: false,
+            sack: [None; wire::SACK_BLOCKS],
         };
+        // What is held past the hole this segment acknowledges, nearest run first: a peer
+        // that offered selective acknowledgement can resend the holes rather than everything
+        // after them.
+        if t.sack_ok {
+            let rcv = t.rcv_nxt;
+            let mut taken = [false; OOO_SEGMENTS];
+            // Nearest run first, chosen by scanning rather than sorting: `sort_by_key` wants
+            // an allocator, and four runs make a scan cheaper than one anyway.
+            for slot in header.sack.iter_mut() {
+                let nearest = t
+                    .ooo
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, r)| !taken[*i] && r.is_some())
+                    .min_by_key(|(_, r)| r.map_or(u32::MAX, |r| r.seq.wrapping_sub(rcv)));
+                let Some((i, Some(run))) = nearest else {
+                    break;
+                };
+                taken[i] = true;
+                *slot = Some((run.seq, run.seq.wrapping_add(run.len)));
+            }
+        }
         let remote_ip = t.remote_ip;
         let plain = |header| {
             Some(Segment {
@@ -1419,6 +1467,7 @@ impl Tcp {
                 }
                 header.seq = t.iss;
                 header.mss = Some(MSS);
+                header.sack_permitted = true;
                 if t.state == State::SynSent {
                     header.flags = TCP_SYN;
                     header.ack = 0;
@@ -1467,7 +1516,7 @@ impl Tcp {
                 let n = if resending && t.recovering && !t.resend {
                     0
                 } else {
-                    unsent.min(usable).min(usize::from(t.mss))
+                    unsent.min(usable).min(t.seg() as usize)
                 };
                 if n > 0 {
                     t.probe = false;
@@ -1542,6 +1591,7 @@ fn segment(
         }
         t.rcv_nxt = seg.seq.wrapping_add(1);
         t.mss = seg.mss.unwrap_or(DEFAULT_MSS).clamp(1, MSS);
+        t.sack_ok = seg.sack_permitted;
         t.snd_wnd = seg.window;
         t.ack_now = true;
         if ack {

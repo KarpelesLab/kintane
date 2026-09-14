@@ -49,6 +49,9 @@ const IPV4_OFFSET: u16 = 0x1fff;
 pub const ICMP_HEADER: usize = 8;
 pub const ICMP_ECHO_REPLY: u8 = 0;
 pub const ICMP_ECHO_REQUEST: u8 = 8;
+/// Destination unreachable, and the code that says which port nobody listens on.
+pub const ICMP_UNREACHABLE: u8 = 3;
+pub const ICMP_PORT_UNREACHABLE: u8 = 3;
 
 pub const UDP_HEADER: usize = 8;
 
@@ -64,6 +67,11 @@ pub const TCP_ACK: u8 = 0x10;
 const TCP_OPT_END: u8 = 0;
 const TCP_OPT_NOP: u8 = 1;
 const TCP_OPT_MSS: u8 = 2;
+const TCP_OPT_SACK_PERMITTED: u8 = 4;
+const TCP_OPT_SACK: u8 = 5;
+/// Blocks one selective acknowledgement carries. Three, with the maximum segment size
+/// option beside them, is what fits the forty bytes a TCP header has room for.
+pub const SACK_BLOCKS: usize = 3;
 
 /// Why bytes were not a packet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -309,6 +317,52 @@ pub fn write_ipv4(
     Ok(IPV4_HEADER)
 }
 
+/// A destination-unreachable message, and what the datagram that provoked it was addressed
+/// to. RFC 792 has such a message carry the offending IPv4 header and the eight bytes after
+/// it, which for UDP and TCP is the ports, and that is what names the socket it belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Unreachable {
+    pub code: u8,
+    /// The protocol, source and destination of the datagram that provoked this.
+    pub protocol: u8,
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+/// Parse a destination-unreachable message: the checksum first, then the embedded header,
+/// whose own length is checked against the bytes actually there before any field is read.
+pub fn parse_icmp_unreachable(p: &[u8]) -> Result<Unreachable, WireError> {
+    if p.len() < ICMP_HEADER {
+        return Err(WireError::Short);
+    }
+    if checksum(&[p]) != 0 {
+        return Err(WireError::BadChecksum);
+    }
+    if p[0] != ICMP_UNREACHABLE {
+        return Err(WireError::NotEcho);
+    }
+    let inner = p.get(ICMP_HEADER..).ok_or(WireError::Short)?;
+    let first = *inner.first().ok_or(WireError::Short)?;
+    if first >> 4 != 4 {
+        return Err(WireError::NotIpv4);
+    }
+    let header = usize::from(first & 0x0f) * 4;
+    if header < IPV4_HEADER || header > inner.len() {
+        return Err(WireError::BadHeaderLength);
+    }
+    let short = WireError::Short;
+    Ok(Unreachable {
+        code: p[1],
+        protocol: *inner.get(9).ok_or(short)?,
+        src: ip_at(inner, 12).ok_or(short)?,
+        dst: ip_at(inner, 16).ok_or(short)?,
+        src_port: be16(inner, header).ok_or(short)?,
+        dst_port: be16(inner, header + 2).ok_or(short)?,
+    })
+}
+
 /// An ICMP echo request or reply.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Echo<'a> {
@@ -442,6 +496,11 @@ pub struct Tcp<'a> {
     pub window: u16,
     /// The maximum segment size option, where the segment carries a well-formed one.
     pub mss: Option<u16>,
+    /// The peer offered selective acknowledgement on this SYN.
+    pub sack_permitted: bool,
+    /// Runs of sequence space the peer says it holds past what it acknowledged, in the order
+    /// they were written: `(start, end)`, `end` exclusive.
+    pub sack: [Option<(u32, u32)>; SACK_BLOCKS],
     pub payload: &'a [u8],
 }
 
@@ -462,6 +521,8 @@ pub fn parse_tcp(p: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Result<Tcp<'_>, Wire
         return Err(WireError::BadChecksum);
     }
     let mut mss = None;
+    let mut sack_permitted = false;
+    let mut sack = [None; SACK_BLOCKS];
     let mut at = TCP_HEADER;
     while at < offset {
         match p[at] {
@@ -475,6 +536,27 @@ pub fn parse_tcp(p: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Result<Tcp<'_>, Wire
                 if kind == TCP_OPT_MSS && n == 4 {
                     mss = be16(p, at + 2);
                 }
+                if kind == TCP_OPT_SACK_PERMITTED && n == 2 {
+                    sack_permitted = true;
+                }
+                // A selective acknowledgement is whole blocks and nothing else; one whose
+                // length is not is ignored rather than read past.
+                if kind == TCP_OPT_SACK && n >= 10 && (n - 2) % 8 == 0 {
+                    for (i, slot) in sack.iter_mut().enumerate() {
+                        let block = at + 2 + i * 8;
+                        if block + 8 > at + n {
+                            break;
+                        }
+                        let word = |o: usize| {
+                            p.get(o..o + 4)
+                                .and_then(|b| b.try_into().ok())
+                                .map(u32::from_be_bytes)
+                        };
+                        if let (Some(start), Some(end)) = (word(block), word(block + 4)) {
+                            *slot = Some((start, end));
+                        }
+                    }
+                }
                 at += n;
             }
         }
@@ -487,6 +569,8 @@ pub fn parse_tcp(p: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Result<Tcp<'_>, Wire
         flags: *p.get(13).ok_or(short)?,
         window: be16(p, 14).ok_or(short)?,
         mss,
+        sack_permitted,
+        sack,
         payload: &p[offset..],
     })
 }
@@ -500,13 +584,29 @@ pub struct TcpHeader {
     pub ack: u32,
     pub flags: u8,
     pub window: u16,
-    /// Written as the one option, padded to a whole header word; on a SYN only, by custom.
+    /// Written as an option padded to a whole header word; on a SYN only, by custom.
     pub mss: Option<u16>,
+    /// Offer selective acknowledgement: on a SYN only, and only where the stack means to
+    /// send blocks.
+    pub sack_permitted: bool,
+    /// The runs held past what this segment acknowledges, written as one option.
+    pub sack: [Option<(u32, u32)>; SACK_BLOCKS],
 }
 
 /// The length of the header [`write_tcp`] writes for `h`, options included.
 pub const fn tcp_header_len(h: &TcpHeader) -> usize {
-    TCP_HEADER + if h.mss.is_some() { 4 } else { 0 }
+    let mut blocks = 0;
+    let mut i = 0;
+    while i < SACK_BLOCKS {
+        if h.sack[i].is_some() {
+            blocks += 1;
+        }
+        i += 1;
+    }
+    TCP_HEADER
+        + if h.mss.is_some() { 4 } else { 0 }
+        + if h.sack_permitted { 4 } else { 0 }
+        + if blocks > 0 { 4 + 8 * blocks } else { 0 }
 }
 
 /// Write a TCP segment, with its checksum, into `buf`; returns its length.
@@ -546,10 +646,34 @@ pub fn write_tcp_header(
     s[13] = h.flags;
     s[14..16].copy_from_slice(&h.window.to_be_bytes());
     s[16..20].copy_from_slice(&[0, 0, 0, 0]);
+    let mut at = TCP_HEADER;
     if let Some(mss) = h.mss {
-        s[20] = TCP_OPT_MSS;
-        s[21] = 4;
-        s[22..24].copy_from_slice(&mss.to_be_bytes());
+        s[at] = TCP_OPT_MSS;
+        s[at + 1] = 4;
+        s[at + 2..at + 4].copy_from_slice(&mss.to_be_bytes());
+        at += 4;
+    }
+    if h.sack_permitted {
+        // Padded to a word with the two no-operation bytes in front, which is how the option
+        // is customarily written beside another.
+        s[at] = TCP_OPT_NOP;
+        s[at + 1] = TCP_OPT_NOP;
+        s[at + 2] = TCP_OPT_SACK_PERMITTED;
+        s[at + 3] = 2;
+        at += 4;
+    }
+    let blocks = h.sack.iter().flatten().count();
+    if blocks > 0 {
+        s[at] = TCP_OPT_NOP;
+        s[at + 1] = TCP_OPT_NOP;
+        s[at + 2] = TCP_OPT_SACK;
+        s[at + 3] = (2 + 8 * blocks) as u8;
+        at += 4;
+        for (start, end) in h.sack.iter().flatten() {
+            s[at..at + 4].copy_from_slice(&start.to_be_bytes());
+            s[at + 4..at + 8].copy_from_slice(&end.to_be_bytes());
+            at += 8;
+        }
     }
     let sum = checksum(&[&pseudo_header(src, dst, PROTO_TCP, len), s]);
     s[16..18].copy_from_slice(&sum.to_be_bytes());
@@ -562,6 +686,8 @@ pub fn write_tcp_header(
 pub enum Frame<'a> {
     Arp(Arp),
     Echo(Ipv4<'a>, Echo<'a>),
+    /// A destination-unreachable message for something this machine sent.
+    Unreachable(Ipv4<'a>, Unreachable),
     Udp(Ipv4<'a>, Udp<'a>),
     Tcp(Ipv4<'a>, Tcp<'a>),
     /// An IPv4 packet for a protocol this stack does not speak.
@@ -578,7 +704,14 @@ pub fn parse_frame(frame: &[u8]) -> Result<(Ethernet<'_>, Frame<'_>), WireError>
         ETHERTYPE_IPV4 => {
             let ip = parse_ipv4(eth.payload)?;
             match ip.protocol {
-                PROTO_ICMP => Frame::Echo(ip, parse_icmp_echo(ip.payload)?),
+                PROTO_ICMP => match parse_icmp_echo(ip.payload) {
+                    Ok(echo) => Frame::Echo(ip, echo),
+                    // Not an echo: an unreachable message is the other one this stack reads.
+                    Err(WireError::NotEcho) => {
+                        Frame::Unreachable(ip, parse_icmp_unreachable(ip.payload)?)
+                    }
+                    Err(e) => return Err(e),
+                },
                 PROTO_UDP => Frame::Udp(ip, parse_udp(ip.payload, ip.src, ip.dst)?),
                 PROTO_TCP => Frame::Tcp(ip, parse_tcp(ip.payload, ip.src, ip.dst)?),
                 _ => Frame::OtherIpv4(ip),

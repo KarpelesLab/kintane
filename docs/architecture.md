@@ -1253,6 +1253,13 @@ user-mode network, and sockets put TCP and UDP behind handles. What it is not:
   when a frame arrives, or a waiter whose wait ran to the stack's next timer. A connection
   nobody waits on — one a program closed and left — retransmits its FIN only when the next
   frame or socket call comes.
+- **Destination unreachable, parsed and delivered** (RFC 792). A message quoting a datagram
+  this machine sent names the port that sent it, and a datagram socket's next receive on that
+  port reports the refusal rather than waiting out its timeout. A message quoting somebody
+  else's datagram, or naming another port, refuses nothing. **No boot exercises this either**:
+  a capture of a whole boot shows QEMU's user-mode network sending echo replies and no
+  unreachable message at all, for the quiet port or anything else, so it too is proven by host
+  tests.
 - **No IPv6, DHCP, DNS or routing table.** One static address, a netmask and a gateway.
 
 **Who runs the stack.** The stack is `&mut self`, driven by whoever holds it under one lock:
@@ -1342,20 +1349,35 @@ Exactly what is implemented:
   not a copy. A run that touches another is merged into it; with every run taken, a nearer run
   displaces the one furthest ahead, and a run that is itself the furthest is dropped for the
   peer to send again. A FIN that arrives ahead of a hole is not remembered.
+- **Selective acknowledgement, the receiving half** (RFC 2018). The stack offers
+  SACK-permitted on its own SYN, remembers whether the peer offered it, and — only to a peer
+  that did — names the runs it holds past a hole, nearest run first, in up to three blocks
+  beside the other options. **No boot exercises it**: QEMU's user-mode network, which is the
+  only peer these checks have, offers no SACK, so a capture of a whole boot shows `MSS` and
+  nothing else from it. It is proven by host tests, and that is said rather than implied.
+- **A segment this stack sends is at most a quarter of the send ring** (`SEND_SEG`, 378
+  bytes), whatever the peer announces, and the congestion window is counted in those terms. A
+  ring is one pool buffer, so a ring's worth is all that can be outstanding; sending a whole
+  1460-byte segment would put one segment in flight, and a peer cannot send three duplicate
+  acknowledgements for a loss when only one later segment exists to draw them. Four smaller
+  segments make the sender's fast retransmit reachable in a guest. The cost is header overhead
+  per byte; the alternative, several pool buffers per ring, is memory every port carries
+  whether or not it has a card.
 - **A fixed receive window**: the free space of a connection's 1514-byte receive ring, never
   scaled, announced again when a read reopens it past a segment. **The peer's window is
   respected**, and a shut one is probed a byte at a time on the timer. **The MSS option** is sent
   on a SYN (1460) and honoured; 536 when the peer sends none.
 
-Exactly what is not: **no selective acknowledgement**, so a hole is filled by the sender
-resending from it and a second loss in one window costs another round trip, which is what
-NewReno's partial acknowledgements handle one hole at a time; **no appropriate byte counting,
+Exactly what is not: **the sending half of selective acknowledgement**, so a hole is filled
+by the sender resending from it and a second loss in one window costs another round trip, which
+is what NewReno's partial acknowledgements handle one hole at a time; blocks a peer sends are
+parsed but not yet used to choose what to resend; **no appropriate byte counting,
 proportional rate reduction or pacing**, so the window is counted in bytes but grown per
 acknowledgement, which over-counts when the peer acknowledges less than a segment; no Nagle, no
 delayed acknowledgements, no explicit congestion notification, no urgent data, timestamps or
-window scaling. The send ring holds one frame's worth of data, so fewer segments are ever
-outstanding than a peer needs to send three duplicate acknowledgements: the sender's fast
-retransmit is proven by host tests rather than by a boot. TIME-WAIT is
+window scaling. The send ring still holds one frame's worth of data, but a segment is a
+quarter of it, so four are outstanding and the sender's fast retransmit is proven by a boot —
+the `net` check's bulk round — as well as by host tests. TIME-WAIT is
 1 s rather than four minutes, and a released connection in TIME-WAIT is given up early when
 every slot is needed. Initial sequence numbers are the clock mixed with the ports, not RFC 6528's
 keyed hash, so they are predictable. Ephemeral ports start from the clock at the first connection

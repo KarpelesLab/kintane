@@ -1438,10 +1438,15 @@ and `shutdown` on a datagram socket, `EMSGSIZE` past 256 bytes, `EAGAIN` when `S
 expires, `ENOPROTOOPT` for `SO_BROADCAST`, and a `sendmsg`/`recvmsg` round trip of one buffer.
 
 **What the quiet port answers is nothing.** A datagram sent to a port nobody listens on earns a
-timeout, not `ECONNREFUSED`: the stack parses no ICMP destination-unreachable message, so
-nothing turns one into an error on the socket. Both programs accept a timeout there, and would
-accept a refusal if the stack ever learned to deliver one; the check says which it got by
-passing at all.
+timeout rather than `ECONNREFUSED`, and both programs still accept the timeout — but the reason
+has changed. The stack now parses ICMP destination-unreachable, matches it to the port that
+sent, and reports the refusal on that socket's next receive; what is missing is anyone to send
+the message. A packet capture of a whole boot (`filter-dump` on the network, read back frame by
+frame) shows QEMU's user-mode network sending echo replies and nothing else of ICMP: no
+unreachable message for the quiet port or for any other. So the path is proven by host tests —
+a refusal reaches the port that sent it, one quoting another address or port refuses nothing —
+and the programs keep accepting either outcome, because on this network only one of them can
+happen.
 
 That is aarch64, where every frame arrives by interrupt. i686 reads the same on line 10,
 through the 8259A, and x86_64 on `line 17, MSI-X`. On a platform that delivers

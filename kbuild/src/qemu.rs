@@ -807,10 +807,13 @@ fn serve_tcp(mut stream: std::net::TcpStream) {
     if !ready {
         return;
     }
+    // Long enough for the bulk request, which is several segments of filler: the guest sends
+    // it so that dropping one segment leaves three behind it to draw duplicate
+    // acknowledgements, which is what its fast retransmit needs.
     let mut request = Vec::new();
     let mut byte = [0u8; 1];
     while !request.ends_with(b"\n") {
-        if request.len() > 256 || !matches!(stream.read(&mut byte), Ok(1)) {
+        if request.len() > 4096 || !matches!(stream.read(&mut byte), Ok(1)) {
             return;
         }
         request.push(byte[0]);
