@@ -564,6 +564,7 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `sigaltstack` | reports that there is no alternate stack; setting one is `ENOSYS`, and logged |
 | `kill` | a signal, or 0 to ask whether the process exists, to a Linux process by pid. A process group and -1 are `EINVAL`, and so is `SIGSTOP`, since nothing here stops a process |
 | `tgkill` | a signal to one thread of a process, by tid; a process's first thread, whose tid is the pid, before it has made a call, takes it as its process |
+| `rt_sigqueueinfo` | a signal to a Linux process carrying a value its handler reads as `si_value`. Only `SI_QUEUE` is accepted in the `siginfo` the sender writes, so no sender may claim the kernel raised the signal, nor that another process sent it. Real-time signals, 32 and up, queue eight deep per process; a ninth is `EAGAIN`. Below 32 a signal coalesces, keeping the first sender's value |
 
 **The thread pointer** is part of a user thread's saved context on both ports. The context
 switch reads `FS` base (x86_64) or `TPIDR_EL0` (aarch64) back into the thread it switches away
@@ -608,7 +609,9 @@ handler to the default while an ignored signal stays ignored.
   record above it that the handler's `x29` points at. The handler starts with the signal, the
   `siginfo` and the `ucontext` in its first three argument registers. Neither frame holds
   floating-point or SIMD state: a handler that uses those registers changes them under the code
-  it interrupted.
+  it interrupted. A frame that comes back *claiming* such state — a non-null `fpstate` pointer on
+  x86_64, any record in aarch64's reserved space — is refused rather than read past, so no
+  program is told its registers were restored when they were not.
 - **`rt_sigreturn`** reads the frame back with `signal::restore`. The frame is the program's to
   write, so a return address outside the user half, or on aarch64 a processor state that is not
   EL0 with only the condition flags, is refused, and on x86_64 only the flags a program may hold
@@ -668,17 +671,26 @@ no corpus yet for a gap to fail.
 
 - **Signals are not complete.** Nothing stops a process: `SIGSTOP` is refused, and the default
   action of the other stop signals does nothing. There is no alternate signal stack,
-  `rt_sigsuspend`, `rt_sigtimedwait` or `signalfd`. A pending signal is a bit, so a second one
-  sent before the first is delivered is lost, real-time signals included: nothing is queued, and
-  `sigqueue` does not exist.
-- **The frame still holds no floating-point or SIMD state,** and that is a gap rather than a
-  choice that is safe on either architecture. The kernel itself cannot clobber those registers
-  — every port is built `+soft-float` with SIMD off, so no kernel instruction touches them, and
-  that is why nothing has needed saving before now. A *handler* is a different matter: it is the
-  program's own code, and one that uses those registers changes them under the code it
-  interrupted, which a program is entitled to assume cannot happen. Saving them means an
-  `fxsave` area behind `sigcontext`'s `fpstate` pointer on x86_64 and an `fpsimd_context` record
-  in aarch64's reserved space, restored by `rt_sigreturn`.
+  `rt_sigsuspend`, `rt_sigtimedwait` or `signalfd`.
+- **Real-time signals queue; the rest coalesce.** A signal of 32 or above sent with
+  `rt_sigqueueinfo` is kept whole — three sent are three delivered, oldest first, each with its
+  own `si_value` — up to eight entries per process, after which a send is `EAGAIN` rather than a
+  silent drop. Below 32 a pending signal is still one bit, so a second before the first is
+  delivered is the same signal arriving once, keeping the first sender's value. Delivery takes
+  the lowest number first, as Linux does.
+- **The frame still holds no floating-point or SIMD state,** and the fix is larger than the
+  frame. A handler is the program's own code, and one that uses those registers changes them
+  under the code it interrupted — but so does *any other thread that runs*, because no context
+  switch on either port saves them either: `hal::HasFpu` is the unbuilt work that would, and
+  aarch64's context switch asserts at compile time that nothing in the image can name an FP
+  register. On x86_64 the question does not even arise yet: `CR4.OSFXSR` is never set, so a user
+  SSE instruction raises #UD, which the personality reports as `SIGILL`, and `fxsave` would save
+  no XMM state at all. Saving state in the frame while a context switch drops it would be a
+  guarantee that is false the moment another thread runs, so the frame instead **refuses** a
+  frame that claims such state. Doing it properly means `HasFpu`: a save area in the thread
+  context, saved and restored by the context switch, `CR4.OSFXSR` and `OSXMMEXCPT` set on every
+  CPU, and then an `fxsave` area behind `sigcontext`'s `fpstate` pointer on x86_64 and an
+  `fpsimd_context` record in aarch64's reserved space.
 - **A handler cannot run from every trap.** Delivery from an interrupt covers the scheduler's
   vectors, so a thread spinning in user mode is reached; a device interrupt that arrives while a
   process runs still returns without delivering, and the signal waits for the next scheduler
