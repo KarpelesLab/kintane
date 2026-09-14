@@ -171,6 +171,26 @@ jobs:
           done
           exit $fail
 
+      # kbuild refuses a kernel whose boot stack is not BOOT_STACK_KIB, but at the default of
+      # 16 KiB it cannot tell a port that honours the option from one that hard-codes 16 KiB.
+      # A size no preset uses can. See docs/testing.md, "The boot stack".
+      - name: Every port sizes its boot stack from the configuration
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in config/presets/*.preset; do
+            name=$(basename "$p" .preset)
+            echo "::group::BOOT_STACK_KIB=20 $name"
+            if ./kbuild/target/release/kbuild build --preset "$name" --set BOOT_STACK_KIB=20; then
+              echo "boot stack ok: $name"
+            else
+              echo "::error title=boot stack not configurable::preset $name"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       # Gate 8 in docs/testing.md: each preset's SIZE_BUDGET_KIB. The deltas against
       # config/size-baseline are printed for the reviewer; only the budget fails.
       - name: Size budget on every preset

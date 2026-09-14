@@ -234,6 +234,9 @@ pub struct ImageSections {
     ///
     /// `(0, 0)` means the port has not carved one out yet.
     pub stack_guard: (u64, u64),
+    /// The boot stack, `[bottom, top)`, directly above `stack_guard`: what the first thread
+    /// of execution runs on, `BOOT_STACK_KIB` of it. `(0, 0)` where the port has not said.
+    pub boot_stack: (u64, u64),
     /// Kernel thread stacks, each above a guard page of its own. Inside `data`, with
     /// every guard page punched back out of it the way `stack_guard` is.
     ///
@@ -351,6 +354,7 @@ impl ImageSections {
             rodata: (0, 0),
             data: (0, 0),
             stack_guard: (0, 0),
+            boot_stack: (0, 0),
             thread_stacks: StackArray::NONE,
         }
     }

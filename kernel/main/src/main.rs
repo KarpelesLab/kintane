@@ -11,6 +11,7 @@
 #![feature(sync_unsafe_cell)]
 
 mod bootargs;
+mod bootstack;
 mod clock;
 mod crash;
 #[cfg(CONFIG_MM_PAGED)]
@@ -194,6 +195,8 @@ type BootOnce<T> = sync::IrqOnce<T, Cpu>;
 /// Called exactly once, by the architecture's boot code, with interrupts masked.
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(boot_arg: u64) -> ! {
+    // Before anything goes deeper than this frame, so the high-water mark sees all of it.
+    bootstack::paint();
     // SAFETY: first and only initialisation of COM1, before any other writer exists.
     unsafe { arch::EARLY.init() };
 
@@ -233,6 +236,10 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // overwritten, and the damage would surface much later, somewhere else.
     let intact = live.still_intact(c);
 
+    // After the banner's checks and the in-kernel suite, everything the boot runs on this
+    // stack before the scheduler takes it over.
+    let stack = bootstack::check(c);
+
     crash::if_configured();
 
     // Both halves gate the exit status. Until this line existed, only the in-kernel
@@ -240,7 +247,7 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
     // kernel address space, printed them, and discarded all four — so a W^X regression
     // printed FAILED and still exited as a pass. A check that cannot change the outcome
     // is a log line.
-    let verdict = ok && boot != Check::Failed && intact;
+    let verdict = ok && boot != Check::Failed && intact && stack != Check::Failed;
     // A loader that counts boots hears from here whether this one worked; one that fell
     // back to safe mode is held to having done so. Every other image's verdict stands.
     let verdict = lastgood::settle(c, boot_arg, verdict);

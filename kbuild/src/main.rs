@@ -5,6 +5,7 @@
 
 mod bios;
 mod bootcfg;
+mod bootstack;
 mod build;
 mod buildid;
 mod cache;
@@ -1071,6 +1072,9 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     }
 
     let linked = image.ok_or("no unit of kind `bin` was built; nothing to boot")?;
+    // Before anything is packaged: a kernel whose port ignored BOOT_STACK_KIB is refused
+    // here rather than booted with a stack of some other size.
+    bootstack::verify(&b.tc.tool("llvm-nm")?, &linked, res.int("BOOT_STACK_KIB"))?;
     let symbols = b.split_symbols(&linked)?;
     let build_id = buildid::stamp(&b.tc.tool("llvm-objcopy")?, &linked, &symbols)?;
     let entries = bootcfg::entry_list(&res, bootcfg::Chain::File(build::ESP_CHAIN_TEST_ENTRY_PATH));

@@ -67,13 +67,7 @@ _start:
     wfi
     j       .Lpark
 
-// The boot stack, in its own section above a page nothing else uses (see link.ld).
-.section .stack, "aw", @nobits
-.balign 4096
-.globl __stack_bottom
-.globl __stack_top
-__stack_bottom:
-    .skip 16384
-__stack_top:
+// The boot stack is not reserved here: link.ld reserves CONFIG_BOOT_STACK_KIB of it, above a
+// page nothing else uses, and defines `__stack_bottom` and `__stack_top`.
 "#
 );

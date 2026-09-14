@@ -162,13 +162,16 @@ fn identity_section(text: &str) -> Vec<u8> {
     v
 }
 
-crate::declare_interface! {
+// The interfaces these tests load modules against, as their import tables record them. Only
+// the signatures: nothing here calls a module, and declaring `kt_add` `extern "C"` twice with
+// two signatures would be the very clash the loader exists to catch at load time.
+crate::interface_signatures! {
     fn kt_log(ptr: *const u8, len: usize);
     fn kt_add(a: u64, b: u64) -> u64;
 }
 
 mod other_interface {
-    crate::declare_interface! {
+    crate::interface_signatures! {
         fn kt_log(ptr: *const u8, len: usize);
         fn kt_add(a: u32, b: u32) -> u32;
     }

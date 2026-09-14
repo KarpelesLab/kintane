@@ -66,8 +66,15 @@
 //!   first worker while it was still busy.
 //! * **Priority.** `high` is spawned *after* the workers, so if its priority did not matter, the
 //!   queue order would put it behind them. It must run before either has counted anything. When its
-//!   timer wakes it, it must run within [`MAX_WAKE_LATENCY`] of the deadline while both workers are
-//!   still busy, which again only preemption can arrange.
+//!   timer wakes it, it must run inside the interrupt that woke it, before the next, and no
+//!   interrupt after its deadline may have passed it over, while both workers are still busy: which
+//!   again only preemption can arrange. How late that was is printed in microseconds and judged in
+//!   interrupts, because how late a loaded host delivers an interrupt is not the kernel's doing,
+//!   and what the kernel does with each one is.
+//! * **Slices.** Every timer interrupt that finds the workers contending must arm the next no more
+//!   than a [`SLICE`] away. The other evidence cannot see a missing slice on x86: the PIT cannot
+//!   arm further than 55 ms, so the workers still alternate every fifth slice, within the tickless
+//!   limit below. This used to be a count of interrupts in the window, which a loaded host fails.
 //! * **Interrupts keep arriving across switches.** Each worker records its longest stretch of spins
 //!   during which the interrupt counter did not move. It must stay within eight slices' worth,
 //!   measured against a spin rate calibrated just before the threads start. This is what an EOI
@@ -78,8 +85,11 @@
 //!   the wait still in progress. The timer is the only enabled interrupt, so an idle loop that spun
 //!   instead of halting would count far more waits than that.
 //!
-//! No wait depends on the scheduler behaving. The workers stop when boot tells them or
-//! after 50 slices' worth of calibrated spins, whichever comes first. The spin cap is
+//! No wait depends on the scheduler behaving, or on the host. Boot stops the workers once
+//! their window has passed and `high` has woken, and waits for everyone to finish, a slice at
+//! a time: a host that stalls the emulator moves the guest's clock past a fixed window without
+//! the threads having run in it. [`PATIENCE`] bounds both waits. The workers stop when boot
+//! tells them or after 50 slices' worth of calibrated spins, whichever comes first. The spin cap is
 //! what keeps a thread that cannot receive interrupts, because it never unmasked or its
 //! interrupt was never acknowledged, from spinning forever. Everything after the workers
 //! waits for a timer, and idle unmasks and waits for exactly that. With preemption
@@ -122,13 +132,17 @@ const HIGH_WAKES_AFTER: Duration = Duration::from_nanos(50_000_000);
 const WORKERS_STOP_AFTER: Duration = Duration::from_nanos(250_000_000);
 const BOOT_WAKES_AFTER: Duration = Duration::from_nanos(300_000_000);
 
-/// `high` must be running within this long of its deadline. Its timer interrupt wakes it
-/// and switches to it, so microseconds are expected; two slices tolerate an emulator that
-/// delivers the interrupt late.
-const MAX_WAKE_LATENCY: Duration = Duration::from_nanos(2 * SLICE.as_nanos());
+/// The longest boot waits, from the check's start, for `high` to wake and for every thread to
+/// finish. Guest time, and a bound on a broken kernel rather than a pass criterion: a working
+/// one is done in about a third of a second of it.
+const PATIENCE: Duration = Duration::from_nanos(5_000_000_000);
 
-/// Interrupts the spin rate is calibrated over, starting on an interrupt edge.
-const CALIBRATION_TICKS: u64 = 2;
+/// The fewest contended interrupts the slice evidence is judged on: a switch each way.
+const MIN_CONTENDED: u64 = 2;
+
+/// Slices the spin rate is calibrated over, each measured alone, keeping the fastest. A host
+/// that stalls the emulator in the middle of a slice leaves fewer spins in it, never more.
+const CALIBRATION_TICKS: u64 = 4;
 /// Absolute bound on each calibration loop. Reached only if the timer is not ticking,
 /// which the interrupt selftest has already ruled out; it exists so that is reported.
 const CALIBRATION_CAP: u64 = 1 << 32;
@@ -162,6 +176,20 @@ static STACKS: [(AtomicUsize, AtomicUsize); MAX_STACKS] =
 /// Written by [`spawn`] under the scheduler lock, before the thread can run.
 static STARTS: [(AtomicUsize, AtomicUsize); MAX_STACKS] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; MAX_STACKS];
+
+/// The raw id of the thread last spawned on each stack slot, `u32::MAX` for none.
+///
+/// A slot may be spawned on again only once that thread has left the table, which is to say
+/// exited and been reaped: two live threads on one stack overwrite each other's frames, and
+/// the one that resumes second jumps to whatever the other left there. Ids are never reused,
+/// so a reaped thread's id is simply unknown to the table.
+static STACK_OWNERS: [AtomicU32; MAX_STACKS] = [const { AtomicU32::new(u32::MAX) }; MAX_STACKS];
+
+/// Whether stack slot `stack` may be spawned on: its last thread, if any, has left `t`.
+fn stack_free(t: &Threads<Cpu, SLOTS, { mp::CPUS }>, stack: usize) -> bool {
+    let owner = STACK_OWNERS[stack].load(Ordering::Relaxed);
+    owner == u32::MAX || t.state(ThreadId::new(owner)).is_none()
+}
 
 /// Slots of `STACKS` claimed so far.
 static CLAIMED: AtomicUsize = AtomicUsize::new(0);
@@ -246,6 +274,23 @@ static HIGH_FIRST_SAW: AtomicU64 = AtomicU64::new(u64::MAX);
 static HIGH_WOKE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Whether both workers were still busy when `high` resumed.
 static HIGH_PREEMPTED_WORKERS: AtomicBool = AtomicBool::new(false);
+/// `high`'s thread id, for the interrupt that wakes it to recognise it.
+static HIGH_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The boot CPU's interrupt count when an interrupt woke `high`, and when `high` resumed.
+/// `u64::MAX` until each happens.
+static HIGH_WOKEN_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+static HIGH_RESUMED_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+/// When the boot CPU's interrupt before the one that woke `high` found the clock, in
+/// nanoseconds. `u64::MAX` until an interrupt wakes `high`.
+static HIGH_WAKE_PREVIOUS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// When the boot CPU's latest scheduler interrupt found the clock, in nanoseconds.
+static LAST_TICK: AtomicU64 = AtomicU64::new(0);
+/// Set while the workers race, for [`on_tick`] to count what it did then.
+static RACING: AtomicBool = AtomicBool::new(false);
+/// Boot-CPU interrupts that found the workers contending while they raced, and those of them
+/// that armed the next interrupt no more than a slice away.
+static CONTENDED: AtomicU64 = AtomicU64::new(0);
+static SLICED: AtomicU64 = AtomicU64::new(0);
 /// Times the boot CPU's idle thread halted to wait for an interrupt.
 static IDLE_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Times a thread was suspended by the timer interrupt and later resumed.
@@ -374,6 +419,10 @@ fn on_tick() {
             while let Some(expired) = q.pop_expired(now) {
                 // The sleeper's timer is gone now; an early wake must not try to cancel it.
                 let _ = forget_timer(expired.payload);
+                if cpu == 0 && expired.payload.raw() == HIGH_ID.load(Ordering::Relaxed) {
+                    HIGH_WOKEN_TICK.store(interrupts, Ordering::Relaxed);
+                    HIGH_WAKE_PREVIOUS.store(LAST_TICK.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
                 match s.threads.wake_on(expired.payload) {
                     Ok(w) if w.cpu != cpu && w.reschedule => wakes_elsewhere |= 1 << w.cpu,
                     Ok(_) => {}
@@ -407,8 +456,17 @@ fn on_tick() {
     unsafe { mp::unlock() };
     send_reschedules(wakes_elsewhere);
     shared::from_interrupt();
+    if cpu == 0 {
+        LAST_TICK.store(now.as_nanos(), Ordering::Relaxed);
+    }
     // SAFETY: interrupt context, so masked.
-    unsafe { timekeeping::program(contended.then_some(SLICE)) };
+    let armed = unsafe { timekeeping::program(contended.then_some(SLICE)) };
+    if cpu == 0 && contended && RACING.load(Ordering::Relaxed) {
+        CONTENDED.fetch_add(1, Ordering::Relaxed);
+        if armed <= SLICE.as_nanos() {
+            SLICED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     kheap::irq_exit();
 
     // SAFETY: interrupt context, so masked, on `cpu`, with nothing held.
@@ -648,6 +706,9 @@ fn spawn_with(
         return None;
     }
     with_table(|t| {
+        if !stack_free(t, stack) {
+            return None;
+        }
         STARTS[stack].0.store(entry as usize, Ordering::Release);
         STARTS[stack].1.store(arg, Ordering::Release);
         let here = Cpu::cpu_index();
@@ -656,9 +717,9 @@ fn spawn_with(
             None => (CpuSet::all(mp::CPUS), here, false),
         };
         // SAFETY: `top` and `size` describe a guarded slot claimed for the scheduler alone,
-        // mapped read-write. The caller guarantees no live thread uses it: either it was
+        // mapped read-write, and `stack_free` has just shown no live thread uses it: it was
         // never handed out, or its thread exited and was reaped.
-        unsafe {
+        let id = unsafe {
             t.spawn_on(
                 thread_start,
                 stack,
@@ -670,7 +731,9 @@ fn spawn_with(
                 idle,
             )
         }
-        .ok()
+        .ok()?;
+        STACK_OWNERS[stack].store(id.raw(), Ordering::Relaxed);
+        Some(id)
     })
 }
 
@@ -752,14 +815,17 @@ fn spawn_prepared_at(
         return None;
     }
     with_table(|t| {
+        if !stack_free(t, stack) {
+            return None;
+        }
         STARTS[stack].0.store(entry as usize, Ordering::Release);
         STARTS[stack].1.store(arg, Ordering::Release);
         let (affinity, cpu) = match pinned {
             Some(cpu) => (CpuSet::single(cpu), cpu),
             None => (CpuSet::all(mp::CPUS), Cpu::cpu_index()),
         };
-        // SAFETY: as in `spawn_with`: a guarded slot claimed for the scheduler alone,
-        // whose previous thread the caller guarantees has been reaped.
+        // SAFETY: as in `spawn_with`: a guarded slot claimed for the scheduler alone, whose
+        // previous thread `stack_free` has just shown to be gone.
         let id = unsafe {
             t.spawn_on(
                 thread_start,
@@ -773,6 +839,7 @@ fn spawn_prepared_at(
             )
         }
         .ok()?;
+        STACK_OWNERS[stack].store(id.raw(), Ordering::Relaxed);
         // The thread is queued but not running, so its saved context is the one a switch
         // into it will load, and `context_mut` refuses anything else.
         prepare(t.context_mut(id).ok()?, KernAddr::new(top));
@@ -814,13 +881,6 @@ pub fn set_affinity(id: ThreadId, mask: u64) -> bool {
 }
 
 /// Whether `id` still exists in the table and has not exited.
-#[cfg_attr(
-    not(CONFIG_USERSPACE),
-    expect(
-        dead_code,
-        reason = "used only by the process checks, which need USERSPACE"
-    )
-)]
 pub fn alive(id: ThreadId) -> bool {
     with_table(|t| !matches!(t.state(id), None | Some(thread::State::Exited)))
 }
@@ -1122,18 +1182,18 @@ fn calibrate() -> u64 {
     // masked from the `irq_save` below, which is the state it saved.
     unsafe { arch::tick::enable_interrupts() };
     let t0 = arch::tick::ticks();
-    // Start on an interrupt edge, so the measured span is whole slices.
+    // Start on an interrupt edge, so each measured span is a whole slice.
     let _ = spin(&SCRATCH, t0 + 1, &NEVER, CALIBRATION_CAP);
-    let end = t0 + 1 + CALIBRATION_TICKS;
-    let spun = spin(&SCRATCH, end, &NEVER, CALIBRATION_CAP);
-    let reached = arch::tick::ticks() >= end;
+    let (mut fastest, mut reached) = (0, true);
+    for tick in 0..CALIBRATION_TICKS {
+        let end = t0 + 2 + tick;
+        let spun = spin(&SCRATCH, end, &NEVER, CALIBRATION_CAP);
+        reached &= arch::tick::ticks() >= end;
+        fastest = fastest.max(spun.spins);
+    }
     let _ = Cpu::irq_save();
     arch::tick::set_hook(None);
-    if reached {
-        spun.spins / CALIBRATION_TICKS
-    } else {
-        0
-    }
+    if reached { fastest } else { 0 }
 }
 
 extern "C" fn worker(which: usize) -> ! {
@@ -1155,6 +1215,7 @@ extern "C" fn high(_: usize) -> ! {
 
     sleep_until(start().saturating_add(HIGH_WAKES_AFTER));
 
+    HIGH_RESUMED_TICK.store(arch::tick::ticks(), Ordering::Relaxed);
     HIGH_WOKE_AT.store(timekeeping::now().as_nanos(), Ordering::Relaxed);
     let busy = !DONE[0].load(Ordering::Relaxed) && !DONE[1].load(Ordering::Relaxed);
     HIGH_PREEMPTED_WORKERS.store(busy, Ordering::Relaxed);
@@ -1173,6 +1234,13 @@ fn priority(level: u8) -> Priority {
 
 fn start() -> Instant {
     Instant::from_nanos(START.load(Ordering::Relaxed))
+}
+
+/// Sleep a slice at a time until `done` holds or `give_up` has passed.
+fn wait_in_slices(give_up: Instant, done: impl Fn() -> bool) {
+    while !done() && timekeeping::now() < give_up {
+        sleep_until(timekeeping::now().saturating_add(SLICE));
+    }
 }
 
 /// Run the threads and judge the result. Called once, from `kmain`, with interrupts
@@ -1241,6 +1309,8 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
         }
     }
     SCHEDULER_BUILT.store(true, Ordering::Relaxed);
+    // `high` is the plan's fourth thread.
+    HIGH_ID.store(ids[3].raw(), Ordering::Relaxed);
 
     let per_tick = calibrate();
     if per_tick == 0 {
@@ -1257,24 +1327,40 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     let start = timekeeping::now();
     START.store(start.as_nanos(), Ordering::Relaxed);
 
-    // The boot thread's part: nothing, until the workers' time is up, then nothing
-    // again until the rest are done.
+    // The boot thread's part: nothing, until the workers' time is up and `high` has woken,
+    // then nothing again until the rest are done. See the module documentation for why
+    // neither is only a fixed window.
+    RACING.store(true, Ordering::Relaxed);
+    let give_up = start.saturating_add(PATIENCE);
     sleep_until(start.saturating_add(WORKERS_STOP_AFTER));
+    wait_in_slices(give_up, || HIGH_RESUMED_TICK.load(Ordering::Relaxed) != u64::MAX);
+    RACING.store(false, Ordering::Relaxed);
     STOP_WORKERS.store(true, Ordering::Relaxed);
     sleep_until(start.saturating_add(BOOT_WAKES_AFTER));
+    // Until they have exited, not until they have set a flag on the way: a thread preempted
+    // between the two is not reapable yet.
+    wait_in_slices(give_up, || ids[1..].iter().all(|&id| !alive(id)));
     let interrupts = arch::tick::ticks() - interrupts;
     let elapsed = timekeeping::now().saturating_duration_since(start);
 
-    // Every thread but idle has exited by now; give their slots back and let the table
-    // check itself in its final state.
+    // Every thread but idle has exited by now, unless the kernel is broken or `PATIENCE` ran
+    // out; give their slots back and let the table check itself in its final state.
     let reaped = ids[1..].iter().all(|&id| reap(id));
-    let consistent = reaped && table_ok();
+    let consistent = table_ok();
 
-    let preempted = report(c, interrupts, elapsed, consistent);
+    let preempted = report(c, interrupts, elapsed, reaped, consistent);
 
-    // The shared-state checks run on the same scheduler, with idle still in place and
-    // the stacks the threads above gave back.
-    let shared = shared::run(c);
+    // The shared-state checks run on the same scheduler, with idle still in place and on
+    // the stacks the threads above gave back. Not if one was not given back: its thread is
+    // still in the table and may yet resume on that stack. `spawn` would refuse the slot
+    // anyway; before it did, a boot on a loaded host started the sleep phase on a worker's
+    // stack and faulted, at a garbage address, when the worker resumed.
+    let shared = if reaped {
+        shared::run(c)
+    } else {
+        c.write_str("\n  shared     not run: a scheduler thread's stack is still in use");
+        Check::Failed
+    };
 
     arch::tick::stop();
     arch::tick::set_hook(None);
@@ -1284,7 +1370,13 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     preempted.and(shared)
 }
 
-fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bool) -> Check {
+fn report(
+    c: &dyn EarlyConsole,
+    interrupts: u64,
+    elapsed: Duration,
+    reaped: bool,
+    table_ok: bool,
+) -> Check {
     let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let counts = [load(&COUNT[0]), load(&COUNT[1])];
     let saw = [load(&SAW_OTHER[0]), load(&SAW_OTHER[1])];
@@ -1295,21 +1387,22 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
     let woke_at = load(&HIGH_WOKE_AT);
     let wake_deadline = start().saturating_add(HIGH_WAKES_AFTER).as_nanos();
     let latency = woke_at.saturating_sub(wake_deadline);
-    let prompt = woke_at != u64::MAX
-        && latency <= MAX_WAKE_LATENCY.as_nanos()
-        && HIGH_PREEMPTED_WORKERS.load(Ordering::Relaxed);
+    // In interrupts: the one before the interrupt that woke `high` came before its deadline,
+    // so none after the deadline passed it over, and `high` ran inside the one that woke it.
+    let woken_tick = load(&HIGH_WOKEN_TICK);
+    let first_after_deadline = woken_tick != u64::MAX && load(&HIGH_WAKE_PREVIOUS) < wake_deadline;
+    let ran_in_it = woken_tick != u64::MAX && load(&HIGH_RESUMED_TICK) == woken_tick;
+    let busy = HIGH_PREEMPTED_WORKERS.load(Ordering::Relaxed);
+    let prompt = first_after_deadline && ran_in_it && busy;
     // Every wait but the one still in progress ended with an interrupt.
     let idled = load(&IDLE_WAITS) > 0 && load(&IDLE_WAITS) <= interrupts + 1;
     let per_tick = load(&SPINS_PER_TICK);
     let tickless = [load(&LONGEST_TICKLESS[0]), load(&LONGEST_TICKLESS[1])];
     let ticks_kept_coming = tickless.iter().all(|&t| t <= per_tick * MAX_TICKLESS_TICKS);
-    // The workers contend for the whole of their window, so a slice must have been armed
-    // on every interrupt in it. Half the slices it holds is the floor. The other
-    // evidence cannot see a missing slice on x86: the PIT cannot arm further than 55 ms,
-    // so the workers still alternate every fifth slice, within the tickless limit. Only
-    // the count of interrupts shows that nothing asked for the slice.
-    let min_interrupts = WORKERS_STOP_AFTER.as_nanos() / SLICE.as_nanos() / 2;
-    let sliced = interrupts >= min_interrupts;
+    // What the kernel asked of the timer on each interrupt that found the workers contending,
+    // which is its own doing however late the host delivered the interrupt.
+    let (contended, armed) = (load(&CONTENDED), load(&SLICED));
+    let sliced = contended >= MIN_CONTENDED && armed == contended;
 
     write_usize(c, DEMO_THREADS);
     c.write_str(" threads, ");
@@ -1326,10 +1419,15 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
     if !idled {
         c.write_str(" BUT DID NOT HALT UNTIL AN INTERRUPT");
     }
-    if !sliced {
-        c.write_str(", TOO FEW FOR SLICES (at least ");
-        write_usize(c, min_interrupts as usize);
-        c.write_str(")");
+    c.write_str("; ");
+    write_usize(c, armed as usize);
+    c.write_str(" of ");
+    write_usize(c, contended as usize);
+    c.write_str(" contended interrupts armed a slice");
+    if contended < MIN_CONTENDED {
+        c.write_str(", TOO FEW CONTENDED INTERRUPTS TO JUDGE");
+    } else if armed != contended {
+        c.write_str(", A CONTENDED INTERRUPT ARMED NO SLICE");
     }
 
     c.write_str("\n             round robin: ");
@@ -1354,11 +1452,15 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
     } else {
         c.write_str("woke ");
         write_usize(c, (latency / 1_000) as usize);
-        c.write_str(" us late ");
-        if latency > MAX_WAKE_LATENCY.as_nanos() {
-            c.write_str("(TOO LATE) ");
-        }
-        c.write_str(if HIGH_PREEMPTED_WORKERS.load(Ordering::Relaxed) {
+        c.write_str(" us late, ");
+        c.write_str(if !first_after_deadline {
+            "AN INTERRUPT AFTER ITS DEADLINE PASSED IT OVER, "
+        } else if !ran_in_it {
+            "NOT IN THE INTERRUPT THAT WOKE IT, "
+        } else {
+            "in the interrupt that woke it, "
+        });
+        c.write_str(if busy {
             "over busy workers"
         } else {
             "AFTER THE WORKERS FINISHED"
@@ -1378,6 +1480,11 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
         c.write_str(" A THREAD STOPPED RECEIVING INTERRUPTS");
     }
 
+    if !reaped {
+        c.write_str(
+            "\n             A THREAD HAD NOT EXITED, so its slot and stack were not given back",
+        );
+    }
     if !table_ok {
         c.write_str("\n             thread table INCONSISTENT after the run");
     }
@@ -1390,6 +1497,7 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
             && ticks_kept_coming
             && sliced
             && idled
+            && reaped
             && table_ok
             && broken == 0,
     )

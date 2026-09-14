@@ -102,7 +102,7 @@ _start:
     movw %ax, %fs
     movw %ax, %gs
     movw %ax, %ss
-    movl $stack_top, %esp
+    movl $__stack_top, %esp
     xorl %ebp, %ebp
 
     movl %esi, multiboot_info
@@ -219,15 +219,10 @@ pd:
 multiboot_info:
     .skip 4
 
-// The boot stack, in a section of its own so that a page-sized hole can be left below
-// it. `link.ld` aligns the section to a page and exports __stack_guard_start /
-// __stack_guard_end for the page beneath; nothing else may be placed there, and the
-// address space the kernel builds for itself leaves it unmapped.
-.section .stack, "aw", @nobits
-.align 4096
-stack_bottom:
-    .skip 16384
-stack_top:
+// The boot stack is not reserved here. `link.ld` reserves CONFIG_BOOT_STACK_KIB of it in a
+// section of its own, page-aligned, with __stack_guard_start / __stack_guard_end for the
+// page beneath; nothing else may be placed there, and the address space the kernel builds
+// for itself leaves it unmapped.
 "#,
     options(att_syntax)
 );
