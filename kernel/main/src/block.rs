@@ -28,7 +28,7 @@ use mm::phys::FrameAllocator;
 use virtio_blk::VirtioBlk;
 use virtio_blk::mem::Dma;
 
-use crate::{Check, Live, Locks, intx, iommu, write_usize};
+use crate::{Check, Live, Locks, intx, iommu, timekeeping, write_usize};
 
 /// Frames for the rings and for every request that may be in flight: each has its own
 /// header, status byte and bounce buffer, so the driver can have several outstanding.
@@ -641,6 +641,9 @@ const BLOCKED_SPINS: u32 = 2_000_000;
 /// function's and a wide destination, each followed by a restore.
 const ENTRY_CHANGES: u64 = 6;
 
+/// Entry changes [`remap_check`] times, to report what one flush costs.
+const FLUSH_SAMPLES: u64 = 256;
+
 pub fn remap_check(c: &dyn EarlyConsole) -> Check {
     if !kconfig::IOMMU {
         c.write_str("skipped: no IOMMU in this build");
@@ -729,6 +732,34 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
             c.write_str("; AN ENTRY CHANGED IN USE WAS NOT FLUSHED");
             return Check::Failed;
         }
+    }
+
+    // What a flush costs: the entry rewritten to the same CPU and its cache invalidated through
+    // the queue, the wait included, averaged over several.
+    c.write_str("; ");
+    let flushes_from = timekeeping::now();
+    for _ in 0..FLUSH_SAMPLES {
+        if let Err(why) = iommu::route_disk_interrupt(line, 0) {
+            c.write_str("; ");
+            c.write_str(why);
+            return Check::Failed;
+        }
+    }
+    let flushes_ns = timekeeping::now()
+        .saturating_duration_since(flushes_from)
+        .as_nanos();
+    write_usize(c, FLUSH_SAMPLES as usize);
+    if flushes_ns == 0 {
+        c.write_str(" entry changes flushed below the boot clock's resolution");
+    } else {
+        c.write_str(" entry changes flushed in ");
+        write_usize(c, (flushes_ns / FLUSH_SAMPLES) as usize);
+        c.write_str(" ns each");
+    }
+    if let Some(stats) = iommu::invalidation_stats() {
+        c.write_str(" (longest wait ");
+        write_usize(c, stats.longest_wait as usize);
+        c.write_str(" status reads)");
     }
 
     c.write_str("; restored");

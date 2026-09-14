@@ -668,6 +668,9 @@ const IRQ_CPU: usize = 1;
 const DOMAIN_CPU: usize = 2;
 const FRESH_CPU: usize = 3;
 
+/// Entry changes [`smp_check`] times, to report what a flush through the queue costs.
+const FLUSH_SAMPLES: u64 = 64;
+
 /// Where a run's domains are placed.
 #[derive(Clone, Copy)]
 enum Placement {
@@ -750,7 +753,26 @@ pub fn smp_check(c: &dyn EarlyConsole) -> Check {
         let _ = preempt::set_affinity(me, every_cpu);
         return Check::Failed;
     }
-    c.write_str("client on CPU 0, interrupt on CPU 1; ");
+    c.write_str("client on CPU 0, interrupt on CPU 1");
+    // What changing the entry costs once the scheduler owns the clock: the entry rewritten to the
+    // same CPU and its cache flushed through the queue, the wait included, averaged.
+    let flushes_from = timekeeping::now();
+    for _ in 0..FLUSH_SAMPLES {
+        if route(IRQ_CPU).is_err() {
+            c.write_str("; THE ENTRY COULD NOT BE CHANGED AGAIN");
+            let _ = preempt::set_affinity(me, every_cpu);
+            return Check::Failed;
+        }
+    }
+    let flushes_ns = timekeeping::now()
+        .saturating_duration_since(flushes_from)
+        .as_nanos();
+    if iommu::disk_interrupt_remapped() {
+        c.write_str("; an entry change flushed in ");
+        write_usize(c, (flushes_ns / FLUSH_SAMPLES) as usize);
+        c.write_str(" ns");
+    }
+    c.write_str("; ");
 
     let taken = |cpu| platform::interrupts_on_cpu(line, cpu);
     let before: [u64; mp::CPUS] = core::array::from_fn(taken);
