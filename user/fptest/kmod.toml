@@ -1,0 +1,39 @@
+# A native program built for the architecture's hard-float target: the proof that one
+# works at all.
+#
+# Every other user program is built for the kernel's own specification, which disables
+# floating point — `-mmx,-sse,+soft-float` on x86_64, `-neon` on aarch64 — so no code in
+# the image could name a floating-point register, and nothing that needs one could be
+# tested. This unit asks for `float = "hard"`, which builds it, its `user`-layer closure
+# and a `core` of its own for `targets/<target>-hf.json`; see docs/targets.md.
+#
+# **Single-threaded, and it must stay that way.** A context switch saves no floating-point
+# state on either port (`hal::HasFpu` is unimplemented), so two threads using those
+# registers would silently clobber each other. This program uses them on one thread and
+# exits; nothing here creates a second.
+#
+# `userfp` is a provider name: with USERSPACE off, `user/fptest-none` provides it as an
+# empty library, so the image depends on the name in every configuration. USERSPACE already
+# depends on `(ARCH_X86_64 || ARCH_AARCH64) && MM_PAGED`, which is exactly the set of
+# architectures that have a hard-float specification.
+[unit]
+name = "userfp"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+float = "hard"
+# As `user/udp-client`: position-independent code at a static link address, the shared
+# user linker script — which is where the KinTane ABI note comes from, so the loader tags
+# this native — and no debug info, because it is embedded with `include_bytes!`.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-T$ROOT/user/init/link.ld",
+    "-C", "link-arg=--no-warnings",
+    "-C", "strip=debuginfo",
+]
+
+[deps]
+units = ["abi"]
+
+[config]
+requires = "USERSPACE"

@@ -1,0 +1,14 @@
+# `userfp` on a configuration without userspace: nothing to embed. The image depends on the
+# name in every configuration, and only this provider is selected when USERSPACE is off —
+# which is also every architecture with no hard-float target specification.
+[unit]
+name = "userfp"
+kind = "lib"
+root = "src/lib.rs"
+layer = "user"
+
+[deps]
+units = []
+
+[config]
+requires = "!USERSPACE"

@@ -375,6 +375,33 @@ Syscall dispatch is generated from `#[syscall]` attributes
 table, the argument-validation code, the userspace bindings, and the documentation
 generated from one source.
 
+## Floating point
+
+A program may not use floating point, with one exception, and the exception is a test.
+
+Every user program is built for the kernel's target specification, which disables floating
+point: `a * b` on two doubles compiles to a call to `__muldf3` in `compiler_builtins`, and no
+floating-point register is named anywhere in the image. That is deliberate — it is what lets a
+context switch save only the general-purpose registers — but it also meant nothing that uses
+those registers could be written, and so nothing could be tested.
+
+A unit may now ask for `float = "hard"`, which builds it and its `user`-layer closure for a
+hard-float target of its own; see [targets.md](targets.md#hard-float-user-programs). Exactly
+one does: `user/fptest`.
+
+**A program built this way must be single-threaded.** No context switch on any port saves
+floating-point state — `hal::HasFpu` is unimplemented, and `arch/aarch64/src/context.rs`
+asserts at compile time that the kernel itself cannot name such a register — so two threads
+using them would overwrite each other's values with no fault, no warning and no diagnostic.
+The kernel will happily schedule such a program; it simply will not preserve what it is
+computing with. Until that trait is implemented, a hard-float program may use these registers
+only on the thread the kernel started it on.
+
+On x86_64 the kernel makes the instructions legal (`CR4.OSFXSR`, `CR4.OSXMMEXCPT`, `CR0.EM`
+clear), which it previously had no reason to do, since its own code emits none. Without those
+bits a user program's first SSE instruction raises `#UD`, which the Linux personality reports
+as `SIGILL`.
+
 ## Waiting on many things at once
 
 `object_wait_any` (call 35) waits on a set of objects until any of them is ready or a deadline

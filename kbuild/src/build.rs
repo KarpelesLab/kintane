@@ -35,8 +35,8 @@ pub struct Build {
     /// module uses, so that only the code the module reaches ends up in it. The kernel
     /// does not, and bitcode would only make its rlibs larger.
     pub bitcode: bool,
-    /// Build position-independent. Set only for the user-program flavor (`main::build_user_flavor`),
-    /// never for the kernel or its modules; see `Build::common`.
+    /// Build position-independent. Set only for the user-program flavor
+    /// (`main::build_user_flavor`), never for the kernel or its modules; see `Build::common`.
     pub pic: bool,
     pub verbose: bool,
 }
@@ -209,6 +209,52 @@ impl Build {
     /// they build everything else.
     pub fn user_needs_pic(&self) -> bool {
         self.cfgs.iter().any(|c| c == "CONFIG_ARCH_X86_64")
+    }
+
+    /// A flavor for user programs that ask for hard float, into an `out/user-hf`
+    /// subdirectory, built against `targets/<target>-hf.json` — the same specification as
+    /// the kernel's but without `rustc-abi: softfloat`, which is the field that rejects the
+    /// floating-point features rather than the feature string itself.
+    ///
+    /// It is a separate flavor because the target is part of every cache key
+    /// (`Target::key`), so this `core` and the soft-float one are distinct entries that can
+    /// never be served for one another. The kernel keeps its own target either way: nothing
+    /// here changes how a kernel crate or a module is built.
+    ///
+    /// Position-independent on the same architectures as [`Self::user_flavor`], for the same
+    /// reason — the link address, which hard float does not change.
+    pub fn hard_float_flavor(&self) -> Result<Build, String> {
+        let spec = self
+            .root
+            .join("targets")
+            .join(format!("{}-hf.json", self.target_name));
+        if !spec.exists() {
+            return Err(format!(
+                "a unit asks for `float = \"hard\"`, but this architecture has no hard-float \
+                 target specification at {}\n  only x86_64 and aarch64 have one; see \
+                 docs/targets.md",
+                spec.display()
+            ));
+        }
+        let out = self.out.join("user-hf");
+        std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(Build {
+            root: self.root.clone(),
+            tc: self.tc.clone(),
+            target_name: format!("{}-hf", self.target_name),
+            target: Target::Spec(spec),
+            out,
+            gen_dir: self.gen_dir.clone(),
+            cache: Cache::new(self.root.join("build/cache"))?,
+            cfgs: self.cfgs.clone(),
+            check_cfgs: self.check_cfgs.clone(),
+            opt_level: self.opt_level.clone(),
+            link_script: self.link_script.clone(),
+            deny_warnings: self.deny_warnings,
+            bitcode: self.bitcode,
+            pic: self.user_needs_pic(),
+            verbose: self.verbose,
+        })
     }
 
     /// Build `core` from the pinned toolchain's own source.

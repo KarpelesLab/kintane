@@ -271,6 +271,35 @@ source with our codegen flags — no prebuilt `core` from rustup, because we nee
 matching `panic_immediate_abort`, `-C soft-float` on targets that require it, and
 consistent `-C relocation-model`.
 
+### Flavors: how a user program can be built differently
+
+A user program is built for the kernel's target, with the kernel's `core`, and linked by its
+own script. Two things make that not quite enough, and each adds a *flavor*: a `Build` of its
+own, writing into a subdirectory of `out`, with its own copies of `core`, `compiler_builtins`,
+`kconfig` and the `user`-layer crates the program links.
+
+- **`out/user`** is position-independent, for architectures whose user half is out of reach of
+  the static model's relocations — x86_64, at 512 GiB. See `Build::user_flavor`.
+- **`out/user-hf`** is built for `targets/<target>-hf.json`, the hard-float specification, for
+  a unit that asks with `float = "hard"`. See `Build::hard_float_flavor` and
+  [targets.md](targets.md#hard-float-user-programs).
+
+A flavor exists only if something needs it: a configuration with no hard-float unit builds no
+second `core`, and on an architecture needing neither flavor a user program is built by the
+kernel's own `Build`, as all of them were before flavors existed.
+
+**The cache keeps them apart by construction.** The target specification's contents are part of
+every cache key (`Target::key`), so a soft-float `core` and a hard-float one are different
+entries and neither can be served for the other. That is worth stating because the two are
+otherwise identical inputs — same source, same toolchain, same flags — and a key that omitted
+the target would quietly serve one for the other, producing a program that looks right and
+holds no floating-point instruction.
+
+**What it costs.** Each `core` is about 69.8 MB of rlib and is the bulk of the work: a cold
+build of `x86_64-qemu` with the hard-float flavour compiles 53 units in 39.4 s wall, against
+16.0 s when the cache is warm and only the changed units rebuild. A configuration that selects
+no hard-float unit pays nothing at all — not a second `core`, not a directory.
+
 ### Images for another target
 
 A unit may name a target of its own:

@@ -16,6 +16,7 @@ mod dwarf;
 mod esp;
 mod fat16;
 mod fat32;
+mod fpregs;
 mod fuzz;
 mod graph;
 mod hosttest;
@@ -684,27 +685,22 @@ fn dispatch(args: &[String]) -> Result<(), String> {
 /// built in, where the architecture needs it (x86_64). It holds a PIC [`build::Build`] into
 /// `out/user` and a map of what it has built there, so the shared `core`, `compiler_builtins`,
 /// `kconfig` and library crates are built once and reused across the user programs.
-struct UserFlavor {
+struct Flavor {
     b: build::Build,
     built: BTreeMap<String, build::Built>,
     bootstrapped: bool,
 }
 
-impl UserFlavor {
-    /// The flavor for this configuration, or `None` where user programs are built like
-    /// everything else and no separate flavor is needed.
-    fn new(kernel: &build::Build) -> Result<Option<UserFlavor>, String> {
-        if !kernel.user_needs_pic() {
-            return Ok(None);
-        }
-        Ok(Some(UserFlavor {
-            b: kernel.user_flavor()?,
+impl Flavor {
+    fn new(b: build::Build) -> Flavor {
+        Flavor {
+            b,
             built: BTreeMap::new(),
             bootstrapped: false,
-        }))
+        }
     }
 
-    /// `core`, `compiler_builtins` and `kconfig`, PIC, built once.
+    /// `core`, `compiler_builtins` and `kconfig`, in this flavor, built once.
     fn bootstrap(&mut self, ordered: &[graph::Unit]) -> Result<(), String> {
         if self.bootstrapped {
             return Ok(());
@@ -724,9 +720,9 @@ impl UserFlavor {
         Ok(())
     }
 
-    /// Build the PIC user program `unit`: its `user`-layer dependency closure first, in
-    /// topological order, then the program itself. Returns the program's artifact, whose
-    /// embed variable points into `out/user` for the kernel unit to include.
+    /// Build the user program `unit` in this flavor: its `user`-layer dependency closure
+    /// first, in topological order, then the program itself. Returns the program's
+    /// artifact, whose embed variable points into this flavor's output directory.
     fn build_program(
         &mut self,
         unit: &graph::Unit,
@@ -745,6 +741,56 @@ impl UserFlavor {
             }
         }
         self.b.build_unit(unit, &self.built)
+    }
+}
+
+/// The flavors user programs are built in, beside the kernel's own build.
+///
+/// `soft` is the position-independent flavor for the architectures that need one (x86_64);
+/// where none is needed, user programs are built by the kernel's `Build` itself and this is
+/// `None`. `hard` exists only if some unit asks for `float = "hard"`, and builds it — and
+/// its `user`-layer closure, and a `core` of its own — for the architecture's hard-float
+/// target. Each flavor keeps its own `built` map, so a soft-float `core` and a hard-float
+/// one never stand in for each other; the target is part of every cache key besides.
+struct UserFlavor {
+    soft: Option<Flavor>,
+    hard: Option<Flavor>,
+}
+
+impl UserFlavor {
+    /// The flavors this configuration needs, or `None` where user programs are built like
+    /// everything else and no separate flavor is needed at all.
+    fn new(kernel: &build::Build, ordered: &[graph::Unit]) -> Result<Option<UserFlavor>, String> {
+        let wants_hard = ordered
+            .iter()
+            .any(|u| u.hard_float && u.kind == graph::Kind::User);
+        if !kernel.user_needs_pic() && !wants_hard {
+            return Ok(None);
+        }
+        Ok(Some(UserFlavor {
+            soft: kernel
+                .user_needs_pic()
+                .then(|| kernel.user_flavor().map(Flavor::new))
+                .transpose()?,
+            hard: wants_hard
+                .then(|| kernel.hard_float_flavor().map(Flavor::new))
+                .transpose()?,
+        }))
+    }
+
+    /// Build `unit` in whichever flavor it asked for, or `None` if this configuration has
+    /// no flavor for it and the caller should build it with the kernel's own `Build`.
+    fn build_program(
+        &mut self,
+        unit: &graph::Unit,
+        ordered: &[graph::Unit],
+    ) -> Option<Result<build::Built, String>> {
+        let flavor = if unit.hard_float {
+            self.hard.as_mut()
+        } else {
+            self.soft.as_mut()
+        }?;
+        Some(flavor.build_program(unit, ordered))
     }
 }
 
@@ -1100,7 +1146,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     // 512 GiB link address where the static model's relocations cannot reach (see
     // `build::Build::common`). The kernel and its modules stay static. Every other
     // architecture links user programs as it builds everything else, so no flavor is needed.
-    let mut user = UserFlavor::new(&b)?;
+    let mut user = UserFlavor::new(&b, &ordered)?;
 
     let mut image = None;
     for unit in &ordered {
@@ -1115,7 +1161,14 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         // A user program on an architecture that needs the PIC flavor is built there and
         // embedded from there; the kernel unit that embeds it reads the path from `built`.
         let b2 = match (&mut user, unit.kind) {
-            (Some(user), graph::Kind::User) => user.build_program(unit, &ordered)?,
+            // A flavor builds it only if this configuration has the one it asked for:
+            // a hard-float program needs the hard-float flavor, and a soft-float one the
+            // PIC flavor where the architecture needs it. Anything else is built by the
+            // kernel's own `Build`, as every user program was before flavors existed.
+            (Some(user), graph::Kind::User) => match user.build_program(unit, &ordered) {
+                Some(r) => r?,
+                None => b.build_unit(unit, &built)?,
+            },
             _ => b.build_unit(unit, &built)?,
         };
         if unit.kind == graph::Kind::Bin {
@@ -1142,6 +1195,19 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     // Before anything is packaged: a kernel whose port ignored BOOT_STACK_KIB is refused
     // here rather than booted with a stack of some other size.
     bootstack::verify(&b.tc.tool("llvm-nm")?, &linked, res.int("BOOT_STACK_KIB"))?;
+    // A program that asked for hard float must actually hold floating-point arithmetic. It
+    // would build and behave identically for the kernel's soft-float target — the answers
+    // are the same, computed by compiler_builtins — so only the instructions say which
+    // target produced it. See `fpregs`.
+    for unit in ordered.iter().filter(|u| u.hard_float) {
+        let Some(program) = built.get(&unit.name) else {
+            continue;
+        };
+        if let Some(n) = fpregs::verify(&b.tc.tool("llvm-objdump")?, &program.path, &b.target_name)?
+        {
+            println!("  float   {} holds {n} floating-point instructions", unit.name);
+        }
+    }
     let symbols = b.split_symbols(&linked)?;
     let build_id = buildid::stamp(&b.tc.tool("llvm-objcopy")?, &linked, &symbols)?;
     let entries = bootcfg::entry_list(&res, bootcfg::Chain::File(build::ESP_CHAIN_TEST_ENTRY_PATH));

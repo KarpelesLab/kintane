@@ -176,6 +176,7 @@ fn build_loader(
         // Built by the `Build` above for `targets/i686-kinboot.json`, not through the
         // per-unit `target` mechanism, which covers only targets built into rustc.
         target: None,
+        hard_float: false,
     };
     let loader = b.build_unit(&loader, &built)?.path;
     if !chain_test {
@@ -212,6 +213,7 @@ fn build_loader(
         host_tests: false,
         manifest: dir.join("kmod.toml"),
         target: None,
+        hard_float: false,
     };
     let chaintest = chain_build.build_unit(&chaintest, &built)?.path;
     Ok((loader, Some(chaintest)))

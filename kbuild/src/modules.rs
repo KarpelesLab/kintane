@@ -272,6 +272,7 @@ pub fn write_sdk(
         rustflags: Vec::new(),
         host_tests: false,
         target: None,
+        hard_float: false,
         manifest: PathBuf::from("@DIR@/kmod.toml"),
     };
     let built = build_dependencies(&mb, &template, ordered)?;

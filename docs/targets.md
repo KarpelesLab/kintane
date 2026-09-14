@@ -85,6 +85,49 @@ code we write and about what a context switch has to save; it is not a claim abo
 what the code generator emits, and the port has to make the emitted instructions
 legal.
 
+### Hard-float user programs
+
+Every target above disables floating point, and the kernel keeps it that way. But *user*
+programs were built for the kernel's own specification, which meant no code in the image —
+kernel or user — could name a floating-point register: `a * b` in a user program compiled to
+a call to `__muldf3`. Nothing that needs those registers could be written, so nothing that
+needs them could be tested, and `hal::HasFpu` could not be implemented against a check that
+was able to fail.
+
+So there is a second specification per architecture that has one, `targets/x86_64-kintane-hf.json`
+and `targets/aarch64-kintane-hf.json`. Each is its kernel counterpart with three changes:
+`rustc-abi: softfloat` removed, `abi: softfloat` removed on aarch64, and the features
+inverted (`+sse,+sse2`; `+neon`). **The `rustc-abi` field is the one that matters** — adding
+`+sse` alone is rejected with *"target feature `sse` is incompatible with the ABI but gets
+enabled in target spec"*, which reads like a feature problem and is not.
+
+A unit opts in with `float = "hard"` in its `[unit]` table, which only a `user` unit may do.
+kbuild then builds it, its `user`-layer closure and **a `core` of its own** for that target,
+into `out/user-hf`. The target is part of every cache key, so the two `core`s are distinct
+entries that can never be served for one another.
+
+**This is opt-in per program, not a blanket switch**, and the reason is the same one that
+makes the i686 note above worth reading: LLVM emits floating-point instructions to move bytes
+around whether or not the source mentions a float. If every user program were built this way,
+every user thread would be using those registers — and **no context switch on any port saves
+them**, because `hal::HasFpu` is unimplemented. Two threads would clobber each other silently.
+So exactly one program opts in today, `user/fptest`, and it is single-threaded by
+construction. Anything built for this target must be, until `HasFpu` exists.
+
+On x86_64 the instructions also have to be made legal: the boot path now sets
+`CR4.OSFXSR | CR4.OSXMMEXCPT` and clears `CR0.EM`, exactly as i686 already did, or a user
+program's first SSE instruction raises `#UD` and the kernel reports `SIGILL`. Secondaries need
+no copy of it — `smp.rs` publishes the boot CPU's `CR4` and each one loads it wholesale. The
+kernel's own target still disables SSE and it still emits none, so this changes nothing about
+kernel code.
+
+That a program really was built this way is checked from outside the compiler, by
+disassembling it (`kbuild/src/fpregs.rs`): a soft-float build would produce the same answers
+through `compiler_builtins`, so behaviour cannot tell the two apart. The check counts
+arithmetic mnemonics, not register names, because a register-name check is unsound — on
+aarch64 a *soft-float* `init` matches `\bd[0-9]+\b` 59 times, since objdump prints the
+encoding beside the instruction and `sub x9, x27, #1` encodes as `d1000769`.
+
 One more difference that will bite anyone copying from `arch/x86_64`: **a 32-bit PAE
 PDPT entry is not a long-mode one.** It carries only the present bit and the two cache
 bits — bits 1 and 2 (R/W and U/S) are reserved and must be zero. The `0x03` that

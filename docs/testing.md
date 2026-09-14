@@ -1915,6 +1915,45 @@ raced from here. Two are covered. Left for later, reachable the same way: a chan
 against a lookup that holds it, a timer expiring against the arming of the queue it delivers to,
 and a socket whose peer closes while a wait is in the window.
 
+### 2j. A program built for the hard-float target
+
+`user/fptest` is built for `targets/<target>-hf.json` rather than the kernel's own
+specification, and multiplies, adds, divides, subtracts and converts doubles — every value
+through `core::hint::black_box`, so the constant folder cannot compute the answers at compile
+time and ship a program with no arithmetic in it. It exits `0x77`, or with the number of the
+first step that disagreed (200 to 206).
+
+The interesting check is not the arithmetic, which a soft-float build would get right too, by
+calling `__muldf3`. It is that the instructions are there at all. `kbuild` disassembles the
+linked program after every build and requires floating-point arithmetic in it:
+
+```
+  float   userfp holds 8 floating-point instructions
+```
+
+A build whose flavour quietly fell back to the kernel's target — a dropped `rustc-abi` change,
+a cache entry served across targets — produces a program that behaves identically and holds
+none, and the build fails there rather than passing.
+
+**Why it counts mnemonics and not registers.** The obvious check, "does a floating-point
+register appear", is unsound, and its failure is instructive. On aarch64 a *soft-float* `init`
+matches `\bd[0-9]+\b` **59 times** — more than the hard-float program's 38 — because objdump
+prints each instruction's encoding beside it and `sub x9, x27, #1` encodes as `d1000769`. The
+`d1` is a byte. On x86_64 the same check happens to work, a soft-float program having no `xmm`
+at all, which is exactly the coincidence that would make a broken check look sound on the port
+someone tested it on. Arithmetic mnemonics discriminate on both: zero in every soft-float
+program, eight in each hard-float one.
+
+| Mutation | Result |
+|---|---|
+| `rustc-abi: softfloat` restored in the hard-float specification | the build fails: `userfp` holds no floating-point arithmetic |
+
+**What this does not prove.** Nothing here runs the program. The kernel enables the
+instructions on x86_64 (`CR4.OSFXSR`, `CR4.OSXMMEXCPT`, `CR0.EM` clear), but no boot check
+executes `fptest` and grades its exit code, so a fault on the first SSE instruction would not
+be caught by this round's work. That check, and `hal::HasFpu` beneath it, are the next piece —
+and they are writable now only because a program that uses these registers can be built at all.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once
