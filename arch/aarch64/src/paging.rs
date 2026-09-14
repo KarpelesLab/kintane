@@ -474,9 +474,24 @@ const T_ROOT: usize = 0;
 const T_LOW: usize = 1;
 /// Index of the table of 2 MiB blocks covering the first GiB of RAM — our level 1.
 const T_RAM: usize = 2;
+/// Index of the table covering the device window — Arm L1, our level 2. It holds the same
+/// 1 GiB Device block as [`T_LOW`]'s first entry, and nothing else: aliasing `T_LOW` itself
+/// would also map RAM, executable, in the device window.
+const T_DEV: usize = 3;
 /// First table available to [`map_page`] for intermediate levels. Everything below is
 /// part of the boot map and must not be handed out.
-const T_SCRATCH: usize = 3;
+const T_SCRATCH: usize = 4;
+
+/// The root entry that holds the device window, `hal::paging::DEVICE_WINDOW_BASE`. Each root
+/// entry covers 512 GiB, so the base must be a whole number of them, and not entry 0, which
+/// is the low map this port runs on.
+const DEVICE_WINDOW_INDEX: usize = (hal::paging::DEVICE_WINDOW_BASE >> 39) as usize;
+const _: () = assert!(
+    hal::paging::DEVICE_WINDOW_BASE % (1 << 39) == 0
+        && DEVICE_WINDOW_INDEX > 0
+        && DEVICE_WINDOW_INDEX < 256,
+    "DEVICE_WINDOW_BASE must be a whole, non-zero number of 512 GiB root entries below 128 TiB"
+);
 /// Four spare tables: enough for the two independent branches the selftest maps. Each
 /// branch diverges at a level-2 entry and so needs a fresh level-1 table and a fresh
 /// level-0 table beneath it.
@@ -706,6 +721,7 @@ pub unsafe extern "C" fn aarch64_mmu_init() {
     let root = phys_to_ptr(PhysAddr::new(page_addr(&TABLES[T_ROOT])));
     let low = PhysAddr::new(page_addr(&TABLES[T_LOW]));
     let ram = PhysAddr::new(page_addr(&TABLES[T_RAM]));
+    let dev = PhysAddr::new(page_addr(&TABLES[T_DEV]));
 
     // Everything below is global: these translations belong to the kernel and must
     // survive an address-space switch rather than being tagged with an ASID.
@@ -723,6 +739,13 @@ pub unsafe extern "C" fn aarch64_mmu_init() {
         // RAM gets 2 MiB blocks rather than a second 1 GiB block, because the
         // permission split the image needs later is a refinement of these.
         write_entry(phys_to_ptr(low), 1, Entry::table(ram, 2));
+        // The device window: the same 1 GiB Device block again, at DEVICE_WINDOW_BASE
+        // above it. Drivers and the early console reach registers only there, so the ones
+        // that start before the kernel's own space exists already use their final
+        // addresses. The low block stays for now: it is harmless, and the kernel's own
+        // space, which maps devices only in the window, replaces this map at boot.
+        write_entry(root, DEVICE_WINDOW_INDEX, Entry::table(dev, 3));
+        write_entry(phys_to_ptr(dev), 0, Entry::leaf(PhysAddr::new(0), device, 2));
     }
 
     let ram_ptr = phys_to_ptr(ram);

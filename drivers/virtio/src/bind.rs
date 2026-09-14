@@ -102,14 +102,18 @@ impl Claims {
 
     /// The transport for the claimed device, of whichever kind its bus is.
     ///
+    /// Reached through [`hal::paging::device_virt`] of the window's physical address, never at
+    /// the physical address itself.
+    ///
     /// # Safety
-    /// The claimed window must be mapped, as device memory, at its physical address, and
-    /// this must be called once per device, because two transports for one device would be
-    /// two drivers for one device.
+    /// The claimed window must be mapped, as device memory, at
+    /// [`hal::paging::DEVICE_WINDOW_BASE`] above its physical address — the kernel's address
+    /// space maps every claimed window there — and this must be called once per device,
+    /// because two transports for one device would be two drivers for one device.
     #[allow(unsafe_code)]
     pub unsafe fn transport(&self) -> Option<AnyTransport> {
         let (phys, len) = self.window();
-        let base = usize::try_from(phys).ok()?;
+        let base = hal::paging::device_virt(phys)?;
         let len = usize::try_from(len).ok()?;
         match &self.bus {
             Bus::Mmio => {

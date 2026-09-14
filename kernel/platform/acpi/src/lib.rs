@@ -260,7 +260,9 @@ impl PhysMemory for BootMemory {
     }
 }
 
-/// Memory-mapped configuration space for one segment, through the boot identity map.
+/// Memory-mapped configuration space for one segment, through the device window: the boot
+/// tables alias the low 4 GiB at `DEVICE_WINDOW_BASE`, and the kernel's own space maps the
+/// claimed ECAM window there.
 ///
 /// Constructed only inside [`discover`], for a segment it checked lies below
 /// `BOOT_IDENTITY_END`.
@@ -272,7 +274,7 @@ impl Ecam {
             return None;
         }
         let base = self.0.function_address(at.bus, at.device, at.function)?;
-        let address = usize::try_from(base.checked_add(u64::from(offset))?).ok()?;
+        let address = hal::paging::device_virt(base.checked_add(u64::from(offset))?)?;
         Some(core::ptr::with_exposed_provenance_mut(address))
     }
 }
@@ -281,7 +283,8 @@ impl ConfigSpace for Ecam {
     fn read(&self, at: Address, offset: u16) -> u32 {
         match self.register(at, offset) {
             // SAFETY: an aligned register inside the segment's window, which `discover`
-            // checked is identity-mapped while an `Ecam` exists. Reading configuration
+            // checked lies below `BOOT_IDENTITY_END` and so inside the boot tables' device
+            // alias, and which the kernel's space maps at the same address. Reading configuration
             // space has no side effects on the standard header fields enumeration reads.
             Some(p) => unsafe { core::ptr::read_volatile(p) },
             None => u32::MAX,

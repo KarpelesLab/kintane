@@ -214,13 +214,13 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         let Ok((phys, len)) = tree.mmio(id, 0) else {
             continue;
         };
-        let (Ok(base), Ok(len)) = (usize::try_from(phys), usize::try_from(len)) else {
+        let (Some(base), Ok(len)) = (hal::paging::device_virt(phys), usize::try_from(len)) else {
             continue;
         };
         use virtio_blk::mmio::Slot;
-        // SAFETY: discovery runs on the boot identity map, which maps every device on this
-        // port, and the read is of the slot's identification registers only, which no
-        // driver owns yet.
+        // SAFETY: discovery runs on the boot tables, whose device alias maps every device on
+        // this port at `DEVICE_WINDOW_BASE` above its physical address, and the read is of
+        // the slot's identification registers only, which no driver owns yet.
         match unsafe { virtio_blk::mmio::identify(base, len) } {
             Slot::Device { device_id } if device_id == virtio_blk::transport::DEVICE_ID_BLOCK => {
                 block_slot = block_slot.or(Some(id));
@@ -235,8 +235,11 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
             // here because this loop is already reading every slot's registers, and the
             // first empty one is as good as any.
             Slot::Empty if kconfig::DRIVER_ISOLATION && ISOLATION.get().is_none() => {
-                // SAFETY: once, on the boot path, before anything reads it.
-                let _ = unsafe { ISOLATION.set((base as u64, len as u64)) };
+                // SAFETY: once, on the boot path, before anything reads it. The physical
+                // address, not `base`: `base` is where this loop reads the registers, in the
+                // device window, and the record is a window the kernel space maps there and
+                // a domain is granted, both of which start from the physical address.
+                let _ = unsafe { ISOLATION.set((phys, len as u64)) };
             }
             _ => {}
         }

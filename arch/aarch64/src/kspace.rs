@@ -50,7 +50,19 @@ pub fn enforcement_selftest(c: &dyn EarlyConsole) -> bool {
     ok &= expect(c, ", rodata w", s.rodata.0, Walk::Write, Some(Fault::Permission));
     ok &= expect(c, ", data w", s.data.0, Walk::Write, None);
     ok &= expect(c, ", guard", s.stack_guard.0, Walk::Read, Some(Fault::Translation));
-    ok &= expect(c, ", uart w", crate::serial::UART0 as u64, Walk::Write, None);
+    // The UART where every driver and the early console reach it, in the device window, and
+    // nowhere else: at its physical address the kernel's own space maps nothing, which is the
+    // point of the window. The boot tables still alias the low device block there, so this
+    // second probe is what shows the switch left that behind.
+    let uart = hal::paging::DEVICE_WINDOW_BASE + crate::serial::UART0 as u64;
+    ok &= expect(c, ", uart w", uart, Walk::Write, None);
+    ok &= expect(
+        c,
+        ", uart at its physical address",
+        crate::serial::UART0 as u64,
+        Walk::Read,
+        Some(Fault::Translation),
+    );
     ok
 }
 

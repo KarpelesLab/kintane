@@ -203,7 +203,11 @@ pub fn build_and_verify<A: HasPageTables>(
     ok.then_some(Verified { space, tables })
 }
 
-/// Map each device window at its own physical address, never executable.
+/// Map each device window in the device window, at `DEVICE_WINDOW_BASE` above its physical
+/// address, never executable.
+///
+/// Never at the physical address itself: on x86_64 firmware put a PCI BAR at 768 GiB, inside
+/// the user half, where a mapping lands in a top-level entry every process mirrors.
 ///
 /// Rounded outward to whole pages: a register block that starts mid-page still needs
 /// the whole page mapped, and a device window is not a place where rounding can grant
@@ -211,8 +215,8 @@ pub fn build_and_verify<A: HasPageTables>(
 ///
 /// Two claimed windows can share a page. QEMU's `virt` packs eight virtio slots into each,
 /// and the disk and the network card land in neighbouring ones. A page an earlier window
-/// already mapped as device memory, at its own address, is left as it is; any other
-/// overlap is still refused, as `AddressSpace::map` refuses it.
+/// already mapped as device memory, to the same physical page, is left as it is; any
+/// other overlap is still refused, as `AddressSpace::map` refuses it.
 fn map_devices<A: HasPageTables>(
     c: &dyn EarlyConsole,
     space: &mut AddressSpace<A>,
@@ -224,7 +228,8 @@ fn map_devices<A: HasPageTables>(
     for d in devices {
         let start = d.phys & !mask;
         let end = d.phys.saturating_add(d.len).saturating_add(mask) & !mask;
-        let (Ok(virt), Ok(len)) = (usize::try_from(start), usize::try_from(end - start)) else {
+        let (Some(virt), Ok(len)) = (hal::paging::device_virt(start), usize::try_from(end - start))
+        else {
             c.write_str("\n             device ");
             c.write_str(d.what);
             c.write_str(" is not addressable");
@@ -235,11 +240,11 @@ fn map_devices<A: HasPageTables>(
         // time only where an earlier window got there first.
         let mapped = match space.map(virt, PhysAddr::new(start), len, flags, frames) {
             Err(MapError::AlreadyMapped) => (0..len).step_by(page).try_for_each(|off| {
-                let v = virt + off;
+                let (v, p) = (virt + off, start + off as u64);
                 match space.translate(v) {
-                    Some((p, f)) if p.raw() == v as u64 && f.contains(PageFlags::DEVICE) => Ok(()),
+                    Some((at, f)) if at.raw() == p && f.contains(PageFlags::DEVICE) => Ok(()),
                     Some(_) => Err(MapError::AlreadyMapped),
-                    None => space.map(v, PhysAddr::new(v as u64), page, flags, frames),
+                    None => space.map(v, PhysAddr::new(p), page, flags, frames),
                 }
             }),
             other => other,
@@ -255,7 +260,8 @@ fn map_devices<A: HasPageTables>(
     true
 }
 
-/// Every device window reads back as device memory, writable and not executable.
+/// Every device window reads back, in the device window, as device memory at its physical
+/// address, writable and not executable.
 fn check_devices<A: HasPageTables>(
     c: &dyn EarlyConsole,
     space: &AddressSpace<A>,
@@ -265,7 +271,7 @@ fn check_devices<A: HasPageTables>(
     for d in devices {
         let last = d.phys + d.len.max(1) - 1;
         for probe in [d.phys, last] {
-            let seen = usize::try_from(probe).ok().and_then(|v| space.translate(v));
+            let seen = hal::paging::device_virt(probe).and_then(|v| space.translate(v));
             let right = match seen {
                 Some((p, f)) => {
                     // Execute is only demanded off where the CPU can express it, for the

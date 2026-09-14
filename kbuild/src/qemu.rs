@@ -60,19 +60,17 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         // the application it starts is the kernel. No -kernel either way: QEMU's own
         // loader is exactly what these configurations exist to not use.
         let fw = uefi_firmware(log.parent().unwrap_or(Path::new(".")))?;
-        // A 36-bit physical address width, so OVMF's 64-bit PCI window lands below 64 GiB.
-        // OVMF sizes and places that window from the CPU's address width: at TCG's 40 bits
-        // it puts a 64-bit BAR — virtio-pci's is one — at 768 GiB, and the kernel maps
-        // device windows at their physical address, which there is inside x86_64's user
-        // half: a top-level entry every process mirrors, so two processes would share
-        // whatever either maps there. The kernel refuses to build a process over such a
-        // mapping (`userproc::user_half_clear`); this keeps the test machine from needing
-        // to. OVMF's `X-PciMmio64Mb` knob does not help: it sizes the window, not where.
+        // No `phys-bits` override, on purpose. OVMF places its 64-bit PCI window from the
+        // CPU's address width, and at TCG's 40 bits a 64-bit BAR — virtio-pci's is one —
+        // lands at 768 GiB, inside x86_64's user half. That is the machine that showed
+        // device windows must not be mapped at their physical address, where such a BAR is
+        // a top-level entry every process mirrors. The kernel maps them in the device
+        // window above the user half now, and this run is what keeps that true.
         let mut args = vec![
             s("-machine"),
             s("q35"),
             s("-cpu"),
-            format!("{cpu},phys-bits=36"),
+            cpu.clone(),
             s("-m"),
             mem,
             s("-drive"),
