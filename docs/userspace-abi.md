@@ -542,8 +542,9 @@ handler to the default while an ignored signal stays ignored.
   would, but runs no handler, since the trap hook has no registers either.
 
 **Limits, all of them fixed sizes:** 4 process slots, and a pool of 3 process threads at once per
-check, an exited thread's entry given back when a `fork` or `clone` starts the next; 8 thread records, and 16
-threads with signal state; 4 pipes; 128 shared-page counts across every Linux process. A child's process slot is freed when whatever started the
+check, an exited thread's entry given back when a `fork` or `clone` starts the next; 8 thread
+records, and 16 threads with signal state; 4 pipes; 128 shared-page counts across every Linux
+process. A child's process slot is freed when whatever started the
 process tree tears it down, not by `wait4`.
 
 **Start-up.** `argv` is `["hello"]`, or `["hello", <mode>]` for the modes the scheduled check
