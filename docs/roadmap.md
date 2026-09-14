@@ -11,9 +11,62 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 0 — Build system and first boot | **done**, including `kinboot-efi` |
 | 1 — The portability spine | **done**, including `kinboot-bios` |
 | 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
-| 3 — SMP and the device model | in progress: aarch64 SMP, the device model from FDT and from ACPI/PCIe |
-| 4 — Configurability, scaling down | in progress: riscv32 without an MMU, `mm::flat`, the full config language, random configs, size budgets |
-| 5 onward | not started |
+| 3 — SMP and the device model | aarch64 and x86_64 SMP on one scheduler, devices from FDT and from ACPI/PCIe; 8 CPUs boot, 4 CPUs stress |
+| 4 — Configurability, scaling down | riscv32 and ARMv7-M ports, `mm::flat`, loadable modules, the full config language, random configs, size budgets |
+| 5 — Driver isolation | not started |
+| 6 — Userspace and the Linux personality | first native slice: processes, syscalls, an init program on x86_64 and aarch64 |
+| 7 onward | not started |
+
+### The fourth round of landings
+
+Eleven presets now boot, including `x86_64-qemu-smp` and `armv7m-mps2`.
+
+- **SMP, both ports, one scheduler.** Each CPU has its own run queue, with host-tested
+  wake placement, balancing with a margin of two, and affinity masks. Cross-CPU wake-ups
+  ride reschedule IPIs. Kernel mapping changes are shot down with an acknowledged IPI
+  protocol that replaces aarch64's broadcast invalidate, so one protocol serves every
+  port. x86_64 brings its CPUs up with INIT and startup IPIs through a real-mode
+  trampoline, and runs on local APIC and I/O APIC drivers bound from the MADT; both ports
+  plug into `hal::HasIpi`.
+- **The first native userspace slice** (Phase 6a). `lib/abi` declares the system-call
+  table once, `kernel/elf` loads static programs, and every x86_64 and aarch64 boot runs
+  three processes from an embedded `init`: one that works, one that can do nothing with
+  forged handles, and one that is killed for faulting while the kernel continues. On
+  x86_64 the entry became per-CPU along with SMP — ring-3 segments in every GDT, `rsp0`
+  installed by the context switch, `syscall` MSRs per CPU, and a `swapgs` discipline whose
+  removal at any single point makes the kernel fault rather than the process.
+- **Loadable modules** (Phase 4, x86_64). A module carries its kernel's build identity
+  and an interface hash. Loading one built for a different configuration is refused with
+  the differing symbol named; a module in use cannot be unloaded; unloading returns every
+  frame. `kbuild sdk` builds an out-of-tree module byte-identical to the in-tree one.
+- **The ARMv7-M port** (Phase 4). A Cortex-M3 executing in place from flash, with its
+  memory map generated from a board description at build time, PendSV preemption and all
+  eight MPU regions enforcing W^X and stack guards. A size-optimised release image is
+  63 KiB of flash, inside the roadmap's 64 KiB. RAM is 324 KiB, mostly thread stacks, and
+  is the open problem.
+- **Epoch reclamation, the object store and channel cycles** (Phase 3). Readers pin, the
+  epoch advances only when every pinned CPU has observed it, and memory is reclaimed two
+  epochs later; a CPU that never unpins is reported instead of leaking. `kobject` gained
+  an object store and a lock-backed identity source for machines without 64-bit atomics.
+  Channels that hold each other in their queues are now collected.
+
+**The ARMv7-M port re-tested the portability rule and split the verdict.** Kernel code
+needed no change at all — not `kernel/main`, `sched`, `thread`, `hal` or the unwinder —
+which is what riscv32's memory-model seam bought. Shared *tooling* still needed two
+fixes: `lib/builtins` had none of the Arm run-time ABI (and LLVM compiled one helper into
+a call to itself), and the symbolizer mishandled Thumb return addresses, where the low bit
+of a return address is set.
+
+**Phase 3's exit criterion is not met yet.** Both SMP ports boot 8 CPUs and pass every
+bring-up check there, but the stress run does not:
+
+- **Thread stacks run out.** The guarded stack slots in each `link.ld` are a fixed count
+  that does not scale with CPUs, so at 8 CPUs the stress run cannot start its workloads.
+- **Epoch retirement is refused at 8 CPUs.** With seven pinned readers the epoch advances
+  too slowly for a fixed-size retirement bag, and the check reports the refusal rather
+  than leaking, which is the designed behaviour and still a failure of the run.
+
+Both are sizing, not design, and both are named here rather than in a commit message.
 
 ### The third round of landings
 
