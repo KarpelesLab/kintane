@@ -92,11 +92,6 @@ pub trait PhysMem {
 pub const PAGE_SIZE: u64 = 4096;
 const PAGE_SHIFT: u64 = 12;
 
-/// Entries in every table here: a root table, a context table and a page table are all one
-/// frame of 512 eight-byte entries — except the root and context tables, which are 256
-/// sixteen-byte entries. Both fill a frame.
-const ENTRIES: u64 = 512;
-
 /// Why the IOMMU could not be brought up or programmed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
@@ -383,9 +378,12 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 /// "…enable status" bit. Re-writing GCMD without them would turn those features back off.
 const GSTS_STICKY: u32 = reg::gsts::TES | reg::gsts::RTPS | reg::gsts::IRES | reg::gsts::QIES;
 
-/// Zero a freshly allocated table frame through the physical-memory accessor.
+/// Zero a freshly allocated table frame through the physical-memory accessor. Every table here
+/// fills one frame — 512 eight-byte entries, or 256 sixteen-byte ones for the root and context
+/// tables — so that is 512 words, and not a byte past them, which belong to whoever the allocator
+/// gave the next frame.
 fn zero_frame(mem: &impl PhysMem, phys: u64) {
-    for i in 0..ENTRIES * 2 {
+    for i in 0..PAGE_SIZE / 8 {
         mem.write64(phys + i * 8, 0);
     }
 }
