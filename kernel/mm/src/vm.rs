@@ -504,6 +504,82 @@ impl<'s, A: HasPageTables, const N: usize> Vm<'s, A, N> {
         Ok(())
     }
 
+    /// Share every page of this address space with `child`, an empty `Vm`, copy-on-write:
+    /// what `fork` does.
+    ///
+    /// Every region is reserved in `child` at the same address with the same permissions,
+    /// every mapped page is mapped there to the same frame, read-only, and every writable
+    /// page here is made read-only too. The first write on either side copies the page
+    /// written, exactly as after [`Self::cow_share`].
+    ///
+    /// The two spaces must count shares in one store ([`Shares::shared`]): a frame mapped
+    /// in both is one frame with two mappings, and the side that writes first must see that
+    /// the other still maps it. Nothing here can check that, so a caller that gives them two
+    /// stores gets a write that lands in both.
+    ///
+    /// Only anonymous regions are shared; a physical one is refused before anything changes
+    /// ([`VmError::Mismatch`]). On any other error `child` holds what was shared so far, and
+    /// releasing its regions puts every count back; the pages made read-only here become
+    /// writable again on their next write, which finds them unshared.
+    pub fn fork_into<const M: usize>(
+        &mut self,
+        child: &mut Vm<'_, A, M>,
+        frames: &mut impl FrameSource,
+    ) -> Result<(), VmError> {
+        if child.regions.iter().next().is_some() {
+            return Err(VmError::NotEmpty);
+        }
+        if self.regions.iter().any(|r| r.backing != Backing::Anonymous) {
+            return Err(VmError::Mismatch);
+        }
+        let mut count = 0usize;
+        for r in self.regions.iter() {
+            let end = r.end().ok_or(VmError::Overflow)?;
+            // Base pages only, so that counts are per page (invariant 5).
+            let mut v = r.start;
+            while let Some(leaf) = self.next_leaf(v, end)? {
+                if leaf.level > 0 {
+                    self.space.split_leaf(leaf.base, frames)?;
+                    continue;
+                }
+                if !self.shares.is_shared(leaf.frame) {
+                    count += 1;
+                }
+                v = leaf.next();
+            }
+        }
+        // Refused before anything is shared, rather than discovered half-way.
+        if count > self.shares.free_slots() {
+            return Err(VmError::SharesFull);
+        }
+        let mut i = 0;
+        loop {
+            let Some(r) = self.regions.iter().nth(i) else {
+                break;
+            };
+            i += 1;
+            child.reserve(r)?;
+            let end = r.end().ok_or(VmError::Overflow)?;
+            let mut v = r.start;
+            while let Some(leaf) = self.next_leaf(v, end)? {
+                let ro = leaf.flags.without(PageFlags::WRITE);
+                child.map_or_prune(leaf.base, leaf.frame, 0, ro, frames)?;
+                if let Err(e) = self.shares.share(leaf.frame) {
+                    // Unreachable after the count above, and handled anyway: an unrecorded
+                    // second mapping is invariant 4 broken, in two spaces at once.
+                    let _ = child.space.unmap(leaf.base, A::PAGE_SIZE, frames);
+                    return Err(e);
+                }
+                if leaf.flags.contains(PageFlags::WRITE) {
+                    self.space
+                        .replace_leaf(leaf.slot, leaf.base, leaf.frame, ro, 0)?;
+                }
+                v = leaf.next();
+            }
+        }
+        Ok(())
+    }
+
     /// Undo [`Self::cow_share`] for the source pages below `upto`.
     fn unshare_prefix(&mut self, s: Region, d: Region, upto: usize, frames: &mut impl FrameSource) {
         let d_upto = d.start + (upto - s.start);

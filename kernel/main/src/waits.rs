@@ -370,6 +370,18 @@ pub fn stress_cycles() -> u64 {
     PAIRS.load(Ordering::Relaxed)
 }
 
+/// The second guarded stack, for a later cycle that runs two process threads too.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(
+        dead_code,
+        reason = "used only by the Linux personality's stress cycle"
+    )
+)]
+pub fn stress_stack() -> usize {
+    STRESS_STACK.load(Ordering::Relaxed)
+}
+
 /// Build, run and destroy one two-threaded waiting process; see the section comment. On the
 /// auditor's thread, after the process cycle.
 pub fn stress_cycle(round: u64) -> Result<(), &'static str> {

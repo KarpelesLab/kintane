@@ -4,19 +4,20 @@
 //! on its own objects: the calls land in `kernel/main/src/personality.rs`, which owns the fd table
 //! and the process. What that file needs and can be written without a process is here:
 //!
-//! * **The table.** [`TABLE_X86_64`] is an in-tree copy of Linux's own `syscall_64.tbl` format, and
-//!   [`name`] reads it, so an unimplemented call is logged by the name Linux gives it. The numbers
-//!   the kernel dispatches on are the constants in [`nr`], and a host test pins each to its name in
-//!   the table, so the dispatch and the table cannot drift apart.
+//! * **The tables.** [`TABLE_X86_64`] and [`TABLE_AARCH64`] are in-tree copies of Linux's own table
+//!   format for each architecture, and [`name`] reads them, so an unimplemented call is logged by
+//!   the name Linux gives it. The calls the kernel dispatches on are [`Call`]s, each with its
+//!   number under each [`Abi`], and a host test pins every number to its name in that ABI's table,
+//!   so the dispatch and the tables cannot drift apart.
 //! * **Errors.** [`Failure`] is every way the personality's calls fail, and [`errno`] is the one
 //!   place each becomes a Linux error number. The roadmap asks for this mapping to be reviewed
 //!   rather than accreted: it is a single exhaustive `match`, so a new failure does not compile
 //!   until someone decides what Linux calls it.
 //! * **The initial stack.** [`initial_stack`] lays out what a Linux program finds at its stack
 //!   pointer when it starts: `argc`, `argv`, `envp` and the auxiliary vector, with the strings and
-//!   `AT_RANDOM`'s bytes above them.
+//!   `AT_RANDOM`'s bytes above them. The layout is the same on both architectures.
 //! * **Structures.** [`stat_bytes`] and [`utsname`], the two layouts a static program's start-up
-//!   and the check's program read.
+//!   and the check's program read. `struct stat` differs between the two ABIs.
 //!
 //! Everything is data or a pure function of data, so it is host-tested and depends on
 //! nothing.
@@ -29,44 +30,193 @@ mod tests;
 
 /// The x86_64 system call table, in the format of Linux's `syscall_64.tbl`.
 pub const TABLE_X86_64: &str = include_str!("../syscalls_x86_64.tbl");
+/// The aarch64 system call table, in the format of Linux's generic `syscall.tbl`.
+pub const TABLE_AARCH64: &str = include_str!("../syscalls_aarch64.tbl");
 
-/// The x86_64 numbers the personality dispatches on. Linux's, and so fixed forever; each is
-/// checked against [`TABLE_X86_64`] by a host test.
-pub mod nr {
-    pub const READ: u64 = 0;
-    pub const WRITE: u64 = 1;
-    pub const CLOSE: u64 = 3;
-    pub const FSTAT: u64 = 5;
-    pub const MMAP: u64 = 9;
-    pub const MUNMAP: u64 = 11;
-    pub const BRK: u64 = 12;
-    pub const GETPID: u64 = 39;
-    pub const EXIT: u64 = 60;
-    pub const UNAME: u64 = 63;
-    pub const ARCH_PRCTL: u64 = 158;
-    pub const GETTID: u64 = 186;
-    pub const SET_TID_ADDRESS: u64 = 218;
-    pub const EXIT_GROUP: u64 = 231;
-    pub const OPENAT: u64 = 257;
+/// A Linux system call ABI: the numbering, and the few layouts that differ with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Abi {
+    X86_64,
+    Aarch64,
+}
 
-    /// Every number above, with the name the table must give it.
-    pub const IMPLEMENTED: [(u64, &str); 15] = [
-        (READ, "read"),
-        (WRITE, "write"),
-        (CLOSE, "close"),
-        (FSTAT, "fstat"),
-        (MMAP, "mmap"),
-        (MUNMAP, "munmap"),
-        (BRK, "brk"),
-        (GETPID, "getpid"),
-        (EXIT, "exit"),
-        (UNAME, "uname"),
-        (ARCH_PRCTL, "arch_prctl"),
-        (GETTID, "gettid"),
-        (SET_TID_ADDRESS, "set_tid_address"),
-        (EXIT_GROUP, "exit_group"),
-        (OPENAT, "openat"),
+impl Abi {
+    /// The ABI of programs built for ELF machine `machine`, if it is one the personality
+    /// speaks.
+    pub const fn for_machine(machine: u16) -> Option<Abi> {
+        match machine {
+            62 => Some(Abi::X86_64),
+            183 => Some(Abi::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// Its table, for [`name`].
+    pub const fn table(self) -> &'static str {
+        match self {
+            Abi::X86_64 => TABLE_X86_64,
+            Abi::Aarch64 => TABLE_AARCH64,
+        }
+    }
+
+    /// `uname`'s machine.
+    pub const fn machine(self) -> &'static str {
+        match self {
+            Abi::X86_64 => "x86_64",
+            Abi::Aarch64 => "aarch64",
+        }
+    }
+
+    /// `open`'s "must be a directory", which arm64 numbers differently from the generic
+    /// value x86_64 uses.
+    pub const fn o_directory(self) -> u64 {
+        match self {
+            Abi::X86_64 => 0o200000,
+            Abi::Aarch64 => 0o40000,
+        }
+    }
+
+    /// `clone`'s arguments as `(flags, stack, parent_tid, child_tid, tls)`. x86_64 passes the
+    /// thread pointer last; aarch64, like most architectures, before the child's tid.
+    pub const fn clone_args(self, a: [u64; 6]) -> [u64; 5] {
+        match self {
+            Abi::X86_64 => [a[0], a[1], a[2], a[3], a[4]],
+            Abi::Aarch64 => [a[0], a[1], a[2], a[4], a[3]],
+        }
+    }
+}
+
+/// A system call the personality implements.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Call {
+    Read,
+    Write,
+    Close,
+    Fstat,
+    Mmap,
+    Munmap,
+    Brk,
+    Pipe,
+    Pipe2,
+    SchedYield,
+    Getpid,
+    Gettid,
+    SetTidAddress,
+    Clone,
+    Fork,
+    Execve,
+    Exit,
+    ExitGroup,
+    Wait4,
+    Uname,
+    ArchPrctl,
+    Futex,
+    Openat,
+}
+
+impl Call {
+    /// Every call, for the host tests and [`decode`].
+    pub const ALL: [Call; 23] = [
+        Call::Read,
+        Call::Write,
+        Call::Close,
+        Call::Fstat,
+        Call::Mmap,
+        Call::Munmap,
+        Call::Brk,
+        Call::Pipe,
+        Call::Pipe2,
+        Call::SchedYield,
+        Call::Getpid,
+        Call::Gettid,
+        Call::SetTidAddress,
+        Call::Clone,
+        Call::Fork,
+        Call::Execve,
+        Call::Exit,
+        Call::ExitGroup,
+        Call::Wait4,
+        Call::Uname,
+        Call::ArchPrctl,
+        Call::Futex,
+        Call::Openat,
     ];
+
+    /// The name the tables give it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Call::Read => "read",
+            Call::Write => "write",
+            Call::Close => "close",
+            Call::Fstat => "fstat",
+            Call::Mmap => "mmap",
+            Call::Munmap => "munmap",
+            Call::Brk => "brk",
+            Call::Pipe => "pipe",
+            Call::Pipe2 => "pipe2",
+            Call::SchedYield => "sched_yield",
+            Call::Getpid => "getpid",
+            Call::Gettid => "gettid",
+            Call::SetTidAddress => "set_tid_address",
+            Call::Clone => "clone",
+            Call::Fork => "fork",
+            Call::Execve => "execve",
+            Call::Exit => "exit",
+            Call::ExitGroup => "exit_group",
+            Call::Wait4 => "wait4",
+            Call::Uname => "uname",
+            Call::ArchPrctl => "arch_prctl",
+            Call::Futex => "futex",
+            Call::Openat => "openat",
+        }
+    }
+
+    /// Its number under `abi`: Linux's, and so fixed forever. `None` where that architecture
+    /// has no such call.
+    pub const fn number(self, abi: Abi) -> Option<u64> {
+        let (x86_64, aarch64) = match self {
+            Call::Read => (0, 63),
+            Call::Write => (1, 64),
+            Call::Close => (3, 57),
+            Call::Fstat => (5, 80),
+            Call::Mmap => (9, 222),
+            Call::Munmap => (11, 215),
+            Call::Brk => (12, 214),
+            Call::Pipe => (22, NONE),
+            Call::Pipe2 => (293, 59),
+            Call::SchedYield => (24, 124),
+            Call::Getpid => (39, 172),
+            Call::Gettid => (186, 178),
+            Call::SetTidAddress => (218, 96),
+            Call::Clone => (56, 220),
+            Call::Fork => (57, NONE),
+            Call::Execve => (59, 221),
+            Call::Exit => (60, 93),
+            Call::ExitGroup => (231, 94),
+            Call::Wait4 => (61, 260),
+            Call::Uname => (63, 160),
+            Call::ArchPrctl => (158, NONE),
+            Call::Futex => (202, 98),
+            Call::Openat => (257, 56),
+        };
+        let n = match abi {
+            Abi::X86_64 => x86_64,
+            Abi::Aarch64 => aarch64,
+        };
+        if n == NONE { None } else { Some(n) }
+    }
+}
+
+/// No such call on that architecture.
+const NONE: u64 = u64::MAX;
+
+/// The implemented call `number` names under `abi`, or `None` for one the personality does
+/// not implement.
+pub fn decode(abi: Abi, number: u64) -> Option<Call> {
+    Call::ALL
+        .iter()
+        .copied()
+        .find(|c| c.number(abi) == Some(number))
 }
 
 /// The name `table` gives system call `number`, for the 64-bit ABI. `None` for a number the
@@ -97,8 +247,10 @@ pub const AT_FDCWD: i64 = -100;
 /// `open`'s access mode bits, and read-only.
 pub const O_ACCMODE: u64 = 3;
 pub const O_RDONLY: u64 = 0;
-/// `open`'s "must be a directory".
-pub const O_DIRECTORY: u64 = 0o200000;
+/// `open`'s and `pipe2`'s "close on `execve`", the same on both architectures.
+pub const O_CLOEXEC: u64 = 0o2000000;
+/// `open`'s and `pipe2`'s "never block", the same on both architectures.
+pub const O_NONBLOCK: u64 = 0o4000;
 
 /// `mmap`'s protections and flags, as far as the personality reads them.
 pub const PROT_READ: u64 = 1;
@@ -108,11 +260,64 @@ pub const MAP_PRIVATE: u64 = 0x02;
 pub const MAP_FIXED: u64 = 0x10;
 pub const MAP_ANONYMOUS: u64 = 0x20;
 
+/// `clone`'s flags, as far as the personality reads them.
+pub mod clone {
+    /// The low byte: the signal a child's exit sends its parent.
+    pub const CSIGNAL: u64 = 0xff;
+    pub const VM: u64 = 0x100;
+    pub const FS: u64 = 0x200;
+    pub const FILES: u64 = 0x400;
+    pub const SIGHAND: u64 = 0x800;
+    pub const VFORK: u64 = 0x4000;
+    pub const THREAD: u64 = 0x10000;
+    pub const SYSVSEM: u64 = 0x40000;
+    pub const SETTLS: u64 = 0x80000;
+    pub const PARENT_SETTID: u64 = 0x100000;
+    pub const CHILD_CLEARTID: u64 = 0x200000;
+    pub const CHILD_SETTID: u64 = 0x1000000;
+    /// Every flag a thread library's `clone` passes, and which the personality honours.
+    pub const THREAD_FLAGS: u64 = VM
+        | FS
+        | FILES
+        | SIGHAND
+        | THREAD
+        | SYSVSEM
+        | SETTLS
+        | PARENT_SETTID
+        | CHILD_CLEARTID
+        | CHILD_SETTID;
+}
+
+/// The signal a child's exit sends, which `fork` implies.
+pub const SIGCHLD: u64 = 17;
+
+/// `futex`'s operations and the flags that modify them.
+pub const FUTEX_WAIT: u64 = 0;
+pub const FUTEX_WAKE: u64 = 1;
+pub const FUTEX_PRIVATE_FLAG: u64 = 128;
+pub const FUTEX_CLOCK_REALTIME: u64 = 256;
+
+/// `wait4`'s "do not wait".
+pub const WNOHANG: u64 = 1;
+
+/// The status `wait4` reports for a child that exited with `code`: the low 8 bits, shifted
+/// into place.
+pub const fn exited_status(code: u64) -> u32 {
+    ((code & 0xff) as u32) << 8
+}
+
+/// The status `wait4` reports for a child the kernel killed. Without signals there is no
+/// signal to name; this is `SIGKILL`'s, which is what the kernel did.
+pub const KILLED_STATUS: u32 = 9;
+
 /// Linux error numbers the personality returns. Linux's values.
 pub mod errno {
     pub const ENOENT: i64 = 2;
     pub const EIO: i64 = 5;
+    pub const ENOEXEC: i64 = 8;
     pub const EBADF: i64 = 9;
+    pub const ECHILD: i64 = 10;
+    pub const EAGAIN: i64 = 11;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
@@ -122,8 +327,10 @@ pub mod errno {
     pub const EMFILE: i64 = 24;
     pub const ENOSPC: i64 = 28;
     pub const EROFS: i64 = 30;
+    pub const EPIPE: i64 = 32;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
+    pub const ETIMEDOUT: i64 = 110;
 }
 
 /// Every way a call the personality implements can fail, before it is a Linux number.
@@ -156,6 +363,17 @@ pub enum Failure {
     Io,
     /// No room left on the volume.
     NoSpace,
+    /// Not now: a futex whose value has already changed, a non-blocking descriptor with
+    /// nothing to give, or no process slot or thread for a `fork` or `clone`.
+    TryAgain,
+    /// `wait4` named no child of the caller.
+    NoChild,
+    /// A write to a pipe no one can read.
+    BrokenPipe,
+    /// `execve` named a file that is not a program this kernel runs as a Linux one.
+    NotExecutable,
+    /// A wait with a timeout, such as a futex's, ran out.
+    TimedOut,
     /// The call is not implemented.
     NotImplemented,
 }
@@ -180,6 +398,14 @@ pub const fn errno(f: Failure) -> i64 {
         Failure::AccessDenied => EACCES,
         Failure::Io => EIO,
         Failure::NoSpace => ENOSPC,
+        // Linux's own answer to a `fork` past the process limit, as well as to the futex and
+        // non-blocking cases.
+        Failure::TryAgain => EAGAIN,
+        Failure::NoChild => ECHILD,
+        // Linux also raises `SIGPIPE`; there are no signals, so the error is all a program gets.
+        Failure::BrokenPipe => EPIPE,
+        Failure::NotExecutable => ENOEXEC,
+        Failure::TimedOut => ETIMEDOUT,
         Failure::NotImplemented => ENOSYS,
     }
 }
@@ -321,28 +547,52 @@ pub enum FileKind {
     Regular,
     Directory,
     CharDevice,
+    /// Either end of a pipe.
+    Fifo,
 }
 
-/// x86_64's `struct stat`, which is 144 bytes.
+/// The largest `struct stat`: x86_64's, 144 bytes. aarch64's, the generic layout, is 128.
 pub const STAT_BYTES: usize = 144;
 
-/// A `struct stat` for a file of `kind` and `size` bytes, inode `ino`. Read-only
-/// permissions: every file the personality opens today is on a read-only volume, and the
-/// console is the process's only writable descriptor.
-pub fn stat_bytes(kind: FileKind, size: u64, ino: u64) -> [u8; STAT_BYTES] {
+impl Abi {
+    /// Bytes of this ABI's `struct stat`.
+    pub const fn stat_len(self) -> usize {
+        match self {
+            Abi::X86_64 => 144,
+            Abi::Aarch64 => 128,
+        }
+    }
+}
+
+/// A `struct stat` in `abi`'s layout for a file of `kind` and `size` bytes, inode `ino`: the
+/// first [`Abi::stat_len`] bytes of the result. Read-only permissions for files, since every
+/// file the personality opens is on a read-only volume.
+pub fn stat_bytes(abi: Abi, kind: FileKind, size: u64, ino: u64) -> [u8; STAT_BYTES] {
     let mut s = [0u8; STAT_BYTES];
     let mode: u32 = match kind {
         FileKind::Regular => 0o100444,
         FileKind::Directory => 0o040555,
         FileKind::CharDevice => 0o020620,
+        FileKind::Fifo => 0o010600,
     };
     s[0..8].copy_from_slice(&1u64.to_le_bytes()); // st_dev
     s[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino
-    s[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
-    s[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
-    // st_uid, st_gid, padding, st_rdev: zero.
+    match abi {
+        Abi::X86_64 => {
+            s[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
+            s[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
+            // st_uid, st_gid, padding, st_rdev: zero.
+            s[56..64].copy_from_slice(&512u64.to_le_bytes()); // st_blksize
+        }
+        Abi::Aarch64 => {
+            s[16..20].copy_from_slice(&mode.to_le_bytes()); // st_mode
+            s[20..24].copy_from_slice(&1u32.to_le_bytes()); // st_nlink
+            // st_uid, st_gid, st_rdev, padding: zero.
+            s[56..60].copy_from_slice(&512u32.to_le_bytes()); // st_blksize
+        }
+    }
+    // The size and the block count sit at the same offsets in both.
     s[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
-    s[56..64].copy_from_slice(&512u64.to_le_bytes()); // st_blksize
     s[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes()); // st_blocks
     s
 }

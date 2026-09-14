@@ -59,6 +59,70 @@ impl SyscallFrameTrait for SyscallFrame {
     }
 }
 
+/// A user thread's registers, for `fork`, `clone` and `execve`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Registers {
+    x: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+}
+
+/// The condition flags, the only part of `SPSR_EL1` a user thread chooses. The rest selects
+/// EL0t with interrupts unmasked, which is zero.
+const USER_PSTATE: u64 = 0xf000_0000;
+
+/// `pc` if it lies in the user half, zero otherwise, where a return faults at EL0 and ends
+/// the process rather than anything else.
+fn user_pc(pc: u64) -> u64 {
+    if hal::user::user_range::<Aarch64>(pc as usize, 1) {
+        pc
+    } else {
+        0
+    }
+}
+
+impl hal::user::UserRegisters for Registers {
+    fn start(pc: usize, sp: usize) -> Self {
+        Registers {
+            x: [0; 31],
+            sp: sp as u64,
+            pc: pc as u64,
+            pstate: 0,
+        }
+    }
+    fn set_return(&mut self, value: u64) {
+        self.x[0] = value;
+    }
+    fn set_stack(&mut self, sp: usize) {
+        self.sp = sp as u64;
+    }
+    fn pc(&self) -> usize {
+        self.pc as usize
+    }
+}
+
+/// The running CPU's `TPIDR_EL0`.
+///
+/// # Safety
+/// At EL1; the value belongs to whichever user thread last ran here.
+pub(crate) unsafe fn read_tpidr_el0() -> u64 {
+    let v: u64;
+    // SAFETY: `TPIDR_EL0` is readable at EL1.
+    unsafe { core::arch::asm!("mrs {v}, tpidr_el0", v = out(reg) v, options(nostack)) };
+    v
+}
+
+/// Set the running CPU's `TPIDR_EL0`.
+///
+/// # Safety
+/// At EL1, for the user thread about to run here.
+pub(crate) unsafe fn write_tpidr_el0(value: u64) {
+    // SAFETY: `TPIDR_EL0` is writable at EL1 and read by nothing the kernel does.
+    unsafe { core::arch::asm!("msr tpidr_el0, {v}", v = in(reg) value, options(nostack)) };
+}
+
 /// The installed hooks.
 struct Hooks(UnsafeCell<Option<UserHooks<SyscallFrame>>>);
 // SAFETY: written once by `install` before any user thread runs, read-only afterwards.
@@ -178,7 +242,71 @@ impl hal::HasUserMode for Aarch64 {
     unsafe fn set_tls(value: usize) {
         // SAFETY: `TPIDR_EL0` is EL0's thread pointer, writable at EL1 and read by nothing the
         // kernel does.
-        unsafe { core::arch::asm!("msr tpidr_el0, {v}", v = in(reg) value, options(nostack)) };
+        unsafe { write_tpidr_el0(value as u64) };
+    }
+
+    unsafe fn tls() -> usize {
+        // SAFETY: as above.
+        unsafe { read_tpidr_el0() as usize }
+    }
+
+    type UserRegisters = Registers;
+
+    fn registers(frame: &SyscallFrame) -> Registers {
+        // SAFETY: `frame` is the live exception frame of this system call.
+        let f = unsafe { &*frame.frame };
+        Registers {
+            x: f.x,
+            sp: f.sp_el0,
+            pc: f.elr,
+            pstate: f.spsr,
+        }
+    }
+
+    fn set_registers(frame: &mut SyscallFrame, regs: &Registers) {
+        // SAFETY: as above; the epilogue restores every one of these on `eret`.
+        let f = unsafe { &mut *frame.frame };
+        f.x = regs.x;
+        f.sp_el0 = regs.sp;
+        f.elr = user_pc(regs.pc);
+        f.spsr = regs.pstate & USER_PSTATE;
+    }
+
+    unsafe fn resume_user(regs: &Registers, _kernel_stack_top: KernAddr) -> ! {
+        let pc = user_pc(regs.pc);
+        let pstate = regs.pstate & USER_PSTATE;
+        // SAFETY: `eret` to EL0t, as in `enter_user`, with every general register loaded from
+        // `regs`. `x30` holds the address of `regs` until it is loaded itself, last.
+        unsafe {
+            core::arch::asm!(
+                "msr sp_el0, {sp}",
+                "msr elr_el1, {pc}",
+                "msr spsr_el1, {pstate}",
+                "ldp x0, x1, [x30, #0]",
+                "ldp x2, x3, [x30, #16]",
+                "ldp x4, x5, [x30, #32]",
+                "ldp x6, x7, [x30, #48]",
+                "ldp x8, x9, [x30, #64]",
+                "ldp x10, x11, [x30, #80]",
+                "ldp x12, x13, [x30, #96]",
+                "ldp x14, x15, [x30, #112]",
+                "ldp x16, x17, [x30, #128]",
+                "ldp x18, x19, [x30, #144]",
+                "ldp x20, x21, [x30, #160]",
+                "ldp x22, x23, [x30, #176]",
+                "ldp x24, x25, [x30, #192]",
+                "ldp x26, x27, [x30, #208]",
+                "ldp x28, x29, [x30, #224]",
+                "ldr x30, [x30, #240]",
+                "isb",
+                "eret",
+                sp = in(reg) regs.sp,
+                pc = in(reg) pc,
+                pstate = in(reg) pstate,
+                in("x30") core::ptr::from_ref(regs),
+                options(noreturn, nostack),
+            )
+        }
     }
 
     unsafe fn enter_user(

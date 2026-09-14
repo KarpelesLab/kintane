@@ -14,7 +14,7 @@
 //! CPU's [`CpuBlock`]. `TPIDR_EL1` holds a pointer to the block, so [`cpu_index`] is two
 //! instructions and a load, on any CPU, at any time, including inside an exception.
 //! `TPIDR_EL1` is banked per CPU and reserved for the kernel: nothing below EL1 can write
-//! it, and the exception entry's scratch registers are `TPIDR_EL0` and `TPIDRRO_EL0`.
+//! it, and the exception entry's scratch registers are `SP_EL0` and `TPIDRRO_EL0`.
 //!
 //! # Starting one
 //!

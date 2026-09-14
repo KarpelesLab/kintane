@@ -75,6 +75,7 @@
 257	common	openat			sys_openat
 262	common	newfstatat		sys_newfstatat
 273	common	set_robust_list		sys_set_robust_list
+293	common	pipe2			sys_pipe2
 302	common	prlimit64		sys_prlimit64
 318	common	getrandom		sys_getrandom
 334	common	rseq			sys_rseq

@@ -59,6 +59,11 @@ pub const USER_END: usize = 2 << 39;
 
 /// The saved registers of a `syscall`, as [`syscall_entry`] pushes them. `repr(C)` and
 /// the assembly offsets are one layout in two languages.
+///
+/// Every register the call returns to user code with, callee-saved ones included, so that
+/// the frame is a thread's whole user state: what a `fork` copies and an `execve` replaces.
+/// The entry pops each of them back, so a register the kernel did not change returns as
+/// the program left it.
 #[repr(C)]
 pub struct SyscallFrame {
     /// The number, in the slot the status is written back to.
@@ -69,10 +74,82 @@ pub struct SyscallFrame {
     r10: u64,
     r8: u64,
     r9: u64,
+    rbx: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
     /// User return address, saved by `syscall` into `rcx`.
     rip: u64,
     /// User flags, saved by `syscall` into `r11`.
     rflags: u64,
+    /// User stack pointer, pushed first.
+    rsp: u64,
+}
+
+/// A user thread's registers, for `fork`, `clone` and `execve`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Registers {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+    rsp: u64,
+}
+
+/// The flags user code may hold: carry, parity, adjust, zero, sign, direction and overflow.
+/// Everything else a resumed thread is given is the kernel's choice: interrupts on, and the
+/// reserved bit that always reads one.
+const USER_FLAGS: u64 = 0xcd5;
+const START_FLAGS: u64 = 0x202;
+
+fn user_flags(rflags: u64) -> u64 {
+    (rflags & USER_FLAGS) | START_FLAGS
+}
+
+/// `rip` if it lies in the user half, zero otherwise: an address a return to user code can
+/// take without the kernel faulting on it. Zero faults in user mode and ends the process.
+fn user_rip(rip: u64) -> u64 {
+    if hal::user::user_range::<X86_64>(rip as usize, 1) {
+        rip
+    } else {
+        0
+    }
+}
+
+impl hal::user::UserRegisters for Registers {
+    fn start(pc: usize, sp: usize) -> Self {
+        Registers {
+            rip: pc as u64,
+            rsp: sp as u64,
+            rflags: START_FLAGS,
+            ..Registers::default()
+        }
+    }
+    fn set_return(&mut self, value: u64) {
+        self.rax = value;
+    }
+    fn set_stack(&mut self, sp: usize) {
+        self.rsp = sp as u64;
+    }
+    fn pc(&self) -> usize {
+        self.rip as usize
+    }
 }
 
 impl SyscallFrameTrait for SyscallFrame {
@@ -171,8 +248,15 @@ __syscall_entry:
 
     // Build a SyscallFrame. Push order is reverse of the struct, so rax (the number) ends
     // up at the lowest address, which is where rsp points and where the struct begins.
+    // Sixteen words with the user stack pointer, so the stack stays aligned for the call.
     push    r11                 // rflags, saved by syscall
     push    rcx                 // rip, saved by syscall
+    push    r15
+    push    r14
+    push    r13
+    push    r12
+    push    rbp
+    push    rbx
     push    r9
     push    r8
     push    r10
@@ -191,6 +275,12 @@ __syscall_entry:
     pop     r10
     pop     r8
     pop     r9
+    pop     rbx
+    pop     rbp
+    pop     r12
+    pop     r13
+    pop     r14
+    pop     r15
     pop     rcx                 // user rip
     pop     r11                 // user rflags
     pop     rsp                 // user stack, from this thread's own kernel stack
@@ -209,7 +299,7 @@ const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
-const MSR_FS_BASE: u32 = 0xC000_0100;
+pub(crate) const MSR_FS_BASE: u32 = 0xC000_0100;
 const EFER_SCE: u64 = 1 << 0;
 /// Clear the interrupt flag and the direction flag on entry.
 const SFMASK: u64 = (1 << 9) | (1 << 10);
@@ -265,6 +355,119 @@ impl hal::HasUserMode for X86_64 {
         // SAFETY: writing `IA32_FS_BASE` is defined at CPL 0. The kernel addresses its per-CPU
         // data through `GS`, never `FS`, so this changes nothing the kernel reads.
         unsafe { paging::write_msr(MSR_FS_BASE, value as u64) };
+    }
+
+    unsafe fn tls() -> usize {
+        // SAFETY: reading `IA32_FS_BASE` is defined at CPL 0.
+        unsafe { paging::read_msr(MSR_FS_BASE) as usize }
+    }
+
+    type UserRegisters = Registers;
+
+    fn registers(frame: &SyscallFrame) -> Registers {
+        Registers {
+            rax: frame.nr,
+            rbx: frame.rbx,
+            // What `syscall` leaves in the two registers it takes over.
+            rcx: frame.rip,
+            rdx: frame.rdx,
+            rsi: frame.rsi,
+            rdi: frame.rdi,
+            rbp: frame.rbp,
+            r8: frame.r8,
+            r9: frame.r9,
+            r10: frame.r10,
+            r11: frame.rflags,
+            r12: frame.r12,
+            r13: frame.r13,
+            r14: frame.r14,
+            r15: frame.r15,
+            rip: frame.rip,
+            rflags: frame.rflags,
+            rsp: frame.rsp,
+        }
+    }
+
+    fn set_registers(frame: &mut SyscallFrame, regs: &Registers) {
+        // `sysretq` returns through `rcx` and `r11`, so those two come back holding the
+        // address and the flags, as after any `syscall`; every other register is `regs`'.
+        *frame = SyscallFrame {
+            nr: regs.rax,
+            rdi: regs.rdi,
+            rsi: regs.rsi,
+            rdx: regs.rdx,
+            r10: regs.r10,
+            r8: regs.r8,
+            r9: regs.r9,
+            rbx: regs.rbx,
+            rbp: regs.rbp,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            // `sysretq` does not check that this is canonical; see the module comment.
+            rip: user_rip(regs.rip),
+            rflags: user_flags(regs.rflags),
+            rsp: regs.rsp,
+        };
+    }
+
+    unsafe fn resume_user(regs: &Registers, kernel_stack_top: KernAddr) -> ! {
+        // SAFETY: as in `enter_user`.
+        unsafe { crate::smp::install_kernel_stack(kernel_stack_top.raw() as u64) };
+        let rip = user_rip(regs.rip);
+        let rflags = user_flags(regs.rflags);
+        // SAFETY: an `iretq` into ring 3, as in `enter_user`, from a frame built of `regs`
+        // with the ring-3 selectors, sanitised flags and an address in the user half. `rdi`
+        // points at `regs`, above the stack the pushes grow into, and is loaded last.
+        unsafe {
+            core::arch::asm!(
+                "push {ss}",
+                "push qword ptr [rdi + {o_rsp}]",
+                "push {rflags}",
+                "push {cs}",
+                "push {rip}",
+                "mov rax, [rdi + {o_rax}]",
+                "mov rbx, [rdi + {o_rbx}]",
+                "mov rcx, [rdi + {o_rcx}]",
+                "mov rdx, [rdi + {o_rdx}]",
+                "mov rsi, [rdi + {o_rsi}]",
+                "mov rbp, [rdi + {o_rbp}]",
+                "mov r8, [rdi + {o_r8}]",
+                "mov r9, [rdi + {o_r9}]",
+                "mov r10, [rdi + {o_r10}]",
+                "mov r11, [rdi + {o_r11}]",
+                "mov r12, [rdi + {o_r12}]",
+                "mov r13, [rdi + {o_r13}]",
+                "mov r14, [rdi + {o_r14}]",
+                "mov r15, [rdi + {o_r15}]",
+                "mov rdi, [rdi + {o_rdi}]",
+                "swapgs",
+                "iretq",
+                ss = in(reg) u64::from(USER_DATA_SELECTOR),
+                rflags = in(reg) rflags,
+                cs = in(reg) u64::from(USER_CODE_SELECTOR),
+                rip = in(reg) rip,
+                in("rdi") core::ptr::from_ref(regs),
+                o_rsp = const core::mem::offset_of!(Registers, rsp),
+                o_rax = const core::mem::offset_of!(Registers, rax),
+                o_rbx = const core::mem::offset_of!(Registers, rbx),
+                o_rcx = const core::mem::offset_of!(Registers, rcx),
+                o_rdx = const core::mem::offset_of!(Registers, rdx),
+                o_rsi = const core::mem::offset_of!(Registers, rsi),
+                o_rbp = const core::mem::offset_of!(Registers, rbp),
+                o_r8 = const core::mem::offset_of!(Registers, r8),
+                o_r9 = const core::mem::offset_of!(Registers, r9),
+                o_r10 = const core::mem::offset_of!(Registers, r10),
+                o_r11 = const core::mem::offset_of!(Registers, r11),
+                o_r12 = const core::mem::offset_of!(Registers, r12),
+                o_r13 = const core::mem::offset_of!(Registers, r13),
+                o_r14 = const core::mem::offset_of!(Registers, r14),
+                o_r15 = const core::mem::offset_of!(Registers, r15),
+                o_rdi = const core::mem::offset_of!(Registers, rdi),
+                options(noreturn),
+            )
+        }
     }
 
     unsafe fn enter_user(

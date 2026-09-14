@@ -938,3 +938,56 @@ fn releasing_everything_returns_every_frame_and_table() {
     assert!(vm.regions().is_empty());
     assert_eq!(mem.live.len(), baseline);
 }
+
+// ---- fork: sharing a whole space with another -----------------------------------
+
+#[test]
+fn a_fork_shares_every_page_and_a_write_on_either_side_stays_on_that_side() {
+    let mut store = slots(16);
+    let counts = core::ptr::NonNull::from(&mut store[..]);
+    let mut mem = Mem::new(64);
+    let space = AddressSpace::<MockFull>::new(mem.direct(), &mut mem).unwrap();
+    // SAFETY: `store` outlives both views, and the test uses one `Vm` at a time.
+    let mut parent: Vm<'_, MockFull, 4> = Vm::new(space, unsafe { Shares::shared(counts) });
+    parent.reserve(anon(BASE, 3)).unwrap();
+    Cpu::write(&mut parent, &mut mem, BASE, 1);
+    Cpu::write(&mut parent, &mut mem, BASE + PAGE, 2);
+
+    let space = AddressSpace::<MockFull>::new(mem.direct(), &mut mem).unwrap();
+    // SAFETY: as above.
+    let mut child: Vm<'_, MockFull, 4> = Vm::new(space, unsafe { Shares::shared(counts) });
+    parent.fork_into(&mut child, &mut mem).unwrap();
+    assert_eq!(child.regions().iter().count(), 1, "the region is reserved in the child");
+    assert_eq!(parent.shares().iter().count(), 2, "both mapped pages are shared");
+    assert_eq!(Cpu::read(&mut child, &mut mem, BASE), 1);
+    assert_eq!(Cpu::read(&mut child, &mut mem, BASE + PAGE), 2);
+
+    // The child writes one page: its copy changes and the parent's does not.
+    Cpu::write(&mut child, &mut mem, BASE, 9);
+    assert_eq!(Cpu::read(&mut parent, &mut mem, BASE), 1);
+    assert_eq!(Cpu::read(&mut child, &mut mem, BASE), 9);
+    // The parent writes the other: the child still reads what was there at the fork.
+    Cpu::write(&mut parent, &mut mem, BASE + PAGE, 7);
+    assert_eq!(Cpu::read(&mut child, &mut mem, BASE + PAGE), 2);
+    assert_eq!(Cpu::read(&mut parent, &mut mem, BASE + PAGE), 7);
+    assert_eq!(parent.shares().iter().count(), 0, "every shared page has been written");
+
+    child.release(BASE, &mut mem).unwrap();
+    parent.release(BASE, &mut mem).unwrap();
+}
+
+#[test]
+fn a_fork_into_a_space_that_has_regions_is_refused() {
+    let mut store = slots(16);
+    let counts = core::ptr::NonNull::from(&mut store[..]);
+    let mut mem = Mem::new(32);
+    let space = AddressSpace::<MockFull>::new(mem.direct(), &mut mem).unwrap();
+    // SAFETY: as in the test above.
+    let mut parent: Vm<'_, MockFull, 4> = Vm::new(space, unsafe { Shares::shared(counts) });
+    parent.reserve(anon(BASE, 1)).unwrap();
+    let space = AddressSpace::<MockFull>::new(mem.direct(), &mut mem).unwrap();
+    // SAFETY: as above.
+    let mut child: Vm<'_, MockFull, 4> = Vm::new(space, unsafe { Shares::shared(counts) });
+    child.reserve(anon(BASE, 1)).unwrap();
+    assert_eq!(parent.fork_into(&mut child, &mut mem), Err(VmError::NotEmpty));
+}

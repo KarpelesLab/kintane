@@ -518,7 +518,10 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `spawn`, whose process slot and stack slots it reuses once that phase has
     // reaped its threads.
     let waits = crate::model::waits_check(c);
-    // After `waits`, which has torn its process down by now: this borrows the process
+    // After `waits`, whose process slot and stack slots it reuses once that phase has torn
+    // its process down: the Linux program with the scheduler, forking and starting a thread.
+    let linux = crate::model::linux_check(c);
+    // After `linux`, which has torn its processes down by now: this borrows the process
     // check's frame pool and reuses its process slot and stack. Before tickless, which
     // wants everything but idle gone.
     c.write_str("\n  isolation  ");
@@ -535,6 +538,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(processes)
         .and(spawn)
         .and(waits)
+        .and(linux)
         .and(isolation)
         .and(tickless)
         .and(abba)

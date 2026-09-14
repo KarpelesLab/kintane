@@ -169,7 +169,7 @@ config USERSPACE
 
 config ABI_LINUX
     bool "Linux system call compatibility"
-    depends on USERSPACE && ARCH_X86_64
+    depends on USERSPACE && (ARCH_X86_64 || ARCH_AARCH64)
     default y
     help
         Run unmodified static Linux programs. The loader tags a program with no
@@ -178,7 +178,8 @@ config ABI_LINUX
         start-up stack and auxiliary vector, errno values, and a file descriptor
         table kept as a view over the process's handles and the filesystem.
 
-        x86_64 only for now: the table is x86_64's. docs/userspace-abi.md
+        x86_64 and aarch64, each with Linux's own numbering for that
+        architecture (kernel/linux/syscalls_*.tbl). docs/userspace-abi.md
         designs this as a tristate for a loadable module; it is a bool until the
         personality can be built as one.
 
