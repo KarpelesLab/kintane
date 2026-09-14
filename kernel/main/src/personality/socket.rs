@@ -1054,6 +1054,7 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     c.write_str(" (two connections, ");
     write_usize(c, poll_told as usize);
     c.write_str(" announcements)");
+    c.write_str("; ");
     match datagram {
         Some(run) => report(c, "udp", run, UDP_SUCCESS),
         None => c.write_str("udp skipped: kbuild announced no datagram service"),
