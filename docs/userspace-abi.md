@@ -395,9 +395,9 @@ process, its descriptors or its mappings, and waits on the kernel's wait queues 
 so that another thread of the process can make the call that ends the wait.
 
 **The numbers and the tables.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 71 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
+`syscall_64.tbl`, in its format: 74 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
 the generic table arm64 numbers its calls by, in the format of Linux's `scripts/syscall.tbl`:
-76 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
+78 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
 each with its number under each `linux::Abi`; a host test pins every number to its name in
 that ABI's table, and the kernel reads a table at run time only to name a call it does not
 implement. The kernel picks the ABI from its port's ELF machine at compile time, and dispatches
@@ -417,7 +417,9 @@ until someone decides what Linux calls it. Filesystem errors map onto `Failure` 
 | a volume or mount table full | `ENOSPC` | |
 | a corrupt volume or a device failure | `EIO` | |
 | a futex whose value has changed, a non-blocking pipe with nothing to give, or no free process slot or thread for `fork` or `clone` | `EAGAIN` | Linux's own answer to a `fork` past its process limit |
-| a write to a pipe with no reader | `EPIPE` | Linux also raises `SIGPIPE`; there are no signals |
+| a write to a pipe with no reader | `EPIPE` | the writer is sent `SIGPIPE` too, whose default action ends it before it sees this |
+| a blocking call a signal with a handler interrupts, without `SA_RESTART` | `EINTR` | |
+| `kill` or `tgkill` naming no live Linux process or thread | `ESRCH` | |
 | `execve` of a file that is not a Linux program for this machine | `ENOEXEC` | |
 | a futex wait whose timeout ran out | `ETIMEDOUT` | |
 | `wait4` with no child to report | `ECHILD` | |
@@ -465,10 +467,17 @@ change shape.
 | `clone` | with `CLONE_THREAD`: a thread in the same process, on the stack given, which requires `CLONE_VM` and `CLONE_SIGHAND`. `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured, and `CLONE_FS`, `CLONE_FILES` and `CLONE_SYSVSEM` accepted, since the process has one of each. Without `CLONE_THREAD`: a fork, allowed only with nothing but the exit signal in the flags and no stack, which is how an aarch64 C library forks. Anything else, `CLONE_VFORK` included, is `EINVAL` |
 | `fork` | x86_64 only, since aarch64 has no such call: a copy-on-write child whose one thread resumes with the parent's registers and thread pointer, returning 0; the parent is answered the child's pid |
 | `execve` | an absolute path read whole from the namespace, at most 128 KiB, with up to 8 arguments and 8 environment strings. Refused with `EAGAIN` while the process has another thread. Once the old memory is released, a failure ends the process, as Linux's does. The thread pointer starts at zero, and close-on-exec descriptors close |
-| `wait4` | a child by pid, or any child with -1, once its last thread has gone; `WNOHANG`. The status is the exit code's low 8 bits shifted up 8, or 9, `SIGKILL`'s, for a child the kernel killed. A process group is `EINVAL`; `rusage` is not written |
+| `wait4` | a child by pid, or any child with -1, once its last thread has gone; `WNOHANG`. The status is the exit code's low 8 bits shifted up 8; the signal's number for a child a signal ended, a trap included, which is `SIGSEGV`; or 9, `SIGKILL`'s, for a child the kernel killed for another reason. No core bit is ever set. A process group is `EINVAL`; `rusage` is not written |
 | `futex` | `FUTEX_WAIT` with an optional relative timeout, and `FUTEX_WAKE`, private or not; any other operation is `ENOSYS` |
 | `exit` | ends the calling thread, and its process with it when it was the last |
 | `exit_group` | ends every thread of the process; the low 8 bits of the code, as Linux reports a status |
+| `rt_sigaction` | any signal but `SIGKILL` and `SIGSTOP`, which are `EINVAL`; `sigsetsize` must be 8. A handler must carry `SA_RESTORER`, since the kernel has no trampoline of its own to return through; one without is `EINVAL`. `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND` are honoured, and `SA_ONSTACK` has no effect, as with no alternate stack set. Setting a signal to be ignored discards it where it is pending |
+| `rt_sigprocmask` | `SIG_BLOCK`, `SIG_UNBLOCK` and `SIG_SETMASK` on the calling thread's mask; `SIGKILL` and `SIGSTOP` are never blocked |
+| `rt_sigpending` | the pending signals the calling thread blocks, its own and its process's |
+| `rt_sigreturn` | resumes from the frame below the stack pointer, validated; a frame it refuses ends the process with `SIGSEGV` |
+| `sigaltstack` | reports that there is no alternate stack; setting one is `ENOSYS`, and logged |
+| `kill` | a signal, or 0 to ask whether the process exists, to a Linux process by pid. A process group and -1 are `EINVAL`, and so is `SIGSTOP`, since nothing here stops a process |
+| `tgkill` | a signal to one thread of a process, by tid; a process's first thread, whose tid is the pid, before it has made a call, takes it as its process |
 
 **The thread pointer** is part of a user thread's saved context on both ports. The context
 switch reads `FS` base (x86_64) or `TPIDR_EL0` (aarch64) back into the thread it switches away
@@ -494,9 +503,47 @@ waker counts under that lock before it wakes, so a wake between the check and th
 as a changed count rather than being lost. A wake wakes the bucket, and every waiter looks
 again, as a futex waiter must.
 
-**Limits, all of them fixed sizes:** 4 process slots, and a pool of 3 process threads per check,
-enough for a program, one thread and one child; 8 thread records; 4 pipes; 128 shared-page
-counts across every Linux process. A child's process slot is freed when whatever started the
+**Signals** divide as Linux divides them (`kernel/main/src/personality/signals.rs`). A process has
+a disposition for each of the 64 signals and a set of signals sent to it as a whole; each thread
+has a mask and a set sent to it alone. A `clone`d thread starts with its creator's mask, a `fork`ed
+child with the parent's dispositions and the forking thread's mask, and `execve` resets every
+handler to the default while an ignored signal stays ignored.
+
+- **Delivery** happens on the way out of a system call, the one place the kernel returns to a
+  Linux thread with its registers at hand: the lowest-numbered signal that is pending and not
+  masked, the thread's own before its process's. An ignored one is discarded. One whose action
+  ends the process ends it, and `wait4` reports the signal. One with a handler gets the frame
+  Linux pushes, and the call returns into the handler, with its `sa_mask` and, unless
+  `SA_NODEFER`, the signal itself added to the mask.
+- **The frame** is `kernel/linux`'s `signal::build`: on x86_64 an `rt_sigframe`, the restorer as
+  its return address, then a `ucontext` whose `sigcontext` holds every general register and a
+  `siginfo`, below the 128-byte red zone and aligned as a call leaves the stack; on aarch64 a
+  `siginfo` and a `ucontext` whose `sigcontext` ends in 4 KiB of reserved space, with a frame
+  record above it that the handler's `x29` points at. The handler starts with the signal, the
+  `siginfo` and the `ucontext` in its first three argument registers. Neither frame holds
+  floating-point or SIMD state: a handler that uses those registers changes them under the code
+  it interrupted.
+- **`rt_sigreturn`** reads the frame back with `signal::restore`. The frame is the program's to
+  write, so a return address outside the user half, or on aarch64 a processor state that is not
+  EL0 with only the condition flags, is refused, and on x86_64 only the flags a program may hold
+  are kept. A segment or a privilege level is never read from it. The restore then goes through
+  the port's `set_registers`, which sanitises the address and the flags again.
+- **A signal whose action ends the process** is acted on when it is sent, not when a thread
+  next returns: the process ends as `exit_group` ends it, a thread spinning in user mode
+  included. A handler, though, waits for its thread's next system call, since the interrupt path
+  has no registers to build a frame from.
+- **Blocking calls.** A pipe read or write, a futex wait and `wait4` look for a deliverable signal
+  that is not ignored each time they wake, and sending one wakes the personality's queues. The
+  call ends with `EINTR` when a handler without `SA_RESTART` runs after it. When the handler has
+  `SA_RESTART`, or no handler runs after all, the call returns to its own system call instruction
+  with its arguments, and runs again.
+- **Generated by the kernel:** `SIGCHLD` to a parent when a child's last thread has gone, and
+  `SIGPIPE` to a thread whose write found no reader. A trap ends a Linux process as `SIGSEGV`
+  would, but runs no handler, since the trap hook has no registers either.
+
+**Limits, all of them fixed sizes:** 4 process slots, and a pool of 3 process threads at once per
+check, an exited thread's entry given back when the next thread starts; 8 thread records, and 16
+threads with signal state; 4 pipes; 128 shared-page counts across every Linux process. A child's process slot is freed when whatever started the
 process tree tears it down, not by `wait4`.
 
 **Start-up.** `argv` is `["hello"]`, or `["hello", <mode>]` for the modes the scheduled check
@@ -517,9 +564,12 @@ no corpus yet for a gap to fail.
 
 **What it does not do yet:**
 
-- **No signals.** A child's exit sends no `SIGCHLD`, a write to a pipe with no reader is `EPIPE`
-  with no `SIGPIPE`, and nothing interrupts a blocked call. A thread spinning in user mode, in a
-  process another thread has ended, is not stopped until its next system call.
+- **Signals are not complete.** Nothing stops a process: `SIGSTOP` is refused, and the default
+  action of the other stop signals does nothing. There is no alternate signal stack,
+  `rt_sigsuspend`, `rt_sigtimedwait` or `signalfd`. A pending signal is a bit, so a second one
+  sent before the first is delivered is lost, real-time signals included. A handler for a thread
+  spinning in user mode waits for its next system call, and no handler runs for a trap. The frame
+  holds no floating-point state.
 - **No sockets.** `socket` and the calls after it are logged as unimplemented.
 - **`AT_RANDOM`'s bytes are not secret.** They are a SplitMix64 stream seeded from the
   process's page-table root and entry point. A C library seeds its stack protector from them.
