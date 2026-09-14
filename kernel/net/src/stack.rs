@@ -637,8 +637,7 @@ impl Stack {
         into: &mut [u8],
     ) -> Option<(Ipv4Addr, u16, usize, usize)> {
         let d = self.st.inbox.iter().flatten().find(|d| {
-            d.dst_port == port
-                && from.is_none_or(|(ip, src)| d.src_ip == ip && d.src_port == src)
+            d.dst_port == port && from.is_none_or(|(ip, src)| d.src_ip == ip && d.src_port == src)
         })?;
         let n = d.len.min(into.len());
         into[..n].copy_from_slice(&d.data[..n]);

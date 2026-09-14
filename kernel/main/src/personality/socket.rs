@@ -64,9 +64,8 @@ use hal::EarlyConsole;
 use kobject::ObjectId;
 use linux::Failure;
 use linux::socket::{
-    AF_INET, IOVEC_LEN, IPPROTO_TCP, IPPROTO_UDP, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK,
-    MSG_TRUNC, MSG_WAITALL,
-    MSGHDR_IOV, MSGHDR_IOVLEN, MSGHDR_LEN, MSGHDR_NAME, MSGHDR_NAMELEN, SHUT_RD,
+    AF_INET, IOVEC_LEN, IPPROTO_TCP, IPPROTO_UDP, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC,
+    MSG_WAITALL, MSGHDR_IOV, MSGHDR_IOVLEN, MSGHDR_LEN, MSGHDR_NAME, MSGHDR_NAMELEN, SHUT_RD,
     SHUT_RDWR, SHUT_WR, SO_BROADCAST, SO_ERROR, SO_KEEPALIVE, SO_RCVTIMEO, SO_REUSEADDR,
     SO_SNDTIMEO, SO_TYPE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SOCK_TYPE_MASK,
     SOCKADDR_IN_LEN, SOL_SOCKET, TCP_NODELAY, TIMEVAL_LEN, word,
@@ -731,7 +730,9 @@ fn message(at: u64) -> Result<([Buffer; MAX_IOV], usize, u64, u64), Failure> {
 fn gather(buffers: &[Buffer], into: &mut [u8]) -> Result<usize, Failure> {
     let mut done = 0;
     for b in buffers {
-        let n = usize::try_from(b.len).unwrap_or(usize::MAX).min(into.len() - done);
+        let n = usize::try_from(b.len)
+            .unwrap_or(usize::MAX)
+            .min(into.len() - done);
         if n == 0 {
             continue;
         }
@@ -831,13 +832,11 @@ fn send_bytes(
         if bytes.len() > crate::sockets::MAX_DATAGRAM {
             return Err(Failure::MessageTooLong);
         }
-        return wait(slot, nonblock, snd, || {
-            match crate::sockets::datagram_send(id, to, bytes) {
-                Ok(n) => Ok(Some(n)),
-                Err(abi::Error::ShouldWait) => Ok(None),
-                Err(abi::Error::InvalidArgument) if to == 0 => Err(Failure::NotConnected),
-                Err(e) => Err(failure(e)),
-            }
+        return wait(slot, nonblock, snd, || match crate::sockets::datagram_send(id, to, bytes) {
+            Ok(n) => Ok(Some(n)),
+            Err(abi::Error::ShouldWait) => Ok(None),
+            Err(abi::Error::InvalidArgument) if to == 0 => Err(Failure::NotConnected),
+            Err(e) => Err(failure(e)),
         });
     }
     let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
@@ -891,7 +890,11 @@ fn recv_into(
         } else if len_at != 0 {
             to_user(len_at, &0u32.to_le_bytes())?;
         }
-        let reported = if flags & MSG_TRUNC != 0 { whole } else { copied };
+        let reported = if flags & MSG_TRUNC != 0 {
+            whole
+        } else {
+            copied
+        };
         return Ok((copied, reported as u64));
     }
     if flags & MSG_TRUNC != 0 {
@@ -899,7 +902,11 @@ fn recv_into(
         return Err(Failure::OperationNotSupported);
     }
     let conn = crate::sockets::connection(id).map_err(|_| Failure::NotConnected)?;
-    let want = if flags & MSG_WAITALL != 0 { into.len() } else { 1 };
+    let want = if flags & MSG_WAITALL != 0 {
+        into.len()
+    } else {
+        1
+    };
     // As in `recv_with`: a peek sees the same bytes until they are taken, so the wait itself
     // decides whether there are enough, rather than looping on them.
     let mut got = 0;
@@ -1398,7 +1405,7 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     });
     Check::from_ok(
         datagram_ok
-        && peek_ok
+            && peek_ok
             && client.code == Some(TCP_SUCCESS)
             && server.code == Some(SERVE_SUCCESS)
             && polled.code == Some(POLL_SUCCESS)
