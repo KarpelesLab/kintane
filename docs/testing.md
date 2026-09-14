@@ -2085,6 +2085,35 @@ climbs or falls away is what a long run is for. Counters whose rate moved by mor
 quarter are marked. The comparison is arithmetic on the guest's own numbers; nothing in it
 decides whether the run passed.
 
+#### What the gates showed
+
+A soak gates a branch at thirty minutes per SMP preset: long enough for every bound above to
+be exercised thousands of times under load, and to compare the first five minutes with the
+last five. The two-hour and twenty-four-hour runs are for leaks a shorter run cannot show,
+and are run on a quiet machine.
+
+`aarch64-virt-smp` at eight CPUs, thirty minutes, on a host carrying other work at load 12 to
+25 throughout: **1,800 heartbeats of 1,800, no audit failed**. Its drift, the first five
+minutes against the last five, is the shape of a machine doing more work as its caches warm
+and nothing else: heap +8%, channels +13%, page faults and copy-on-write +16%, pages +11%,
+block +13%, filesystem +13%, datagrams +11%, TCP +3%. No counter ran away, and the retry
+counts fell slightly.
+
+What the bounds had left at the end of that run, against what would have failed it:
+
+| Margin | Reached | Bound |
+|---|---|---|
+| Slices to park | 44 | 512 |
+| Slices without progress | 0 | 512 |
+| Late wakes blamed on the scheduler | 0 | any |
+| Late wakes charged to the host | 1, worst 581 ms | reported, not fatal |
+| Slow exchanges | 0 | reported, not fatal |
+| Waits charged nothing at all | 0 | reported, not fatal |
+| Stalled shootdown waits | 0 of 4,397,954, mean 186 µs | reported, not fatal |
+
+The counts that are *reported rather than fatal* are the point of this round's work: on a
+loaded host they stay near zero on a healthy kernel, and every one of them used to end a run.
+
 #### What the soaks found
 
 Seven attempts at a two-hour soak died, six of them inside the first ten minutes, on six
