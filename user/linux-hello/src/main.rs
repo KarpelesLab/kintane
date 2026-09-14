@@ -863,35 +863,35 @@ fn rtsig() -> ! {
     let handler = on_rt as *const () as u64;
 
     // 250: a real-time signal takes a handler like any other.
-    expect(sigaction(SIGRT_A, handler, SA_SIGINFO) == 0, 250);
-    expect(sigaction(SIGRT_B, handler, SA_SIGINFO) == 0, 250);
+    expect(sigaction(SIGRT_A, handler, SA_SIGINFO) == 0, 240);
+    expect(sigaction(SIGRT_B, handler, SA_SIGINFO) == 0, 240);
 
     // 251-253: with both blocked, three of one number and one of the other are queued. Nothing
     // runs yet, so what arrives later is what the queue kept, in the order it kept it.
-    expect(sigprocmask(SIG_BLOCK, bit(SIGRT_A) | bit(SIGRT_B)) == 0, 251);
+    expect(sigprocmask(SIG_BLOCK, bit(SIGRT_A) | bit(SIGRT_B)) == 0, 241);
     for value in 1..=3u64 {
-        expect(rt_queue(pid, SIGRT_A, value) == 0, 252);
+        expect(rt_queue(pid, SIGRT_A, value) == 0, 242);
     }
-    expect(rt_queue(pid, SIGRT_B, 9) == 0, 253);
-    expect(RT_HITS.load(Ordering::Relaxed) == 0, 253);
+    expect(rt_queue(pid, SIGRT_B, 9) == 0, 243);
+    expect(RT_HITS.load(Ordering::Relaxed) == 0, 243);
 
     // 254: both numbers are pending while they are blocked.
     let mut pending = 0u64;
     let asked = sys::call(sys::RT_SIGPENDING, [&raw mut pending as u64, 8, 0, 0, 0, 0]);
-    expect(asked == 0 && pending & bit(SIGRT_A) != 0 && pending & bit(SIGRT_B) != 0, 254);
+    expect(asked == 0 && pending & bit(SIGRT_A) != 0 && pending & bit(SIGRT_B) != 0, 244);
 
     // 255: the queue fills, and one more is refused rather than dropped on the floor.
     let mut queued = 4;
     while queued < RT_DEPTH {
-        expect(rt_queue(pid, SIGRT_B, 100 + queued as u64) == 0, 255);
+        expect(rt_queue(pid, SIGRT_B, 100 + queued as u64) == 0, 245);
         queued += 1;
     }
-    expect(rt_queue(pid, SIGRT_B, 200) == -EAGAIN, 255);
+    expect(rt_queue(pid, SIGRT_B, 200) == -EAGAIN, 245);
 
     // 256-259: unblocked, every one queued is delivered — the lower number first, and within a
     // number in the order it was queued.
-    expect(sigprocmask(SIG_UNBLOCK, bit(SIGRT_A) | bit(SIGRT_B)) == 0, 256);
-    expect(RT_HITS.load(Ordering::Relaxed) == RT_DEPTH as u64, 257);
+    expect(sigprocmask(SIG_UNBLOCK, bit(SIGRT_A) | bit(SIGRT_B)) == 0, 246);
+    expect(RT_HITS.load(Ordering::Relaxed) == RT_DEPTH as u64, 247);
     for (i, expected) in [
         (SIGRT_A, 1u64),
         (SIGRT_A, 2),
@@ -906,9 +906,9 @@ fn rtsig() -> ! {
     .enumerate()
     {
         let seen = RT_SEEN[i].load(Ordering::Relaxed);
-        expect(seen == ((expected.0 << 32) | expected.1), 258);
+        expect(seen == ((expected.0 << 32) | expected.1), 248);
     }
-    expect(RT_CODE.load(Ordering::Relaxed) == SI_QUEUE as i64 as u64, 259);
+    expect(RT_CODE.load(Ordering::Relaxed) == SI_QUEUE as i64 as u64, 249);
     exit(RTSIG_SUCCESS)
 }
 
