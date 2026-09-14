@@ -126,13 +126,6 @@ pub unsafe fn volume() -> Option<&'static mut Fat<'static, 'static>> {
 /// # Safety
 /// As [`volume`]: the caller is on the boot path, before the file server or the stress run
 /// has started.
-#[cfg_attr(
-    not(CONFIG_ABI_LINUX),
-    expect(
-        dead_code,
-        reason = "the Linux personality's check is the one boot-path user left"
-    )
-)]
 pub unsafe fn volume32() -> Option<&'static mut Fat<'static, 'static>> {
     if !MOUNTED32.load(Ordering::Acquire) {
         return None;
@@ -179,13 +172,6 @@ pub fn consistency(volume: &mut Fat<'_, '_>) -> Result<fat::Consistency, Error> 
 /// waits for anything else.
 pub struct Lease {
     volume: &'static mut Fat<'static, 'static>,
-    #[cfg_attr(
-        not(CONFIG_USERSPACE),
-        expect(
-            dead_code,
-            reason = "only the file server and the personality mount the second volume, and they need USERSPACE"
-        )
-    )]
     volume32: Option<&'static mut Fat<'static, 'static>>,
 }
 
@@ -196,13 +182,6 @@ impl Lease {
     /// needs both borrows live at the same time, which two methods could not give it. A
     /// caller that mounts the second puts it below the first, so a rename across the two —
     /// and its refusal — is something a program can meet.
-    #[cfg_attr(
-        not(CONFIG_USERSPACE),
-        expect(
-            dead_code,
-            reason = "only the file server and the personality mount the second volume, and they need USERSPACE"
-        )
-    )]
     pub fn both(&mut self) -> (&mut Fat<'static, 'static>, Option<&mut Fat<'static, 'static>>) {
         let second = match &mut self.volume32 {
             Some(v) => Some(&mut **v),
