@@ -108,6 +108,12 @@ SMP now default the boot stack to 32 KiB, as `BLOCK_DOMAIN` already did, which p
 at 46% and 36%. The next deepest are `armv7m-tiny`'s at 70% of its 14 KiB — a 56 KiB board, so it
 keeps what it has — and `x86_64-efistub`'s at 65%.
 
+A stress image is deeper again, its setup running on the boot stack as well: `x86_64-qemu`'s
+reached 77% and failed, and `i686-qemu`'s passed at 74%, one point short. `STRESS_TEST` therefore
+defaults the boot stack to 32 KiB too. Each of these was found by the check itself during this
+round's verification, which is the argument for having it: all three configurations were within a
+kilobyte or two of the guard page, and nothing before this said so.
+
 The size is checked twice. Each port's linker script asserts that `__stack_bottom` to
 `__stack_top` is `BOOT_STACK_KIB` rounded up to a page, and kbuild refuses any linked kernel
 where it is not, whatever its script says (`kbuild/src/bootstack.rs`, with host tests). The
