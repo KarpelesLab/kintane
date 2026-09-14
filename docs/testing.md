@@ -2111,6 +2111,15 @@ What the bounds had left at the end of that run, against what would have failed 
 | Waits charged nothing at all | 0 | reported, not fatal |
 | Stalled shootdown waits | 0 of 4,397,954, mean 186 µs | reported, not fatal |
 
+`x86_64-qemu-smp` at eight CPUs, thirty minutes, on the same busy host: **1,800 heartbeats of
+1,800, no audit failed**. Its drift runs the other way — heap −7%, channels −12%, faults −8%,
+pages −5% — because the host grew busier as the run went on rather than because anything in
+the kernel slowed. That is what the comparison is for: the direction says where the work went,
+and neither run has a counter that ran away. Its margins at the end were 244 slices to park of
+512, no interval without progress, and zero for every reportable count: no late wake charged to
+the host (the worst was 214 ms), no slow exchange, no wait charged nothing, no stalled
+shootdown wait.
+
 The counts that are *reported rather than fatal* are the point of this round's work: on a
 loaded host they stay near zero on a healthy kernel, and every one of them used to end a run.
 
