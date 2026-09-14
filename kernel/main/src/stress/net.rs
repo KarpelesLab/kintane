@@ -25,14 +25,13 @@ const TIMEOUT_NS: u64 = 1_000_000_000;
 const TRIES: u32 = 3;
 
 /// The pause between polls while a reply is awaited, and between one round of exchanges and
-/// the next. Paced, because this thread wakes several times for every exchange where the
-/// disk workloads wake once an iteration: at one millisecond each, on a single CPU it took
-/// enough of the CPU from the user process below it that the process made no progress in
-/// its 80 ms window, on x86_64-qemu and aarch64-virt both. At 2 ms and 10 ms it passed,
-/// until MSI-X put the disk's completions and the card's on interrupts too, and x86_64-qemu
-/// failed the same way once in two runs; hence 5 ms and 25 ms.
-const POLL_MS: u64 = 5;
-const ROUND_MS: u64 = 25;
+/// the next. It was 5 ms and 25 ms, paced so that on a single CPU this thread did not take
+/// the user process below it past a fixed 80 ms progress window. That check now counts the
+/// slices the process was given instead (`procs::await_slices`), and unpaced the 20-second
+/// runs pass on x86_64-qemu, aarch64-virt and i686-qemu, and on x86_64-qemu beside six busy
+/// guests.
+const POLL_MS: u64 = 1;
+const ROUND_MS: u64 = 1;
 
 static PINGS: AtomicU64 = AtomicU64::new(0);
 static ROUNDS: AtomicU64 = AtomicU64::new(0);

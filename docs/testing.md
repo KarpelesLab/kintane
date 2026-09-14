@@ -854,13 +854,16 @@ with 1,536 echo replies, 1,536 round trips and 2 retries, beside 255,650 disk co
 interrupt and none polled. The 20-second runs pass on
 `x86_64-qemu`, `i686-qemu`, `aarch64-virt`, both SMP presets at four CPUs and both at eight.
 
-The workload is paced: it sleeps 5 ms between polls for a reply and 25 ms between rounds.
-Unpaced, at one millisecond each, it passed 60 s at four CPUs with 8,547 round trips. On a
-single CPU, though, it took enough time from the user process below it that `x86_64-qemu` and
-`aarch64-virt` both failed at 15–16 s with `user process: a process made no progress`. The
-same runs without the card passed. At 2 ms and 10 ms both passed, until MSI-X put the disk and
-the card on interrupts on x86_64 and `x86_64-qemu` failed the same way at 5 s in one run of
-two (the run without the card passed). At 5 ms and 25 ms it passed three runs of three.
+The workload is no longer paced: it sleeps 1 ms between polls for a reply and between
+rounds. For a while it slept 5 ms and 25 ms. At one millisecond each on a single CPU, it took
+enough time from the user process below it that `x86_64-qemu` and `aarch64-virt` both failed
+with `user process: a process made no progress`, and 2 ms and 10 ms stopped being enough once
+MSI-X put the disk and the card on interrupts. What failed was the process check's fixed
+80 ms window, not the process. With that check counting slices
+([below](#3a-stress)), the unpaced 20-second runs passed three times on `x86_64-qemu`, twice
+on `aarch64-virt` and once on `i686-qemu`, with about 2,300 round trips each where the paced
+runs made 470. Beside six busy guests, both `x86_64-qemu` runs that got past bring-up passed.
+The other three stopped in the boot `preempt` check, before the workload ran.
 
 The first two such runs hung at about 40 s: in one a workload missed its checkpoint, and the
 watchdog killed the other. The network workload took the stack's spinlock without masking
@@ -1005,9 +1008,20 @@ With only other agents' work loading the host, the old window also failed 2 runs
 - `waits`' 10 s and 5 s patience, `procs::wait_exit`'s 1 s drain in the boot check, and
   `PARK_WITHIN`'s 3 s: generous bounds on something that normally takes milliseconds;
 - the boot `preempt` check, which requires 12 interrupts in 300 ms and a 20 ms wake-up.
-  Under the load above it failed once: 11 interrupts, and a wake 51.8 ms late. It checks
-  interrupt delivery and latency, which are wall-clock properties, so it was not changed.
-  It is the next check a loaded host can break.
+  Under the same load it failed bring-up in 4 of 15 runs, with 7 to 11 interrupts and wakes
+  45.7 to 56.2 ms late. It checks interrupt delivery and latency, which are wall-clock
+  properties, so it was not changed. It is now the check a loaded host breaks first.
+
+**What the slice check was shown to catch**, each mutation in a 20-second run on
+`x86_64-qemu` unless named:
+
+| Mutation | Result |
+|---|---|
+| The process runs but never publishes a pass (`user/init` skips the write when the kernel sets a word) | `a process ran its slices and made no progress` at 3 s. With the first, total passed-over bound it read `was passed over`, which is why that bound is now per slice run |
+| The process thread is never made ready (`spawn_on` skips the run queue once) | `a process was passed over for its slices and made no progress` at 0 s |
+| The process pinned to a CPU that never joined, on `x86_64-qemu-smp` | `a process thread could not be moved` at 0 s: `set_affinity` refuses an offline CPU, so that thread cannot exist |
+| The vm workload (priority 5) spins from its start, above the process (4) | `a process made no progress: ready, behind more urgent threads` at 10 s, from the 5 s bound |
+| A priority inversion: heap A (4) holds a flag the sleeper (8) waits on, and the page workload (6) spins while it is held | `a workload did not reach a checkpoint: heap A` at 3 s. The audit's 3 s park bound caught the starvation before a process cycle's 5 s bound could. Held for only 100 heap iterations, heap A finished before the page workload woke, and the run passed |
 
 **What each check was shown to catch**, by breaking the code and watching the run fail:
 
