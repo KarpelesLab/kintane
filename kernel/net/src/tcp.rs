@@ -234,6 +234,9 @@ pub struct Counters {
     pub dup_acks: u64,
     /// Segments sent again on [`DUP_ACK_THRESHOLD`] duplicates, without waiting for the timer.
     pub fast_retransmits: u64,
+    /// Retransmissions that stepped over a run the peer selectively acknowledged, rather than
+    /// sending it again as go-back-N would.
+    pub sack_retransmits: u64,
     /// Round-trip measurements taken (never from a retransmitted segment: Karn's rule).
     pub rtt_samples: u64,
     pub resets_sent: u64,
@@ -388,6 +391,11 @@ struct Tcb {
     /// Nothing is sent to a peer that did not ask, which is every peer this stack has met:
     /// QEMU's user-mode network offers none. See the module's "What is not".
     sack_ok: bool,
+    /// Runs past `snd_una` the peer has said it already holds, from its latest blocks and
+    /// clamped to what was actually sent. A block naming data this end never sent is
+    /// discarded rather than believed: a peer cannot talk this stack out of resending what it
+    /// owes. Cleared when recovery ends and when a timeout falls back to go-back-N.
+    sacked: [Option<(u32, u32)>; wire::SACK_BLOCKS],
     /// The peer's window is shut and the timer ran out: send one byte past it.
     probe: bool,
     retries: u32,
@@ -436,6 +444,7 @@ const EMPTY: Tcb = Tcb {
     rto: RTO_INITIAL_NS,
     deadline: None,
     sack_ok: false,
+    sacked: [None; wire::SACK_BLOCKS],
     probe: false,
     retries: 0,
     time_wait_until: 0,
@@ -650,6 +659,64 @@ impl Tcb {
         .min(RING as u32);
     }
 
+    /// Take in the peer's selective acknowledgement blocks, keeping what lies after `snd_una`
+    /// and no later than `snd_max`. A block outside that range names data never sent, or
+    /// already acknowledged, and is dropped. `true` if any run was kept.
+    fn record_sack(&mut self, blocks: &[Option<(u32, u32)>; wire::SACK_BLOCKS]) -> bool {
+        let mut kept = false;
+        for (slot, block) in self.sacked.iter_mut().zip(blocks.iter()) {
+            *slot = match *block {
+                Some((start, end))
+                    if lt(start, end) && le(self.snd_una, start) && le(end, self.snd_max) =>
+                {
+                    kept = true;
+                    Some((start, end))
+                }
+                _ => None,
+            };
+        }
+        kept
+    }
+
+    /// Forget runs the acknowledgement has overtaken, and everything once recovery is over.
+    fn forget_sacked(&mut self, through: u32) {
+        for slot in &mut self.sacked {
+            if slot.is_some_and(|(_, end)| le(end, through)) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// The first byte at or after `from` the peer has not said it holds: where a
+    /// retransmission is owed. Without blocks this is `from` itself, which is go-back-N.
+    fn first_hole(&self, from: u32) -> u32 {
+        let mut at = from;
+        // Four runs at most, so a scan per step is cheaper than ordering them.
+        for _ in 0..=wire::SACK_BLOCKS {
+            match self
+                .sacked
+                .iter()
+                .flatten()
+                .find(|(start, end)| le(*start, at) && lt(at, *end))
+            {
+                Some((_, end)) => at = *end,
+                None => break,
+            }
+        }
+        at
+    }
+
+    /// How far a segment starting at `from` may run before it reaches a run the peer already
+    /// holds. `None` when no block lies ahead of it.
+    fn to_next_block(&self, from: u32) -> Option<u32> {
+        self.sacked
+            .iter()
+            .flatten()
+            .filter(|(start, _)| lt(from, *start))
+            .map(|(start, _)| start.wrapping_sub(from))
+            .min()
+    }
+
     /// A loss the duplicate acknowledgements found: halve the threshold, inflate the window by
     /// what has left the network, and send the oldest unacknowledged segment again at once
     /// (RFC 5681 §3.2, RFC 6582 §3.2).
@@ -659,7 +726,9 @@ impl Tcb {
         self.cwnd = self.ssthresh.saturating_add(DUP_ACK_THRESHOLD * seg);
         self.recover = self.snd_max;
         self.recovering = true;
-        self.snd_nxt = self.snd_una;
+        // The oldest byte the peer has not said it holds. With no blocks that is `snd_una`,
+        // which is go-back-N.
+        self.snd_nxt = self.first_hole(self.snd_una);
         self.resend = true;
         // Karn's rule: nothing sent from here is a measurement.
         self.timing = None;
@@ -672,6 +741,9 @@ impl Tcb {
         self.cwnd = seg;
         self.dup_acks = 0;
         self.recovering = false;
+        // What the peer said it held may be stale by now, and a timeout resends from the
+        // oldest byte regardless: go-back-N, as the module documents.
+        self.sacked = [None; wire::SACK_BLOCKS];
         self.timing = None;
     }
 
@@ -735,16 +807,20 @@ impl Tcb {
             self.timing = None;
             self.sample_rtt(now.saturating_sub(sent), counters);
         }
+        self.forget_sacked(ack);
         if self.recovering {
             if le(self.recover, ack) {
                 // Everything outstanding when the loss was found is acknowledged: back to
                 // the threshold, and out of recovery.
                 self.cwnd = self.ssthresh;
                 self.recovering = false;
+                self.sacked = [None; wire::SACK_BLOCKS];
             } else {
                 // A partial acknowledgement: the next hole, sent again at once, and the
-                // window deflated by what this acknowledged (RFC 6582 §3.2).
-                self.snd_nxt = ack;
+                // window deflated by what this acknowledged (RFC 6582 §3.2). With selective
+                // acknowledgement the hole is what the peer has not got, so the runs it
+                // already holds are stepped over rather than sent again.
+                self.snd_nxt = self.first_hole(ack);
                 self.cwnd = self.cwnd.saturating_sub(acked).max(self.seg());
                 self.resend = true;
                 counters.fast_retransmits += 1;
@@ -828,6 +904,7 @@ impl Tcp {
                 out_of_order_delivered: 0,
                 dup_acks: 0,
                 fast_retransmits: 0,
+                sack_retransmits: 0,
                 rtt_samples: 0,
                 resets_sent: 0,
                 resets_received: 0,
@@ -1539,11 +1616,16 @@ impl Tcp {
                 // exactly one goes out for each acknowledgement that asked for it; a timeout,
                 // which is not recovery, resends from the oldest byte as go-back-N.
                 let resending = lt(t.snd_nxt, t.snd_max);
-                let n = if resending && t.recovering && !t.resend {
+                let mut n = if resending && t.recovering && !t.resend {
                     0
                 } else {
                     unsent.min(usable).min(t.seg() as usize)
                 };
+                // Never send through a run the peer has said it holds: a retransmission stops
+                // where that run starts, and `advance` below steps over it.
+                if resending && let Some(gap) = t.to_next_block(t.snd_nxt) {
+                    n = n.min(gap as usize);
+                }
                 if n > 0 {
                     t.probe = false;
                     t.ack_now = false;
@@ -1557,6 +1639,15 @@ impl Tcp {
                     let at = (t.tx.head + sent) % RING;
                     let ring = t.tx.buf;
                     t.advance(n, now);
+                    if resending {
+                        // Past whatever the peer already holds, so the next retransmission is
+                        // the next hole rather than bytes it has.
+                        let skipped = t.first_hole(t.snd_nxt);
+                        if skipped != t.snd_nxt {
+                            self.counters.sack_retransmits += 1;
+                            t.snd_nxt = skipped;
+                        }
+                    }
                     return Some(Segment {
                         remote_ip,
                         header,
@@ -1688,6 +1779,11 @@ fn segment(
             // segment before it is missing or merely late (RFC 5681 §2). Three say missing.
             counters.dup_acks += 1;
             t.dup_acks += 1;
+            // What it says it holds, so the loss recovery below resends the hole rather than
+            // everything after it.
+            if t.sack_ok {
+                t.record_sack(&seg.sack);
+            }
             if t.recovering {
                 // Each further duplicate is one more segment that has left the network.
                 t.cwnd = t.cwnd.saturating_add(t.seg());

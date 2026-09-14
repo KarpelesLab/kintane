@@ -1358,12 +1358,19 @@ Exactly what is implemented:
   not a copy. A run that touches another is merged into it; with every run taken, a nearer run
   displaces the one furthest ahead, and a run that is itself the furthest is dropped for the
   peer to send again. A FIN that arrives ahead of a hole is not remembered.
-- **Selective acknowledgement, the receiving half** (RFC 2018). The stack offers
+- **Selective acknowledgement, both halves** (RFC 2018). *Receiving*: the stack offers
   SACK-permitted on its own SYN, remembers whether the peer offered it, and — only to a peer
   that did — names the runs it holds past a hole, nearest run first, in up to three blocks
-  beside the other options. **No boot exercises it**: QEMU's user-mode network, which is the
-  only peer these checks have, offers no SACK, so a capture of a whole boot shows `MSS` and
-  nothing else from it. It is proven by host tests, and that is said rather than implied.
+  beside the other options. *Sending*: the blocks a peer sends are recorded against the
+  connection, clamped to what was actually sent, so a block naming data this end never sent is
+  discarded rather than believed — a peer cannot talk the stack out of resending what it owes.
+  Recovery then begins at the first byte the peer has *not* reported, a retransmission stops
+  where the next reported run begins and steps over it, and the record is dropped when recovery
+  ends and when a timeout falls back to go-back-N, which resends from the oldest byte whatever
+  the peer last said. Without blocks every one of those reduces to the go-back-N it replaces.
+  **No boot exercises either half**: QEMU's user-mode network, which is the only peer these
+  checks have, offers no SACK, so a capture of a whole boot shows `MSS` and nothing else from
+  it. Both are proven by host tests, and that is said rather than implied.
 - **A segment this stack sends is at most a quarter of the send ring** (`SEND_SEG`, 378
   bytes), whatever the peer announces, and the congestion window is counted in those terms. A
   ring is one pool buffer, so a ring's worth is all that can be outstanding; sending a whole
@@ -1377,10 +1384,7 @@ Exactly what is implemented:
   respected**, and a shut one is probed a byte at a time on the timer. **The MSS option** is sent
   on a SYN (1460) and honoured; 536 when the peer sends none.
 
-Exactly what is not: **the sending half of selective acknowledgement**, so a hole is filled
-by the sender resending from it and a second loss in one window costs another round trip, which
-is what NewReno's partial acknowledgements handle one hole at a time; blocks a peer sends are
-parsed but not yet used to choose what to resend; **no appropriate byte counting,
+Exactly what is not: **no appropriate byte counting,
 proportional rate reduction or pacing**, so the window is counted in bytes but grown per
 acknowledgement, which over-counts when the peer acknowledges less than a segment; no Nagle, no
 delayed acknowledgements, no explicit congestion notification, no urgent data, timestamps or
