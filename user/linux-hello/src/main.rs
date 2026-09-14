@@ -946,7 +946,7 @@ fn read_line(fd: u64, line: &mut [u8]) -> usize {
 }
 
 /// `a` then `b` into `buf`. The length written.
-fn join(buf: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+fn concat(buf: &mut [u8], a: &[u8], b: &[u8]) -> usize {
     let mut n = 0;
     for (to, &from) in buf.iter_mut().zip(a.iter().chain(b)) {
         *to = from;
@@ -1146,16 +1146,16 @@ fn serve() -> ! {
         exit(136)
     };
     let mut tag_buf = [0u8; 32];
-    let tag_len = join(&mut tag_buf, tag, b"");
+    let tag_len = concat(&mut tag_buf, tag, b"");
     let tag = tag_buf.get(..tag_len).unwrap_or(&[]);
     // 137: the reply.
     let mut reply = [0u8; 64];
-    let r = join(&mut reply, INBOUND_REPLY, tag);
+    let r = concat(&mut reply, INBOUND_REPLY, tag);
     expect(write_all(c, reply.get(..r).unwrap_or(&[])), 137);
     // 138: kbuild checked the reply, and says so.
     let n = read_line(c, &mut line);
     let mut verified = [0u8; 64];
-    let v = join(&mut verified, INBOUND_VERIFIED, tag);
+    let v = concat(&mut verified, INBOUND_VERIFIED, tag);
     expect(line.get(..n) == verified.get(..v), 138);
     // 139: then kbuild closes its end.
     expect(sys::call(sys::READ, [c, line.as_mut_ptr() as u64, 1, 0, 0, 0]) == 0, 139);
