@@ -26,8 +26,10 @@ const TIMEOUT_NS: u64 = 2_000_000_000;
 const TRIES: u32 = 3;
 
 /// The pause between polls while a round waits, and between rounds: paced as the datagram
-/// workload is, for the same reason.
-const POLL_MS: u64 = 5;
+/// workload is, for the same reason. Polls are further apart than its, because a round spends
+/// most of its time in the 300 ms retransmission wait the relay's drop forces, and at 5 ms a
+/// single-CPU run once failed the user process's progress check at 3 s.
+const POLL_MS: u64 = 10;
 const ROUND_MS: u64 = 25;
 
 static ROUNDS: AtomicU64 = AtomicU64::new(0);

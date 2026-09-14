@@ -850,6 +850,12 @@ TCP retransmits after a second or so. Every buffer must be back afterwards, as b
 ([userspace-abi.md](userspace-abi.md)); i686 has no userspace, and gates on the TCP part of
 `net` alone.
 
+The boot counter test, which resets one QEMU several times, found a fault the single boots
+could not. Every boot opened its first connections from port 49152 again, with nearly the same
+initial sequence numbers, and QEMU's TCP still held those connections from the boot before. A
+later boot's round was refused, and the next boot's program could not connect. Ephemeral ports
+now start from the clock at the first connection.
+
 On MSI-X the card first took no interrupts at all. Its table entry was written and unmasked,
 both queues read back vector 0, and QEMU's trace showed `virtio_notify` for its queues, but
 no `apic_deliver_irq` for its vector. The function was not a bus master: nothing in discovery

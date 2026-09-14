@@ -491,7 +491,8 @@ impl Tcp {
             tcbs: [EMPTY; CONNECTIONS],
             syns: [None; BACKLOG],
             resets: [None; RESETS],
-            next_port: EPHEMERAL_FIRST,
+            // Zero until the first connection chooses where to start: see `ephemeral`.
+            next_port: 0,
             counters: Counters {
                 segments_in: 0,
                 segments_out: 0,
@@ -599,7 +600,16 @@ impl Tcp {
         self.tcbs.iter().any(|t| t.active && t.local_port == port)
     }
 
-    fn ephemeral(&mut self) -> Option<u16> {
+    /// A free ephemeral port. The first is chosen from the clock at the first connection, so a
+    /// machine that restarts does not open its first connections from the ports it used last
+    /// time, which the peer may still hold, in TIME-WAIT or otherwise; after that they are taken
+    /// in turn.
+    fn ephemeral(&mut self, now: u64) -> Option<u16> {
+        if self.next_port == 0 {
+            let span = u64::from(u16::MAX - EPHEMERAL_FIRST) + 1;
+            let offset = now.wrapping_mul(0x9e37_79b9_7f4a_7c15) % span;
+            self.next_port = EPHEMERAL_FIRST + offset as u16;
+        }
         for _ in EPHEMERAL_FIRST..=u16::MAX {
             let port = self.next_port;
             self.next_port = if port == u16::MAX {
@@ -645,7 +655,7 @@ impl Tcp {
         now: u64,
     ) -> Result<Conn, TcpError> {
         let i = self.slot().ok_or(TcpError::NoRoom)?;
-        let port = self.ephemeral().ok_or(TcpError::PortInUse)?;
+        let port = self.ephemeral(now).ok_or(TcpError::PortInUse)?;
         let (rx, tx) = take_two(pool).ok_or(TcpError::NoRoom)?;
         let iss = Self::iss(now, port, remote_port);
         self.counters.connects += 1;

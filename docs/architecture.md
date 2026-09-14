@@ -1136,7 +1136,9 @@ out-of-order queue, so a reordered segment is dropped and the sender's retransmi
 gap; no delayed acknowledgements, urgent data, SACK, timestamps or window scaling. TIME-WAIT is
 1 s rather than four minutes, and a released connection in TIME-WAIT is given up early when
 every slot is needed. Initial sequence numbers are the clock mixed with the ports, not RFC 6528's
-keyed hash, so they are predictable.
+keyed hash, so they are predictable. Ephemeral ports start from the clock at the first connection
+and are then taken in turn, so a machine that restarts does not reuse the ports its last boot
+closed.
 
 Memory is bounded: four connection slots, listeners included, and two pool buffers for each
 connection that carries data, taken when it opens and given back when it is over and its
