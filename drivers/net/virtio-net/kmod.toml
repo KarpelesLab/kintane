@@ -1,0 +1,15 @@
+# virtio-net: a network card over virtio 1.x, bound from a memory-mapped virtio slot or a
+# PCI function, and a `net::Nic` for the stack above it.
+#
+# The second virtio driver, and the reason `drivers/virtio` exists: the virtqueue, the
+# transports and the DMA types are shared with virtio-blk. Host-tested against the shared
+# fake device on the other side of both queues.
+[unit]
+name = "virtio-net"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = ["hal", "device", "sync", "virtio", "net"]

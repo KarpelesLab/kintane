@@ -45,6 +45,7 @@ mod block;
 mod fs;
 mod heap;
 mod ipc;
+mod net;
 mod pages;
 mod sleep;
 mod vm;
@@ -88,20 +89,26 @@ pub enum Workload {
     BlockB,
     /// Present only when the filesystem check mounted the test disk's volume.
     Fs,
+    /// Present only when the net check completed its round trips with kbuild.
+    Net,
 }
 
-const WORKLOADS: usize = 10;
+const WORKLOADS: usize = 11;
 
 const NAMES: [&str; WORKLOADS] = [
-    "heap A", "heap B", "ping", "pong", "sleep", "vm", "pages", "block", "block B", "fs",
+    "heap A", "heap B", "ping", "pong", "sleep", "vm", "pages", "block", "block B", "fs", "net",
 ];
 
 /// Guarded stacks the run claims beyond the ones the scheduler's own check left behind.
 /// `preempt` asserts at compile time that `KERNEL_THREAD_SLOTS` covers both.
 pub const EXTRA_STACKS: usize = if kconfig::STRESS_TEST {
     // The four named workloads; the three disk workloads (two block, one filesystem) when the
-    // disk is attached; and the user process the auditor drives when there is userspace.
-    EXTRA_NAMES.len() + 3 * kconfig::QEMU_BLOCK_TEST as usize + kconfig::USERSPACE as usize
+    // disk is attached; the network workload when a card is; and the user process the
+    // auditor drives when there is userspace.
+    EXTRA_NAMES.len()
+        + 3 * kconfig::QEMU_BLOCK_TEST as usize
+        + kconfig::QEMU_NET_TEST as usize
+        + kconfig::USERSPACE as usize
 } else {
     0
 };
@@ -383,6 +390,7 @@ fn start() -> Result<(), &'static str> {
     vm::setup()?;
     block::setup()?;
     fs::setup()?;
+    net::setup()?;
 
     // Idle keeps the first of the scheduler's stacks. The other three the boot checks
     // used are free again; four more come from the port's array.
@@ -390,9 +398,9 @@ fn start() -> Result<(), &'static str> {
     // After the workloads' own, so their slot numbers are what they were: the stack the
     // user process the auditor drives runs on, in an image with userspace.
     crate::model::process_stress_setup()?;
-    // Every workload but the three that need the disk, which are spawned below only if it
-    // exists.
-    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 3] = [
+    // Every workload but the three that need the disk and the one that needs the network,
+    // which are spawned below only if those exist.
+    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 4] = [
         (heap::worker, 0, 4, 1),
         (heap::worker, 1, 4, extra),
         (ipc::ping, 0, 4, 2),
@@ -430,6 +438,14 @@ fn start() -> Result<(), &'static str> {
     } else {
         PARKED[Workload::Fs as usize].store(Parked::Empty as u8, Ordering::Release);
     }
+    // The network workload needs the card and kbuild's address, which the net check leaves
+    // only where it passed; its slot is treated the same way. It claims a stack as the disk
+    // workloads do.
+    if net::present() {
+        spawn_disk_workload("net", net::worker, 0)?;
+    } else {
+        PARKED[Workload::Net as usize].store(Parked::Empty as u8, Ordering::Release);
+    }
     Ok(())
 }
 
@@ -462,7 +478,10 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
         }
         let now = PROGRESS[w].load(Ordering::Acquire);
         let is_block = w == Workload::Block as usize || w == Workload::BlockB as usize;
-        if (is_block && !block::present()) || (w == Workload::Fs as usize && !fs::present()) {
+        let absent = (is_block && !block::present())
+            || (w == Workload::Fs as usize && !fs::present())
+            || (w == Workload::Net as usize && !net::present());
+        if absent {
             continue;
         }
         if now == last[w] {
@@ -487,6 +506,9 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
     }
     if let Err(what) = fs::audit() {
         audit_failed(c, seconds, "filesystem", what);
+    }
+    if let Err(what) = net::audit() {
+        audit_failed(c, seconds, "network", what);
     }
     if !preempt::table_ok() {
         audit_failed(c, seconds, "thread table", "an invariant does not hold");
@@ -579,6 +601,18 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         c.write_str(" hit/miss, ");
         write_usize(c, drops as usize);
         c.write_str(" drops)");
+    }
+    if net::present() {
+        let (pings, rounds, retries) = net::counts();
+        c.write_str(", net ");
+        write_usize(c, p(Workload::Net));
+        c.write_str(" (echo replies ");
+        write_usize(c, pings as usize);
+        c.write_str(", udp round trips ");
+        write_usize(c, rounds as usize);
+        c.write_str(", retries ");
+        write_usize(c, retries as usize);
+        c.write_str(")");
     }
     if mp::CPUS > 1 {
         let s = preempt::stats();

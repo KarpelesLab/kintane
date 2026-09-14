@@ -207,14 +207,20 @@ pub fn build_and_verify<A: HasPageTables>(
 ///
 /// Rounded outward to whole pages: a register block that starts mid-page still needs
 /// the whole page mapped, and a device window is not a place where rounding can grant
-/// anything to a neighbour, because nothing else is mapped beside it.
+/// anything to a neighbour, because nothing but other device windows is mapped beside it.
+///
+/// Two claimed windows can share a page. QEMU's `virt` packs eight virtio slots into each,
+/// and the disk and the network card land in neighbouring ones. A page an earlier window
+/// already mapped as device memory, at its own address, is left as it is; any other
+/// overlap is still refused, as `AddressSpace::map` refuses it.
 fn map_devices<A: HasPageTables>(
     c: &dyn EarlyConsole,
     space: &mut AddressSpace<A>,
     frames: &mut Frames<'_, '_, A>,
     devices: &[DeviceWindow],
 ) -> bool {
-    let mask = A::PAGE_SIZE as u64 - 1;
+    let page = A::PAGE_SIZE;
+    let mask = page as u64 - 1;
     for d in devices {
         let start = d.phys & !mask;
         let end = d.phys.saturating_add(d.len).saturating_add(mask) & !mask;
@@ -225,7 +231,20 @@ fn map_devices<A: HasPageTables>(
             return false;
         };
         let flags = PageFlags::KERNEL_DATA | PageFlags::DEVICE;
-        if let Err(e) = space.map(virt, PhysAddr::new(start), len, flags, frames) {
+        // The whole window at once, so a large one still gets large pages; one page at a
+        // time only where an earlier window got there first.
+        let mapped = match space.map(virt, PhysAddr::new(start), len, flags, frames) {
+            Err(MapError::AlreadyMapped) => (0..len).step_by(page).try_for_each(|off| {
+                let v = virt + off;
+                match space.translate(v) {
+                    Some((p, f)) if p.raw() == v as u64 && f.contains(PageFlags::DEVICE) => Ok(()),
+                    Some(_) => Err(MapError::AlreadyMapped),
+                    None => space.map(v, PhysAddr::new(v as u64), page, flags, frames),
+                }
+            }),
+            other => other,
+        };
+        if let Err(e) = mapped {
             c.write_str("\n             map device ");
             c.write_str(d.what);
             c.write_str(" failed: ");

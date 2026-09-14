@@ -25,6 +25,9 @@ pub mod status {
 pub const VERSION_1_WORD: u32 = 1;
 pub const VERSION_1_BIT: u32 = 1 << 0;
 
+/// The virtio device type for a network card (virtio 1.1 §5.1).
+pub const DEVICE_ID_NET: u32 = 1;
+
 /// The virtio device type for a block device (virtio 1.1 §5.2).
 pub const DEVICE_ID_BLOCK: u32 = 2;
 

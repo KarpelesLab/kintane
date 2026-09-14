@@ -75,9 +75,18 @@ pub const VENDOR: u16 = 0x1af4;
 pub const DEVICE_MODERN_BLOCK: u16 = 0x1042;
 pub const DEVICE_TRANSITIONAL_BLOCK: u16 = 0x1001;
 
+/// The same pair for a network card: 0x1041, and 0x1000 transitional.
+pub const DEVICE_MODERN_NET: u16 = 0x1041;
+pub const DEVICE_TRANSITIONAL_NET: u16 = 0x1000;
+
 /// Whether a function is a virtio block device of either kind.
 pub fn is_block_device(f: &Function) -> bool {
     f.vendor == VENDOR && (f.device == DEVICE_MODERN_BLOCK || f.device == DEVICE_TRANSITIONAL_BLOCK)
+}
+
+/// Whether a function is a virtio network card of either kind.
+pub fn is_net_device(f: &Function) -> bool {
+    f.vendor == VENDOR && (f.device == DEVICE_MODERN_NET || f.device == DEVICE_TRANSITIONAL_NET)
 }
 
 /// One structure's place: which BAR, how far into it, and how long.

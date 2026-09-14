@@ -44,11 +44,10 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
-pub mod mem;
-pub mod mmio;
-pub mod pci;
-pub mod queue;
-pub mod transport;
+// The virtqueue, the transports and the DMA types are shared with every virtio driver, in
+// `drivers/virtio`. Re-exported under their old names, so every path into this crate still
+// resolves: `virtio_blk::mem::Dma`, `virtio_blk::mmio::identify` and the rest.
+pub use virtio::{AnyTransport, mem, mmio, pci, queue, transport};
 
 #[cfg(test)]
 mod test_support;
@@ -60,12 +59,13 @@ mod tests;
 mod drain_tests;
 
 use block::{BlockDevice, Error as BlockError, Geometry, Op, Queue as RequestQueue, Ticket};
-use device::{BootCell, Bound, Driver, IrqLine, Mmio as MmioClaim, Probe, ProbeError};
-use mem::{Dma, Window};
+use device::{BootCell, Bound, Driver, IrqLine, Probe, ProbeError};
+use mem::Dma;
 use queue::{Buf, Ring};
 use sync::LockFamily;
 use sync::lockdep::LockClass;
 use transport::{Error, Transport};
+use virtio::Claims;
 
 /// What this driver binds to: a memory-mapped virtio slot, or a PCI function whose vendor
 /// and device ID say it is a virtio block device.
@@ -133,81 +133,6 @@ const _: () = assert!(
 /// between them.
 pub const fn dma_bytes(bounce: usize) -> usize {
     transport::queue_bytes(QUEUE_SIZE) + IN_FLIGHT * (HEADER_BYTES + 1 + 32 + bounce)
-}
-
-/// A virtio transport, of whichever kind this machine has.
-pub enum AnyTransport {
-    Mmio(mmio::Mmio),
-    Pci(pci::Pci),
-}
-
-impl Transport for AnyTransport {
-    fn device_id(&self) -> u32 {
-        match self {
-            AnyTransport::Mmio(t) => t.device_id(),
-            AnyTransport::Pci(t) => t.device_id(),
-        }
-    }
-    fn status(&self) -> u8 {
-        match self {
-            AnyTransport::Mmio(t) => t.status(),
-            AnyTransport::Pci(t) => t.status(),
-        }
-    }
-    fn set_status(&self, value: u8) {
-        match self {
-            AnyTransport::Mmio(t) => t.set_status(value),
-            AnyTransport::Pci(t) => t.set_status(value),
-        }
-    }
-    fn device_features(&self, select: u32) -> u32 {
-        match self {
-            AnyTransport::Mmio(t) => t.device_features(select),
-            AnyTransport::Pci(t) => t.device_features(select),
-        }
-    }
-    fn set_driver_features(&self, select: u32, value: u32) {
-        match self {
-            AnyTransport::Mmio(t) => t.set_driver_features(select, value),
-            AnyTransport::Pci(t) => t.set_driver_features(select, value),
-        }
-    }
-    fn queue_max(&self, index: u16) -> u16 {
-        match self {
-            AnyTransport::Mmio(t) => t.queue_max(index),
-            AnyTransport::Pci(t) => t.queue_max(index),
-        }
-    }
-    fn setup_queue(&self, index: u16, size: u16, desc: u64, avail: u64, used: u64) {
-        match self {
-            AnyTransport::Mmio(t) => t.setup_queue(index, size, desc, avail, used),
-            AnyTransport::Pci(t) => t.setup_queue(index, size, desc, avail, used),
-        }
-    }
-    fn notify(&self, index: u16) {
-        match self {
-            AnyTransport::Mmio(t) => t.notify(index),
-            AnyTransport::Pci(t) => t.notify(index),
-        }
-    }
-    fn ack_interrupt(&self) -> u32 {
-        match self {
-            AnyTransport::Mmio(t) => t.ack_interrupt(),
-            AnyTransport::Pci(t) => t.ack_interrupt(),
-        }
-    }
-    fn config_read8(&self, offset: usize) -> u8 {
-        match self {
-            AnyTransport::Mmio(t) => t.config_read8(offset),
-            AnyTransport::Pci(t) => t.config_read8(offset),
-        }
-    }
-    fn config_read32(&self, offset: usize) -> u32 {
-        match self {
-            AnyTransport::Mmio(t) => t.config_read32(offset),
-            AnyTransport::Pci(t) => t.config_read32(offset),
-        }
-    }
 }
 
 /// The memory one request owns while it is in flight.
@@ -665,38 +590,16 @@ impl<L: LockFamily, T: Transport> BlockDevice for VirtioBlk<L, T> {
     }
 }
 
-/// What the probe claimed, kept for bring-up.
-///
-/// `bus` is what the probe learned about where the registers are, which differs by
-/// transport: a memory-mapped slot is the claimed window itself, and a PCI function is
-/// that window plus the layout its capabilities described, since the driver cannot read
-/// configuration space once the enumerator is gone.
-struct Claims {
-    mmio: MmioClaim,
-    irq: Option<IrqLine>,
-    bus: Bus,
-}
-
-/// Which transport the bound device is on, and what it takes to build it.
-enum Bus {
-    Mmio,
-    Pci {
-        layout: pci::Layout,
-        bar: u8,
-        device_id: u32,
-    },
-}
-
 static CLAIMS: BootCell<Claims> = BootCell::new();
 
 /// The window the bound device claimed, as a physical `(address, length)`.
 pub fn window() -> Option<(u64, u64)> {
-    CLAIMS.get().map(|c| (c.mmio.phys(), c.mmio.len()))
+    CLAIMS.get().map(Claims::window)
 }
 
 /// Whether an interrupt line was claimed for the device.
 pub fn has_irq() -> bool {
-    CLAIMS.get().is_some_and(|c| c.irq.is_some())
+    CLAIMS.get().is_some_and(|c| c.irq().is_some())
 }
 
 /// The transport for the bound device, of whichever kind its bus is.
@@ -707,28 +610,8 @@ pub fn has_irq() -> bool {
 /// because two transports for one device would be two drivers for one device.
 #[allow(unsafe_code)]
 pub unsafe fn transport() -> Option<AnyTransport> {
-    let claims = CLAIMS.get()?;
-    let (phys, len) = window()?;
-    let base = usize::try_from(phys).ok()?;
-    let len = usize::try_from(len).ok()?;
-    match &claims.bus {
-        Bus::Mmio => {
-            // SAFETY: the caller's contract.
-            let window = unsafe { Window::new(base, len) };
-            // SAFETY: as above; one transport for the one device the driver bound.
-            Some(AnyTransport::Mmio(unsafe { mmio::Mmio::new(window) }))
-        }
-        Bus::Pci {
-            layout,
-            bar,
-            device_id,
-        } => {
-            // SAFETY: the caller's contract; the window is the BAR the probe claimed, and
-            // every structure the layout names was checked to be inside it.
-            let t = unsafe { pci::Pci::new(layout, *bar, base, len, *device_id) };
-            t.ok().map(AnyTransport::Pci)
-        }
-    }
+    // SAFETY: the caller's contract is this function's.
+    unsafe { CLAIMS.get()?.transport() }
 }
 
 pub struct VirtioBlkDriver;
@@ -747,51 +630,12 @@ impl Driver for VirtioBlkDriver {
     }
 
     fn probe(&self, p: &mut Probe<'_, '_, '_, '_>) -> Result<(), ProbeError> {
-        // Which transport this is comes from the node, not from a guess: a PCI function
-        // carries the record enumeration made, and a memory-mapped slot does not.
-        let function = match p.tree().node(p.node()).origin() {
-            device::Origin::Pci(f) => Some(f),
-            _ => None,
-        };
-        let (mmio, bus) = match function {
-            Some(f) => {
-                let layout = pci::Layout::read(f).map_err(|_| {
-                    ProbeError::Declined("no modern virtio structures in the capability list")
-                })?;
-                // Every structure must be in one BAR, because one window is what a probe
-                // claims and therefore what the kernel maps. QEMU's virtio-pci puts all
-                // four in the same BAR; a device that spreads them is refused rather than
-                // half-driven.
-                let bar = layout.common.bar;
-                if layout.bars().iter().any(|b| *b != bar) {
-                    return Err(ProbeError::Declined(
-                        "the device's structures are spread over several BARs",
-                    ));
-                }
-                let index = f
-                    .memory_bar_index(bar)
-                    .ok_or(ProbeError::Declined("the structures' BAR decodes no memory"))?;
-                let mmio = p.claim_mmio(index, "virtio-blk registers")?;
-                let bus = Bus::Pci {
-                    layout,
-                    bar,
-                    device_id: transport::DEVICE_ID_BLOCK,
-                };
-                (mmio, bus)
-            }
-            None => {
-                let mmio = p.claim_mmio(0, "virtio-blk registers")?;
-                if mmio.len() < mmio::MIN_WINDOW {
-                    return Err(ProbeError::Declined("the window is too small for virtio-mmio"));
-                }
-                (mmio, Bus::Mmio)
-            }
-        };
-        // A device whose interrupt is malformed or taken can still be polled, so an
-        // interrupt that cannot be claimed is not a reason to refuse the disk.
-        let irq = p.claim_irq(0).ok();
+        // What a virtio probe claims is the same for every device type; see
+        // `virtio::bind`. A device whose interrupt cannot be claimed is still bound, and
+        // polled.
+        let claims = Claims::claim(p, "virtio-blk registers", transport::DEVICE_ID_BLOCK)?;
         // SAFETY: probe runs during single-threaded boot.
-        unsafe { CLAIMS.set(Claims { mmio, irq, bus }) }
+        unsafe { CLAIMS.set(claims) }
             .map(|_| ())
             .map_err(|_| ProbeError::Declined("one virtio-blk device is supported"))
     }
@@ -808,7 +652,7 @@ impl Driver for VirtioBlkDriver {
     /// until `bring_up` writes `DRIVER_OK`, which happens later still, so a handler
     /// registered here cannot run before the driver exists to serve it.
     fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
-        let irq = CLAIMS.get()?.irq.as_ref()?;
+        let irq = CLAIMS.get()?.irq()?;
         Some((irq, on_device_interrupt))
     }
 }

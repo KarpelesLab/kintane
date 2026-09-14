@@ -20,6 +20,9 @@ pub struct Machine {
     /// Whether to answer the kernel's serial receive check (`SERIAL_IRQ_TEST`): type each
     /// of [`SERIAL_PROBES`] when the kernel prints its prompt.
     pub serial_probe: bool,
+    /// The loopback UDP port QEMU forwards to the kernel's network check (`QEMU_NET_TEST`),
+    /// which [`run_watched`] answers on: see [`udp_peer`].
+    pub net_port: Option<u16>,
 }
 
 pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine, String> {
@@ -37,6 +40,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         ));
     }
     let s = |x: &str| x.to_string();
+    let net_port = net_port(res)?;
     let mem = format!("{}M", {
         let m = res.int("QEMU_MEMORY_MB");
         if m > 0 { m } else { 128 }
@@ -84,7 +88,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             s("-drive"),
             format!("format=raw,snapshot=on,file={}", image.display()),
         ]);
-        args.extend(x86_platform(res, "q35", image));
+        args.extend(x86_platform(res, "q35", image, net_port));
         args.extend([
             s("-device"),
             s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
@@ -111,6 +115,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             success_code: (0x10 << 1) | 1,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
+            net_port,
         });
     }
 
@@ -148,12 +153,13 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 log.display().to_string(),
             ]
             .into_iter()
-            .chain(x86_platform(res, "q35", image))
+            .chain(x86_platform(res, "q35", image, net_port))
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
+            net_port,
         });
     }
 
@@ -182,12 +188,13 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 log.display().to_string(),
             ]
             .into_iter()
-            .chain(x86_platform(res, "pc", image))
+            .chain(x86_platform(res, "pc", image, net_port))
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
+            net_port,
         });
     }
 
@@ -210,6 +217,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             .into_iter()
             .chain(smp)
             .chain(block_disk(res, image, "virtio-blk-device"))
+            .chain(net_card(res, "virtio-net-device", net_port))
             .chain([
                 s("-kernel"),
                 image.display().to_string(),
@@ -232,6 +240,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             success_code: 0,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
+            net_port,
         });
     }
 
@@ -292,6 +301,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             success_code: 0,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
+            net_port: None,
         });
     }
 
@@ -335,16 +345,32 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
 /// The processors and devices an x86 guest's firmware describes, beyond the chipset's
 /// own: `-smp` from `QEMU_CPUS`, with `QEMU_PCI_TEST_DEVICE` a pci-testdev behind a
 /// bridge (a PCI Express root port on q35, a PCI-to-PCI bridge on pc), which enumeration
-/// finds only by following the bridge, and with `QEMU_BLOCK_TEST` the test disk on a PCI
-/// virtio-blk function. `docs/testing.md` lists what the kernel checks.
+/// finds only by following the bridge, with `QEMU_BLOCK_TEST` the test disk on a PCI
+/// virtio-blk function, and with `QEMU_NET_TEST` a virtio-net function on the user-mode
+/// network. `docs/testing.md` lists what the kernel checks.
 ///
 /// `disable-legacy=on`: the driver speaks virtio 1.x, and a transitional device would
 /// offer the legacy interface as well. Saying so here makes the device modern-only, which
 /// is what the driver's refusal of a legacy device would otherwise turn into a boot
 /// failure — the same trap the memory-mapped transport hit with `force-legacy`.
-fn x86_platform(res: &Resolution, chipset: &str, image: &Path) -> Vec<String> {
+fn x86_platform(
+    res: &Resolution,
+    chipset: &str,
+    image: &Path,
+    net_port: Option<u16>,
+) -> Vec<String> {
     let mut args = vec!["-smp".to_string(), res.int("QEMU_CPUS").max(1).to_string()];
     args.extend(block_disk(res, image, "virtio-blk-pci,disable-legacy=on"));
+    // On `pc`, slot 0x1e: the chipset routes its INTA to a different line from the disk's
+    // function, and a line has one handler (`device::Handlers`), so the two cannot share.
+    // On q35 no PCI line is trusted (`PCI_LINE_TRUSTED`) and the card is polled wherever
+    // it lands.
+    let nic = if chipset == "q35" {
+        "virtio-net-pci,disable-legacy=on,romfile="
+    } else {
+        "virtio-net-pci,disable-legacy=on,romfile=,addr=0x1e"
+    };
+    args.extend(net_card(res, nic, net_port));
     if res.is_on("QEMU_PCI_TEST_DEVICE") {
         let (bridge, device) = if chipset == "q35" {
             ("pcie-root-port,id=kt_bridge,chassis=1", "pci-testdev,bus=kt_bridge")
@@ -359,6 +385,111 @@ fn x86_platform(res: &Resolution, chipset: &str, image: &Path) -> Vec<String> {
         ]);
     }
     args
+}
+
+/// The guest port the kernel's network check listens on, and the messages it exchanges with
+/// [`udp_peer`]: `kernel/main/src/net.rs`'s `PORT`, `PROBE`, `ECHO` and `ACK`.
+const NET_GUEST_PORT: u16 = 5555;
+const NET_PROBE: &[u8] = b"kintane-udp-probe";
+const NET_ECHO: &[u8] = b"kintane-udp-echo ";
+const NET_ACK: &[u8] = b"kintane-udp-ack ";
+
+/// How often [`udp_peer`] sends its probe.
+const NET_PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A free loopback UDP port for the guest's network check to be reached on, when the
+/// configuration attaches a card.
+///
+/// Found by binding port 0 and letting the socket go, so another process could take it in
+/// between. QEMU then refuses to start and says why, which is a visible failure rather than
+/// a wrong answer.
+fn net_port(res: &Resolution) -> Result<Option<u16>, String> {
+    if !res.is_on("QEMU_NET_TEST") {
+        return Ok(None);
+    }
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .map_err(|e| format!("no loopback UDP port for the network check: {e}"))?
+        .port();
+    Ok(Some(port))
+}
+
+/// A virtio-net card of the given kind on QEMU's user-mode network, when the configuration
+/// asks for one.
+///
+/// `-netdev user` is QEMU's own NAT: no privileges and no host network, and its gateway,
+/// 10.0.2.2, answers ARP and echo requests itself. `hostfwd` forwards the loopback `port`
+/// to the guest's check, which is how [`udp_peer`] reaches it. `romfile=` on the PCI card
+/// leaves out its boot ROM, so firmware does not offer to boot from the network.
+fn net_card(res: &Resolution, device: &str, port: Option<u16>) -> Vec<String> {
+    let Some(port) = port else {
+        return Vec::new();
+    };
+    let mut args = vec![
+        "-netdev".to_string(),
+        format!("user,id=kt_net,hostfwd=udp:127.0.0.1:{port}-:{NET_GUEST_PORT}"),
+        "-device".to_string(),
+        format!("{device},netdev=kt_net"),
+    ];
+    // As for the disk, the memory-mapped transport is legacy unless told otherwise; once is
+    // enough when the disk's arguments already say it.
+    if device == "virtio-net-device" && !res.is_on(crate::testdisk::SYMBOL) {
+        args.extend([
+            "-global".to_string(),
+            "virtio-mmio.force-legacy=false".to_string(),
+        ]);
+    }
+    args
+}
+
+/// kbuild's side of the kernel's network check: a UDP peer on the loopback interface.
+///
+/// From the moment QEMU starts until `stop`, it sends [`NET_PROBE`] to the forwarded port
+/// four times a second, so a probe is waiting whenever the check first looks. Nothing reads
+/// the console for it: a probe that arrives before the guest listens is dropped, and the
+/// next one comes a quarter of a second later. Every `NET_ECHO <n>` that comes back is
+/// answered with `NET_ACK <n>`, which is what makes the check a round trip rather than a
+/// delivery in one direction.
+///
+/// It answers; it does not judge. The verdict is still the guest's exit code.
+fn udp_peer(
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::ErrorKind;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    std::thread::spawn(move || {
+        let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        if socket.connect(("127.0.0.1", port)).is_err()
+            || socket
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .is_err()
+        {
+            return;
+        }
+        let mut last: Option<Instant> = None;
+        let mut buf = [0u8; 512];
+        while !stop.load(Ordering::Relaxed) {
+            if last.is_none_or(|t| t.elapsed() >= NET_PROBE_EVERY) {
+                let _ = socket.send(NET_PROBE);
+                last = Some(Instant::now());
+            }
+            match socket.recv(&mut buf) {
+                Ok(n) => {
+                    if let Some(number) = buf[..n].strip_prefix(NET_ECHO) {
+                        let _ = socket.send(&[NET_ACK, number].concat());
+                    }
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                // Refused, most likely: QEMU has not bound the port yet. Go round again.
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    })
 }
 
 /// How an x86 guest gets its kernel: straight from QEMU's multiboot loader, or from a
@@ -574,7 +705,7 @@ pub fn run_watched(
     watch: Option<Watch>,
 ) -> Result<Outcome, String> {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let mut child = Command::new(m.binary)
         .args(&m.args)
@@ -610,6 +741,8 @@ pub fn run_watched(
         .stdout
         .take()
         .ok_or("QEMU's console was not captured")?;
+    let stop_peer = Arc::new(AtomicBool::new(false));
+    let peer = m.net_port.map(|port| udp_peer(port, stop_peer.clone()));
     let start = std::time::Instant::now();
     // Heartbeats seen, and when the last arrived, in milliseconds since `start`.
     let beats = Arc::new(AtomicU64::new(0));
@@ -695,6 +828,10 @@ pub fn run_watched(
             Err(e) => return Err(format!("waiting for QEMU: {e}")),
         }
     };
+    stop_peer.store(true, Ordering::Relaxed);
+    if let Some(peer) = peer {
+        let _ = peer.join();
+    }
     let console = tee.join().unwrap_or_default();
     Ok(Outcome {
         code,

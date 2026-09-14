@@ -114,7 +114,7 @@ impl Transport for FakeTransport {
             device.take_available();
             return;
         }
-        device.serve_block(&mut self.disk.borrow_mut(), self.fail_io.get());
+        crate::test_support::serve_block(device, &mut self.disk.borrow_mut(), self.fail_io.get());
     }
 
     fn ack_interrupt(&self) -> u32 {

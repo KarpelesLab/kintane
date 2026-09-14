@@ -13,4 +13,4 @@ host-tests = true
 layer = "device"
 
 [deps]
-units = ["hal", "device", "block", "sync"]
+units = ["hal", "device", "block", "sync", "virtio"]

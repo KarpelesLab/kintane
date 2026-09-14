@@ -57,6 +57,11 @@ mod block;
 #[cfg(CONFIG_MM_FLAT)]
 #[path = "block_off.rs"]
 mod block;
+#[cfg(CONFIG_MM_PAGED)]
+mod net;
+#[cfg(CONFIG_MM_FLAT)]
+#[path = "net_off.rs"]
+mod net;
 // The filesystem check on a paged kernel; on a flat one, the same call doing nothing.
 #[cfg(CONFIG_MM_PAGED)]
 mod fs;
@@ -334,6 +339,9 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // while this waits, before the tick's hook is installed.
     c.write_str("\n  block irq  ");
     let block_irq = block::interrupt_check(c);
+    // For the same reason again: the card's receive interrupt is taken while this waits.
+    c.write_str("\n  net        ");
+    let net = net::check(c);
     c.write_str("\n  preempt    ");
     // Built on both of the above, so it runs only when both passed. Their failures
     // already gate the verdict, and a scheduler check on a broken switch or a silent
@@ -374,6 +382,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(clock)
         .and(serial)
         .and(block_irq)
+        .and(net)
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))
         .and(smp)
@@ -576,6 +585,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(model::userspace_check(c, &mut frames, live))
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(block::check(c, &mut frames, live))
+        .and(net::bring_up(c, &mut frames, live))
         .and(fs::check(c, &mut frames, live))
         .and(stress::reserve(c, &mut frames, &regions[..n], live))
         .and(model::process_reserve(&mut frames, live));

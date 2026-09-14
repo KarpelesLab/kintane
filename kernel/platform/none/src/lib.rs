@@ -59,6 +59,11 @@ pub fn block_line() -> Option<u32> {
     None
 }
 
+/// No network card is bound on these ports either.
+pub fn net_line() -> Option<u32> {
+    None
+}
+
 /// Nothing received: `(interrupts, bytes)`.
 pub fn console_received() -> (u32, u32) {
     (0, 0)

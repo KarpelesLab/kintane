@@ -16,6 +16,7 @@ pub mod elf;
 pub mod fdt;
 pub mod menu;
 pub mod module;
+pub mod net;
 pub mod pci;
 pub mod syscall;
 pub mod virtio_ring;
@@ -106,6 +107,14 @@ pub const TARGETS: &[Target] = &[
         generate: virtio_ring::generate,
         run: virtio_ring::run,
         accepts: None,
+    },
+    Target {
+        name: "net",
+        what: "Ethernet frames carrying ARP, IPv4, ICMP and UDP, as anything on a network sends them",
+        needs_seeds: true,
+        generate: net::generate,
+        run: net::run,
+        accepts: Some(net::accepts),
     },
     Target {
         name: "syscall",

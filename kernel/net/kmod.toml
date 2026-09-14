@@ -1,0 +1,15 @@
+# net: the network stack above a NIC — Ethernet framing, ARP, IPv4, ICMP echo and UDP.
+#
+# Depends on nothing. A driver hands it frames through the `Nic` trait and it hands frames
+# back, so the whole stack — every parser, the ARP cache, the buffer pool and the dispatch
+# between them — runs as a host test against a simulated gateway, with no device and no
+# emulator. `core` because it is written once for every port and reaches no hardware.
+[unit]
+name = "net"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+[deps]
+units = []

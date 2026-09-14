@@ -1,0 +1,17 @@
+# virtio: what every virtio driver shares — the split virtqueue, the status handshake and
+# feature negotiation, the memory-mapped and PCI transports, DMA regions, and what a probe
+# claims.
+#
+# Factored out of virtio-blk when virtio-net became the second driver, mechanically: the
+# modules moved unchanged, and virtio-blk re-exports them under their old names. The fake
+# device the host tests drive is here too, compiled only when MOCK_ARCH is set, so each
+# driver's tests can use it and no image carries it.
+[unit]
+name = "virtio"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = ["hal", "device"]
