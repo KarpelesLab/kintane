@@ -19,3 +19,9 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
     c.write_str("skipped: needs MM_PAGED");
     Check::Skipped
 }
+
+/// Skipped: no device, so no interrupt to move.
+pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("skipped: needs MM_PAGED");
+    Check::Skipped
+}
