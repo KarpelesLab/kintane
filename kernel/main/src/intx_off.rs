@@ -4,6 +4,14 @@
 //! namespace, so no line is ever a routed pin here. The calls exist so `block` reads the same
 //! on every port. See `intx.rs`.
 
+#![cfg_attr(
+    CONFIG_MM_FLAT,
+    expect(
+        dead_code,
+        reason = "only block.rs calls pin routing's stand-ins, and a flat kernel builds block_off.rs"
+    )
+)]
+
 /// A PCI pin's route, as the PC platform gives it. Never made here.
 #[derive(Clone, Copy)]
 pub struct PinRoute {

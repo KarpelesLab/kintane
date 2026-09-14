@@ -5,4 +5,4 @@
 //! instead. Only `kernel/platform/acpi` routes pins, so the device-tree ports take
 //! `intx_off.rs`, where none is ever routed.
 
-pub use platform::{PinRoute, block_has_msix, check_pin_entry, pin_route};
+pub use platform::{block_has_msix, check_pin_entry, pin_route};

@@ -4,6 +4,14 @@
 //! DMA reaches physical memory directly, as it always has. The calls still exist and do
 //! nothing, so `block` reads the same on every port. See `docs/isolation.md`.
 
+#![cfg_attr(
+    CONFIG_MM_FLAT,
+    expect(
+        dead_code,
+        reason = "only block.rs calls the IOMMU's stand-ins, and a flat kernel builds block_off.rs"
+    )
+)]
+
 use hal::EarlyConsole;
 use mm::DirectMap;
 use vtd::Fault;

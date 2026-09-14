@@ -5,6 +5,14 @@
 //! calls still exist and do nothing, so `kmain` and the disk's interrupt handler read the same
 //! on every port. See `docs/isolation.md`.
 
+#![cfg_attr(
+    CONFIG_MM_FLAT,
+    expect(
+        dead_code,
+        reason = "only block.rs calls the driver domain's stand-ins, and a flat kernel builds block_off.rs"
+    )
+)]
+
 use hal::EarlyConsole;
 
 use crate::Check;
