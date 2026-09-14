@@ -3,40 +3,40 @@ section .bss 172032
 section .data 135168
 section .rodata 32768
 section .stack 16384
-section .text 311296
+section .text 331776
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 3654 data 0 bss 0
+crate (anonymous) text 0 rodata 3720 data 0 bss 0
 crate (unmangled) text 1274 rodata 0 data 0 bss 0
 crate __rustc text 161 rodata 0 data 0 bss 0
 crate acpi text 6827 rodata 0 data 0 bss 0
 crate arch text 25049 rodata 8 data 312 bss 67660
-crate bcache text 2798 rodata 0 data 0 bss 0
+crate bcache text 5251 rodata 0 data 0 bss 0
 crate block text 1981 rodata 0 data 0 bss 0
 crate bootinfo text 2511 rodata 0 data 0 bss 0
 crate buildid text 181 rodata 32 data 0 bss 0
 crate cmdline text 1271 rodata 0 data 0 bss 0
-crate core text 9463 rodata 0 data 0 bss 0
+crate core text 9809 rodata 0 data 0 bss 0
 crate device text 23868 rodata 0 data 0 bss 0
-crate fat text 5767 rodata 0 data 0 bss 0
+crate fat text 19709 rodata 0 data 0 bss 0
 crate hal text 1412 rodata 0 data 0 bss 0
 crate hwproxy text 327 rodata 0 data 0 bss 0
-crate kalloc text 13307 rodata 0 data 0 bss 0
-crate kintane text 84423 rodata 32 data 25116 bss 77195
+crate kalloc text 13258 rodata 0 data 0 bss 0
+crate kintane text 85197 rodata 32 data 25116 bss 77483
 crate mm text 23086 rodata 0 data 0 bss 0
 crate multiboot text 625 rodata 0 data 0 bss 0
-crate net text 26112 rodata 0 data 0 bss 0
+crate net text 27379 rodata 0 data 0 bss 0
 crate platform text 22225 rodata 88 data 108397 bss 1507
 crate sched text 2357 rodata 0 data 0 bss 0
 crate strip_suffix text 39 rodata 0 data 0 bss 0
-crate sync text 12856 rodata 16 data 800 bss 136
+crate sync text 14444 rodata 16 data 800 bss 136
 crate thread text 4280 rodata 0 data 0 bss 0
 crate time text 3971 rodata 0 data 0 bss 0
 crate uart16550 text 1959 rodata 0 data 208 bss 88
 crate unwind text 2448 rodata 0 data 0 bss 0
-crate vfs text 2665 rodata 0 data 0 bss 0
+crate vfs text 2839 rodata 0 data 0 bss 0
 crate virtio text 5404 rodata 0 data 0 bss 0
 crate virtio_bind text 2015 rodata 0 data 0 bss 0
 crate virtio_blk text 3160 rodata 8 data 144 bss 4
-crate virtio_blk_core text 2822 rodata 0 data 0 bss 0
+crate virtio_blk_core text 2120 rodata 0 data 0 bss 0
 crate virtio_net text 6715 rodata 8 data 144 bss 4
-total 929792
+total 950272
