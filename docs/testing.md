@@ -1986,6 +1986,25 @@ which is the half of the check an emulator cannot forge.
 The second is the point of the change: on a host running two soaks and five other jobs, three
 quarters of a second of lateness was reported and not one wake-up was the scheduler's doing.
 
+#### A message that arrived late is not a wake-up that was lost
+
+The waiting-pair program's `recv_promptly` returned `TimedOut` for two different facts: nothing
+received inside `WAKE_NS`, which is a wake that never came, and a message that *did* arrive but
+took longer than `LOST_NS`. Both exited 0x603 or 0x613, and the auditor called either one a lost
+wake-up. A two-hour soak on `x86_64-qemu-smp` at eight CPUs died that way at 42 seconds beside a
+second soak: the message arrived, a second late, because the host was not running the sender's
+CPU.
+
+A message that arrived is proof the wake was not lost. So the slow case exits 0x608 or 0x617 and
+is counted as a *slow exchange*, printed in the heartbeat beside the wait counters; a receive
+that saw nothing at all still exits 0x603 or 0x613 and still fails the run.
+
+| Mutation | Result |
+|---|---|
+| The peer never sends, so the wake really is lost | `a waiting process's receive timed out: a wake-up was lost`, at 2 s |
+| The pair reports a slow exchange on a receive that did arrive | the run **passes**, with `slow exchanges 23` in the heartbeat |
+| `LOST_NS` cut to a millisecond | the *boot* `waits` check fails and bring-up stops; it proves nothing about the stress cycle |
+
 #### A slow shootdown is not a broken one
 
 The audit failed on `mismatches + stalls` together. They are not the same kind of fact. A
@@ -2038,6 +2057,7 @@ bound, and none on anything the kernel did wrong. They are why the bounds above 
 | `aarch64-virt-smp`, 8 CPUs | 108 s | `linux processes: a churning process's thread did not end` | `PAIR_PATIENCE`, 10 s, over two Linux processes each faulting 1,600 pages |
 | `aarch64-virt-smp`, 8 CPUs | 77 s | the same | the same, on final code: which is what settled it |
 | `x86_64-qemu-smp`, 8 CPUs | 159 s | `user process: a process ran its slices after it moved and made no progress` | `RAN_SLICES`, 16, below what healthy runs measure |
+| `x86_64-qemu-smp`, 8 CPUs | 42 s | `waiting process: a waiting process's receive timed out: a wake-up was lost` | a message that arrived a second late, reported as one that never came |
 
 Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
 
@@ -2066,6 +2086,10 @@ twenty-eight, derived from those measurements rather than from what looked gener
 
 The first mutation is the lesson, not the test: a check that dies during bring-up says nothing
 about the bound in the stress run, so the mutation has to be scoped to the cycle's own wait.
+Three of this round's mutations failed that way before they were scoped — the pass counter, the
+shootdown mismatch and the receive patience each kill bring-up when changed wholesale, because
+the boot checks use the same code the stress run does. A mutation that stops the guest before
+the audit runs is not a falsification of the audit.
 
 ### 4. Hardware — deferred
 
