@@ -131,6 +131,7 @@ fn build_loader(
         link_script: Some(dir.join("loader/link.ld")),
         deny_warnings: true,
         bitcode: false,
+        pic: false,
         verbose,
     };
 
@@ -196,6 +197,7 @@ fn build_loader(
         opt_level: "s".into(),
         deny_warnings: true,
         bitcode: false,
+        pic: false,
         verbose,
     };
     let chaintest = Unit {

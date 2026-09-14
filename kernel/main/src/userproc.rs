@@ -426,10 +426,10 @@ fn direct() -> DirectMap {
 /// Device memory, mapped into a process: readable and writable by user code, and neither
 /// cached nor speculated into. What a granted register window is mapped with.
 #[cfg_attr(
-    not(CONFIG_DRIVER_ISOLATION),
+    not(any(CONFIG_DRIVER_ISOLATION, CONFIG_BLOCK_DOMAIN)),
     expect(
         dead_code,
-        reason = "used only by the driver-isolation check, which needs DRIVER_ISOLATION"
+        reason = "used only by the driver-isolation and block-domain checks, which grant a window"
     )
 )]
 pub(crate) fn user_device() -> hal::PageFlags {

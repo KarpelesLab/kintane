@@ -575,6 +575,90 @@ fn dispatch(args: &[String]) -> Result<(), String> {
 /// `build/<kernel target>/<triple>/`. Sharing nothing compiled with the kernel is the
 /// point, not a cost: the kernel's `boot_protocol` rlib is for a different target and
 /// could not be linked here anyway. The cache keys include the triple, so switching
+/// The position-independent flavor a user program and its `user`-layer dependency closure are
+/// built in, where the architecture needs it (x86_64). It holds a PIC [`build::Build`] into
+/// `out/user` and a map of what it has built there, so the shared `core`, `compiler_builtins`,
+/// `kconfig` and library crates are built once and reused across the user programs.
+struct UserFlavor {
+    b: build::Build,
+    built: BTreeMap<String, build::Built>,
+    bootstrapped: bool,
+}
+
+impl UserFlavor {
+    /// The flavor for this configuration, or `None` where user programs are built like
+    /// everything else and no separate flavor is needed.
+    fn new(kernel: &build::Build) -> Result<Option<UserFlavor>, String> {
+        if !kernel.user_needs_pic() {
+            return Ok(None);
+        }
+        Ok(Some(UserFlavor {
+            b: kernel.user_flavor()?,
+            built: BTreeMap::new(),
+            bootstrapped: false,
+        }))
+    }
+
+    /// `core`, `compiler_builtins` and `kconfig`, PIC, built once.
+    fn bootstrap(&mut self, ordered: &[graph::Unit]) -> Result<(), String> {
+        if self.bootstrapped {
+            return Ok(());
+        }
+        self.built.insert("core".into(), self.b.build_core()?);
+        let cb = ordered
+            .iter()
+            .find(|u| u.name == "compiler_builtins")
+            .ok_or("no compiler_builtins unit in this configuration")?;
+        let cb_built = self.b.build_unit(cb, &self.built)?;
+        self.built.insert(cb.name.clone(), cb_built);
+        let kconfig = self
+            .b
+            .build_kconfig(&self.built["core"], &self.built["compiler_builtins"])?;
+        self.built.insert("kconfig".into(), kconfig);
+        self.bootstrapped = true;
+        Ok(())
+    }
+
+    /// Build the PIC user program `unit`: its `user`-layer dependency closure first, in
+    /// topological order, then the program itself. Returns the program's artifact, whose
+    /// embed variable points into `out/user` for the kernel unit to include.
+    fn build_program(
+        &mut self,
+        unit: &graph::Unit,
+        ordered: &[graph::Unit],
+    ) -> Result<build::Built, String> {
+        self.bootstrap(ordered)?;
+        let closure = transitive_deps(unit, ordered);
+        // `ordered` is topological, so a dependency is built before whatever needs it.
+        for u in ordered {
+            if u.kind == graph::Kind::Lib
+                && closure.contains(&u.name)
+                && !self.built.contains_key(&u.name)
+            {
+                let b = self.b.build_unit(u, &self.built)?;
+                self.built.insert(u.name.clone(), b);
+            }
+        }
+        self.b.build_unit(unit, &self.built)
+    }
+}
+
+/// The names of `unit`'s transitive dependencies, walked over `ordered`.
+fn transitive_deps(unit: &graph::Unit, ordered: &[graph::Unit]) -> std::collections::BTreeSet<String> {
+    let by_name: BTreeMap<&str, &graph::Unit> = ordered.iter().map(|u| (u.name.as_str(), u)).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack: Vec<String> = unit.deps.clone();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(u) = by_name.get(name.as_str()) {
+            stack.extend(u.deps.iter().cloned());
+        }
+    }
+    seen
+}
+
 /// between the two never serves one target's artifact to the other.
 fn build_foreign_image(
     kernel: &build::Build,
@@ -598,6 +682,7 @@ fn build_foreign_image(
         link_script: None,
         deny_warnings: false,
         bitcode: false,
+        pic: false,
         verbose: kernel.verbose,
     };
     println!("\x1b[36mbuilding\x1b[0m {} for {triple}", unit.name);
@@ -862,6 +947,7 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         },
         deny_warnings: false,
         bitcode: false,
+        pic: false,
         verbose: opts.verbose,
     };
 
@@ -891,6 +977,13 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     let kconfig = b.build_kconfig(&built["core"], &built["compiler_builtins"])?;
     built.insert("kconfig".into(), kconfig);
 
+    // The user-program flavor: an x86_64 user program is built position-independent, and so
+    // is the closure of `user`-layer crates it links, because they meet at the user half's
+    // 512 GiB link address where the static model's relocations cannot reach (see
+    // `build::Build::common`). The kernel and its modules stay static. Every other
+    // architecture links user programs as it builds everything else, so no flavor is needed.
+    let mut user = UserFlavor::new(&b)?;
+
     let mut image = None;
     for unit in &ordered {
         // Units with a target of their own are separate images, and modules are built
@@ -901,7 +994,12 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         {
             continue;
         }
-        let b2 = b.build_unit(unit, &built)?;
+        // A user program on an architecture that needs the PIC flavor is built there and
+        // embedded from there; the kernel unit that embeds it reads the path from `built`.
+        let b2 = match (&mut user, unit.kind) {
+            (Some(user), graph::Kind::User) => user.build_program(unit, &ordered)?,
+            _ => b.build_unit(unit, &built)?,
+        };
         if unit.kind == graph::Kind::Bin {
             image = Some(b2.path.clone());
         }

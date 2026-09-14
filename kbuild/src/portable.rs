@@ -93,6 +93,7 @@ pub fn check(
         link_script: None,
         deny_warnings: true,
         bitcode: false,
+        pic: false,
         verbose,
     };
 

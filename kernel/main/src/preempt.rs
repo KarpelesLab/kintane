@@ -183,7 +183,11 @@ pub const MAX_STACKS: usize = kconfig::KERNEL_THREAD_SLOTS;
 /// the scheduler's check leaves behind and claims `stress::EXTRA_STACKS` more, and the
 /// driver-isolation check claims `isolation::STACKS` for its domains on every boot.
 const _: () = assert!(
-    MAX_STACKS >= THREAD_STACKS + crate::stress::EXTRA_STACKS + crate::isolation::STACKS,
+    MAX_STACKS
+        >= THREAD_STACKS
+            + crate::stress::EXTRA_STACKS
+            + crate::isolation::STACKS
+            + crate::blockdomain::STACKS,
     "KERNEL_THREAD_SLOTS is below what this build's kernel threads need"
 );
 

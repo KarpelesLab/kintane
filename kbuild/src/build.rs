@@ -35,10 +35,14 @@ pub struct Build {
     /// module uses, so that only the code the module reaches ends up in it. The kernel
     /// does not, and bitcode would only make its rlibs larger.
     pub bitcode: bool,
+    /// Build position-independent. Set only for the user-program flavor (`main::build_user_flavor`),
+    /// never for the kernel or its modules; see `Build::common`.
+    pub pic: bool,
     pub verbose: bool,
 }
 
 /// What `--target` names.
+#[derive(Clone)]
 pub enum Target {
     /// One of our specifications in `targets/`. Its contents are part of every cache key.
     Spec(PathBuf),
@@ -129,6 +133,16 @@ impl Build {
                 "embed-bitcode=no".into()
             },
         ];
+        // A user-program flavor is built position-independent (see `Build::pic` and
+        // `main::build_user_flavor`): an x86_64 user program links at the user half's 512 GiB,
+        // out of reach of the small/static model's 32-bit absolute relocations, and an isolated
+        // driver domain that pulls `core`'s slice-bounds and formatting paths cannot otherwise
+        // be linked there. The kernel and its modules stay static — the module loader applies
+        // absolute relocations, not PIC's GOT-relative ones — so this flavor is separate.
+        if self.pic {
+            a.push("-C".into());
+            a.push("relocation-model=pic".into());
+        }
         // No build directory in the binary: same source must produce the same bytes
         // on any machine. See docs/build-system.md#reproducibility.
         a.push("--remap-path-prefix".into());
@@ -162,6 +176,39 @@ impl Build {
             eprint!("{stderr}");
         }
         Ok(())
+    }
+
+    /// A position-independent build for a user program's flavor, into an `out/user`
+    /// subdirectory so its artifacts never collide with the static ones. Shares the content
+    /// cache, since a build's identity — not its output path — is its cache key.
+    pub fn user_flavor(&self) -> Result<Build, String> {
+        let out = self.out.join("user");
+        std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(Build {
+            root: self.root.clone(),
+            tc: self.tc.clone(),
+            target_name: self.target_name.clone(),
+            target: self.target.clone(),
+            out,
+            gen_dir: self.gen_dir.clone(),
+            cache: Cache::new(self.root.join("build/cache"))?,
+            cfgs: self.cfgs.clone(),
+            check_cfgs: self.check_cfgs.clone(),
+            opt_level: self.opt_level.clone(),
+            link_script: self.link_script.clone(),
+            deny_warnings: self.deny_warnings,
+            bitcode: self.bitcode,
+            pic: true,
+            verbose: self.verbose,
+        })
+    }
+
+    /// Whether this configuration's user programs need the position-independent flavor: only
+    /// x86_64, whose user half sits at 512 GiB beyond the static model's reach. i686's user
+    /// half is under 4 GiB and aarch64 addresses PC-relative, so both link user programs as
+    /// they build everything else.
+    pub fn user_needs_pic(&self) -> bool {
+        self.cfgs.iter().any(|c| c == "CONFIG_ARCH_X86_64")
     }
 
     /// Build `core` from the pinned toolchain's own source.

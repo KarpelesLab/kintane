@@ -190,6 +190,7 @@ fn module_build(
         link_script: None,
         deny_warnings: false,
         bitcode: true,
+        pic: false,
         verbose: kernel.verbose,
     })
 }
