@@ -9,6 +9,17 @@ use hal::EarlyConsole;
 use crate::Check;
 
 /// No window to park in.
+///
+/// Dead on a kernel without userspace: nothing there blocks on a wait queue, so `wait_once`
+/// is never reached and neither is this. Expected rather than allowed, so a port that starts
+/// waiting fails the build instead of quietly carrying an unused function.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "only WaitQueue::wait_once calls this, and nothing waits without USERSPACE"
+    )
+)]
 #[inline(always)]
 pub fn stall() {}
 
