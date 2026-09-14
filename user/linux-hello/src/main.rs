@@ -14,7 +14,8 @@
 //! * `rich`: [`rich`], a pipe, `fork`, `execve`, `wait4`, and a thread sharing a futex-guarded
 //!   counter;
 //! * `child`: what `rich`'s child `execve`s into, which writes to the pipe it inherited;
-//! * `tls`: [`tls`], a thread pointer checked across a hundred yields, run two at a time.
+//! * `tls`: [`tls`], a thread pointer checked across a hundred yields, run two at a time;
+//! * `signals`: [`signals`], handlers, masks, `EINTR`, `SIGCHLD`, `SIGPIPE` and default actions.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -159,6 +160,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"rich" => rich(),
         b"child" => child(),
         b"tls" => tls(),
+        b"signals" => signals(),
         _ => hello(&s),
     }
 }
@@ -535,6 +537,222 @@ fn tls() -> ! {
         expect(sys::tls_word() == mark, 91);
     }
     exit(TLS_SUCCESS)
+}
+
+// ---- signals: handlers, masks, EINTR, SIGCHLD, SIGPIPE and default actions -----------------
+
+const SIGNALS_SUCCESS: u64 = 46;
+const SIGKILL: u64 = 9;
+const SIGUSR1: u64 = 10;
+const SIGUSR2: u64 = 12;
+const SIGPIPE: u64 = 13;
+const SIGTERM: u64 = 15;
+const SIGCHLD: u64 = 17;
+const SIGSTOP: u64 = 19;
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SA_SIGINFO: u64 = 4;
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_RESTART: u64 = 0x1000_0000;
+const EINTR: i64 = 4;
+const EINVAL: i64 = 22;
+const EPIPE: i64 = 32;
+
+/// Times the handler that zeroes the callee-saved registers ran; `sys`'s assembly counts them.
+pub static CLOBBER_HITS: AtomicU64 = AtomicU64::new(0);
+static USR2_HITS: AtomicU64 = AtomicU64::new(0);
+static USR2_SIGNO: AtomicU64 = AtomicU64::new(0);
+static INTR_HITS: AtomicU64 = AtomicU64::new(0);
+static CHLD_HITS: AtomicU64 = AtomicU64::new(0);
+/// The pipe the interrupted thread reads, that it is about to, what its read answered, and its
+/// tid word, which the kernel zeroes as it exits.
+static INTR_FD: AtomicU64 = AtomicU64::new(0);
+static INTR_READY: AtomicU64 = AtomicU64::new(0);
+static INTR_RESULT: AtomicU64 = AtomicU64::new(0);
+static INTR_TID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn bit(sig: u64) -> u64 {
+    1 << (sig - 1)
+}
+
+/// Install `handler` for `sig`, returning through `sys::restorer`.
+fn sigaction(sig: u64, handler: u64, flags: u64) -> i64 {
+    let act = [handler, flags | SA_RESTORER, sys::restorer(), 0u64];
+    sys::call(sys::RT_SIGACTION, [sig, act.as_ptr() as u64, 0, 8, 0, 0])
+}
+
+fn sigprocmask(how: u64, set: u64) -> i64 {
+    sys::call(sys::RT_SIGPROCMASK, [how, &raw const set as u64, 0, 8, 0, 0])
+}
+
+fn pipe(step: u64) -> [u64; 2] {
+    let mut fds = [0u32; 2];
+    expect(call1(sys::PIPE2, fds.as_mut_ptr() as u64) == 0, step);
+    fds.map(u64::from)
+}
+
+fn wait_child(child: i64, step: u64) -> u32 {
+    let mut status = 0u32;
+    let reaped = sys::call(sys::WAIT4, [child as u64, &raw mut status as u64, 0, 0, 0, 0]);
+    expect(reaped == child, step);
+    status
+}
+
+/// Wait on a tid word until the kernel zeroes it as its thread exits.
+fn join(word: &AtomicU32, step: u64) {
+    loop {
+        let t = word.load(Ordering::Acquire);
+        if t == 0 {
+            return;
+        }
+        let r = sys::call(sys::FUTEX, [word.as_ptr() as u64, FUTEX_WAIT, u64::from(t), 0, 0, 0]);
+        expect(r == 0 || r == -11 || r == -EINTR, step);
+    }
+}
+
+extern "C" fn on_usr2(_sig: i32, info: *const i32, _uc: *const u8) {
+    USR2_HITS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the kernel passes the `siginfo` it pushed, whose first field is the signal.
+    USR2_SIGNO.store(unsafe { *info } as u64, Ordering::Relaxed);
+}
+
+extern "C" fn on_intr(_sig: i32) {
+    INTR_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+extern "C" fn on_chld(_sig: i32) {
+    CHLD_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The thread [`signals`] interrupts: it reads an empty pipe no one writes.
+extern "C" fn intr_thread() -> u64 {
+    let mut b = [0u8; 1];
+    INTR_READY.store(1, Ordering::Release);
+    let fd = INTR_FD.load(Ordering::Relaxed);
+    let n = sys::call(sys::READ, [fd, b.as_mut_ptr() as u64, 1, 0, 0, 0]);
+    INTR_RESULT.store(n as u64, Ordering::Relaxed);
+    0
+}
+
+fn signals() -> ! {
+    let pid = sys::call(sys::GETPID, [0; 6]) as u64;
+    let usr2 = on_usr2 as *const () as u64;
+
+    // 110: SIGKILL and SIGSTOP take no disposition.
+    expect(sigaction(SIGKILL, usr2, 0) == -EINVAL, 110);
+    expect(sigaction(SIGSTOP, usr2, 0) == -EINVAL, 110);
+
+    // 111–113: a signal a process sends itself runs its handler on the way out of `kill`. The
+    // handler zeroes every callee-saved register, and `rt_sigreturn` gives each back.
+    expect(sigaction(SIGUSR1, sys::clobber_handler(), 0) == 0, 111);
+    let intact = sys::raise_marked(pid, SIGUSR1);
+    expect(CLOBBER_HITS.load(Ordering::Relaxed) == 1, 112);
+    expect(intact, 113);
+
+    // 114–118: a blocked signal stays pending, runs once unblocked, and its siginfo names it.
+    expect(sigaction(SIGUSR2, usr2, SA_SIGINFO) == 0, 114);
+    expect(sigprocmask(SIG_BLOCK, bit(SIGUSR2)) == 0, 114);
+    expect(sys::call(sys::KILL, [pid, SIGUSR2, 0, 0, 0, 0]) == 0, 114);
+    expect(USR2_HITS.load(Ordering::Relaxed) == 0, 115);
+    let mut pending = 0u64;
+    let asked = sys::call(sys::RT_SIGPENDING, [&raw mut pending as u64, 8, 0, 0, 0, 0]);
+    expect(asked == 0 && pending & bit(SIGUSR2) != 0, 116);
+    expect(sigprocmask(SIG_UNBLOCK, bit(SIGUSR2)) == 0, 117);
+    expect(USR2_HITS.load(Ordering::Relaxed) == 1, 117);
+    expect(USR2_SIGNO.load(Ordering::Relaxed) == SIGUSR2, 118);
+
+    // 119: SIGPIPE ignored, a write no one can read is EPIPE.
+    expect(sigaction(SIGPIPE, SIG_IGN, 0) == 0, 119);
+    let [r, w] = pipe(119);
+    expect(call1(sys::CLOSE, r) == 0, 119);
+    expect(sys::call(sys::WRITE, [w, b"x".as_ptr() as u64, 1, 0, 0, 0]) == -EPIPE, 119);
+    expect(call1(sys::CLOSE, w) == 0, 119);
+    expect(sigaction(SIGPIPE, SIG_DFL, 0) == 0, 119);
+
+    // 120–124: a thread blocked reading an empty pipe is signalled by this one; its handler
+    // runs, and its read answers EINTR.
+    expect(sigaction(SIGUSR1, on_intr as *const () as u64, 0) == 0, 120);
+    let [r, w] = pipe(120);
+    INTR_FD.store(r, Ordering::Relaxed);
+    let stack = map(4 * PAGE);
+    let block = map(PAGE);
+    expect(stack > 0 && block > 0, 121);
+    let mut parent_tid = 0u32;
+    let tid = sys::clone_thread(
+        (stack as u64) + 4 * PAGE,
+        &raw mut parent_tid,
+        INTR_TID.as_ptr(),
+        block as u64,
+        intr_thread,
+    );
+    expect(tid > 0, 121);
+    while INTR_READY.load(Ordering::Acquire) == 0 {
+        yield_now();
+    }
+    // Long enough that its read has blocked.
+    for _ in 0..LINGER {
+        yield_now();
+    }
+    expect(sys::call(sys::TGKILL, [pid, tid as u64, SIGUSR1, 0, 0, 0]) == 0, 122);
+    join(&INTR_TID, 123);
+    expect(INTR_RESULT.load(Ordering::Relaxed) == -EINTR as u64, 123);
+    expect(INTR_HITS.load(Ordering::Relaxed) == 1, 124);
+    expect(call1(sys::CLOSE, r) == 0 && call1(sys::CLOSE, w) == 0, 124);
+
+    // 125–127: a child writing to a pipe no one reads is ended by SIGPIPE's default action; its
+    // end sends this process SIGCHLD, and wait4 still reaps it and says which signal.
+    expect(sigaction(SIGCHLD, on_chld as *const () as u64, SA_RESTART) == 0, 125);
+    let [r, w] = pipe(125);
+    expect(call1(sys::CLOSE, r) == 0, 125);
+    let child = sys::fork();
+    expect(child >= 0, 125);
+    if child == 0 {
+        sys::call(sys::WRITE, [w, b"x".as_ptr() as u64, 1, 0, 0, 0]);
+        exit(125)
+    }
+    let status = wait_child(child, 125);
+    expect(status == SIGPIPE as u32, if status == 125 << 8 { 125 } else { 126 });
+    expect(CHLD_HITS.load(Ordering::Relaxed) == 1, 127);
+    expect(call1(sys::CLOSE, w) == 0, 127);
+    expect(sigaction(SIGCHLD, SIG_DFL, 0) == 0, 127);
+
+    // 128–130: SIGTERM's default action ends a child blocked in a read.
+    let [r, w] = pipe(128);
+    let child = sys::fork();
+    expect(child >= 0, 128);
+    if child == 0 {
+        call1(sys::CLOSE, w);
+        let mut b = [0u8; 1];
+        sys::call(sys::READ, [r, b.as_mut_ptr() as u64, 1, 0, 0, 0]);
+        exit(128)
+    }
+    expect(call1(sys::CLOSE, r) == 0, 128);
+    for _ in 0..LINGER {
+        yield_now();
+    }
+    expect(sys::call(sys::KILL, [child as u64, SIGTERM, 0, 0, 0, 0]) == 0, 128);
+    let status = wait_child(child, 129);
+    expect(status == SIGTERM as u32, 130);
+    expect(call1(sys::CLOSE, w) == 0, 130);
+
+    // 131–132: SIGKILL cannot be caught, and ends a child that tried.
+    let child = sys::fork();
+    expect(child >= 0, 131);
+    if child == 0 {
+        expect(sigaction(SIGKILL, usr2, 0) == -EINVAL, 131);
+        loop {
+            yield_now();
+        }
+    }
+    for _ in 0..LINGER {
+        yield_now();
+    }
+    expect(sys::call(sys::KILL, [child as u64, SIGKILL, 0, 0, 0, 0]) == 0, 132);
+    let status = wait_child(child, 132);
+    expect(status == SIGKILL as u32, if status == 131 << 8 { 131 } else { 132 });
+    exit(SIGNALS_SUCCESS)
 }
 
 #[panic_handler]

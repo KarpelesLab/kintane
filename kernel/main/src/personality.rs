@@ -38,8 +38,15 @@
 //! in the same process on the stack the caller gave it. Both use the scheduler's pool of
 //! process threads ([`spawn::start_resumed`]). `execve` reads a program whole from the
 //! namespace and replaces the calling process's memory with it. `wait4` reports a child once
-//! its last thread has gone. There are no signals: a child's exit wakes `wait4`, and nothing
-//! else.
+//! its last thread has gone, and its parent is sent `SIGCHLD`.
+//!
+//! # Signals
+//!
+//! Dispositions, masks and delivery are [`signals`]. This file calls into it at the few places
+//! signals touch a call: on the way out of every call, which is where a signal is delivered; in
+//! the waits of a pipe, a futex and `wait4`, which a signal interrupts; in `clone`, `fork`,
+//! `execve` and a thread's exit, which carry or reset signal state; and when a process ends,
+//! for its parent's `SIGCHLD`.
 //!
 //! # What is checked at boot
 //!
@@ -48,8 +55,9 @@
 //! grading it by what it wrote, by its exit code and by the unimplemented call it made. It
 //! keeps the program. [`scheduled_check`] runs it again with the scheduler, in the mode that
 //! uses pipes, `fork`, `execve`, `wait4`, a thread and a futex, and requires that a pipe read
-//! and a futex wait really blocked. The stress run starts two of it at once on one CPU, each
-//! checking its own thread pointer across a hundred yields ([`stress_cycle`]).
+//! and a futex wait really blocked, and then in the mode that exercises signals
+//! ([`signals::check`]). The stress run starts two of it at once on one CPU, each checking its
+//! own thread pointer across a hundred yields ([`stress_cycle`]).
 
 #![allow(unsafe_code)]
 
@@ -73,6 +81,8 @@ use vfs::{Kind, Vfs};
 use crate::userproc::{self, MAX_PROCS, Personality, Process};
 use crate::wait::WaitQueue;
 use crate::{Check, Live, preempt, spawn, timekeeping, write_hex, write_usize};
+
+mod signals;
 
 /// This kernel has the Linux personality, so [`userproc::personality_of`] tags programs
 /// with no KinTane note `linux` rather than refusing them.
@@ -222,6 +232,8 @@ fn with_ns<R>(f: impl FnOnce(&mut Namespace) -> Result<R, Failure>) -> Result<R,
 pub(crate) fn syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFrame) {
     // A thread whose process another thread has ended ends at its next call...
     userproc::end_if_exiting(slot);
+    // What the call was made with: a call a signal interrupts runs again from these.
+    let entry = Cpu::registers(frame).to_words();
     let number = frame.number();
     let result = match linux::decode(ABI, number) {
         Some(call) => dispatch(slot, frame, call),
@@ -229,7 +241,13 @@ pub(crate) fn syscalls(slot: usize, frame: &mut <Cpu as HasUserMode>::SyscallFra
     };
     // ...or on its way out of the one it was in, which the ending woke.
     userproc::end_if_exiting(slot);
+    if result == Err(Failure::BrokenPipe) {
+        signals::raise_self(slot, linux::signal::SIGPIPE);
+    }
     frame.set_return(linux::ret(result));
+    // The way out of a call is where a signal is delivered: the one place the kernel returns
+    // to a Linux thread with its registers at hand.
+    signals::deliver(slot, frame, &entry, result);
 }
 
 fn dispatch(
@@ -268,6 +286,13 @@ fn dispatch(
         Call::ArchPrctl => arch_prctl(a0, a1),
         Call::Futex => futex(slot, a0, a1, a2, a3),
         Call::Openat => openat(slot, a0, a1, a2),
+        Call::RtSigaction => signals::sigaction(slot, a0, a1, a2, a3),
+        Call::RtSigprocmask => signals::procmask(slot, a0, a1, a2, a3),
+        Call::RtSigreturn => signals::sigreturn(slot, frame),
+        Call::RtSigpending => signals::pending(slot, a0, a1),
+        Call::Sigaltstack => signals::altstack(a0, a1),
+        Call::Kill => signals::kill(slot, a0, a1),
+        Call::Tgkill => signals::tgkill(slot, a0, a1, a2),
     }
 }
 
@@ -287,6 +312,16 @@ fn unimplemented(slot: usize, number: u64) -> Result<u64, Failure> {
     }
     e.write_str("\n");
     Err(Failure::NotImplemented)
+}
+
+/// The exit code a process a trap ends is recorded with: a Linux process is reported to its
+/// parent as ended by `SIGSEGV`, whatever the trap was, since the trap hook has no registers to
+/// run a handler with; a native process as killed.
+pub(crate) fn killed_by(personality: Personality) -> u64 {
+    match personality {
+        Personality::Linux => linux::signal::exit_code(linux::signal::SIGSEGV),
+        Personality::Native => userproc::KILLED,
+    }
 }
 
 fn pid(slot: usize) -> u64 {
@@ -751,20 +786,28 @@ fn read_pipe(
         if userproc::exiting(slot) {
             return Some(Err(Failure::Io));
         }
-        let mut pipes = PIPE_TABLE.lock_irqsave();
-        let p = &mut pipes[pipe];
-        if p.len > 0 {
-            Some(Ok(p.take(&mut chunk[..count])))
-        } else if p.writers == 0 {
-            Some(Ok(0))
-        } else if nonblock {
-            Some(Err(Failure::TryAgain))
-        } else {
-            None
-        }
+        let taken = {
+            let mut pipes = PIPE_TABLE.lock_irqsave();
+            let p = &mut pipes[pipe];
+            if p.len > 0 {
+                Some(Ok(p.take(&mut chunk[..count])))
+            } else if p.writers == 0 {
+                Some(Ok(0))
+            } else if nonblock {
+                Some(Err(Failure::TryAgain))
+            } else {
+                None
+            }
+        };
+        // Nothing to read, and a signal to act on: the read ends, outside the pipe's lock.
+        taken.or_else(|| signals::interrupting(slot).then_some(Err(Failure::Interrupted)))
     });
     // Before the scheduler runs nothing can write, so a wait that cannot block reports it.
-    let n = got.map_err(|_| Failure::TryAgain)??;
+    let n = got.map_err(|_| Failure::TryAgain)?;
+    if n == Err(Failure::Interrupted) && looks >= 3 {
+        signals::blocked_call_interrupted();
+    }
+    let n = n?;
     // A first look, a second after registering, and a third after the block: a read that
     // needed three waited for a writer.
     if looks >= 3 && n > 0 {
@@ -792,17 +835,20 @@ fn write_pipe(
             if userproc::exiting(slot) {
                 return Some(Err(Failure::Io));
             }
-            let mut pipes = PIPE_TABLE.lock_irqsave();
-            let p = &mut pipes[pipe];
-            if p.readers == 0 {
-                Some(Err(Failure::BrokenPipe))
-            } else if p.len < PIPE_BYTES {
-                Some(Ok(p.put(&chunk[done..count])))
-            } else if nonblock {
-                Some(Err(Failure::TryAgain))
-            } else {
-                None
-            }
+            let put = {
+                let mut pipes = PIPE_TABLE.lock_irqsave();
+                let p = &mut pipes[pipe];
+                if p.readers == 0 {
+                    Some(Err(Failure::BrokenPipe))
+                } else if p.len < PIPE_BYTES {
+                    Some(Ok(p.put(&chunk[done..count])))
+                } else if nonblock {
+                    Some(Err(Failure::TryAgain))
+                } else {
+                    None
+                }
+            };
+            put.or_else(|| signals::interrupting(slot).then_some(Err(Failure::Interrupted)))
         });
         match put {
             Ok(Ok(n)) => done += n,
@@ -884,6 +930,7 @@ fn set_tid_address(slot: usize, addr: u64) -> Result<u64, Failure> {
 /// its address since, zeroes it and wakes a futex waiting there first: how a thread library
 /// joins a thread.
 fn exit_thread(slot: usize, code: u64) -> ! {
+    signals::thread_ended(slot);
     if let Some(me) = preempt::current_thread()
         && let Some(r) = record_of(me)
     {
@@ -953,6 +1000,9 @@ fn clone(
     {
         r.clear_tid.store(child_tid, Ordering::Release);
     }
+    if let Some(id) = started {
+        signals::cloned(slot, id, tid);
+    }
     // SAFETY: pairs with the `irq_save` above.
     unsafe { Cpu::irq_restore(irq) };
     started.map(|_| tid).ok_or(Failure::TryAgain)
@@ -1017,12 +1067,18 @@ fn futex_wait(slot: usize, addr: u64, val: u32, timeout: u64) -> Result<u64, Fai
     let mut looks = 0u32;
     let woken = FUTEX_WAITS[b].wait_until(deadline, || {
         looks += 1;
-        (userproc::exiting(slot) || FUTEX_SEQ.lock_irqsave()[b] != seen).then_some(())
+        if userproc::exiting(slot) || FUTEX_SEQ.lock_irqsave()[b] != seen {
+            return Some(Ok(0));
+        }
+        signals::interrupting(slot).then_some(Err(Failure::Interrupted))
     });
     if looks >= 3 {
         FUTEX_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        if woken == Ok(Err(Failure::Interrupted)) {
+            signals::blocked_call_interrupted();
+        }
     }
-    woken.map(|()| 0).map_err(|_| Failure::TimedOut)
+    woken.map_err(|_| Failure::TimedOut)?
 }
 
 /// Wake the waiters on the futex at `addr`. Returns how many were woken, at most `n`.
@@ -1068,10 +1124,13 @@ pub(crate) fn process_ended(slot: usize, code: u64) {
     close_all(fds.unwrap_or([Descriptor::Closed; MAX_FDS]));
     let reported = if code == userproc::KILLED {
         linux::KILLED_STATUS
+    } else if let Some(signo) = linux::signal::exit_signal(code) {
+        linux::signal::status(signo)
     } else {
         linux::exited_status(code)
     };
     status.store(u64::from(reported) | ENDED, Ordering::Release);
+    signals::child_ended(slot);
     CHILD_WAIT.wake_all();
 }
 
@@ -1082,6 +1141,7 @@ fn fork(slot: usize, frame: &<Cpu as HasUserMode>::SyscallFrame) -> Result<u64, 
     let tls = unsafe { Cpu::tls() };
     let (child, root) = userproc::fork_linux(slot).ok_or(Failure::TryAgain)?;
     let started = inherit(slot, child).and_then(|()| {
+        signals::forked(slot, child);
         STATUS[child].store(0, Ordering::Release);
         PARENT[child].store(slot + 1, Ordering::Release);
         spawn::start_resumed(child, root, regs, tls).ok_or(Failure::TryAgain)
@@ -1270,6 +1330,7 @@ fn exec_image(
     };
     // SAFETY: from the calling thread's own system call; a new program starts with none.
     unsafe { Cpu::set_tls(0) };
+    signals::executed(slot);
     let regs = <Cpu as HasUserMode>::UserRegisters::start(program.entry as usize, sp);
     Cpu::set_registers(frame, &regs);
     Ok(0)
@@ -1316,7 +1377,8 @@ fn wait4(slot: usize, pid_arg: u64, status: u64, options: u64) -> Result<u64, Fa
                 if userproc::exiting(slot) {
                     return Some(Err(Failure::Io));
                 }
-                find()
+                // A child to report first, then a signal to act on.
+                find().or_else(|| signals::interrupting(slot).then_some(Err(Failure::Interrupted)))
             })
             .map_err(|_| Failure::TryAgain)?
     };
@@ -1341,6 +1403,7 @@ pub(crate) fn wake_all_waiters() {
 /// files, its pipe ends, its threads' records, and its place in the family. Called from
 /// teardown, once every thread of it has ended.
 pub(crate) fn release(slot: usize) {
+    signals::release(slot);
     for r in &RECORDS {
         if r.slot.load(Ordering::Acquire) == slot {
             r.thread.store(NO_THREAD, Ordering::Release);
@@ -1678,37 +1741,43 @@ const STACKS: [usize; 3] = [1, 2, 3];
 const PATIENCE: Duration = Duration::from_nanos(10_000_000_000);
 const POLL: Duration = Duration::from_nanos(5_000_000);
 
-/// Run the program again with the scheduler, in its mode that forks, pipes, execs, waits and
-/// starts a thread that shares a futex-guarded counter, and grade it. On the boot thread.
-pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
-    c.write_str("\n  linux mt   ");
+/// How one run of the kept program with the scheduler went.
+struct Run {
+    started: bool,
+    /// Its exit code, or `None` if it had not exited when [`PATIENCE`] ran out.
+    code: Option<u64>,
+    /// Whether every thread it started ended, so its processes could be torn down.
+    ended: bool,
+    /// Files left open in its namespace.
+    open: usize,
+    /// Frames of the process pool not given back.
+    frames: usize,
+}
+
+/// Run the kept program in the mode `argv` names, with the scheduler and the volume's
+/// namespace, until it and every process it made have exited or [`PATIENCE`] runs out, and tear
+/// them down. On the boot thread. `Err` is the verdict, and what to say, when it cannot run.
+fn run_mode(argv: &'static [&'static [u8]]) -> Result<Run, (Check, &'static str)> {
     let Some(program) = kept_program() else {
-        c.write_str("skipped: the linux check kept no program");
-        return Check::Skipped;
+        return Err((Check::Skipped, "skipped: the linux check kept no program"));
     };
     if userproc::with_frames(|f| f.alloc.stats().free).is_none() {
-        c.write_str("skipped: no frames for processes");
-        return Check::Skipped;
+        return Err((Check::Skipped, "skipped: no frames for processes"));
     }
     // SAFETY: as in `check`: the stress run has not started, and nothing else on the boot
     // path holds the volume now.
     let Some(volume) = (unsafe { crate::fs::volume() }) else {
-        c.write_str("skipped: no volume is mounted");
-        return Check::Skipped;
+        return Err((Check::Skipped, "skipped: no volume is mounted"));
     };
     let mut ns: Namespace = Vfs::new();
     if ns.mount("/", volume).is_err() {
-        c.write_str("MOUNTING THE VOLUME FAILED");
-        return Check::Failed;
+        return Err((Check::Failed, "MOUNTING THE VOLUME FAILED"));
     }
     spawn::use_stacks(&STACKS);
     let frames_before = free_frames();
-    let reads_before = PIPE_BLOCKED_READS.load(Ordering::Relaxed);
-    let blocks_before = FUTEX_BLOCKS.load(Ordering::Relaxed);
-    let wakes_before = FUTEX_WAKES.load(Ordering::Relaxed);
     NS.store(core::ptr::from_mut(&mut ns).cast(), Ordering::Relaxed);
 
-    let started = userproc::start_linux(SLOT, &program, start_with(&RICH_ARGV));
+    let started = userproc::start_linux(SLOT, &program, start_with(argv));
     let give_up = timekeeping::now().saturating_add(PATIENCE);
     let running = || {
         started.is_some_and(preempt::alive)
@@ -1732,18 +1801,60 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
     let open = ns.open_count();
     let _ = ns.unmount("/");
     drop(ns);
+    Ok(Run {
+        started: started.is_some(),
+        code,
+        ended,
+        open,
+        frames: frames_before.saturating_sub(free_frames()),
+    })
+}
 
+/// Report what a run left behind. Whether it left nothing.
+fn report_run(c: &dyn EarlyConsole, run: &Run) -> bool {
+    if !run.ended {
+        c.write_str("; A THREAD NEVER ENDED, its processes left in place");
+    }
+    if run.open != 0 {
+        c.write_str("; ");
+        write_usize(c, run.open);
+        c.write_str(" FILES LEFT OPEN");
+    }
+    c.write_str("; ");
+    write_usize(c, run.frames);
+    c.write_str(if run.frames == 0 {
+        " frames left ok"
+    } else {
+        " FRAMES LEAKED"
+    });
+    run.ended && run.open == 0 && run.frames == 0
+}
+
+/// Run the program again with the scheduler, in its mode that forks, pipes, execs, waits and
+/// starts a thread that shares a futex-guarded counter, and grade it; then in its signals mode.
+/// On the boot thread.
+pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux mt   ");
+    let reads_before = PIPE_BLOCKED_READS.load(Ordering::Relaxed);
+    let blocks_before = FUTEX_BLOCKS.load(Ordering::Relaxed);
+    let wakes_before = FUTEX_WAKES.load(Ordering::Relaxed);
+    let run = match run_mode(&RICH_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
     let reads = PIPE_BLOCKED_READS.load(Ordering::Relaxed) - reads_before;
     let blocks = FUTEX_BLOCKS.load(Ordering::Relaxed) - blocks_before;
     let wakes = FUTEX_WAKES.load(Ordering::Relaxed) - wakes_before;
-    let frames = frames_before.saturating_sub(free_frames());
-    match (started, code) {
-        (None, _) => c.write_str("the program NEVER STARTED"),
-        (Some(_), None) => c.write_str("the program NEVER EXITED"),
-        (Some(_), Some(RICH_SUCCESS)) => {
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(RICH_SUCCESS)) => {
             c.write_str("pipe, fork, execve, wait4, a thread and a futex ok")
         }
-        (Some(_), Some(code)) => {
+        (true, Some(code)) => {
             c.write_str("the program exited ");
             write_hex(c, code);
             c.write_str(", WRONG");
@@ -1760,22 +1871,14 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
     if !blocked {
         c.write_str("; NOTHING REALLY BLOCKED");
     }
-    if !ended {
-        c.write_str("; A THREAD NEVER ENDED, its processes left in place");
+    let clean = report_run(c, &run);
+    let rich = Check::from_ok(run.code == Some(RICH_SUCCESS) && blocked && clean);
+    if !run.ended {
+        // Its processes are still in the slots the signals run would use.
+        c.write_str("\n  linux sig  NOT RUN: the run before it left its processes in place");
+        return Check::Failed;
     }
-    if open != 0 {
-        c.write_str("; ");
-        write_usize(c, open);
-        c.write_str(" FILES LEFT OPEN");
-    }
-    c.write_str("; ");
-    write_usize(c, frames);
-    c.write_str(if frames == 0 {
-        " frames left ok"
-    } else {
-        " FRAMES LEAKED"
-    });
-    Check::from_ok(code == Some(RICH_SUCCESS) && blocked && ended && open == 0 && frames == 0)
+    rich.and(signals::check(c))
 }
 
 fn free_frames() -> usize {

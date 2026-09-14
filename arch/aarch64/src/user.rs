@@ -101,6 +101,25 @@ impl hal::user::UserRegisters for Registers {
     fn pc(&self) -> usize {
         self.pc as usize
     }
+    /// In field order: `x0`–`x30, sp, pc, pstate`.
+    fn to_words(&self) -> [u64; hal::user::REGISTER_WORDS] {
+        let mut w = [0u64; hal::user::REGISTER_WORDS];
+        w[..31].copy_from_slice(&self.x);
+        w[31] = self.sp;
+        w[32] = self.pc;
+        w[33] = self.pstate;
+        w
+    }
+    fn from_words(w: &[u64; hal::user::REGISTER_WORDS]) -> Self {
+        let mut x = [0u64; 31];
+        x.copy_from_slice(&w[..31]);
+        Registers {
+            x,
+            sp: w[31],
+            pc: w[32],
+            pstate: w[33],
+        }
+    }
 }
 
 /// The running CPU's `TPIDR_EL0`.

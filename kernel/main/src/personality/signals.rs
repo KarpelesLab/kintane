@@ -1,0 +1,733 @@
+//! Signals for Linux processes: dispositions, masks, pending sets, and delivery.
+//!
+//! # Who holds what
+//!
+//! As Linux divides it: a process has one disposition per signal ([`ACTIONS`]) and a set of
+//! signals sent to the process as a whole ([`PROCESS_PENDING`]); each thread has a mask and a
+//! set of signals sent to it ([`THREAD_SIGNALS`]). A thread gets its entry the first time it
+//! makes a call. A `clone`d thread is given one at `clone`, with the mask of the thread that
+//! made it, and a `fork`ed process's first thread starts with the forking thread's mask and the
+//! parent's dispositions. `execve` resets every handler to the default and keeps the rest.
+//!
+//! # Delivery
+//!
+//! A signal is delivered on the way out of a system call ([`deliver`]), where the thread's
+//! registers are at hand: the lowest-numbered one that is pending and not masked, the thread's
+//! own before its process's. An ignored one is discarded; one whose action ends the process
+//! ends it, reporting the signal to `wait4`; one with a handler gets a frame on the thread's
+//! stack (`linux::signal::build`) and the call returns into the handler instead, with the
+//! handler's mask added. `rt_sigreturn` reads the frame back, refuses one the program has made
+//! unsafe, and resumes where the handler interrupted.
+//!
+//! A thread spinning in user mode is not interrupted to run a handler: its signal waits for
+//! its next system call. The interrupt path has no registers to build a frame from. A signal
+//! whose action ends the process does not wait: it is acted on when it is sent, and the
+//! process's threads end the way an `exit_group` ends them, spinning ones included.
+//!
+//! # Blocking calls
+//!
+//! A pipe read or write, a futex wait and `wait4` look at [`interrupting`] each time they wake,
+//! and end with `EINTR` when a signal that is not ignored is deliverable; sending one wakes the
+//! personality's wait queues, so a blocked thread looks. If the handler has `SA_RESTART`, or no
+//! handler runs after all — the signal went to another thread, or turned out to be ignored — the
+//! call returns to its own system call instruction with its arguments, and runs again.
+//!
+//! # Not built
+//!
+//! Stopping: `SIGSTOP` is refused by `kill` and `tgkill`, and the other stop signals' default
+//! action does nothing. Alternate signal stacks: `sigaltstack` reports none and refuses to set
+//! one. `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd`, real-time signal queueing (a pending
+//! signal is a bit, so a second before the first is delivered is lost), and saving
+//! floating-point state in the frame.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use arch::Cpu;
+use hal::user::UserRegisters;
+use hal::{EarlyConsole, HasUserMode};
+use linux::Failure;
+use linux::signal::{self as sig, Action, Delivery, Effect};
+use sched::ThreadId;
+use sync::SpinLock;
+use sync::lockdep::LockClass;
+
+use super::{ABI, ENDED, PARENT, STATUS};
+use crate::userproc::{self, MAX_PROCS};
+use crate::{Check, preempt, write_hex, write_usize};
+
+const _: () = assert!(
+    hal::user::REGISTER_WORDS == sig::REGISTER_WORDS,
+    "hal and kernel/linux disagree on how many words a context is"
+);
+
+type Words = [u64; sig::REGISTER_WORDS];
+
+const USER_START: u64 = <Cpu as HasUserMode>::USER_START as u64;
+const USER_END: u64 = <Cpu as HasUserMode>::USER_END as u64;
+const SIGNALS: usize = sig::NSIG as usize;
+
+// ---- state -------------------------------------------------------------------------------
+
+/// Threads of Linux processes that can hold signal state at once.
+const THREADS: usize = 16;
+/// An entry no thread holds, and one a thread is claiming.
+const FREE: u32 = u32::MAX;
+const CLAIMING: u32 = u32::MAX - 1;
+/// The key of a thread the boot-time slice runs, which has no identity on the scheduler: one
+/// per process slot, above every thread id the scheduler hands out.
+const SLICE_KEY: u32 = 0x8000_0000;
+
+/// One thread's signal state.
+struct ThreadSignals {
+    /// The thread's key ([`key`]), or [`FREE`].
+    key: AtomicU32,
+    slot: AtomicUsize,
+    tid: AtomicU64,
+    mask: AtomicU64,
+    pending: AtomicU64,
+}
+
+static THREAD_SIGNALS: [ThreadSignals; THREADS] = [const {
+    ThreadSignals {
+        key: AtomicU32::new(FREE),
+        slot: AtomicUsize::new(0),
+        tid: AtomicU64::new(0),
+        mask: AtomicU64::new(0),
+        pending: AtomicU64::new(0),
+    }
+}; THREADS];
+
+static ACTION_CLASS: LockClass = LockClass::new("linux.sigaction");
+/// Each process's dispositions. Held only to read or write them, and nothing is taken inside.
+static ACTIONS: SpinLock<[[Action; SIGNALS]; MAX_PROCS], Cpu> =
+    SpinLock::with_class([[Action::DEFAULT; SIGNALS]; MAX_PROCS], &ACTION_CLASS);
+/// Signals sent to each process as a whole.
+static PROCESS_PENDING: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
+/// The mask each process's first thread starts with: its forking parent thread's.
+static FIRST_MASK: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
+/// The pid that last sent each process each signal, zero for the kernel: `siginfo`'s `si_pid`.
+static SENDER: [[AtomicU32; SIGNALS]; MAX_PROCS] =
+    [const { [const { AtomicU32::new(0) }; SIGNALS] }; MAX_PROCS];
+
+/// Handlers entered, frames `rt_sigreturn` accepted, blocked calls a signal ended, and
+/// processes a signal ended.
+static HANDLED: AtomicU64 = AtomicU64::new(0);
+static RETURNED: AtomicU64 = AtomicU64::new(0);
+static INTERRUPTED: AtomicU64 = AtomicU64::new(0);
+static SIGNAL_ENDS: AtomicU64 = AtomicU64::new(0);
+
+fn key(slot: usize) -> u32 {
+    preempt::current_thread().map_or(SLICE_KEY | slot as u32, ThreadId::raw)
+}
+
+fn held(t: &ThreadSignals) -> bool {
+    !matches!(t.key.load(Ordering::Acquire), FREE | CLAIMING)
+}
+
+fn claim(key: u32, slot: usize, tid: u64, mask: u64) -> Option<&'static ThreadSignals> {
+    let t = THREAD_SIGNALS.iter().find(|t| {
+        t.key
+            .compare_exchange(FREE, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })?;
+    t.slot.store(slot, Ordering::Release);
+    t.tid.store(tid, Ordering::Release);
+    t.mask.store(mask & !sig::UNBLOCKABLE, Ordering::Release);
+    t.pending.store(0, Ordering::Release);
+    // Last, so no one looking for the key finds the entry half made.
+    t.key.store(key, Ordering::Release);
+    Some(t)
+}
+
+/// The calling thread's entry, made for it if it has none. `None` only when every entry is
+/// held, in which case the thread's signals wait for one.
+fn mine(slot: usize) -> Option<&'static ThreadSignals> {
+    let k = key(slot);
+    if let Some(t) = THREAD_SIGNALS
+        .iter()
+        .find(|t| t.key.load(Ordering::Acquire) == k)
+    {
+        if t.slot.load(Ordering::Acquire) == slot {
+            return Some(t);
+        }
+        // A thread that ended without saying so, whose id the scheduler has since given to a
+        // thread of another process.
+        t.key.store(FREE, Ordering::Release);
+    }
+    claim(k, slot, super::tid(slot), FIRST_MASK[slot].load(Ordering::Acquire))
+}
+
+fn action_of(slot: usize, signo: u64) -> Action {
+    ACTIONS.lock_irqsave()[slot][(signo - 1) as usize]
+}
+
+/// Take the lowest signal in `set` that `allowed` lets through, clearing it.
+fn take(set: &AtomicU64, allowed: u64) -> Option<u64> {
+    set.try_update(Ordering::AcqRel, Ordering::Acquire, |p| {
+        let d = p & allowed;
+        (d != 0).then_some(p & !(d & d.wrapping_neg()))
+    })
+    .ok()
+    .map(|before| u64::from((before & allowed).trailing_zeros()) + 1)
+}
+
+// ---- the lifecycle hooks -------------------------------------------------------------------
+
+/// A thread `clone` started in `slot` as `thread`, with tid `tid`: it starts with the calling
+/// thread's mask and nothing pending.
+pub(super) fn cloned(slot: usize, thread: ThreadId, tid: u64) {
+    let mask = mine(slot).map_or(0, |t| t.mask.load(Ordering::Acquire));
+    if let Some(stale) = THREAD_SIGNALS
+        .iter()
+        .find(|t| t.key.load(Ordering::Acquire) == thread.raw())
+    {
+        stale.key.store(FREE, Ordering::Release);
+    }
+    let _ = claim(thread.raw(), slot, tid, mask);
+}
+
+/// `fork` made `child` from `parent`: the parent's dispositions, the forking thread's mask,
+/// and nothing pending.
+pub(super) fn forked(parent: usize, child: usize) {
+    let mask = mine(parent).map_or(0, |t| t.mask.load(Ordering::Acquire));
+    forget_threads(child);
+    FIRST_MASK[child].store(mask, Ordering::Release);
+    PROCESS_PENDING[child].store(0, Ordering::Release);
+    let mut actions = ACTIONS.lock_irqsave();
+    actions[child] = actions[parent];
+}
+
+/// `execve` replaced `slot`'s program: every handler is reset to the default, since the new
+/// program has no such code. An ignored signal stays ignored.
+pub(super) fn executed(slot: usize) {
+    for a in ACTIONS.lock_irqsave()[slot].iter_mut() {
+        if a.handler != sig::SIG_IGN {
+            *a = Action::DEFAULT;
+        }
+    }
+}
+
+/// The calling thread of `slot` is ending alone.
+pub(super) fn thread_ended(slot: usize) {
+    let k = key(slot);
+    if let Some(t) = THREAD_SIGNALS
+        .iter()
+        .find(|t| t.key.load(Ordering::Acquire) == k && t.slot.load(Ordering::Acquire) == slot)
+    {
+        t.key.store(FREE, Ordering::Release);
+    }
+}
+
+/// `slot`'s process is torn down: nothing of its signals is left.
+pub(super) fn release(slot: usize) {
+    forget_threads(slot);
+    PROCESS_PENDING[slot].store(0, Ordering::Release);
+    FIRST_MASK[slot].store(0, Ordering::Release);
+    for s in &SENDER[slot] {
+        s.store(0, Ordering::Release);
+    }
+    ACTIONS.lock_irqsave()[slot] = [Action::DEFAULT; SIGNALS];
+}
+
+fn forget_threads(slot: usize) {
+    for t in &THREAD_SIGNALS {
+        if held(t) && t.slot.load(Ordering::Acquire) == slot {
+            t.key.store(FREE, Ordering::Release);
+        }
+    }
+}
+
+/// `child`'s last thread has gone and its status is recorded: its parent, if it has one, is
+/// sent `SIGCHLD`.
+pub(super) fn child_ended(child: usize) {
+    let parent = PARENT[child].load(Ordering::Acquire);
+    if parent != 0 {
+        let _ = send_process(parent - 1, sig::SIGCHLD, super::pid(child) as u32);
+    }
+}
+
+// ---- sending ------------------------------------------------------------------------------
+
+/// End process `slot` for `signo`, now: its threads end as an `exit_group` ends them.
+fn end_by(slot: usize, signo: u64) {
+    SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
+    userproc::end_process(slot, sig::exit_code(signo));
+}
+
+/// Whether every thread of `slot` masks `bit`, so a process-wide signal must wait.
+fn masked_everywhere(slot: usize, bit: u64) -> bool {
+    let mut any = false;
+    for t in THREAD_SIGNALS
+        .iter()
+        .filter(|t| held(t) && t.slot.load(Ordering::Acquire) == slot)
+    {
+        any = true;
+        if t.mask.load(Ordering::Acquire) & bit == 0 {
+            return false;
+        }
+    }
+    any || FIRST_MASK[slot].load(Ordering::Acquire) & bit != 0
+}
+
+fn send_process(target: usize, signo: u64, from: u32) -> Result<u64, Failure> {
+    if signo == 0 {
+        return Ok(0);
+    }
+    let bit = sig::bit(signo);
+    match sig::effect(signo, &action_of(target, signo)) {
+        Effect::Ignore => {}
+        Effect::Terminate if signo == sig::SIGKILL || !masked_everywhere(target, bit) => {
+            end_by(target, signo)
+        }
+        Effect::Terminate | Effect::Handle => {
+            SENDER[target][(signo - 1) as usize].store(from, Ordering::Release);
+            PROCESS_PENDING[target].fetch_or(bit, Ordering::AcqRel);
+            super::wake_all_waiters();
+        }
+    }
+    Ok(0)
+}
+
+fn send_thread(target: usize, t: &ThreadSignals, signo: u64, from: u32) {
+    let bit = sig::bit(signo);
+    match sig::effect(signo, &action_of(target, signo)) {
+        Effect::Ignore => {}
+        Effect::Terminate if signo == sig::SIGKILL || t.mask.load(Ordering::Acquire) & bit == 0 => {
+            end_by(target, signo)
+        }
+        Effect::Terminate | Effect::Handle => {
+            SENDER[target][(signo - 1) as usize].store(from, Ordering::Release);
+            t.pending.fetch_or(bit, Ordering::AcqRel);
+            super::wake_all_waiters();
+        }
+    }
+}
+
+/// Raise `signo` on the calling thread of `slot`, from the kernel: `SIGPIPE` for a write no one
+/// can read. Delivered on the way out of the call that raised it.
+pub(super) fn raise_self(slot: usize, signo: u64) {
+    if sig::effect(signo, &action_of(slot, signo)) == Effect::Ignore {
+        return;
+    }
+    if let Some(t) = mine(slot) {
+        SENDER[slot][(signo - 1) as usize].store(0, Ordering::Release);
+        t.pending.fetch_or(sig::bit(signo), Ordering::AcqRel);
+    }
+}
+
+/// Whether the calling thread of `slot` has a signal to act on: pending, not masked, not
+/// ignored. What a blocking call looks at when it wakes.
+pub(super) fn interrupting(slot: usize) -> bool {
+    let k = key(slot);
+    let (mask, pending) = THREAD_SIGNALS
+        .iter()
+        .find(|t| t.key.load(Ordering::Acquire) == k && t.slot.load(Ordering::Acquire) == slot)
+        .map_or((FIRST_MASK[slot].load(Ordering::Acquire), 0), |t| {
+            (t.mask.load(Ordering::Acquire), t.pending.load(Ordering::Acquire))
+        });
+    let deliverable = (pending | PROCESS_PENDING[slot].load(Ordering::Acquire)) & !mask;
+    if deliverable == 0 {
+        return false;
+    }
+    let actions = ACTIONS.lock_irqsave();
+    (1..=sig::NSIG).any(|s| {
+        deliverable & sig::bit(s) != 0
+            && sig::effect(s, &actions[slot][(s - 1) as usize]) != Effect::Ignore
+    })
+}
+
+/// Count a call that blocked and was ended by a signal.
+pub(super) fn blocked_call_interrupted() {
+    INTERRUPTED.fetch_add(1, Ordering::Relaxed);
+}
+
+// ---- delivery -----------------------------------------------------------------------------
+
+/// Deliver what the calling thread of `slot` has pending, on the way out of the call in
+/// `frame`, which returned `result` and was made with the registers `entry`. See the module
+/// documentation.
+pub(super) fn deliver(
+    slot: usize,
+    frame: &mut <Cpu as HasUserMode>::SyscallFrame,
+    entry: &Words,
+    result: Result<u64, Failure>,
+) {
+    let interrupted = result == Err(Failure::Interrupted);
+    if let Some(me) = mine(slot) {
+        loop {
+            let mask = me.mask.load(Ordering::Acquire);
+            let Some(signo) =
+                take(&me.pending, !mask).or_else(|| take(&PROCESS_PENDING[slot], !mask))
+            else {
+                break;
+            };
+            let action = action_of(slot, signo);
+            match sig::effect(signo, &action) {
+                Effect::Ignore => {}
+                Effect::Terminate => {
+                    SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
+                    super::exit_group(slot, sig::exit_code(signo))
+                }
+                Effect::Handle => {
+                    handle(slot, me, frame, entry, interrupted, signo, action, mask);
+                    return;
+                }
+            }
+        }
+    }
+    // No handler ran, so a call a signal interrupted runs again.
+    if interrupted {
+        Cpu::set_registers(frame, &UserRegisters::from_words(&restarted(entry)));
+    }
+}
+
+/// The registers `entry` with the program counter back on the system call instruction.
+fn restarted(entry: &Words) -> Words {
+    let mut ctx = *entry;
+    let pc = ABI.pc_word();
+    ctx[pc] = ctx[pc].wrapping_sub(ABI.syscall_len());
+    ctx
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle(
+    slot: usize,
+    me: &ThreadSignals,
+    frame: &mut <Cpu as HasUserMode>::SyscallFrame,
+    entry: &Words,
+    interrupted: bool,
+    signo: u64,
+    action: Action,
+    mask: u64,
+) {
+    use sig::flags::{SA_NODEFER, SA_RESETHAND, SA_RESTART};
+    // What the handler returns to: the call again, or its answer.
+    let ctx = if interrupted && action.flags & SA_RESTART != 0 {
+        restarted(entry)
+    } else {
+        Cpu::registers(frame).to_words()
+    };
+    let from = SENDER[slot][(signo - 1) as usize].load(Ordering::Acquire);
+    let code = if signo == sig::SIGCHLD {
+        // CLD_EXITED: the only change a child reports here.
+        1
+    } else if from != 0 {
+        sig::SI_USER
+    } else {
+        sig::SI_KERNEL
+    };
+    let d = Delivery {
+        sig: signo,
+        action,
+        old_mask: mask,
+        code,
+        pid: from,
+    };
+    let built = sig::build(ABI, &ctx, &d, USER_START, USER_END)
+        .ok()
+        .filter(write_frame);
+    let Some(built) = built else {
+        // No room below the stack for the frame, or not memory the thread can write: Linux's
+        // answer is SIGSEGV, which ends the process.
+        SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
+        super::exit_group(slot, sig::exit_code(sig::SIGSEGV))
+    };
+    let mut blocked = mask | action.mask;
+    if action.flags & SA_NODEFER == 0 {
+        blocked |= sig::bit(signo);
+    }
+    me.mask
+        .store(blocked & !sig::UNBLOCKABLE, Ordering::Release);
+    if action.flags & SA_RESETHAND != 0 {
+        ACTIONS.lock_irqsave()[slot][(signo - 1) as usize] = Action::DEFAULT;
+    }
+    Cpu::set_registers(frame, &UserRegisters::from_words(&built.regs));
+    HANDLED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Write a frame to the calling thread's stack. `false` if any of it could not be.
+fn write_frame(b: &sig::Built) -> bool {
+    if super::to_user(b.at, &b.head[..b.head_len]).is_err() {
+        return false;
+    }
+    let zeros = [0u8; 256];
+    let mut done = 0;
+    while done < b.zeros {
+        let n = (b.zeros - done).min(zeros.len());
+        if super::to_user(b.at + (b.head_len + done) as u64, &zeros[..n]).is_err() {
+            return false;
+        }
+        done += n;
+    }
+    b.record
+        .is_none_or(|(at, bytes)| super::to_user(at, &bytes).is_ok())
+}
+
+// ---- the calls ----------------------------------------------------------------------------
+
+pub(super) fn sigaction(
+    slot: usize,
+    signo: u64,
+    act: u64,
+    old: u64,
+    size: u64,
+) -> Result<u64, Failure> {
+    use sig::flags::SA_RESTORER;
+    if size != sig::SIGSET_BYTES || signo == 0 || signo > sig::NSIG {
+        return Err(Failure::InvalidArgument);
+    }
+    let new = if act == 0 {
+        None
+    } else {
+        if sig::bit(signo) & sig::UNBLOCKABLE != 0 {
+            return Err(Failure::InvalidArgument);
+        }
+        let mut bytes = [0u8; sig::ACTION_BYTES];
+        super::from_user(act, &mut bytes)?;
+        let a = Action::from_bytes(&bytes);
+        // The kernel has no trampoline of its own for a handler to return through, so a
+        // handler must name its restorer, as x86_64 Linux requires too.
+        if !matches!(a.handler, sig::SIG_DFL | sig::SIG_IGN) && a.flags & SA_RESTORER == 0 {
+            return Err(Failure::InvalidArgument);
+        }
+        Some(Action {
+            mask: a.mask & !sig::UNBLOCKABLE,
+            ..a
+        })
+    };
+    let before = {
+        let mut actions = ACTIONS.lock_irqsave();
+        let entry = &mut actions[slot][(signo - 1) as usize];
+        let before = *entry;
+        if let Some(a) = new {
+            *entry = a;
+        }
+        before
+    };
+    // A signal set to be ignored is discarded wherever it is pending.
+    if let Some(a) = new
+        && sig::effect(signo, &a) == Effect::Ignore
+    {
+        let bit = sig::bit(signo);
+        PROCESS_PENDING[slot].fetch_and(!bit, Ordering::AcqRel);
+        for t in THREAD_SIGNALS
+            .iter()
+            .filter(|t| held(t) && t.slot.load(Ordering::Acquire) == slot)
+        {
+            t.pending.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+    if old != 0 {
+        super::to_user(old, &before.to_bytes())?;
+    }
+    Ok(0)
+}
+
+pub(super) fn procmask(
+    slot: usize,
+    how: u64,
+    set: u64,
+    old: u64,
+    size: u64,
+) -> Result<u64, Failure> {
+    if size != sig::SIGSET_BYTES {
+        return Err(Failure::InvalidArgument);
+    }
+    let me = mine(slot).ok_or(Failure::TryAgain)?;
+    let before = me.mask.load(Ordering::Acquire);
+    if set != 0 {
+        let mut bytes = [0u8; 8];
+        super::from_user(set, &mut bytes)?;
+        let set = u64::from_le_bytes(bytes);
+        let after = match how {
+            sig::SIG_BLOCK => before | set,
+            sig::SIG_UNBLOCK => before & !set,
+            sig::SIG_SETMASK => set,
+            _ => return Err(Failure::InvalidArgument),
+        };
+        me.mask.store(after & !sig::UNBLOCKABLE, Ordering::Release);
+    }
+    if old != 0 {
+        super::to_user(old, &before.to_le_bytes())?;
+    }
+    Ok(0)
+}
+
+pub(super) fn pending(slot: usize, set: u64, size: u64) -> Result<u64, Failure> {
+    if size > sig::SIGSET_BYTES {
+        return Err(Failure::InvalidArgument);
+    }
+    let me = mine(slot).ok_or(Failure::TryAgain)?;
+    let pending = (me.pending.load(Ordering::Acquire)
+        | PROCESS_PENDING[slot].load(Ordering::Acquire))
+        & me.mask.load(Ordering::Acquire);
+    super::to_user(set, &pending.to_le_bytes()[..size as usize])?;
+    Ok(0)
+}
+
+/// `sigaltstack`: there is never an alternate stack, which is what a query is told, and setting
+/// one is refused.
+pub(super) fn altstack(ss: u64, old: u64) -> Result<u64, Failure> {
+    if ss != 0 {
+        let mut bytes = [0u8; sig::STACK_T_BYTES];
+        super::from_user(ss, &mut bytes)?;
+        let flags = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if flags & sig::SS_DISABLE == 0 {
+            arch::EARLY.write_str("linux: sigaltstack with a stack is not implemented\n");
+            return Err(Failure::NotImplemented);
+        }
+    }
+    if old != 0 {
+        let mut bytes = [0u8; sig::STACK_T_BYTES];
+        bytes[8..12].copy_from_slice(&sig::SS_DISABLE.to_le_bytes());
+        super::to_user(old, &bytes)?;
+    }
+    Ok(0)
+}
+
+/// A signal number `kill` and `tgkill` accept: 0, the existence check, to 64. `SIGSTOP` is
+/// refused, since nothing here can stop a process.
+fn sendable(signo: u64) -> Result<(), Failure> {
+    if signo > sig::NSIG || signo == sig::SIGSTOP {
+        Err(Failure::InvalidArgument)
+    } else {
+        Ok(())
+    }
+}
+
+/// The slot of the live Linux process `pid_arg` names. Process groups, and "every process",
+/// are refused: there are none.
+fn target_of(pid_arg: u64) -> Result<usize, Failure> {
+    let pid = pid_arg as i64;
+    if pid <= 0 {
+        return Err(Failure::InvalidArgument);
+    }
+    let target = usize::try_from(pid - 1)
+        .ok()
+        .filter(|&s| s < MAX_PROCS)
+        .ok_or(Failure::NoProcess)?;
+    let linux = super::locked(target, |_, _| Ok(())).is_ok();
+    if linux && STATUS[target].load(Ordering::Acquire) & ENDED == 0 {
+        Ok(target)
+    } else {
+        Err(Failure::NoProcess)
+    }
+}
+
+/// `kill`: every Linux process may signal every other; there is one user.
+pub(super) fn kill(slot: usize, pid_arg: u64, signo: u64) -> Result<u64, Failure> {
+    sendable(signo)?;
+    let target = target_of(pid_arg)?;
+    send_process(target, signo, super::pid(slot) as u32)
+}
+
+pub(super) fn tgkill(slot: usize, tgid: u64, tid: u64, signo: u64) -> Result<u64, Failure> {
+    sendable(signo)?;
+    if tid as i64 <= 0 {
+        return Err(Failure::InvalidArgument);
+    }
+    let target = target_of(tgid)?;
+    let from = super::pid(slot) as u32;
+    let thread = THREAD_SIGNALS.iter().find(|t| {
+        held(t) && t.slot.load(Ordering::Acquire) == target && t.tid.load(Ordering::Acquire) == tid
+    });
+    match thread {
+        Some(t) => {
+            if signo != 0 {
+                send_thread(target, t, signo, from);
+            }
+            Ok(0)
+        }
+        // A process's first thread that has made no call yet has no entry: its tid is the pid,
+        // and the process as a whole takes the signal.
+        None if tid == tgid => send_process(target, signo, from),
+        None => Err(Failure::NoProcess),
+    }
+}
+
+/// `rt_sigreturn`: resume what the handler interrupted, from the frame below the stack pointer.
+/// A frame that cannot be read or that [`sig::restore`] refuses ends the process with
+/// `SIGSEGV`, as Linux's bad frame does.
+pub(super) fn sigreturn(
+    slot: usize,
+    frame: &mut <Cpu as HasUserMode>::SyscallFrame,
+) -> Result<u64, Failure> {
+    let ctx = Cpu::registers(frame).to_words();
+    let len = ABI.restore_len();
+    let mut bytes = [0u8; sig::HEAD_BYTES];
+    let restored = ABI
+        .frame_at(ctx[ABI.sp_word()])
+        .ok()
+        .filter(|&at| super::from_user(at, &mut bytes[..len]).is_ok())
+        .and_then(|_| sig::restore(ABI, &bytes[..len], USER_START, USER_END).ok());
+    let Some(r) = restored else {
+        SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
+        super::exit_group(slot, sig::exit_code(sig::SIGSEGV))
+    };
+    if let Some(me) = mine(slot) {
+        me.mask.store(r.mask, Ordering::Release);
+    }
+    Cpu::set_registers(frame, &UserRegisters::from_words(&r.regs));
+    RETURNED.fetch_add(1, Ordering::Relaxed);
+    // The return register, which the table sets last, is the one the frame holds.
+    Ok(r.regs[0])
+}
+
+// ---- the check ----------------------------------------------------------------------------
+
+/// `argv` for the program's signals mode, and its exit code when every step behaved; mirror
+/// `user/linux-hello/src/main.rs`.
+const SIGNALS_ARGV: [&[u8]; 2] = [b"hello", b"signals"];
+const SIGNALS_SUCCESS: u64 = 46;
+/// What the mode does at least: four handlers (one that zeroes every callee-saved register, one
+/// for a signal it unblocks, one that interrupts a blocked read, one for `SIGCHLD`), and three
+/// children ended by a default action (`SIGPIPE`, `SIGTERM`, `SIGKILL`).
+const HANDLERS: u64 = 4;
+const ENDS: u64 = 3;
+
+fn counters() -> [u64; 4] {
+    [&HANDLED, &RETURNED, &INTERRUPTED, &SIGNAL_ENDS].map(|n| n.load(Ordering::Relaxed))
+}
+
+/// Run the program in its signals mode with the scheduler, and grade it. On the boot thread,
+/// after the `linux mt` run, whose slot and stacks it reuses.
+pub(super) fn check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux sig  ");
+    let before = counters();
+    let run = match super::run_mode(&SIGNALS_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
+    let after = counters();
+    let [handled, returned, interrupted, ends] = [0, 1, 2, 3].map(|i| after[i] - before[i]);
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(SIGNALS_SUCCESS)) => {
+            c.write_str("handlers, masks, EINTR, SIGCHLD, SIGPIPE and default actions ok")
+        }
+        (true, Some(code)) => {
+            c.write_str("the program exited ");
+            write_hex(c, code);
+            c.write_str(", WRONG");
+        }
+    }
+    c.write_str("; ");
+    write_usize(c, handled as usize);
+    c.write_str(" handlers run, ");
+    write_usize(c, returned as usize);
+    c.write_str(" returned, ");
+    write_usize(c, interrupted as usize);
+    c.write_str(" blocked calls interrupted, ");
+    write_usize(c, ends as usize);
+    c.write_str(" processes ended by a signal");
+    let counted = handled >= HANDLERS && returned == handled && interrupted > 0 && ends >= ENDS;
+    if !counted {
+        c.write_str("; NOT WHAT THE MODE DOES");
+    }
+    let clean = super::report_run(c, &run);
+    Check::from_ok(run.code == Some(SIGNALS_SUCCESS) && counted && clean)
+}

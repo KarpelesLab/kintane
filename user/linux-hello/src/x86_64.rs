@@ -23,6 +23,11 @@ pub const EXIT_GROUP: u64 = 231;
 pub const OPENAT: u64 = 257;
 pub const PIPE2: u64 = 293;
 pub const GETRANDOM: u64 = 318;
+pub const RT_SIGACTION: u64 = 13;
+pub const RT_SIGPROCMASK: u64 = 14;
+pub const RT_SIGPENDING: u64 = 127;
+pub const KILL: u64 = 62;
+pub const TGKILL: u64 = 234;
 
 const ARCH_SET_FS: u64 = 0x1002;
 
@@ -118,6 +123,99 @@ unsafe extern "C" {
         tls: u64,
         f: extern "C" fn() -> u64,
     ) -> i64;
+}
+
+// Signals. `linux_restorer` is what every handler returns into: `rt_sigreturn`. The clobbering
+// handler zeroes every callee-saved register and returns; `linux_raise_marked` loads each with a
+// mark, sends the signal to its own process with `kill` (rdi pid, rsi signal), and answers 1 in
+// rax if every mark is back once the call has returned through the handler.
+global_asm!(
+    ".pushsection .text.linux_signals, \"ax\"",
+    ".globl linux_restorer",
+    "linux_restorer:",
+    "    mov eax, 15",
+    "    syscall",
+    "    ud2",
+    ".globl linux_clobber",
+    "linux_clobber:",
+    "    lea rax, [rip + {hits}]",
+    "    inc qword ptr [rax]",
+    "    xor ebx, ebx",
+    "    xor ebp, ebp",
+    "    xor r12d, r12d",
+    "    xor r13d, r13d",
+    "    xor r14d, r14d",
+    "    xor r15d, r15d",
+    "    ret",
+    ".globl linux_raise_marked",
+    "linux_raise_marked:",
+    "    push rbx",
+    "    push rbp",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    movabs rbx, 0x5349474e414c0001",
+    "    movabs rbp, 0x5349474e414c0002",
+    "    movabs r12, 0x5349474e414c0003",
+    "    movabs r13, 0x5349474e414c0004",
+    "    movabs r14, 0x5349474e414c0005",
+    "    movabs r15, 0x5349474e414c0006",
+    "    mov eax, 62",
+    "    syscall",
+    "    xor eax, eax",
+    "    movabs rcx, 0x5349474e414c0001",
+    "    cmp rbx, rcx",
+    "    jne 2f",
+    "    movabs rcx, 0x5349474e414c0002",
+    "    cmp rbp, rcx",
+    "    jne 2f",
+    "    movabs rcx, 0x5349474e414c0003",
+    "    cmp r12, rcx",
+    "    jne 2f",
+    "    movabs rcx, 0x5349474e414c0004",
+    "    cmp r13, rcx",
+    "    jne 2f",
+    "    movabs rcx, 0x5349474e414c0005",
+    "    cmp r14, rcx",
+    "    jne 2f",
+    "    movabs rcx, 0x5349474e414c0006",
+    "    cmp r15, rcx",
+    "    jne 2f",
+    "    mov eax, 1",
+    "2:",
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop rbp",
+    "    pop rbx",
+    "    ret",
+    ".popsection",
+    hits = sym crate::CLOBBER_HITS,
+);
+
+unsafe extern "C" {
+    fn linux_restorer();
+    fn linux_clobber();
+    fn linux_raise_marked(pid: u64, sig: u64) -> u64;
+}
+
+/// The restorer every handler is installed with.
+pub fn restorer() -> u64 {
+    linux_restorer as *const () as u64
+}
+
+/// A handler that zeroes every callee-saved register before it returns.
+pub fn clobber_handler() -> u64 {
+    linux_clobber as *const () as u64
+}
+
+/// Send `sig` to process `pid` with every callee-saved register marked, and say whether every
+/// mark survived the handler.
+pub fn raise_marked(pid: u64, sig: u64) -> bool {
+    // SAFETY: the function saves and restores every register it marks, and makes one system call.
+    unsafe { linux_raise_marked(pid, sig) == 1 }
 }
 
 /// The flags a thread library's `clone` passes for a thread.

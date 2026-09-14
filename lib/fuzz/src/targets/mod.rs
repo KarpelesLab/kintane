@@ -19,6 +19,7 @@ pub mod menu;
 pub mod module;
 pub mod net;
 pub mod pci;
+pub mod sigframe;
 pub mod syscall;
 pub mod virtio_ring;
 
@@ -124,6 +125,14 @@ pub const TARGETS: &[Target] = &[
         generate: net::generate,
         run: net::run,
         accepts: Some(net::accepts),
+    },
+    Target {
+        name: "sigframe",
+        what: "Linux signal frames, as a program leaves them on its stack for rt_sigreturn",
+        needs_seeds: false,
+        generate: sigframe::generate,
+        run: sigframe::run,
+        accepts: Some(sigframe::accepts),
     },
     Target {
         name: "syscall",

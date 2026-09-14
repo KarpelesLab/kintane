@@ -53,7 +53,19 @@ pub trait UserRegisters: Copy {
     fn set_stack(&mut self, sp: usize);
     /// The address the thread resumes at.
     fn pc(&self) -> usize;
+    /// Every register as a word, in the port's own order, which its `Registers` documents; a
+    /// port with fewer than [`REGISTER_WORDS`] leaves the rest zero. What a kernel that keeps a
+    /// context in user memory reads and writes: a Linux signal frame.
+    fn to_words(&self) -> [u64; REGISTER_WORDS];
+    /// Registers from words in that order. Nothing is checked here: a context returns to user
+    /// code only through [`HasUserMode::set_registers`] or [`HasUserMode::resume_user`], which
+    /// sanitise its address and its flags.
+    fn from_words(words: &[u64; REGISTER_WORDS]) -> Self;
 }
+
+/// Words [`UserRegisters::to_words`] gives: aarch64's thirty-one general registers, its stack
+/// pointer, program counter and processor state.
+pub const REGISTER_WORDS: usize = 34;
 
 /// Why a user thread must stop: a trap its process did not ask for and the kernel could
 /// not resolve.
