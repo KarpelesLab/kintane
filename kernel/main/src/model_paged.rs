@@ -189,6 +189,19 @@ pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// The Linux program's socket modes: a TCP client, and a server kbuild connects to. Passed,
+/// silently, without the personality.
+#[cfg(CONFIG_USERSPACE)]
+pub fn linux_sockets_check(c: &dyn EarlyConsole) -> Check {
+    crate::personality::sockets_check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn linux_sockets_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// The Linux program again, with the scheduler: pipes, `fork`, `execve`, `wait4`, a thread
 /// and a futex. Passed, silently, without the personality.
 #[cfg(CONFIG_USERSPACE)]

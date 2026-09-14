@@ -23,6 +23,18 @@ pub const EXIT_GROUP: u64 = 231;
 pub const OPENAT: u64 = 257;
 pub const PIPE2: u64 = 293;
 pub const GETRANDOM: u64 = 318;
+pub const SOCKET: u64 = 41;
+pub const CONNECT: u64 = 42;
+pub const SENDTO: u64 = 44;
+pub const RECVFROM: u64 = 45;
+pub const SHUTDOWN: u64 = 48;
+pub const BIND: u64 = 49;
+pub const LISTEN: u64 = 50;
+pub const GETSOCKNAME: u64 = 51;
+pub const GETPEERNAME: u64 = 52;
+pub const SETSOCKOPT: u64 = 54;
+pub const GETSOCKOPT: u64 = 55;
+pub const ACCEPT4: u64 = 288;
 
 const ARCH_SET_FS: u64 = 0x1002;
 

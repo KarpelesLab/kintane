@@ -533,7 +533,10 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `linux`, which has torn its processes down by now, reusing the same process slot;
     // and long after the net check, which learned kbuild's TCP port.
     let sockets = crate::model::sockets_check(c);
-    // After `sockets`, which has torn its process down by now: this borrows the process
+    // After `sockets`, which has torn its process down by now, reusing the same process slot:
+    // the Linux program as a TCP client, and as a server kbuild connects to.
+    let linux_net = crate::model::linux_sockets_check(c);
+    // After `linux net`, which has torn its processes down by now: this borrows the process
     // check's frame pool and reuses its process slot and stack. Before tickless, which
     // wants everything but idle gone.
     c.write_str("\n  isolation  ");
@@ -559,6 +562,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(files)
         .and(linux)
         .and(sockets)
+        .and(linux_net)
         .and(isolation)
         .and(blk_domain)
         .and(tickless)

@@ -31,25 +31,12 @@
 //! every [`LOOK_EVERY_NS`]; those looks are counted as polls, and on a port that has a route the
 //! check requires that there were none.
 //!
-//! # Where Linux's calls would land
+//! # Linux's calls
 //!
-//! No Linux socket call is implemented: the Linux personality answers each with `-ENOSYS`. When
-//! it gains them, each is a thin layer over one of the native calls, as its file descriptors are
-//! already a view over handles:
-//!
-//! * `socket(AF_INET, SOCK_STREAM, 0)` → `socket_create(STREAM)`, the descriptor naming the handle;
-//! * `bind` → `socket_bind`, the `sockaddr_in` packed into one address word; `listen` →
-//!   `socket_listen`; `accept` and `accept4` → `socket_accept`, with `O_NONBLOCK` a zero timeout
-//!   and `ShouldWait` as `-EAGAIN`;
-//! * `connect` → `socket_connect`, with `PeerClosed` as `-ECONNREFUSED` and `TimedOut` as
-//!   `-ETIMEDOUT`;
-//! * `send`, `sendto` without an address, and `write` → `socket_send`, looping past its 512-byte
-//!   chunk; `recv`, `recvfrom` and `read` → `socket_recv`, whose zero at the end of the stream is
-//!   Linux's too;
-//! * `shutdown(SHUT_WR)` → `socket_shutdown`; `close` → `handle_close`.
-//!
-//! Socket options, `SHUT_RD`, datagram sockets, and readiness through `poll` or `epoll` need
-//! more than exists.
+//! The Linux personality's socket calls (`personality::socket`) are a layer over the functions
+//! here, as the native calls are: a Linux socket descriptor names a socket object like the one
+//! a handle names, and waits on the same queue. Datagram sockets, `SHUT_RD`, and readiness
+//! through `poll` or `epoll` need more than exists.
 //!
 //! # The check
 //!
@@ -308,6 +295,31 @@ pub fn listen(id: ObjectId) -> Result<u64, Error> {
     let listener = stack(|s, _, _| s.tcp_listen(port))?.map_err(error)?;
     keep(id, listener, true)?;
     Ok(0)
+}
+
+/// Socket `id`'s local port, and its peer's address and port once it has a connection.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "the Linux personality's names are its only users")
+)]
+pub fn endpoints(id: ObjectId) -> Result<(u16, Option<(net::Ipv4Addr, u16)>), Error> {
+    match state_of(id)? {
+        (Some(conn), _, false) => {
+            let (local, ip, port) =
+                stack(|s, _, _| s.tcp_endpoints(conn))?.ok_or(Error::BadHandle)?;
+            Ok((local, Some((ip, port))))
+        }
+        (_, port, _) => Ok((port, None)),
+    }
+}
+
+/// Whether something listens on `port`.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "the Linux socket check is its only user")
+)]
+pub fn listening_on(port: u16) -> bool {
+    crate::net::with_stack(|s, _, _| s.tcp_listening(port)).unwrap_or(false)
 }
 
 /// A new socket object for a connection `listener` has, or `None` while it has none.

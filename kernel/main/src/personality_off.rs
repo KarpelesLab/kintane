@@ -59,6 +59,15 @@ pub fn scheduled_check(_c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// No Linux sockets to check either.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "only userspace runs the scheduled checks")
+)]
+pub fn sockets_check(_c: &dyn EarlyConsole) -> Check {
+    Check::Passed
+}
+
 /// No Linux processes for the stress run to start.
 #[cfg_attr(
     not(CONFIG_USERSPACE),
