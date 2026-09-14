@@ -53,13 +53,22 @@ pub fn campaign(m: &Machine, disk: &Path, runs: u64, seed: u64) -> Result<(), St
         total_ops += ops;
         match diskcheck::after_crash(disk) {
             Ok(c) => {
-                lost_runs += usize::from(c.lost != 0);
-                differ_runs += usize::from(c.fats_differ != 0);
-                max_lost = max_lost.max(c.lost);
+                lost_runs += usize::from(c.lost != 0 || c.lost32 != 0);
+                differ_runs += usize::from(c.fats_differ != 0 || c.fats_differ32 != 0);
+                max_lost = max_lost.max(c.lost.max(c.lost32));
                 println!(
                     "  cut {run:>3} after {delay:>4} ms, {ops:>5}+ ops: consistent; {} files, {} lost clusters, \
-                     tables differ in {}; {} workload files, {} bytes checked",
-                    c.files, c.lost, c.fats_differ, c.crash_files, c.crash_bytes
+                     tables differ in {}; {} workload files, {} bytes checked; FAT32: {} lost, \
+                     tables differ in {}, {} files, {} bytes",
+                    c.files,
+                    c.lost,
+                    c.fats_differ,
+                    c.crash_files,
+                    c.crash_bytes,
+                    c.lost32,
+                    c.fats_differ32,
+                    c.crash_files32,
+                    c.crash_bytes32
                 );
             }
             Err(e) => {

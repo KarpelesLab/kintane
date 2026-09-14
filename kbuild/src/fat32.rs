@@ -644,6 +644,29 @@ impl<'a> Volume<'a> {
         data.truncate(e.size as usize);
         Ok(Some(data))
     }
+
+    /// The files directly in the directory `path` names, by name, `None` if there is none.
+    ///
+    /// What the crash test reads: after a cut the directory may not have reached the disk at
+    /// all, which is `None` rather than an error.
+    pub fn files_in(&self, path: &str) -> Result<Option<Vec<(String, Vec<u8>)>>, String> {
+        let Some(dir) = self.find(path)? else {
+            return Ok(None);
+        };
+        if !dir.dir {
+            return Err(format!("{path} is not a directory"));
+        }
+        let mut out = Vec::new();
+        for e in self.entries(Some(dir.first))? {
+            if !e.dir {
+                let data = self
+                    .read(&format!("{path}/{}", e.name))?
+                    .unwrap_or_default();
+                out.push((e.name, data));
+            }
+        }
+        Ok(Some(out))
+    }
 }
 
 #[cfg(test)]
