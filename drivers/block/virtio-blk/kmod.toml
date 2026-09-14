@@ -1,10 +1,12 @@
 # virtio-blk: a block device over virtio 1.x, bound from the device tree's memory-mapped
-# virtio slots.
+# virtio slots or from a PCI function.
 #
 # The first driver with DMA: the device reads and writes the rings and buffers the kernel
-# hands it. The virtqueue, the status handshake and the block requests are host-tested
-# against a fake device on the other side of the rings, so nothing here is gated on an
-# architecture.
+# hands it. The protocol itself is `virtio-blk-core`, written over the proxy layer so the
+# same source also runs in a driver domain; this crate is what only the kernel adds —
+# binding through the device model, the block layer's requests, a lock, the interrupt
+# handler. Both are host-tested against a fake device on the other side of the rings, so
+# nothing here is gated on an architecture.
 [unit]
 name = "virtio-blk"
 kind = "lib"
@@ -13,4 +15,4 @@ host-tests = true
 layer = "device"
 
 [deps]
-units = ["hal", "device", "block", "sync"]
+units = ["hal", "device", "block", "sync", "hwproxy", "virtio-blk-core"]

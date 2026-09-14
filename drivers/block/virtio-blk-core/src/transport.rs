@@ -25,6 +25,16 @@ pub mod status {
 pub const VERSION_1_WORD: u32 = 1;
 pub const VERSION_1_BIT: u32 = 1 << 0;
 
+/// `VIRTIO_F_ACCESS_PLATFORM`: bit 33, so bit 1 of feature word 1 (virtio 1.1 §6).
+///
+/// A device that offers it sends its DMA through the platform's IOMMU: the addresses a
+/// driver puts in a descriptor are device addresses the IOMMU translates, not physical ones.
+/// A device offering it may refuse `FEATURES_OK` to a driver that does not accept it, and
+/// QEMU's does — found when the first boot with `iommu_platform=on` refused the handshake.
+/// The driver accepts it whenever it is offered, because every address it hands a device
+/// is already a device address ([`crate::mem::Dma::phys`]).
+pub const ACCESS_PLATFORM_BIT: u32 = 1 << 1;
+
 /// The virtio device type for a block device (virtio 1.1 §5.2).
 pub const DEVICE_ID_BLOCK: u32 = 2;
 
@@ -93,8 +103,8 @@ pub trait Transport {
 /// Returns the features that were accepted, as two words. The caller finishes bring-up
 /// with [`finish`] after its queues are set up, because `DRIVER_OK` is the promise that
 /// the driver is ready for interrupts.
-pub fn negotiate(
-    transport: &dyn Transport,
+pub fn negotiate<T: Transport + ?Sized>(
+    transport: &T,
     device: u32,
     wanted: [u32; 2],
 ) -> Result<[u32; 2], Error> {
@@ -139,7 +149,11 @@ pub fn negotiate(
 }
 
 /// Set up queue `index` over `ring` and tell the device about it.
-pub fn setup_queue(transport: &dyn Transport, index: u16, ring: &Ring) -> Result<(), Error> {
+pub fn setup_queue<T: Transport + ?Sized>(
+    transport: &T,
+    index: u16,
+    ring: &Ring,
+) -> Result<(), Error> {
     let max = transport.queue_max(index);
     if max == 0 || max < ring.size() {
         return Err(Error::BadQueue { max });
@@ -155,7 +169,7 @@ pub fn setup_queue(transport: &dyn Transport, index: u16, ring: &Ring) -> Result
 }
 
 /// The last step: the driver is ready, and the device may use the queues.
-pub fn finish(transport: &dyn Transport) -> Result<(), Error> {
+pub fn finish<T: Transport + ?Sized>(transport: &T) -> Result<(), Error> {
     let all = status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK;
     transport.set_status(all);
     let status = transport.status();
