@@ -424,7 +424,7 @@ fn wire(
     started: &Started,
     console: bool,
 ) -> bool {
-    let Some((line, handler)) = drv.interrupt() else {
+    let Some((line, handler)) = drv.interrupt(started.bound()) else {
         return true;
     };
     let Ok(number) = gic::translate(line.specifier().cells()) else {

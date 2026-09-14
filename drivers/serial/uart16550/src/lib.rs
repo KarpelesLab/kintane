@@ -288,7 +288,8 @@ impl Driver for Uart16550Driver {
     }
 
     #[cfg(all(target_has_atomic = "8", target_has_atomic = "32"))]
-    fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
+    fn interrupt(&self, _bound: &Bound) -> Option<(&'static IrqLine, fn())> {
+        // The console part, whichever binding is current; see `current`.
         let line = current()?.claims.get()?.irq.as_ref()?;
         Some((line, on_interrupt))
     }

@@ -553,7 +553,7 @@ impl Driver for VirtioBlkDriver {
     /// The platform registers and enables it after `start`. The device raises nothing
     /// until `bring_up` writes `DRIVER_OK`, which happens later still, so a handler
     /// registered here cannot run before the driver exists to serve it.
-    fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
+    fn interrupt(&self, _bound: &Bound) -> Option<(&'static IrqLine, fn())> {
         let irq = CLAIMS.get()?.irq()?;
         Some((irq, on_device_interrupt))
     }

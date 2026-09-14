@@ -563,7 +563,8 @@ impl Driver for VirtioNetDriver {
         Ok(())
     }
 
-    fn interrupt(&self) -> Option<(&'static IrqLine, fn())> {
+    fn interrupt(&self, _bound: &Bound) -> Option<(&'static IrqLine, fn())> {
+        // One card: the probe declines a second, so the claims are this device's.
         let irq = CLAIMS.get()?.irq()?;
         Some((irq, on_device_interrupt))
     }
