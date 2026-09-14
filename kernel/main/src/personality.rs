@@ -1793,10 +1793,16 @@ fn free_frames() -> usize {
 //
 // A hundred, not thousands: a yield on a CPU a busy workload shares can hand that workload a
 // whole slice, and two thousand of them took longer than the patience below on aarch64.
+//
+// And only every fourth audit interval. On one CPU a pair still costs the workloads a good
+// part of a second, and run every interval it cut a 20 s run on `aarch64-virt` from 20 audits
+// to 12; the thread pointer on one CPU is what the boot check already proves.
 
 /// Pairs of Linux processes the stress run has run to completion.
 static PAIRS: AtomicU64 = AtomicU64::new(0);
 const PAIR_PATIENCE: Duration = Duration::from_nanos(10_000_000_000);
+/// Audit intervals per pair.
+const PAIR_EVERY: u64 = 4;
 
 pub fn stress_cycles() -> u64 {
     PAIRS.load(Ordering::Relaxed)
@@ -1804,6 +1810,10 @@ pub fn stress_cycles() -> u64 {
 
 /// Run one pair; see the section comment. On the auditor's thread, after the waiting process.
 pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
+    if round % PAIR_EVERY != 0 {
+        return Ok(());
+    }
+    let pair = round / PAIR_EVERY;
     let Some(program) = kept_program() else {
         // No disk, so no program: the boot check said so, and there is nothing to run.
         return Ok(());
@@ -1817,7 +1827,7 @@ pub fn stress_cycle(round: u64) -> Result<(), &'static str> {
     }
     spawn::use_stacks(&[first, second]);
     let frames_before = free_frames();
-    let cpu = (round as usize) % preempt::stats().cpus.max(1);
+    let cpu = (pair as usize) % preempt::stats().cpus.max(1);
 
     let a = userproc::start_linux(0, &program, start_with(&TLS_ARGV));
     let b = userproc::start_linux(1, &program, start_with(&TLS_ARGV));
