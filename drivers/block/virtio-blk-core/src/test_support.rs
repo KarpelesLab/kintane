@@ -277,6 +277,14 @@ pub struct FakeTransport {
     /// Take requests off the ring and never answer.
     pub silent: Cell<bool>,
     pub notifies: Cell<u32>,
+    /// Entries in the MSI-X table; 0 for a device without one, which refuses every vector.
+    pub msix_entries: u16,
+    pub queue_vector: Cell<u16>,
+    pub config_vector: Cell<u16>,
+    /// The queue's vector when the queue was set up, which is when it must already be set.
+    pub vector_at_setup: Cell<Option<u16>>,
+    /// Reads of the interrupt status register.
+    pub isr_reads: Cell<u32>,
 }
 
 impl FakeTransport {
@@ -301,6 +309,20 @@ impl FakeTransport {
             fail_io: Cell::new(false),
             silent: Cell::new(false),
             notifies: Cell::new(0),
+            msix_entries: 2,
+            queue_vector: Cell::new(transport::NO_VECTOR),
+            config_vector: Cell::new(transport::NO_VECTOR),
+            vector_at_setup: Cell::new(None),
+            isr_reads: Cell::new(0),
+        }
+    }
+
+    /// What a device answers to a vector: kept when it is in the table, refused otherwise.
+    fn take_vector(&self, vector: u16) -> u16 {
+        if vector < self.msix_entries {
+            vector
+        } else {
+            transport::NO_VECTOR
         }
     }
 }
@@ -315,6 +337,11 @@ impl Transport for FakeTransport {
     }
 
     fn set_status(&self, value: u8) {
+        if value == 0 {
+            // A reset forgets the vectors, as it forgets everything else.
+            self.queue_vector.set(transport::NO_VECTOR);
+            self.config_vector.set(transport::NO_VECTOR);
+        }
         if value & status::FEATURES_OK != 0 && self.refuse_features {
             // A device refusing the features leaves FEATURES_OK clear.
             self.status.set(value & !status::FEATURES_OK);
@@ -341,6 +368,7 @@ impl Transport for FakeTransport {
     }
 
     fn setup_queue(&self, _index: u16, size: u16, desc: u64, avail: u64, used: u64) {
+        self.vector_at_setup.set(Some(self.queue_vector.get()));
         *self.device.borrow_mut() = Some(FakeDevice::at(self.view, desc, avail, used, size));
     }
 
@@ -358,7 +386,19 @@ impl Transport for FakeTransport {
     }
 
     fn ack_interrupt(&self) -> u32 {
+        // Nothing pending, ever: what a device delivering on an MSI-X vector reports.
+        self.isr_reads.set(self.isr_reads.get() + 1);
         0
+    }
+
+    fn set_config_vector(&self, vector: u16) -> u16 {
+        self.config_vector.set(self.take_vector(vector));
+        self.config_vector.get()
+    }
+
+    fn set_queue_vector(&self, _index: u16, vector: u16) -> u16 {
+        self.queue_vector.set(self.take_vector(vector));
+        self.queue_vector.get()
     }
 
     fn config_read8(&self, _offset: usize) -> u8 {

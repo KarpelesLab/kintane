@@ -288,7 +288,12 @@ fn restart(c: &dyn EarlyConsole, virt: usize, phys: u64, len: usize, buf: &mut [
         c.write_str("; NO TRANSPORT ON RESTART");
         return false;
     };
-    let blk = match VirtioBlk::<Locks>::bring_up(transport, dma) {
+    // Keep the disk on its MSI-X vector across the restart: the device reset forgot the queue
+    // vector, but the platform's MSI-X table entry still stands, so bring-up sets the vector
+    // again. Otherwise the restarted disk would drop to polling and the block-irq check fail.
+    let vector = virtio_blk::msix_entry()
+        .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi));
+    let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(b) => b,
         Err(e) => {
             c.write_str("; RESTART BRING-UP FAILED: ");

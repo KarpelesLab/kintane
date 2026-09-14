@@ -53,9 +53,13 @@ mod common {
     pub const DEVICE_FEATURE: usize = 0x04;
     pub const DRIVER_FEATURE_SELECT: usize = 0x08;
     pub const DRIVER_FEATURE: usize = 0x0c;
+    /// The MSI-X vector for configuration-change interrupts.
+    pub const MSIX_CONFIG: usize = 0x10;
     pub const DEVICE_STATUS: usize = 0x14;
     pub const QUEUE_SELECT: usize = 0x16;
     pub const QUEUE_SIZE: usize = 0x18;
+    /// The MSI-X vector for the selected queue's interrupts.
+    pub const QUEUE_MSIX_VECTOR: usize = 0x1a;
     pub const QUEUE_ENABLE: usize = 0x1c;
     pub const QUEUE_NOTIFY_OFF: usize = 0x1e;
     pub const QUEUE_DESC: usize = 0x20;
@@ -285,6 +289,18 @@ impl<R: Regs> Transport for Pci<R> {
         // The ISR status register clears on read, which is the acknowledgement: a second read
         // would report nothing pending and lose the reason for the first.
         Self::at(&self.layout.isr, 0, 1).map_or(0, |o| u32::from(self.bar.read8(o)))
+    }
+
+    fn set_config_vector(&self, vector: u16) -> u16 {
+        self.set_common16(common::MSIX_CONFIG, vector);
+        self.common16(common::MSIX_CONFIG)
+    }
+
+    fn set_queue_vector(&self, index: u16, vector: u16) -> u16 {
+        // The queue must be selected first: the vector register is per queue, like its size.
+        self.set_common16(common::QUEUE_SELECT, index);
+        self.set_common16(common::QUEUE_MSIX_VECTOR, vector);
+        self.common16(common::QUEUE_MSIX_VECTOR)
     }
 
     fn config_read8(&self, offset: usize) -> u8 {

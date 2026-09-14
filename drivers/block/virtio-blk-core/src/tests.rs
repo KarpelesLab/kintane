@@ -11,7 +11,7 @@ use crate::{Engine, F_FLUSH, IN_FLIGHT, QUEUE_SIZE, dma_bytes};
 fn started(backing: &mut Backing, sectors: u64, bounce: usize) -> (Engine, FakeTransport) {
     let dma = backing.take(dma_bytes(bounce), 4096);
     let t = FakeTransport::new(backing, sectors);
-    let engine = Engine::bring_up(&t, dma).expect("bring-up");
+    let engine = Engine::bring_up(&t, dma, None).expect("bring-up");
     (engine, t)
 }
 
@@ -37,7 +37,7 @@ fn the_platform_iommu_feature_is_accepted_only_when_offered() {
     let dma = backing.take(dma_bytes(SECTOR), 4096);
     let mut t = FakeTransport::new(&backing, 64);
     t.offered[1] |= transport::ACCESS_PLATFORM_BIT;
-    let engine = Engine::bring_up(&t, dma).unwrap();
+    let engine = Engine::bring_up(&t, dma, None).unwrap();
     assert_ne!(t.accepted.get()[1] & transport::ACCESS_PLATFORM_BIT, 0);
     assert!(engine.facts().platform_iommu);
 }
@@ -48,7 +48,7 @@ fn a_device_of_another_type_is_refused() {
     let dma = backing.take(dma_bytes(SECTOR), 4096);
     let mut t = FakeTransport::new(&backing, 64);
     t.device_id = 1;
-    assert_eq!(Engine::bring_up(&t, dma).err(), Some(Error::WrongDevice { id: 1 }));
+    assert_eq!(Engine::bring_up(&t, dma, None).err(), Some(Error::WrongDevice { id: 1 }));
 }
 
 #[test]
@@ -136,6 +136,7 @@ fn idle(backing: &mut Backing) -> Engine {
             read_only: false,
             flush_supported: true,
             platform_iommu: false,
+            uses_msix: false,
         },
     }
 }

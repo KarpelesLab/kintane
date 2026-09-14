@@ -50,6 +50,9 @@ pub struct Facts {
     /// Whether `VIRTIO_F_ACCESS_PLATFORM` was negotiated: the device's DMA goes through the
     /// platform's IOMMU rather than straight to physical memory.
     pub platform_iommu: bool,
+    /// Whether the request queue was given an MSI-X vector, in which case the device signals
+    /// completion on it and does not set the interrupt status register for it.
+    pub uses_msix: bool,
 }
 
 /// Why a request could not be published.
@@ -136,12 +139,31 @@ impl Engine {
     /// geometry read out of its configuration space.
     ///
     /// `dma` is memory the device may read and write for as long as the engine lives.
-    pub fn bring_up<T: Transport + ?Sized>(transport: &T, mut dma: Dma) -> Result<Engine, Error> {
+    ///
+    /// When `vector` is `Some`, the request queue's interrupts are put on that MSI-X table
+    /// entry, written after `negotiate`'s reset forgets it and before the queue is enabled.
+    /// A device that will not take the vector reads back [`transport::NO_VECTOR`], which is
+    /// [`Error::VectorRefused`] — a queue that silently kept no vector would never interrupt.
+    /// Configuration-change interrupts are given none: the driver reads the configuration once,
+    /// here, and never asks again.
+    pub fn bring_up<T: Transport + ?Sized>(
+        transport: &T,
+        mut dma: Dma,
+        vector: Option<u16>,
+    ) -> Result<Engine, Error> {
         let wanted = [
             F_BLK_SIZE | F_FLUSH,
             transport::VERSION_1_BIT | transport::ACCESS_PLATFORM_BIT,
         ];
         let accepted = transport::negotiate(transport, transport::DEVICE_ID_BLOCK, wanted)?;
+
+        transport.set_config_vector(transport::NO_VECTOR);
+        if let Some(v) = vector {
+            if transport.set_queue_vector(QUEUE_INDEX, v) != v {
+                transport.set_status(transport::status::FAILED);
+                return Err(Error::VectorRefused { queue: QUEUE_INDEX });
+            }
+        }
 
         let ring = transport::carve_ring(&mut dma, QUEUE_SIZE)?;
         transport::setup_queue(transport, QUEUE_INDEX, &ring)?;
@@ -202,6 +224,7 @@ impl Engine {
                 read_only: accepted[0] & F_RO != 0,
                 flush_supported: accepted[0] & F_FLUSH != 0,
                 platform_iommu: accepted[1] & transport::ACCESS_PLATFORM_BIT != 0,
+                uses_msix: vector.is_some(),
             },
         })
     }
