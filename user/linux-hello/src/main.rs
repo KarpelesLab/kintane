@@ -1212,7 +1212,7 @@ fn openat(path: &[u8], flags: u64) -> i64 {
 }
 
 /// Write all of `bytes`, in pieces that start and end anywhere.
-fn write_all(fd: u64, bytes: &[u8]) -> bool {
+fn write_pieces(fd: u64, bytes: &[u8]) -> bool {
     let mut done = 0;
     while done < bytes.len() {
         let take = (bytes.len() - done).min(700);
@@ -1270,7 +1270,7 @@ fn files() -> ! {
     let fd = openat(TEMP, O_WRONLY | O_CREAT | O_EXCL);
     expect(fd >= 0, 80);
     let fd = fd as u64;
-    expect(write_all(fd, &data), 81);
+    expect(write_pieces(fd, &data), 81);
     expect(openat(TEMP, O_WRONLY | O_CREAT | O_EXCL) == -EEXIST, 82);
     expect(call1(sys::CLOSE, fd) == 0, 83);
 
@@ -1288,7 +1288,7 @@ fn files() -> ! {
     let fd = openat(TEMP, O_WRONLY | O_APPEND);
     expect(fd >= 0, 87);
     let fd = fd as u64;
-    expect(write_all(fd, b"tail") && size_of_fd(fd) == 3004, 87);
+    expect(write_pieces(fd, b"tail") && size_of_fd(fd) == 3004, 87);
     expect(call1(sys::CLOSE, fd) == 0, 87);
 
     // 88: ftruncate shortens, and what is left reads back.
@@ -1351,7 +1351,7 @@ fn files() -> ! {
     for (i, b) in out.iter_mut().enumerate() {
         *b = out_byte(OUT_SEED, i);
     }
-    expect(write_all(fd, &out), 95);
+    expect(write_pieces(fd, &out), 95);
     expect(call1(sys::FSYNC, fd) == 0, 95);
     expect(call1(sys::CLOSE, fd) == 0, 95);
 
