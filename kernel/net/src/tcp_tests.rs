@@ -42,6 +42,8 @@ struct Seg {
     flags: u8,
     window: u16,
     mss: Option<u16>,
+    sack_permitted: bool,
+    sack: [Option<(u32, u32)>; wire::SACK_BLOCKS],
     payload: Vec<u8>,
 }
 
@@ -97,6 +99,8 @@ impl Wire {
                         flags: t.flags,
                         window: t.window,
                         mss: t.mss,
+                        sack_permitted: t.sack_permitted,
+                        sack: t.sack,
                         payload: t.payload.to_vec(),
                     }
                 }
@@ -142,6 +146,8 @@ impl Wire {
             flags,
             window,
             mss,
+            sack_permitted: false,
+            sack: [None; wire::SACK_BLOCKS],
         };
         let mut buf = vec![0u8; wire::FRAME_MAX];
         let n = wire::write_tcp(&mut buf[34..], PEER, US, &h, payload).unwrap();
@@ -150,6 +156,110 @@ impl Wire {
         buf.truncate(34 + n);
         self.to_stack.borrow_mut().push_back(buf);
     }
+}
+
+impl Wire {
+    /// A segment from a peer that offered selective acknowledgement on its SYN.
+    #[allow(clippy::too_many_arguments)]
+    fn peer_sack(
+        &self,
+        from_port: u16,
+        to_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        mss: Option<u16>,
+        payload: &[u8],
+    ) {
+        let h = TcpHeader {
+            src_port: from_port,
+            dst_port: to_port,
+            seq,
+            ack,
+            flags,
+            window: 8192,
+            mss,
+            sack_permitted: true,
+            sack: [None; wire::SACK_BLOCKS],
+        };
+        let mut buf = vec![0u8; wire::FRAME_MAX];
+        let n = wire::write_tcp(&mut buf[34..], PEER, US, &h, payload).unwrap();
+        wire::write_ipv4(&mut buf[ETH_HEADER..], PEER, US, PROTO_TCP, 1, n).unwrap();
+        wire::write_ethernet(&mut buf, OUR_MAC, PEER_MAC, ETHERTYPE_IPV4).unwrap();
+        buf.truncate(34 + n);
+        self.to_stack.borrow_mut().push_back(buf);
+    }
+}
+
+/// An established connection whose peer offered selective acknowledgement.
+fn open_sack(s: &mut Stack, w: &Wire) -> (Conn, u16, u32) {
+    let c = s.tcp_connect(w, PEER, PORT, 0).unwrap();
+    let syn = w.one();
+    assert!(syn.sack_permitted, "the stack offers it on its own SYN");
+    let (me, iss) = (syn.src_port, syn.seq);
+    w.peer_sack(PORT, me, PEER_ISS, iss + 1, TCP_SYN | TCP_ACK, Some(1460), &[]);
+    s.poll(w, MS);
+    w.one();
+    assert_eq!(s.tcp_status(c).unwrap().state, State::Established);
+    (c, me, iss)
+}
+
+#[test]
+fn the_selective_acknowledgement_options_are_written_and_parsed_back() {
+    let h = TcpHeader {
+        src_port: 1,
+        dst_port: 2,
+        seq: 3,
+        ack: 4,
+        flags: TCP_ACK,
+        window: 8192,
+        mss: Some(1460),
+        sack_permitted: true,
+        sack: [Some((10, 20)), Some((30, 40)), None],
+    };
+    // Every option is padded to a whole word, so a header length is a whole number of them.
+    assert_eq!(wire::tcp_header_len(&h) % 4, 0);
+    let mut buf = vec![0u8; wire::FRAME_MAX];
+    let n = wire::write_tcp(&mut buf, US, PEER, &h, b"hi").unwrap();
+    let back = wire::parse_tcp(&buf[..n], US, PEER).unwrap();
+    assert!(back.sack_permitted);
+    assert_eq!(back.sack, [Some((10, 20)), Some((30, 40)), None]);
+    assert_eq!(back.mss, Some(1460));
+    assert_eq!(back.payload, b"hi");
+}
+
+#[test]
+fn blocks_name_the_runs_held_past_a_hole_nearest_first() {
+    let (mut s, w) = ready();
+    let (_, me, iss) = open_sack(&mut s, &w);
+    let base = PEER_ISS + 1;
+    // Two runs past a hole, the further one first: the blocks name the nearer one first,
+    // because that is the one the stream needs.
+    w.peer_sack(PORT, me, base + 40, iss + 1, TCP_ACK | TCP_PSH, None, b"ef");
+    s.poll(&w, 2 * MS);
+    assert_eq!(w.one().sack[0], Some((base + 40, base + 42)));
+    w.peer_sack(PORT, me, base + 20, iss + 1, TCP_ACK | TCP_PSH, None, b"cd");
+    s.poll(&w, 3 * MS);
+    let ack = w.one();
+    assert_eq!(ack.ack, base, "still asking for the byte the hole starts at");
+    assert_eq!(
+        (ack.sack[0], ack.sack[1]),
+        (Some((base + 20, base + 22)), Some((base + 40, base + 42))),
+        "nearest first"
+    );
+}
+
+#[test]
+fn a_peer_that_offered_no_selective_acknowledgement_is_sent_no_blocks() {
+    let (mut s, w) = ready();
+    let (_, syn) = open(&mut s, &w);
+    let (me, iss) = (syn.src_port, syn.seq);
+    let base = PEER_ISS + 1;
+    w.peer(me, base + 20, iss + 1, TCP_ACK | TCP_PSH, b"cd");
+    s.poll(&w, 2 * MS);
+    let ack = w.one();
+    assert_eq!(ack.ack, base);
+    assert_eq!(ack.sack, [None; wire::SACK_BLOCKS], "it never asked for them");
 }
 
 fn stack() -> Box<Stack> {
@@ -218,6 +328,8 @@ fn a_written_segment_parses_back_with_its_option() {
         flags: TCP_SYN | TCP_ACK,
         window: 512,
         mss: Some(1400),
+        sack_permitted: false,
+        sack: [None; wire::SACK_BLOCKS],
     };
     let mut buf = [0u8; 64];
     let n = wire::write_tcp(&mut buf, US, PEER, &h, b"hi").unwrap();
@@ -240,6 +352,8 @@ fn a_bad_data_offset_or_option_length_is_refused() {
         flags: TCP_SYN,
         window: 0,
         mss: Some(536),
+        sack_permitted: false,
+        sack: [None; wire::SACK_BLOCKS],
     };
     let fix = |buf: &mut [u8]| {
         buf[16..18].copy_from_slice(&[0, 0]);

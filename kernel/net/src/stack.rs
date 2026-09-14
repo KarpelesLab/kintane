@@ -82,10 +82,14 @@ pub struct Counters {
     pub fragments_dropped: u64,
     /// Sets given up because the fragments they were missing never came.
     pub reassembly_timeouts: u64,
+    /// Destination-unreachable messages for datagrams this machine sent.
+    pub unreachable_received: u64,
 }
 
 /// Echo replies remembered for a caller to collect.
 const REPLIES: usize = 8;
+/// Refusals remembered for the sockets that provoked them.
+const REFUSALS: usize = 4;
 /// Datagrams held for a caller to collect, across every port.
 ///
 /// Four was enough while the kernel's own check was the only reader. A datagram socket shares
@@ -125,6 +129,9 @@ struct State {
     /// The next slot [`State::replies`] overwrites when it is full.
     next_reply: usize,
     inbox: [Option<Datagram>; INBOX],
+    /// Local ports a destination-unreachable message named, waiting for whoever sent from
+    /// them to ask. A refusal nobody collects is forgotten when the slots fill.
+    refused: [Option<u16>; REFUSALS],
     counters: Counters,
     ip_id: u16,
     tcp: Tcp,
@@ -158,6 +165,7 @@ impl Stack {
                 replies: [None; REPLIES],
                 next_reply: 0,
                 inbox: [None; INBOX],
+                refused: [None; REFUSALS],
                 counters: Counters {
                     rx_frames: 0,
                     tx_frames: 0,
@@ -181,6 +189,7 @@ impl Stack {
                     datagrams_reassembled: 0,
                     fragments_dropped: 0,
                     reassembly_timeouts: 0,
+                    unreachable_received: 0,
                 },
                 ip_id: 1,
                 tcp: Tcp::new(),
@@ -592,6 +601,20 @@ impl Stack {
         result
     }
 
+    /// Whether a destination-unreachable message named `port` since this was last asked,
+    /// which is how a datagram socket learns its peer refused it. Taking it forgets it: the
+    /// refusal belongs to the call that was waiting, not to every later one.
+    pub fn take_refusal(&mut self, port: u16) -> bool {
+        let slot = self.st.refused.iter_mut().find(|r| **r == Some(port));
+        match slot {
+            Some(slot) => {
+                *slot = None;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The oldest datagram received for `port`, copied into `into`: its source address,
     /// source port and length. Taking it forgets it.
     pub fn udp_recv(&mut self, port: u16, into: &mut [u8]) -> Option<(Ipv4Addr, u16, usize)> {
@@ -720,6 +743,22 @@ impl State {
                     self.counters.echo_replies_received += 1;
                     self.replies[self.next_reply] = Some((echo.id, echo.seq, ip.src));
                     self.next_reply = (self.next_reply + 1) % REPLIES;
+                }
+            }
+            Frame::Unreachable(ip, un) => {
+                if ip.dst != self.config.ip {
+                    self.counters.not_for_us += 1;
+                    return;
+                }
+                self.counters.unreachable_received += 1;
+                // Only a datagram of ours, and only the port that sent it: a message about
+                // somebody else's traffic says nothing about this machine's sockets.
+                if un.protocol == wire::PROTO_UDP
+                    && un.src == self.config.ip
+                    && un.code == wire::ICMP_PORT_UNREACHABLE
+                    && let Some(slot) = self.refused.iter_mut().find(|r| r.is_none())
+                {
+                    *slot = Some(un.src_port);
                 }
             }
             Frame::Udp(ip, udp) => {

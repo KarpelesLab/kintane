@@ -671,6 +671,13 @@ pub fn datagram_recv(id: ObjectId, into: &mut [u8]) -> Result<Option<(u64, usize
     // kbuild's probes land in the same inbox, and nothing else drains them once the boot's
     // checks are over; see `net::drain_probes`.
     crate::net::drain_probes();
+    // A refusal the peer sent for a datagram of ours: the port it named is this one, and the
+    // call that was waiting is the one it belongs to. Nothing on the networks these checks
+    // run against ever sends one — see `net`'s notes on QEMU's user-mode stack — so this is
+    // proven by host tests rather than by a boot.
+    if stack(|s, _, _| s.take_refusal(port))? {
+        return Err(Error::PeerClosed);
+    }
     stack(|s, _, _| {
         loop {
             let (ip, src, copied, whole) = s.udp_recv_from(port, into)?;

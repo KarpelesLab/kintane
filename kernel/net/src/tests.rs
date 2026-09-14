@@ -148,6 +148,64 @@ fn resolved(s: &mut Stack, link: &Link) -> [u8; 6] {
         .expect("the gateway answered")
 }
 
+/// An ICMP destination-unreachable message for a datagram this machine sent from `from` to
+/// `to`, as a peer would send it: the message, then the header it quotes and the eight bytes
+/// after it, which for UDP is its ports.
+fn unreachable_for(from: u16, to: u16, code: u8) -> Vec<u8> {
+    let mut out = vec![0u8; wire::FRAME_MAX];
+    let mut quoted = [0u8; wire::IPV4_HEADER + wire::UDP_HEADER];
+    wire::write_ipv4(&mut quoted, config().ip, GATEWAY, wire::PROTO_UDP, 9, wire::UDP_HEADER)
+        .unwrap();
+    quoted[wire::IPV4_HEADER..wire::IPV4_HEADER + 2].copy_from_slice(&from.to_be_bytes());
+    quoted[wire::IPV4_HEADER + 2..wire::IPV4_HEADER + 4].copy_from_slice(&to.to_be_bytes());
+    let n = wire::ICMP_HEADER + quoted.len();
+    {
+        let icmp = &mut out[34..];
+        icmp[0] = wire::ICMP_UNREACHABLE;
+        icmp[1] = code;
+        icmp[2..8].copy_from_slice(&[0; 6]);
+        icmp[wire::ICMP_HEADER..n].copy_from_slice(&quoted);
+        let sum = wire::checksum(&[&icmp[..n]]);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    }
+    wire::write_ipv4(&mut out[ETH_HEADER..], GATEWAY, config().ip, wire::PROTO_ICMP, 9, n).unwrap();
+    wire::write_ethernet(&mut out, OUR_MAC, GATEWAY_MAC, wire::ETHERTYPE_IPV4).unwrap();
+    out.truncate(34 + n);
+    out
+}
+
+#[test]
+fn a_port_nobody_listens_on_is_refused_to_the_socket_that_sent() {
+    let (mut s, link) = (stack(), Link::new());
+    resolved(&mut s, &link);
+    assert!(!s.take_refusal(4000), "nothing is owed before the message arrives");
+    link.deliver(unreachable_for(4000, 9999, wire::ICMP_PORT_UNREACHABLE));
+    s.poll(&link, 0);
+    assert_eq!(s.counters().unreachable_received, 1);
+    assert!(!s.take_refusal(4001), "another port's socket is not refused");
+    assert!(s.take_refusal(4000));
+    assert!(!s.take_refusal(4000), "taking it forgets it");
+}
+
+#[test]
+fn an_unreachable_message_for_somebody_elses_datagram_refuses_nothing() {
+    let (mut s, link) = (stack(), Link::new());
+    resolved(&mut s, &link);
+    // Well-formed, but it quotes a datagram from another address: it says nothing about this
+    // machine's sockets.
+    let mut frame = unreachable_for(4000, 9999, wire::ICMP_PORT_UNREACHABLE);
+    let quoted = 34 + wire::ICMP_HEADER;
+    frame[quoted + 12..quoted + 16].copy_from_slice(&[10, 0, 2, 99]);
+    let icmp_len = frame.len() - 34;
+    frame[36..38].copy_from_slice(&[0, 0]);
+    let sum = wire::checksum(&[&frame[34..34 + icmp_len]]);
+    frame[36..38].copy_from_slice(&sum.to_be_bytes());
+    link.deliver(frame);
+    s.poll(&link, 0);
+    assert_eq!(s.counters().unreachable_received, 1, "seen");
+    assert!(!s.take_refusal(4000), "but not ours to act on");
+}
+
 #[test]
 fn checksum_matches_rfc_1071_examples() {
     // RFC 1071 §3: the sum of these words is 0xddf2, so the checksum is its complement.

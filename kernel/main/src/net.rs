@@ -131,6 +131,14 @@ const REPLY_NS: u64 = 3_000_000_000;
 const PROBE_NS: u64 = 15_000_000_000;
 /// The longest one TCP round may take: a handshake, a retransmission or two, and a close.
 const TCP_NS: u64 = 10_000_000_000;
+/// The bulk round's request, in bytes: four segments' worth, which is the whole send ring.
+///
+/// kbuild's relay drops each connection's first data segment. With a one-line request that
+/// is the only segment there is, and the timer is what sends it again; with four, the three
+/// behind it draw the three duplicate acknowledgements the sender's fast retransmit needs
+/// (`net::tcp::SEND_SEG`, `DUP_ACK_THRESHOLD`). It is the one round that proves that path in
+/// a guest rather than in a host test.
+const BULK_LEN: usize = 4 * net::tcp::SEND_SEG;
 /// How long the check keeps listening after its TCP rounds, for anything the peer sends again.
 /// QEMU's TCP retransmits no sooner than a second.
 pub const LINGER_NS: u64 = 3_000_000_000;
@@ -644,6 +652,10 @@ fn exchange(
         Ok(round) => round,
         Err(why) => return Some(why),
     };
+    let bulk = match tcp_bulk_round(card, port, TCP_NS, now, spin) {
+        Ok(round) => round,
+        Err(why) => return Some(why),
+    };
     // Counted before the linger: kbuild's relay swaps a pair of the reply's segments and sends
     // one of them twice, so a segment held out of order and a duplicate are what the rounds
     // are *for*. What may not happen is either of them after the rounds are over.
@@ -664,7 +676,11 @@ fn exchange(
     write_usize(c, (rounds.out_of_order_queued - before.out_of_order_queued) as usize);
     c.write_str(" segments held out of order, ");
     write_usize(c, (rounds.out_of_order_delivered - before.out_of_order_delivered) as usize);
-    c.write_str(" runs joined up");
+    c.write_str(" runs joined up, bulk round ");
+    write_usize(c, bulk.fast_retransmits as usize);
+    c.write_str(" fast retransmits in ");
+    write_usize(c, bulk.retransmits as usize);
+    c.write_str(" resends");
 
     let through = |round: &TcpRound, states: &[State]| {
         round.closed && states.iter().all(|s| round.visited & s.bit() != 0)
@@ -678,6 +694,11 @@ fn exchange(
     if guest.retransmits == 0 || peer.retransmits == 0 {
         return Some(
             "A CONNECTION RETRANSMITTED NO DATA, THOUGH KBUILD DROPS THE FIRST SEGMENT OF EACH",
+        );
+    }
+    if bulk.fast_retransmits == 0 {
+        return Some(
+            "THE BULK ROUND'S LOST SEGMENT WAITED FOR THE TIMER RATHER THAN THREE DUPLICATE ACKNOWLEDGEMENTS",
         );
     }
     if rounds.out_of_order_queued == before.out_of_order_queued {
@@ -849,6 +870,10 @@ pub struct TcpRound {
     pub visited: u16,
     /// Data segments sent again during the round.
     pub retransmits: u64,
+    /// Of those, the ones sent on three duplicate acknowledgements rather than on the timer.
+    pub fast_retransmits: u64,
+    /// Retransmission timers that ran out during the round.
+    pub timeouts: u64,
     /// The connection reached the end its close order leads to: TIME-WAIT for the kernel's
     /// close, CLOSED and reaped for kbuild's.
     pub closed: bool,
@@ -875,18 +900,20 @@ pub fn tcp_round(
     let request_len = line(&mut request, TCP_REQUEST, mode, n);
     let mut reply = [0u8; 64];
     let reply_len = line(&mut reply, TCP_REPLY, mode, n);
-    let before = STACK.lock_irqsave().tcp_counters().data_retransmits;
+    let before = STACK.lock_irqsave().tcp_counters();
     let t = now();
     let conn = STACK
         .lock_irqsave()
         .tcp_connect(card, GATEWAY, port, t)
         .map_err(|_| "NO TCP CONNECTION COULD BE OPENED")?;
+    let mut got = [0u8; 64];
     let result = tcp_exchange(
         card,
         conn,
         guest_closes,
         &request[..request_len],
         &reply[..reply_len],
+        &mut got,
         timeout_ns,
         now,
         pause,
@@ -897,7 +924,65 @@ pub fn tcp_round(
         let _ = STACK.lock_irqsave().tcp_abort(card, conn, t);
     }
     let mut round = result?;
-    round.retransmits = STACK.lock_irqsave().tcp_counters().data_retransmits - before;
+    let after = STACK.lock_irqsave().tcp_counters();
+    round.retransmits = after.data_retransmits - before.data_retransmits;
+    round.fast_retransmits = after.fast_retransmits - before.fast_retransmits;
+    round.timeouts = after.retransmit_timeouts - before.retransmit_timeouts;
+    Ok(round)
+}
+
+/// A round whose request fills the send ring: four segments rather than one line.
+///
+/// kbuild's relay drops each connection's first data segment. With one segment there is
+/// nothing behind it and the retransmission timer is what sends it again; with four, the
+/// three behind it draw three duplicate acknowledgements and the sender's fast retransmit
+/// sends it again at once. That is the only way this path is reachable in a guest: it needs
+/// a peer that acknowledges out-of-order data, which QEMU's user-mode network does.
+pub fn tcp_bulk_round(
+    card: &VirtioNet<Locks>,
+    port: u16,
+    timeout_ns: u64,
+    now: &mut dyn FnMut() -> u64,
+    pause: fn(Seen),
+) -> Result<TcpRound, &'static str> {
+    let mut head = [0u8; 64];
+    let head_len = line(&mut head, TCP_REQUEST, b"bulk ", 3);
+    // The line kbuild answers, then filler, and the newline it reads to at the very end, so
+    // the whole thing is one request and its reply is the same length.
+    let mut request = [b'.'; BULK_LEN];
+    request[..head_len - 1].copy_from_slice(&head[..head_len - 1]);
+    request[BULK_LEN - 1] = b'\n';
+    let mut got = [0u8; BULK_LEN];
+    let before = STACK.lock_irqsave().tcp_counters();
+    let t = now();
+    let conn = STACK
+        .lock_irqsave()
+        .tcp_connect(card, GATEWAY, port, t)
+        .map_err(|_| "NO TCP CONNECTION COULD BE OPENED FOR THE BULK ROUND")?;
+    // The reply is the request with `reply` for `request`, so only its head is checked here;
+    // what the round is for is the retransmission, not the bytes.
+    let mut reply = [0u8; 64];
+    let reply_len = line(&mut reply, TCP_REPLY, b"bulk ", 3);
+    let result = tcp_exchange(
+        card,
+        conn,
+        true,
+        &request,
+        &reply[..reply_len - 1],
+        &mut got,
+        timeout_ns,
+        now,
+        pause,
+    );
+    if result.is_err() {
+        let t = now();
+        let _ = STACK.lock_irqsave().tcp_abort(card, conn, t);
+    }
+    let mut round = result?;
+    let after = STACK.lock_irqsave().tcp_counters();
+    round.retransmits = after.data_retransmits - before.data_retransmits;
+    round.fast_retransmits = after.fast_retransmits - before.fast_retransmits;
+    round.timeouts = after.retransmit_timeouts - before.retransmit_timeouts;
     Ok(round)
 }
 
@@ -908,6 +993,7 @@ fn tcp_exchange(
     guest_closes: bool,
     request: &[u8],
     reply: &[u8],
+    got: &mut [u8],
     timeout_ns: u64,
     now: &mut dyn FnMut() -> u64,
     pause: fn(Seen),
@@ -936,7 +1022,6 @@ fn tcp_exchange(
     })
     .ok_or("THE TCP CONNECTION WAS NEVER ESTABLISHED")??;
 
-    let mut got = [0u8; 64];
     let mut len = 0;
     wait(card, timeout_ns, now, pause, |s, t| {
         loop {
@@ -1005,6 +1090,8 @@ fn tcp_exchange(
     Ok(TcpRound {
         visited,
         retransmits: 0,
+        fast_retransmits: 0,
+        timeouts: 0,
         closed,
     })
 }
