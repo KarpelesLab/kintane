@@ -5,7 +5,7 @@ section .rodata 24576
 section .stack 16384
 section .text 258048
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 3131 data 0 bss 0
+crate (anonymous) text 0 rodata 2917 data 0 bss 0
 crate (unmangled) text 1274 rodata 0 data 0 bss 0
 crate __rustc text 161 rodata 0 data 0 bss 0
 crate acpi text 6827 rodata 0 data 0 bss 0
@@ -15,22 +15,24 @@ crate block text 1981 rodata 0 data 0 bss 0
 crate bootinfo text 2511 rodata 0 data 0 bss 0
 crate buildid text 181 rodata 32 data 0 bss 0
 crate cmdline text 1271 rodata 0 data 0 bss 0
-crate core text 8314 rodata 0 data 0 bss 0
+crate core text 8518 rodata 0 data 0 bss 0
 crate device text 23554 rodata 0 data 0 bss 0
 crate fat text 5767 rodata 0 data 0 bss 0
 crate hal text 1412 rodata 0 data 0 bss 0
-crate kalloc text 13307 rodata 0 data 0 bss 0
-crate kintane text 69205 rodata 24 data 3844 bss 77014
-crate mm text 23101 rodata 0 data 0 bss 0
+crate hwproxy text 327 rodata 0 data 0 bss 0
+crate kalloc text 13104 rodata 0 data 0 bss 0
+crate kintane text 70275 rodata 24 data 3892 bss 77014
+crate mm text 23154 rodata 0 data 0 bss 0
 crate multiboot text 625 rodata 0 data 0 bss 0
-crate platform text 22403 rodata 88 data 108332 bss 1502
+crate platform text 22467 rodata 88 data 108332 bss 1502
 crate sched text 2357 rodata 0 data 0 bss 0
 crate strip_suffix text 39 rodata 0 data 0 bss 0
-crate sync text 12350 rodata 16 data 800 bss 136
+crate sync text 10046 rodata 16 data 800 bss 136
 crate thread text 4786 rodata 0 data 0 bss 0
 crate time text 3971 rodata 0 data 0 bss 0
 crate uart16550 text 1959 rodata 0 data 208 bss 88
 crate unwind text 2448 rodata 0 data 0 bss 0
 crate vfs text 2665 rodata 0 data 0 bss 0
-crate virtio_blk text 12086 rodata 8 data 144 bss 4
+crate virtio_blk text 5870 rodata 8 data 144 bss 4
+crate virtio_blk_core text 7041 rodata 0 data 0 bss 0
 total 847872
