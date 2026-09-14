@@ -1,7 +1,8 @@
 # Userspace ABI
 
-Status: **the native slice is built; the Linux personality runs one static program on
-x86_64** ([as built](#as-built--one-static-program-x86_64)). The principles below are the
+Status: **the native slice is built; the Linux personality runs static programs on x86_64 and
+aarch64, with pipes, threads, `fork`, `execve` and `wait4`, and no signals or sockets**
+([as built](#as-built--static-programs-x86_64-and-aarch64)). The principles below are the
 commitment; the native syscall numbers are not.
 
 ## As built — the native vertical slice
@@ -471,6 +472,15 @@ no corpus yet for a gap to fail.
 - **Only the checks have a filesystem namespace.** A Linux process started any other way, the
   stress run's included, would find `openat` and `execve` failing with `EIO`.
 - **`execve` does not end a process's other threads**, and refuses instead.
+- **On a multiprocessor, a `fork` or an `execve` can hang against another process's page
+  fault.** Both change mappings under the frame lock every process's `Vm` operations take, and
+  a change that makes a page read-only or unmaps one shoots down TLBs while holding that lock.
+  A thread faulting on another CPU at that moment spins for the lock with interrupts masked,
+  so it never answers the shootdown. The rule in `shootdown.rs` forbids exactly this, and a
+  native process installing its program breaks it the same way. The stress run hung on eight
+  CPUs when it started one Linux process before installing the next, and it now installs both
+  first. The general fix is a frame lock whose spin answers shootdowns, or per-process
+  locking. That is in `userproc`'s object layer, not here.
 - **No `dup`, `mprotect`, `/proc`, or console input.**
 
 ### The tag

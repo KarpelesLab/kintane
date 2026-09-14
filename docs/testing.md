@@ -799,18 +799,37 @@ switch between them is one a thread pointer must survive. On `x86_64-qemu` the l
 
 On `aarch64-virt` it read 42 futex waits blocked and 42 woken.
 
-**In the stress run.** Once per audit interval, after the waiting process, the auditor starts the
-program twice as `hello tls`, on the two stacks the process and waiting-process cycles use, and
-pins both processes to one CPU, a different one each round. Each sets its own thread pointer to a
-block marked with its pid and checks it after each of 100 yields, then exits with 44. A process
-that reads another's mark exits 91 and fails the audit; so does a pair that is not over in 10 s, or
-that leaves a frame behind. The heartbeat counts the pairs. A 20 s run on `x86_64-qemu-smp`, with 4
-CPUs, ran 16.
+**In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
+the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.
+It builds and installs both processes before starting either, then pins both to one CPU, a
+different one each pair. Each sets its own thread pointer to a block marked with its pid and checks
+it after each of 100 yields, then exits with 44. A process that reads another's mark exits 91 and
+fails the audit, and so does a pair that is not over in 10 s or that leaves a frame behind. The
+heartbeat counts the pairs. In 20 s runs, `x86_64-qemu`, `aarch64-virt`, and both SMP presets at 4
+and at 8 CPUs each ran 5 pairs and 20 audits.
 
-The first version yielded 2000 times, and on `aarch64-virt-smp` one pair in twenty did not end
-within its patience. A yield on a CPU that a busy stress workload shares can hand that workload a
-whole 10 ms slice, so 2000 yields could take 20 s. The yield count was lowered rather than the
-patience raised past what a pair should take.
+Three versions came before this one, and the stress run found something wrong with each:
+
+- **2000 yields.** On `aarch64-virt-smp` one pair in twenty did not end within its patience. A
+  yield on a CPU a busy stress workload shares can hand that workload a whole 10 ms slice, so 2000
+  yields could take 20 s. The count went down, and the patience did not go up past what a pair
+  should take.
+- **A pair every interval.** On one CPU a pair costs the workloads a good part of a second, and a
+  20 s run on `aarch64-virt` fell from 20 audits to 12, and on `x86_64-qemu` from 20 to 16.
+- **Starting each process as it was built.** On 8 CPUs, both `x86_64-qemu-smp` and
+  `aarch64-virt-smp` hung: the heartbeat watchdog stopped the runs after heartbeats 12 and 8. The
+  first process's thread was faulting on another CPU, spinning with interrupts masked for the
+  frame lock, while the auditor installed the second process, whose segment protection shoots down
+  TLBs holding that lock. `shootdown.rs` forbids waiting masked for a lock held across a shootdown.
+  `userproc::prepare_linux` now builds a process without starting it, and the same hazard for
+  `fork` and `execve` on a multiprocessor is written down in
+  [userspace-abi.md](userspace-abi.md#as-built--static-programs-x86_64-and-aarch64) as open.
+
+During this branch's verification, 20 s single-CPU stress runs also failed as the round-7 notes
+describe: `x86_64-qemu` with "user process: a process made no progress", and `i686-qemu` with
+"a workload made no progress since the last audit: heap A", under a host load average near 9. The
+base commit, `9576bb2`, failed both the same way in the same conditions, `i686-qemu` once in three
+runs. `i686` does not build the personality.
 
 `kernel/linux` is host-tested (9 tests), covering:
 
