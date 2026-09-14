@@ -125,8 +125,12 @@ and the calls numbered 17–26 are built on them:
   receiver may keep — rights only narrow — all or nothing. **`channel_recv`** blocks for a
   message and returns its length and handle count. `channel_write` and `channel_read` remain,
   non-blocking and without handles.
-- **`completion_wait`** blocks for a completion. `process_wait` still only arms a completion; the
-  wait for a process is `completion_wait` on that queue, which `rt::Process::join` does.
+- **`completion_wait`** blocks for a completion.
+- **`process_wait`** has two forms. With a completion queue it arms that queue, as it always
+  did, and takes no timeout. With a zero completion handle it blocks for the process itself, up
+  to its timeout, and returns the exit code — `TimedOut` if the process is still running, like
+  every other wait. `rt::Process::join(timeout_ns)` is that form; `rt::Process::wait_on` is
+  the other.
 - **Events** (`event_create`, `event_signal`, `event_wait`): a latch. Signalling needs `SIGNAL`,
   waiting needs `WAIT`, and a wait consumes the signal.
 - **Timers** (`timer_create`, `timer_set`, `timer_cancel`) deliver to a completion queue, once or

@@ -51,10 +51,17 @@ crate::syscalls! {
     /// `entry` is an address in that process, or 0 for its program's entry point; `arg` is
     /// the value its first argument register holds. Returns a handle to the thread.
     11 => fn thread_create(process: Handle, entry: u64, arg: u64);
-    /// Ask for `key` and the exit code to be posted to `completion` when the process
-    /// `process` names ends. `process` needs `WAIT`, `completion` needs `WRITE`. A process
-    /// that has already ended posts at once. One waiter per process; a second is `Full`.
-    12 => fn process_wait(process: Handle, completion: Handle, key: u64);
+    /// Wait for the process `process` names, which needs `WAIT`, to end.
+    ///
+    /// With `completion` zero, wait up to `timeout_ns`, as every waiting call below does, and
+    /// return the exit code. A process still running when the wait runs out is `ShouldWait`
+    /// for a zero timeout and `TimedOut` otherwise.
+    ///
+    /// With `completion` naming a completion queue, which needs `WRITE`, wait for nothing: ask
+    /// for `key` and the exit code to be posted there when the process ends — at once if it
+    /// already has — and return zero. `timeout_ns` must then be zero. One such waiter per
+    /// process; a second is `Full`.
+    12 => fn process_wait(process: Handle, completion: Handle, key: u64, timeout_ns: u64);
     /// Create a completion queue: where finished asynchronous operations report. Returns a
     /// handle to it with every right.
     13 => fn completion_create();

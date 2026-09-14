@@ -331,6 +331,7 @@ pub fn take(object: &mut Object) -> Option<(u64, u64)> {
 /// module documentation.
 pub fn on_process_exit(slot: usize, code: u64) {
     let mut post_to = None;
+    let mut waiting = None;
     for cell in CELLS.iter() {
         let found = cell.with(|o| match o {
             Object::Process {
@@ -347,12 +348,26 @@ pub fn on_process_exit(slot: usize, code: u64) {
             _ => false,
         });
         if found {
+            waiting = WAITS.get(cell.index());
             break;
         }
     }
     if let Some((queue, key)) = post_to {
         let _ = post(queue, key, code);
     }
+    // After the post, so a thread woken from `process_wait` finds a queued exit there too.
+    if let Some(waiters) = waiting {
+        waiters.wake_all();
+    }
+}
+
+/// The exit code of the process `id` names: `Some(None)` while it runs, `None` if `id` is not
+/// a live process.
+pub fn exit_code(id: ObjectId) -> Option<Option<u64>> {
+    with(id, |o| match o {
+        Object::Process { exited, code, .. } => Some(exited.then_some(*code)),
+        _ => None,
+    })?
 }
 
 // ---- channels -----------------------------------------------------------------------------

@@ -13,7 +13,9 @@
 //! service. `init` then, in order:
 //!
 //! 1. polls an empty completion queue and is told `ShouldWait` at once, then waits on it with a
-//!    timeout and must be told `TimedOut` no earlier than the timeout and not long after;
+//!    timeout and must be told `TimedOut` no earlier than the timeout and not long after. A
+//!    `process_wait` for its own process, which cannot end while it waits, must run out the same
+//!    way, and arming a queue with a timeout is refused;
 //! 2. arms a one-shot timer on the queue and waits for its completion, then a periodic one for
 //!    three expirations, cancels it, and sees nothing more arrive;
 //! 3. starts a second thread in its own process, which writes to a page the first mapped and

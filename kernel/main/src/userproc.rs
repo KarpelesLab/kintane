@@ -963,7 +963,32 @@ impl abi::Handler for Syscalls {
         process: AbiHandle,
         completion: AbiHandle,
         key: u64,
+        timeout_ns: u64,
     ) -> Result<u64, Error> {
+        if completion.0 == 0 {
+            // Wait for the process itself, on its object's queue, which its exit wakes.
+            let id = self
+                .p()
+                .table
+                .get_checked(handle(process), ObjectType::Process, Rights::WAIT)
+                .map_err(handle_error)?
+                .object;
+            let waiters = objects::waiters(id).ok_or(Error::BadHandle)?;
+            return self.wait_for(
+                waiters,
+                timeout_ns,
+                || None,
+                move |_| match objects::exit_code(id) {
+                    Some(Some(code)) => Ok(Some(code)),
+                    Some(None) => Ok(None),
+                    None => Err(Error::BadHandle),
+                },
+            );
+        }
+        // Arming a queue waits for nothing, so a timeout on it is a caller's mistake.
+        if timeout_ns != 0 {
+            return Err(Error::InvalidArgument);
+        }
         let queue = self
             .p()
             .table

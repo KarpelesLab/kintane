@@ -334,11 +334,16 @@ fn spawn(image: Handle, console: Handle) -> u64 {
     if rt::send(mine, CHILD_REPLY).is_err() {
         return 0x407;
     }
-    let Ok(code) = child.join(queue, CHILD_KEY) else {
+    let Ok(code) = child.join(WAKE_NS) else {
         return 0x408;
     };
     if code != CHILD_SUCCESS {
         return 0x409;
+    }
+    // The exit asked for on the queue arrives too, with the same code.
+    match rt::completion_wait_timeout(queue, WAKE_NS) {
+        Ok(c) if c.key == CHILD_KEY && c.value == code => {}
+        _ => return 0x40c,
     }
     let _ = rt::print(console, b"init: the process it created exited as expected\n");
     SPAWN_SUCCESS
@@ -416,6 +421,9 @@ fn waits(console: Handle, me: Handle, files: Handle) -> u64 {
     if !times_out_on_time(queue) {
         return 0x501;
     }
+    if !process_wait_times_out(me, queue) {
+        return 0x502;
+    }
     let steps = [
         timers(queue),
         two_threads(me),
@@ -442,6 +450,22 @@ fn times_out_on_time(queue: Handle) -> bool {
     }
     let start = rt::now_ns();
     let result = rt::completion_wait_timeout(queue, TIMEOUT_NS);
+    let took = rt::now_ns().wrapping_sub(start);
+    result == Err(Error::TimedOut) && took >= TIMEOUT_NS && took < TIMEOUT_NS + LATE_NS
+}
+
+/// A wait for a process runs out on time, as every other wait does. The process waited for is
+/// this one, which cannot end while its own thread waits. Arming a queue takes no timeout.
+fn process_wait_times_out(me: Handle, queue: Handle) -> bool {
+    let this = rt::Process { handle: me };
+    if this.join(rt::NO_WAIT) != Err(Error::ShouldWait) {
+        return false;
+    }
+    if call::process_wait(me, queue, 1, TIMEOUT_NS) != Err(Error::InvalidArgument) {
+        return false;
+    }
+    let start = rt::now_ns();
+    let result = this.join(TIMEOUT_NS);
     let took = rt::now_ns().wrapping_sub(start);
     result == Err(Error::TimedOut) && took >= TIMEOUT_NS && took < TIMEOUT_NS + LATE_NS
 }
