@@ -703,23 +703,32 @@ The boot gates on two lines ([architecture.md](architecture.md#net--the-network-
              9 frames in, 8 out, 12 interrupts, 0 polled, 0 stack buffers held ok
 ```
 
-That is aarch64, where every frame arrives by interrupt; i686 reads the same on line 10.
-x86_64 has no trusted PCI interrupt route, so its line starts `polled: no interrupt route on
-this port` and counts `0 interrupts, 9 polled`. The interrupt half of the check does not
-apply there, and the rest does. Every wait is bounded by the clock: 5 s for the gateway, 3 s
-for each reply, 15 s for kbuild's first probe. A broken path fails the boot rather than
-timing it out.
+That is aarch64, where every frame arrives by interrupt. i686 reads the same on line 10,
+through the 8259A, and x86_64 on `line 17, MSI-X`. On a platform that delivers
+message-signalled interrupts, a card that came up on anything but MSI-X fails with `THE CARD
+IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT`. Every wait is bounded by the clock: 5 s for
+the gateway, 3 s for each reply, 15 s for kbuild's first probe. A broken path fails the boot
+rather than timing it out.
+
+On MSI-X the card first took no interrupts at all. Its table entry was written and unmasked,
+both queues read back vector 0, and QEMU's trace showed `virtio_notify` for its queues, but
+no `apic_deliver_irq` for its vector. The function was not a bus master: nothing in discovery
+sets the bit, QEMU's virtio DMA does not need it, and the disk's interrupts arrived only
+because SeaBIOS had made the disk a bus master to boot from it. The platform now sets the bit
+before programming a function's message.
 
 Host tests, without QEMU:
 
-- `kernel/net`: 20 tests against a simulated gateway. They cover RFC 1071 checksums, IPv4
+- `kernel/net`: 21 tests against a simulated gateway. They cover RFC 1071 checksums, IPv4
   lengths, fragments and bad checksums refused and counted, and the UDP pseudo-header. For
   ARP: resolution through the gateway and its retry limit, a reply with the wrong operation
   ignored, and expiry followed by a new request. Then echo replies matched by sequence
   number, a UDP round trip, the stack answering ARP and pings addressed to it and ignoring
   frames for other hosts, a refused send holding no buffer, a full inbox counted, a flood
   handled in bounded polls, and the pool refusing a second give.
-- `drivers/net/virtio-net`: 13 tests against the shared fake device on both queues. They cover
+- `drivers/net/virtio-net`: 16 tests against the shared fake device on both queues, three of
+  them for MSI-X: both queues on one vector with the status register left unread, a refused
+  vector failing bring-up, and no vector without one. They cover
   the handshake, the address and its fallback, a legacy or block device refused, a frame
   sent behind a zero header, bad lengths refused, a full transmit queue recovering, frames
   received in order with their buffers posted again, a short completion and one naming a
@@ -758,7 +767,8 @@ Falsified, each mutation confirmed applied, then restored:
 | ARP requests sent with operation 3 | `aarch64-virt`, `i686-qemu` | **not caught at first**: both passed. QEMU asks for the guest's address before it forwards kbuild's first probe, and the stack learned the gateway from that request. The check now forgets the gateway and requires a reply to its own request, and fails with `THE GATEWAY NEVER ANSWERED AN ARP REQUEST`. Eight host tests fail too |
 | The first received frame's buffer never given back to the pool | `aarch64-virt`, `x86_64-qemu` | every exchange passed, then `1 stack buffers held, A STACK BUFFER WAS NOT GIVEN BACK`. Seven host tests fail too |
 | The 500th received frame's buffer never given back | `aarch64-virt-smp` stress | the boot check passed, then `stress AUDIT FAILED at 3 s: network: a stack buffer is out of its pool with nothing using it (a leak)` |
-| The card's interrupt handler acknowledges but never drains the receive queue | `aarch64-virt`, `i686-qemu` | `0 frames in, 28 interrupts`, then `THE GATEWAY NEVER ANSWERED AN ARP REQUEST`. The host test `in_interrupt_mode_only_the_handler_collects` fails too. **Not observable on x86_64**, where the card is polled and the handler never runs: that boot passed |
+| The card's interrupt handler acknowledges but never drains the receive queue | `aarch64-virt`, `i686-qemu`, `x86_64-qemu` | `0 frames in, 28 interrupts`, then `THE GATEWAY NEVER ANSWERED AN ARP REQUEST`, on the GIC, the 8259A and MSI-X alike. The host test `in_interrupt_mode_only_the_handler_collects` fails too. Before MSI-X landed the x86_64 card was polled, and the same mutation passed there |
+| The platform does not make a function a bus master before programming its message | `x86_64-qemu` | the disk still passes `block irq` on MSI-X, because SeaBIOS made it a bus master; the card takes `0 interrupts` and fails with `THE GATEWAY NEVER ANSWERED AN ARP REQUEST`. The host test `a_bus_master_keeps_the_rest_of_its_command_register` covers the register write |
 | `recv` drains the receive queue even in interrupt-driven mode | host test | `in_interrupt_mode_only_the_handler_collects` fails. **Not observable under QEMU**: `aarch64-virt` and `i686-qemu` both passed with `0 polled`, because the card completes and interrupts before the waiter first looks, so the handler always collects first. The check is sound, but QEMU cannot make the waiter win |
 
 **Not covered.** TCP, fragment reassembly, IPv6, DHCP and a socket API do not exist. The

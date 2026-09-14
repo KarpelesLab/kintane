@@ -1062,8 +1062,16 @@ tests use it and no image carries it.
 - **Where the card takes interrupts.** On aarch64, through the GIC. On i686, through the 8259A
   on the line firmware routed: the test machine puts the card at PCI slot `0x1e` on `pc`,
   whose INTA routes to IRQ 10, because the disk's function is on 11 and a line has one handler.
-  On x86_64 no PCI line is trusted without `_PRT` or MSI-X, so the card is polled. Nothing in
-  the driver changes when an MSI-X vector delivers its interrupt instead.
+  On x86_64, by MSI-X through `device::msi`, as the disk: `virtio::bind::Claims` claims the
+  table's BAR and entry 0, the platform programs and unmasks it, and
+  `VirtioNet::bring_up_with_vector` puts both queues on that entry. On a vector the handler
+  does not read the interrupt status register, which the device does not set for it.
+- **Bus mastering.** A message-signalled interrupt is a write the function makes, and a
+  function that is not a bus master makes none. Nothing in discovery set the command
+  register's bit, and under QEMU virtio's DMA does not need it, so the card's queues worked
+  and only its interrupts went missing. The disk's arrived only because SeaBIOS had set the
+  bit to boot from it. The platform now sets it (`msi::set_bus_master`) before it programs a
+  function's message.
 - **Registers through the device window.** `Claims::transport` reaches both transports through
   `hal::paging::device_virt`, as virtio-blk did, and the platform's slot scan identifies a
   memory-mapped network card the way it identifies a disk.
