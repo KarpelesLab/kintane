@@ -295,8 +295,26 @@ fn exchange(
     now: &mut dyn FnMut() -> u64,
 ) -> Option<&'static str> {
     let spin = core::hint::spin_loop;
-    let Some(mac) = wait(card, RESOLVE_NS, now, spin, |s, t| s.resolve(card, GATEWAY, t)) else {
-        return Some("THE GATEWAY WAS NEVER RESOLVED");
+    // Forgotten first. QEMU asks for the guest's address before it forwards kbuild's first
+    // probe, and the stack learns the gateway from that request. Resolved from that alone,
+    // the check passed with a stack whose own requests no gateway could answer, so the
+    // gateway counts as resolved only once a reply to one of them has arrived.
+    let replies = {
+        let mut s = STACK.lock_irqsave();
+        s.forget(GATEWAY);
+        s.counters().arp_learned
+    };
+    let resolved = wait(card, RESOLVE_NS, now, spin, |s, t| {
+        let mac = s.resolve(card, GATEWAY, t)?;
+        if s.counters().arp_learned > replies {
+            return Some(mac);
+        }
+        // Learned again from someone else's request: forget it, so the next try asks.
+        s.forget(GATEWAY);
+        None
+    });
+    let Some(mac) = resolved else {
+        return Some("THE GATEWAY NEVER ANSWERED AN ARP REQUEST");
     };
     c.write_str("; gateway ");
     write_mac(c, mac);

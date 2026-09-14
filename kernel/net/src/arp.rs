@@ -88,6 +88,15 @@ impl Cache {
         self.entries[victim] = Some(entry);
     }
 
+    /// Drop whatever is known about `ip`, live or not.
+    pub fn forget(&mut self, ip: Ipv4Addr) {
+        for slot in self.entries.iter_mut() {
+            if slot.is_some_and(|e| e.ip == ip) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Entries live at `now`.
     pub fn live(&self, now: u64) -> usize {
         self.entries

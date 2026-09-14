@@ -185,6 +185,14 @@ impl Stack {
         self.st.arp.lookup(ip, now)
     }
 
+    /// Forget `ip`'s hardware address, so the next [`resolve`](Self::resolve) asks for it.
+    ///
+    /// The retry limit is kept: forgetting is not a way to send requests faster than
+    /// [`ARP_RETRY_NS`].
+    pub fn forget(&mut self, ip: Ipv4Addr) {
+        self.st.arp.forget(ip);
+    }
+
     /// Receive and handle what the device has, answering what needs an answer. Returns how
     /// many frames were handled. Every buffer taken is given back before this returns.
     pub fn poll<N: Nic>(&mut self, nic: &N, now: u64) -> usize {

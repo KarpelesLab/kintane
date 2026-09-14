@@ -215,7 +215,7 @@ fn a_udp_checksum_covers_the_pseudo_header() {
 fn the_gateway_is_resolved_and_the_request_is_not_repeated_every_call() {
     let link = Link::new();
     let mut s = stack();
-    assert_eq!(s.resolve(&*link_ref(&link), GATEWAY, 0), None);
+    assert_eq!(s.resolve(&link, GATEWAY, 0), None);
     assert_eq!(s.resolve(&link, GATEWAY, MS), None);
     assert_eq!(s.counters().arp_requests_sent, 1, "a second call within the retry is quiet");
     s.poll(&link, 2 * MS);
@@ -229,8 +229,21 @@ fn the_gateway_is_resolved_and_the_request_is_not_repeated_every_call() {
     assert!(s.balanced());
 }
 
-fn link_ref(l: &Link) -> &Link {
-    l
+#[test]
+fn a_forgotten_address_is_asked_for_again_but_not_sooner_than_the_retry_limit() {
+    let link = Link::new();
+    let mut s = stack();
+    resolved(&mut s, &link);
+    assert_eq!(s.counters().arp_learned, 1);
+    s.forget(GATEWAY);
+    assert_eq!(s.arp_entry(GATEWAY, 3 * MS), None);
+    assert_eq!(s.resolve(&link, GATEWAY, 3 * MS), None);
+    assert_eq!(s.counters().arp_requests_sent, 1, "the request at 0 ms still holds the retry");
+    assert_eq!(s.resolve(&link, GATEWAY, 300 * MS), None);
+    assert_eq!(s.counters().arp_requests_sent, 2);
+    s.poll(&link, 301 * MS);
+    assert_eq!(s.resolve(&link, GATEWAY, 302 * MS), Some(GATEWAY_MAC));
+    assert_eq!(s.counters().arp_learned, 2, "resolved by a second reply, counted");
 }
 
 #[test]
