@@ -223,6 +223,10 @@ pub fn start_resumed(
         install: false,
         args: [0; 4],
     };
+    // Only here, for a Linux process's `fork` or `clone`: a native thread that has exited stays
+    // in the table until its check reaps it, which is what `thread_join` and the checks that
+    // wait for a thread read.
+    reap_exited();
     start_on_pool(start, Some((regs, tls)))
 }
 
@@ -256,6 +260,29 @@ fn start_on_pool(start: Start, resume: Option<Resume>) -> Option<ThreadId> {
             THREAD[index].store(FREE, Ordering::Release);
             None
         }
+    }
+}
+
+/// Give back every pool entry whose thread has already exited, reaping it, so its stack can
+/// run another: a Linux process that forks and clones in one check starts more threads than
+/// the pool holds at once. An entry is claimed while its thread is reaped, so two starters
+/// never reap one thread, and one whose thread still runs is left as it was.
+fn reap_exited() {
+    for thread in &THREAD {
+        let raw = thread.load(Ordering::Acquire);
+        if raw >= CLAIMING {
+            continue;
+        }
+        let id = ThreadId::new(raw as u32);
+        if preempt::alive(id)
+            || thread
+                .compare_exchange(raw, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            continue;
+        }
+        let back = if preempt::reap(id) { FREE } else { raw };
+        thread.store(back, Ordering::Release);
     }
 }
 

@@ -37,6 +37,16 @@ pub(crate) fn release(_slot: usize) {}
 )]
 pub(crate) fn wake_all_waiters() {}
 
+/// No Linux process to report: a trap kills a native process, recorded as `userproc::KILLED`,
+/// all ones.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "only userspace traps processes")
+)]
+pub(crate) fn killed_by<P>(_personality: P) -> u64 {
+    u64::MAX
+}
+
 /// No Linux parent to tell.
 #[cfg_attr(
     not(CONFIG_USERSPACE),

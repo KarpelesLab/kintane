@@ -150,6 +150,53 @@ impl hal::user::UserRegisters for Registers {
     fn pc(&self) -> usize {
         self.rip as usize
     }
+    /// In field order: `rax, rbx, rcx, rdx, rsi, rdi, rbp, r8`–`r15, rip, rflags, rsp`.
+    fn to_words(&self) -> [u64; hal::user::REGISTER_WORDS] {
+        let mut w = [0u64; hal::user::REGISTER_WORDS];
+        w[..18].copy_from_slice(&[
+            self.rax,
+            self.rbx,
+            self.rcx,
+            self.rdx,
+            self.rsi,
+            self.rdi,
+            self.rbp,
+            self.r8,
+            self.r9,
+            self.r10,
+            self.r11,
+            self.r12,
+            self.r13,
+            self.r14,
+            self.r15,
+            self.rip,
+            self.rflags,
+            self.rsp,
+        ]);
+        w
+    }
+    fn from_words(w: &[u64; hal::user::REGISTER_WORDS]) -> Self {
+        Registers {
+            rax: w[0],
+            rbx: w[1],
+            rcx: w[2],
+            rdx: w[3],
+            rsi: w[4],
+            rdi: w[5],
+            rbp: w[6],
+            r8: w[7],
+            r9: w[8],
+            r10: w[9],
+            r11: w[10],
+            r12: w[11],
+            r13: w[12],
+            r14: w[13],
+            r15: w[14],
+            rip: w[15],
+            rflags: w[16],
+            rsp: w[17],
+        }
+    }
 }
 
 impl SyscallFrameTrait for SyscallFrame {

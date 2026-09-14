@@ -23,6 +23,11 @@ pub const EXIT_GROUP: u64 = 94;
 pub const OPENAT: u64 = 56;
 pub const PIPE2: u64 = 59;
 pub const GETRANDOM: u64 = 278;
+pub const RT_SIGACTION: u64 = 134;
+pub const RT_SIGPROCMASK: u64 = 135;
+pub const RT_SIGPENDING: u64 = 136;
+pub const KILL: u64 = 129;
+pub const TGKILL: u64 = 131;
 
 const SIGCHLD: u64 = 17;
 
@@ -129,6 +134,132 @@ unsafe extern "C" {
         tls: u64,
         f: extern "C" fn() -> u64,
     ) -> i64;
+}
+
+// Signals, as on x86_64: the restorer makes `rt_sigreturn`; the clobbering handler zeroes
+// x19–x29 and returns through x30, which the kernel pointed at the restorer; and
+// `linux_raise_marked` marks x19–x30, sends the signal with `kill` (x0 pid, x1 signal) and
+// answers 1 in x0 if every mark is back.
+global_asm!(
+    ".pushsection .text.linux_signals, \"ax\"",
+    ".globl linux_restorer",
+    "linux_restorer:",
+    "    mov x8, #139",
+    "    svc #0",
+    "    brk #2",
+    ".globl linux_clobber",
+    "linux_clobber:",
+    "    adrp x9, {hits}",
+    "    add x9, x9, :lo12:{hits}",
+    "    ldr x10, [x9]",
+    "    add x10, x10, #1",
+    "    str x10, [x9]",
+    "    mov x19, xzr",
+    "    mov x20, xzr",
+    "    mov x21, xzr",
+    "    mov x22, xzr",
+    "    mov x23, xzr",
+    "    mov x24, xzr",
+    "    mov x25, xzr",
+    "    mov x26, xzr",
+    "    mov x27, xzr",
+    "    mov x28, xzr",
+    "    mov x29, xzr",
+    "    ret",
+    ".globl linux_raise_marked",
+    "linux_raise_marked:",
+    "    stp x19, x20, [sp, #-96]!",
+    "    stp x21, x22, [sp, #16]",
+    "    stp x23, x24, [sp, #32]",
+    "    stp x25, x26, [sp, #48]",
+    "    stp x27, x28, [sp, #64]",
+    "    stp x29, x30, [sp, #80]",
+    "    ldr x19, =0x5349474e414c0013",
+    "    ldr x20, =0x5349474e414c0014",
+    "    ldr x21, =0x5349474e414c0015",
+    "    ldr x22, =0x5349474e414c0016",
+    "    ldr x23, =0x5349474e414c0017",
+    "    ldr x24, =0x5349474e414c0018",
+    "    ldr x25, =0x5349474e414c0019",
+    "    ldr x26, =0x5349474e414c001a",
+    "    ldr x27, =0x5349474e414c001b",
+    "    ldr x28, =0x5349474e414c001c",
+    "    ldr x29, =0x5349474e414c001d",
+    "    ldr x30, =0x5349474e414c001e",
+    "    mov x8, #129",
+    "    svc #0",
+    "    mov x0, xzr",
+    "    ldr x9, =0x5349474e414c0013",
+    "    cmp x19, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c0014",
+    "    cmp x20, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c0015",
+    "    cmp x21, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c0016",
+    "    cmp x22, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c0017",
+    "    cmp x23, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c0018",
+    "    cmp x24, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c0019",
+    "    cmp x25, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c001a",
+    "    cmp x26, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c001b",
+    "    cmp x27, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c001c",
+    "    cmp x28, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c001d",
+    "    cmp x29, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x5349474e414c001e",
+    "    cmp x30, x9",
+    "    b.ne 2f",
+    "    mov x0, #1",
+    "2:",
+    "    ldp x29, x30, [sp, #80]",
+    "    ldp x27, x28, [sp, #64]",
+    "    ldp x25, x26, [sp, #48]",
+    "    ldp x23, x24, [sp, #32]",
+    "    ldp x21, x22, [sp, #16]",
+    "    ldp x19, x20, [sp], #96",
+    "    ret",
+    "    .ltorg",
+    ".popsection",
+    hits = sym crate::CLOBBER_HITS,
+);
+
+unsafe extern "C" {
+    fn linux_restorer();
+    fn linux_clobber();
+    fn linux_raise_marked(pid: u64, sig: u64) -> u64;
+}
+
+/// The restorer every handler is installed with.
+pub fn restorer() -> u64 {
+    linux_restorer as *const () as u64
+}
+
+/// A handler that zeroes every callee-saved register before it returns.
+pub fn clobber_handler() -> u64 {
+    linux_clobber as *const () as u64
+}
+
+/// Send `sig` to process `pid` with every callee-saved register marked, and say whether every
+/// mark survived the handler.
+pub fn raise_marked(pid: u64, sig: u64) -> bool {
+    // SAFETY: the function saves and restores every register it marks, and makes one system call.
+    unsafe { linux_raise_marked(pid, sig) == 1 }
 }
 
 /// The flags a thread library's `clone` passes for a thread.

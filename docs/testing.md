@@ -993,6 +993,36 @@ switch between them is one a thread pointer must survive. On `x86_64-qemu` the l
 
 On `aarch64-virt` it read 42 futex waits blocked and 42 woken.
 
+**Signals.** Once `linux mt` has torn its processes down, a `linux sig` check runs the program again,
+as `hello signals`, on the same slot and stacks. Its exit code is 47 when every step behaved:
+
+| Step | What it checks |
+|---|---|
+| 110 | `rt_sigaction` refuses a handler for `SIGKILL` and for `SIGSTOP` |
+| 111–113 | a signal the process sends itself with `kill` runs its handler on the way out of that call. The handler, in assembly, zeroes every callee-saved register (`rbx`, `rbp`, `r12`–`r15`; `x19`–`x29`) and returns through the restorer, and every register marked before the `kill` holds its mark after it, `x30` too |
+| 114–118 | `SIGUSR2` blocked with `rt_sigprocmask` and sent: its handler does not run, `rt_sigpending` shows it, and unblocking it runs the handler once, whose `siginfo` names the signal |
+| 119 | with `SIGPIPE` ignored, a write to a pipe with no reader is `EPIPE` |
+| 120–124 | a thread started with `clone` blocks reading an empty pipe; after 50 yields the first thread sends it `SIGUSR1` with `tgkill`; its handler runs on it, and its read answers `EINTR` |
+| 125–127 | a child writing to a pipe with no reader is ended by `SIGPIPE`'s default action; its end sends the parent `SIGCHLD`, whose handler runs once, and `wait4` still reaps the child and reports signal 13 |
+| 128–130 | a child blocked reading a pipe is ended by `SIGTERM`'s default action, reported as signal 15 |
+| 131–132 | a child is refused a `SIGKILL` handler, spins yielding, and is ended by `SIGKILL`, reported as signal 9 |
+
+The check requires that exit code, and counts from the kernel: at least four handlers run, as many
+frames returned through `rt_sigreturn` as handlers run, at least one blocked call a signal ended
+(the kernel counts a pipe read or futex wait that had registered and blocked before it did), and at
+least three processes a signal's default action ended. It also requires every thread ended, no file
+left open and every frame back. On `x86_64-qemu` and `aarch64-virt`, and on both SMP presets:
+
+```
+  linux sig  handlers, masks, EINTR, SIGCHLD, SIGPIPE and default actions ok; 4 handlers run, 4 returned, 1 blocked calls interrupted, 3 processes ended by a signal; 0 frames left ok
+```
+
+A check that forks three children and clones a thread starts five process threads, more than the
+pool of three holds at once. A Linux `fork` or `clone` now reaps a pool entry whose thread has
+exited before it looks for a free one; before that, the first run stopped at step 128, its second
+`fork` refused. Native thread starts do not reap: a native thread that has exited stays in the
+table until its check reaps it.
+
 **In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
 the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.
 It starts each process as it builds it and pins both to one CPU, a
@@ -1064,7 +1094,7 @@ describe: `x86_64-qemu` with "user process: a process made no progress", and `i6
 base commit, `9576bb2`, failed both the same way in the same conditions, `i686-qemu` once in three
 runs. `i686` does not build the personality.
 
-`kernel/linux` is host-tested (9 tests), covering:
+`kernel/linux` is host-tested (15 tests), covering:
 
 - every dispatched number, for both architectures, against its name in that architecture's table,
   and `decode` finding it;
@@ -1073,7 +1103,22 @@ runs. `i686` does not build the personality.
 - the errno encoding and its range;
 - the start-up stack, read back the way start-up code reads it, at 40 string lengths for its
   alignment;
-- the `struct stat` offsets in both layouts, and `struct utsname`'s.
+- the `struct stat` offsets in both layouts, and `struct utsname`'s;
+- signals: `SIGKILL` and `SIGSTOP` taking no disposition and every default action, `struct
+  sigaction` read back, and a signal's exit code told apart from a program's and from the kernel's
+  killed;
+- each architecture's signal frame, at Linux's offsets, built and read back to the context it was
+  built from, with the handler's registers, x86_64's red zone and alignment, and aarch64's frame
+  record;
+- a frame whose return address is outside the user half, whose aarch64 state is not EL0, or which
+  is short, refused; x86_64 flags a program may not hold dropped; a mask blocking `SIGKILL` given
+  back without it; and a stack with no room below it taking no frame.
+
+The `sigframe` fuzz target reads random bytes, and frames `signal::build` laid out and then
+corrupted, as a frame `rt_sigreturn` would find, and asserts that nothing it accepts carries a
+return address outside the user half, flags or a processor state that are not a program's own, or a
+mask that blocks `SIGKILL` or `SIGSTOP`. A 200,000-input campaign ran with no failures, 31% of
+inputs accepted.
 
 `kernel/mm` has 2 more, for `Vm::fork_into`: two address spaces over one share store, where a write
 on either side after the fork stays on that side and the other still reads the value from before,
@@ -1098,6 +1143,10 @@ was restored and compared byte for byte.
 | A pipe read that answers `EAGAIN` instead of blocking while a writer is left | boot: `linux mt  the program exited 0x0000000000000037, WRONG; 0 pipe reads blocked`, step 55 |
 | `Vm::fork_into` mapping the shared pages writable in both spaces, so no write copies | boot: `linux mt  the program exited 0x000000000000003b, WRONG`, step 59: the parent read the child's write. Host: `a_fork_shares_every_page_and_a_write_on_either_side_stays_on_that_side` fails |
 | A futex wake that wakes its bucket without counting the wake | boot: `linux mt  the program NEVER EXITED; 1 pipe reads blocked, 0 futex waits blocked, 1 woken; NOTHING REALLY BLOCKED; A THREAD NEVER ENDED`. The woken waiter found the count unchanged and waited again, and nothing woke it after |
+| `signal::restore` giving `rbx` back as zero (x86_64) | boot: `linux sig  the program exited 0x71, WRONG; 1 handlers run, 1 returned`, step 113: a callee-saved register did not survive the handler |
+| Delivery ignoring the mask (aarch64) | boot: `linux sig  the program exited 0x73, WRONG`, step 115: the blocked `SIGUSR2`'s handler ran |
+| Sending a signal waking no blocked thread (x86_64) | boot: `linux sig  the program NEVER EXITED; 2 handlers run, 2 returned, 0 blocked calls interrupted; A THREAD NEVER ENDED`. The thread in its read was never woken to see the signal, and the check's patience, not a hang, ended the run |
+| `rt_sigaction` taking a disposition for `SIGKILL` (aarch64) | boot: `linux sig  the program exited 0x6e, WRONG`, step 110 |
 
 `LINUX_ENOSYS_FATAL=y` was booted as well. The boot passes, with `exit 0xffffffffffffffff ok` and
 the log line `linux: getrandom (318) is not implemented, and LINUX_ENOSYS_FATAL ends the process`.

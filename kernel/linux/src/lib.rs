@@ -18,6 +18,8 @@
 //!   `AT_RANDOM`'s bytes above them. The layout is the same on both architectures.
 //! * **Structures.** [`stat_bytes`] and [`utsname`], the two layouts a static program's start-up
 //!   and the check's program read. `struct stat` differs between the two ABIs.
+//! * **Signals.** [`signal`]: the numbers and their default actions, `struct sigaction`, and the
+//!   signal frame each architecture pushes and `rt_sigreturn` reads back, validated there.
 //!
 //! Everything is data or a pure function of data, so it is host-tested and depends on
 //! nothing.
@@ -27,6 +29,8 @@
 
 #[cfg(test)]
 mod tests;
+
+pub mod signal;
 
 /// The x86_64 system call table, in the format of Linux's `syscall_64.tbl`.
 pub const TABLE_X86_64: &str = include_str!("../syscalls_x86_64.tbl");
@@ -112,11 +116,18 @@ pub enum Call {
     ArchPrctl,
     Futex,
     Openat,
+    RtSigaction,
+    RtSigprocmask,
+    RtSigreturn,
+    RtSigpending,
+    Sigaltstack,
+    Kill,
+    Tgkill,
 }
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 23] = [
+    pub const ALL: [Call; 30] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -140,6 +151,13 @@ impl Call {
         Call::ArchPrctl,
         Call::Futex,
         Call::Openat,
+        Call::RtSigaction,
+        Call::RtSigprocmask,
+        Call::RtSigreturn,
+        Call::RtSigpending,
+        Call::Sigaltstack,
+        Call::Kill,
+        Call::Tgkill,
     ];
 
     /// The name the tables give it.
@@ -168,6 +186,13 @@ impl Call {
             Call::ArchPrctl => "arch_prctl",
             Call::Futex => "futex",
             Call::Openat => "openat",
+            Call::RtSigaction => "rt_sigaction",
+            Call::RtSigprocmask => "rt_sigprocmask",
+            Call::RtSigreturn => "rt_sigreturn",
+            Call::RtSigpending => "rt_sigpending",
+            Call::Sigaltstack => "sigaltstack",
+            Call::Kill => "kill",
+            Call::Tgkill => "tgkill",
         }
     }
 
@@ -198,6 +223,13 @@ impl Call {
             Call::ArchPrctl => (158, NONE),
             Call::Futex => (202, 98),
             Call::Openat => (257, 56),
+            Call::RtSigaction => (13, 134),
+            Call::RtSigprocmask => (14, 135),
+            Call::RtSigreturn => (15, 139),
+            Call::RtSigpending => (127, 136),
+            Call::Sigaltstack => (131, 132),
+            Call::Kill => (62, 129),
+            Call::Tgkill => (234, 131),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,
@@ -306,13 +338,16 @@ pub const fn exited_status(code: u64) -> u32 {
     ((code & 0xff) as u32) << 8
 }
 
-/// The status `wait4` reports for a child the kernel killed. Without signals there is no
-/// signal to name; this is `SIGKILL`'s, which is what the kernel did.
+/// The status `wait4` reports for a child the kernel killed for a reason no signal names, such
+/// as a system call under LINUX_ENOSYS_FATAL: `SIGKILL`'s, which is what the kernel did. A child
+/// a signal ended reports that signal ([`signal::status`]).
 pub const KILLED_STATUS: u32 = 9;
 
 /// Linux error numbers the personality returns. Linux's values.
 pub mod errno {
     pub const ENOENT: i64 = 2;
+    pub const ESRCH: i64 = 3;
+    pub const EINTR: i64 = 4;
     pub const EIO: i64 = 5;
     pub const ENOEXEC: i64 = 8;
     pub const EBADF: i64 = 9;
@@ -376,6 +411,10 @@ pub enum Failure {
     TimedOut,
     /// The call is not implemented.
     NotImplemented,
+    /// A blocking call was interrupted by a signal with a handler to run, and is not restarted.
+    Interrupted,
+    /// `kill` or `tgkill` named no Linux process or thread.
+    NoProcess,
 }
 
 /// The Linux error number for `f`. One exhaustive `match`, reviewed as a whole.
@@ -402,11 +441,13 @@ pub const fn errno(f: Failure) -> i64 {
         // non-blocking cases.
         Failure::TryAgain => EAGAIN,
         Failure::NoChild => ECHILD,
-        // Linux also raises `SIGPIPE`; there are no signals, so the error is all a program gets.
+        // The writer is sent `SIGPIPE` as well, whose default action ends it before it sees this.
         Failure::BrokenPipe => EPIPE,
         Failure::NotExecutable => ENOEXEC,
         Failure::TimedOut => ETIMEDOUT,
         Failure::NotImplemented => ENOSYS,
+        Failure::Interrupted => EINTR,
+        Failure::NoProcess => ESRCH,
     }
 }
 

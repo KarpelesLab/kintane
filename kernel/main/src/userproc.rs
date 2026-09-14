@@ -637,9 +637,10 @@ fn on_kill(trap: UserTrap) -> ! {
     let (last, exit) = match lock(slot) {
         Some(mut held) => {
             let p = held.process();
-            // A fault before the program set an exit code is the process being killed. If
-            // it had already exited, `record_exit` keeps that.
-            record_exit(p, KILLED);
+            // A fault before the program set an exit code is the process being killed: as a
+            // Linux parent is told, by SIGSEGV. If it had already exited, `record_exit` keeps
+            // that.
+            record_exit(p, crate::personality::killed_by(p.personality));
             (leave(slot), p.exit)
         }
         None => (leave(slot), Some(KILLED)),
@@ -870,6 +871,19 @@ pub(crate) fn exit_thread_current(slot: usize, code: u64) -> ! {
         None => (leave(slot), Some(code)),
     };
     finish_thread(slot, last, exit)
+}
+
+/// End process `slot` with `code`, from outside it: what a signal whose action ends a process
+/// does. Its threads end as an `exit_group` ends them: at their next call, at the wait they are
+/// in, or from an interrupt if they spin in user mode. Called holding no process lock.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "used only by the Linux personality")
+)]
+pub(crate) fn end_process(slot: usize, code: u64) {
+    if let Some(mut held) = lock(slot) {
+        record_exit(held.process(), code);
+    }
 }
 
 /// Build a Linux process for `program` in `slot` and start its first thread, from a kernel
