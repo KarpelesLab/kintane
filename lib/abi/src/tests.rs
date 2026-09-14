@@ -245,10 +245,8 @@ impl Handler for Recorder {
         ready: UserPtr,
         timeout_ns: u64,
     ) -> Result<u64, Error> {
-        self.calls.push((
-            "object_wait_any",
-            vec![entries.0, count as u64, ready.0, timeout_ns],
-        ));
+        self.calls
+            .push(("object_wait_any", vec![entries.0, count as u64, ready.0, timeout_ns]));
         Ok(0)
     }
 }

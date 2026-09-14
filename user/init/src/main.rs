@@ -1031,9 +1031,18 @@ fn poll_wait(console: Handle, channel: Handle, event: Handle) -> u64 {
         return 0x701;
     };
     let set = [
-        rt::Watch { handle: channel, interest: rt::ready::READ },
-        rt::Watch { handle: event, interest: rt::ready::READ },
-        rt::Watch { handle: queue, interest: rt::ready::READ },
+        rt::Watch {
+            handle: channel,
+            interest: rt::ready::READ,
+        },
+        rt::Watch {
+            handle: event,
+            interest: rt::ready::READ,
+        },
+        rt::Watch {
+            handle: queue,
+            interest: rt::ready::READ,
+        },
     ];
     let mut ready = [0u32; 3];
 

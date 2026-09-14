@@ -53,10 +53,9 @@
 
 mod check;
 
-pub use check::check;
-
 use core::sync::atomic::Ordering;
 
+pub use check::check;
 use kobject::ObjectType;
 use kobject::handle::Entry;
 

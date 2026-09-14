@@ -20,8 +20,8 @@
 //!
 //! * `init` exits with [`POLL_SUCCESS`]; a failure names the step or the round.
 //! * Every request this check received was answered, and there was at least one.
-//! * Threads really blocked and were really woken: `wait::stats` and [`super::stats`] both move,
-//!   so a kernel whose "waits" all found something at their first look fails here.
+//! * Threads really blocked and were really woken: `wait::stats` and [`super::stats`] both move, so
+//!   a kernel whose "waits" all found something at their first look fails here.
 //! * Every thread ended, and every object and frame is back.
 
 use hal::EarlyConsole;
@@ -180,8 +180,7 @@ fn run(program: &elf::Program) -> Run {
     let Some(event) = objects::create(Object::Event { signalled: false }) else {
         return out;
     };
-    let granted =
-        userproc::slot(SLOT).and_then(|p| p.grant(event, ObjectType::Event, Rights::ALL));
+    let granted = userproc::slot(SLOT).and_then(|p| p.grant(event, ObjectType::Event, Rights::ALL));
     let Some(event_handle) = granted else {
         objects::retire(event);
         return out;
@@ -236,8 +235,10 @@ fn run(program: &elf::Program) -> Run {
         }
         preempt::sleep_until(timekeeping::now().saturating_add(POLL));
     }
-    out.took_ms = (timekeeping::now().as_nanos().saturating_sub(started.as_nanos()) / 1_000_000)
-        as usize;
+    out.took_ms = (timekeeping::now()
+        .as_nanos()
+        .saturating_sub(started.as_nanos())
+        / 1_000_000) as usize;
     if !preempt::alive(main) && userproc::threads_live(SLOT) == 0 {
         // Every thread has ended, so nothing else borrows the process.
         out.code = userproc::slot(SLOT).and_then(|p| p.exit);

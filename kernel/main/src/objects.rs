@@ -722,9 +722,7 @@ pub fn next_timer_for(queue: ObjectId) -> Option<u64> {
     for cell in CELLS.iter() {
         let due = cell.with(|o| match o {
             Object::Timer {
-                queue: q,
-                deadline,
-                ..
+                queue: q, deadline, ..
             } if *q == queue && *deadline != DISARMED => Some(*deadline),
             _ => None,
         });

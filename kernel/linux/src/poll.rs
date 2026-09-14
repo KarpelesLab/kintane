@@ -12,10 +12,9 @@
 //! * **`poll`** takes `nfds` entries of [`POLLFD_BYTES`]: a signed descriptor, the events asked
 //!   for, and the events that happened, which the kernel writes back. A negative descriptor is
 //!   skipped and answers zero, as Linux does.
-//! * **`select`** takes three bitmaps of `nfds` bits each, least significant bit first, and
-//!   answers with the same bitmaps holding only what is ready. [`FD_SET_BYTES`] caps how much of
-//!   one the kernel reads; a program that asks past it is refused rather than truncated
-//!   silently.
+//! * **`select`** takes three bitmaps of `nfds` bits each, least significant bit first, and answers
+//!   with the same bitmaps holding only what is ready. [`FD_SET_BYTES`] caps how much of one the
+//!   kernel reads; a program that asks past it is refused rather than truncated silently.
 //! * **`epoll`** keeps its set in the kernel, and `epoll_wait` writes out `struct epoll_event`s.
 //!   That structure is packed on x86_64 and aligned on aarch64, so its size is the ABI's
 //!   ([`event_bytes`]) and every field is read and written at the offset that ABI gives it.
@@ -265,7 +264,11 @@ pub fn timeval_ns(bytes: &[u8; TIMESPEC_BYTES]) -> Result<u64, Failure> {
 
 /// Seconds and a fraction, as `timespec` and `timeval` both spell them: the fraction is
 /// refused at `fraction_limit` and scaled by `scale` nanoseconds.
-fn two_words(bytes: &[u8; TIMESPEC_BYTES], fraction_limit: u64, scale: u64) -> Result<u64, Failure> {
+fn two_words(
+    bytes: &[u8; TIMESPEC_BYTES],
+    fraction_limit: u64,
+    scale: u64,
+) -> Result<u64, Failure> {
     let mut seconds = [0u8; 8];
     let mut fraction = [0u8; 8];
     seconds.copy_from_slice(&bytes[..8]);

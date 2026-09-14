@@ -163,9 +163,9 @@ fn set_ready(slot: usize, i: usize) -> bool {
         Some(set) if set.used => set.members,
         _ => return false,
     };
-    members.iter().any(|m| {
-        m.used && poll::revents(poll::poll_events(m.events), ready_of(slot, m.fd)) != 0
-    })
+    members
+        .iter()
+        .any(|m| m.used && poll::revents(poll::poll_events(m.events), ready_of(slot, m.fd)) != 0)
 }
 
 // ---- the wait -------------------------------------------------------------------------------
@@ -384,10 +384,7 @@ pub(super) fn epoll_ctl(
     // The descriptor must name something, whatever the operation does with it.
     descriptor_of(slot, fd)?;
     let event = if op == poll::EPOLL_CTL_DEL {
-        EpollEvent {
-            events: 0,
-            data: 0,
-        }
+        EpollEvent { events: 0, data: 0 }
     } else {
         let mut bytes = [0u8; poll::EVENT_BYTES_MAX];
         let len = poll::event_bytes(super::ABI);
@@ -400,7 +397,10 @@ pub(super) fn epoll_ctl(
         event
     };
     let mut table = TABLE.lock_irqsave();
-    let set = table.get_mut(i).filter(|s| s.used).ok_or(Failure::BadDescriptor)?;
+    let set = table
+        .get_mut(i)
+        .filter(|s| s.used)
+        .ok_or(Failure::BadDescriptor)?;
     let held = set.members.iter().position(|m| m.used && m.fd == fd);
     match op {
         poll::EPOLL_CTL_ADD => {

@@ -1558,6 +1558,76 @@ queue, datagram sockets and `poll`/`select`/`epoll` do not exist. Native `listen
 QEMU machine routes the card's interrupt. The only network card driver is virtio-net, and it has
 run only under QEMU.
 
+### 2h. Waiting on many things at once
+
+Two checks, one native and one Linux, for the one mechanism: a wait over a set of things, where
+whichever becomes ready first ends it.
+
+**`readiness`** runs `init` in a poll mode holding three objects — a channel whose other end the
+check holds, an event the check signals, and a completion queue its own timer delivers to — and
+waits on all three with one call. Over that channel it asks the check to make one of them ready
+after a delay it names, so every wake is deliberate rather than incidental:
+
+```
+  readiness  init waited on a channel, an event and a timer at once; 18 of 18 wakes delivered in
+             150 ms, 20 blocks, 18 woken, 243 looks; 0 objects left, 0 frames left ok
+```
+
+In order: a wait with nothing ready runs out, and not before its timeout; a zero timeout answers
+at once with nothing ready; the event, then the channel, then the timer's completion each comes
+back as the member that is ready, and is consumed so it is not ready again; and then sixteen
+rounds ask for the event a little later each time. Those rounds vary when the wake lands relative to the wait,
+and each one must end with the event reported ready.
+
+**What they do not cover.** A wait looks at its set, registers on the queue, looks again, and only
+then blocks. The dangerous window is between the first look and registering, and these rounds do
+not reach it: this check serves requests on a millisecond poll, so the wake lands after the waiting
+thread is already blocked, whatever delay the round asked for. Removing the second look from
+`WaitQueue::wait_once` — the check that closes that window — leaves this check passing, 18 wakes of
+18. It is recorded here rather than implied away: the window is sub-microsecond and cannot be aimed
+at from another thread without a hook inside the wait, and that hook does not exist. What the
+rounds do prove is that a wake is delivered and acted on every time, rather than a wait expiring at
+its deadline and finding the thing ready afterwards, which is what the counters distinguish.
+
+The boot fails if the program does not exit with its success code, if a request went unanswered,
+or if nothing really blocked and was woken — the counters above are what make "waited" mean
+waited. A lost wake shows as a round that never ends, so the program's patience is far longer than
+a round takes and the check reports it rather than hanging the boot. The difference the wake path
+makes is visible in those numbers: with the set queue woken only by channels and the card, the
+same run delivered 13 wakes in 60 seconds with 2 of them woken — the rest were waits expiring at
+their deadline and finding the event already signalled.
+
+**`poll`, inside `linux net`**, is the same mechanism through Linux's calls. The check announces
+the guest's listener to kbuild twice under two numbers, so kbuild makes two connections into one
+listener, and the program serves them in the order they arrive while watching the listener for the
+next one:
+
+```
+  linux net  tcp client ok; server ok; poll ok (two connections, 4 announcements)
+```
+
+It waits with `ppoll` over the listener and its connections; serves each request and checks
+kbuild's verdict; requires a wait over an idle listener to run out; repeats it through `pselect6`,
+and through `select` and `poll` on the architecture that has them; adds both connections to an
+`epoll` set and requires `epoll_pwait` to report them; and requires an `EPOLLET` interest to be
+refused with `EINVAL`, since edge-triggered is not built. A connection that arrives carrying
+nothing is QEMU's port forward accepting before kbuild is there, not a failure: it is closed and
+another is waited for, up to a bound. The `linux net` verdict also requires every `epoll` set to
+have been let go of, as it already requires of sockets.
+
+Each property was falsified: the mutation applied, the boot run, the failure seen, and the file
+restored.
+
+| Mutation | Result |
+|---|---|
+| A socket is never reported ready (`ready_of`) | `linux net`: `poll NEVER EXITED, A THREAD NEVER ENDED`; the boot fails |
+| A wait runs out at once whatever timeout it was given | `readiness`: `init exited 0x710, WRONG` — the step that requires a timeout not to fire early — with `A REQUEST WAS NEVER ANSWERED, NOTHING REALLY BLOCKED OR WAS WOKEN` |
+| The second look after registering is removed from `WaitQueue::wait_once` | **`readiness` still passed**, 18 of 18 wakes delivered. The window it closes is not reached by this check; see above. |
+
+Timing is measured on the native side only. This personality has no `clock_gettime`, so a Linux
+program here cannot read a clock to say its timeout ran out on time; `readiness` is where that is
+checked.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

@@ -1232,7 +1232,10 @@ fn select_idle(fd: u64, timeout_ns: u64) -> (i64, Option<i64>) {
     fd_set_bit(&mut read, fd);
     let nfds = fd + 1;
     // `pselect6` takes a `timespec` and a pointer to (mask, size), which is null here.
-    let spec = [(timeout_ns / 1_000_000_000) as i64, (timeout_ns % 1_000_000_000) as i64];
+    let spec = [
+        (timeout_ns / 1_000_000_000) as i64,
+        (timeout_ns % 1_000_000_000) as i64,
+    ];
     let mut copy = read;
     let p = sys::call(
         sys::PSELECT6,
@@ -1247,7 +1250,10 @@ fn select_idle(fd: u64, timeout_ns: u64) -> (i64, Option<i64>) {
     );
     // `select` takes a `timeval`: seconds and microseconds.
     let plain = sys::SELECT.map(|nr| {
-        let tv = [(timeout_ns / 1_000_000_000) as i64, ((timeout_ns % 1_000_000_000) / 1_000) as i64];
+        let tv = [
+            (timeout_ns / 1_000_000_000) as i64,
+            ((timeout_ns % 1_000_000_000) / 1_000) as i64,
+        ];
         let mut copy = read;
         sys::call(nr, [nfds, copy.as_mut_ptr() as u64, 0, 0, tv.as_ptr() as u64, 0])
     });
@@ -1341,7 +1347,10 @@ fn poll_mode() -> ! {
         while i < accepted {
             let ready = revents(&fds, 1 + i) & (POLLIN | POLLHUP | POLLERR) != 0;
             let fresh = done.get(i) == Some(&false);
-            if ready && fresh && let Some(&c) = conns.get(i) {
+            if ready
+                && fresh
+                && let Some(&c) = conns.get(i)
+            {
                 if poll_serve(c, 154) {
                     served += 1;
                 } else {
@@ -1405,8 +1414,7 @@ fn poll_mode() -> ! {
                 }
             }
             expect(
-                sys::call(sys::EPOLL_CTL, [ep, EPOLL_CTL_ADD, c, event.as_ptr() as u64, 0, 0])
-                    == 0,
+                sys::call(sys::EPOLL_CTL, [ep, EPOLL_CTL_ADD, c, event.as_ptr() as u64, 0, 0]) == 0,
                 161,
             );
         }

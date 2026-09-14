@@ -1551,8 +1551,10 @@ impl abi::Handler for Syscalls {
         let set = &set[..count];
         // Written first, so the answer cannot fault once the wait has found something.
         // SAFETY: as above.
-        unsafe { Cpu::copy_to_user(user(ready), &[0u8; crate::readiness::MAX_SET * 4][..count * 4]) }
-            .map_err(|_| Error::Fault)?;
+        unsafe {
+            Cpu::copy_to_user(user(ready), &[0u8; crate::readiness::MAX_SET * 4][..count * 4])
+        }
+        .map_err(|_| Error::Fault)?;
         let has_socket = set.iter().any(crate::readiness::Watch::is_socket);
         let queues: [Option<ObjectId>; crate::readiness::MAX_SET] = core::array::from_fn(|i| {
             set.get(i)

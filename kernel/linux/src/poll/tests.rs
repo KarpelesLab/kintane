@@ -65,10 +65,7 @@ fn a_select_past_the_bitmap_is_refused() {
     assert_eq!(fd_set_bytes(1), Ok(1));
     assert_eq!(fd_set_bytes(9), Ok(2));
     assert_eq!(fd_set_bytes(FD_SET_BITS as u64), Ok(FD_SET_BYTES));
-    assert_eq!(
-        fd_set_bytes(FD_SET_BITS as u64 + 1),
-        Err(Failure::InvalidArgument)
-    );
+    assert_eq!(fd_set_bytes(FD_SET_BITS as u64 + 1), Err(Failure::InvalidArgument));
     assert_eq!(fd_set_bytes(u64::MAX), Err(Failure::InvalidArgument));
 }
 

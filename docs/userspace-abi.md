@@ -359,6 +359,36 @@ Syscall dispatch is generated from `#[syscall]` attributes
 table, the argument-validation code, the userspace bindings, and the documentation
 generated from one source.
 
+## Waiting on many things at once
+
+`object_wait_any` (call 35) waits on a set of objects until any of them is ready or a deadline
+passes. The set is an array of entries, each a handle and the `ready` bits asked about; the answer
+is one mask per entry, and the call returns how many are ready.
+
+```rust
+let set = [Watch { handle: channel, interest: ready::READ },
+           Watch { handle: event,   interest: ready::READ }];
+let mut ready = [0u32; 2];
+let n = rt::wait_any(&set, &mut ready, timeout_ns)?;
+```
+
+The bits are `READ`, `WRITE`, `ERROR` and `CLOSED`. `ERROR` and `CLOSED` come back whether or not
+they were asked for, because a set with a dead member must not wait for it. A handle needs the
+right its interest implies — `READ` to be told readable, `WRITE` writable, `WAIT` for a process's
+end — and one that lacks it is simply never ready, since the call it would enable is refused
+anyway. A handle that names nothing fails the whole call rather than leaving a hole in the set.
+
+What it answers is what the *next call* would find, and it consumes nothing: a channel reported
+readable still holds its message, and the receive that follows is what takes it. Readiness is
+level-triggered, so a member that stays ready is reported every time. At most eight entries, and
+an interest outside the four bits is refused. The design, and why a wake cannot be lost between
+the two looks a wait makes, is in
+[architecture.md](architecture.md#readiness--waiting-on-many-things-at-once).
+
+Channels, events, completion queues, processes and sockets can be waited on. A timer is not waited
+on itself: a program watches the completion queue it delivers to, and the wait delivers due timers
+before calling that queue ready.
+
 ## The Linux personality
 
 ### As built — static programs, x86_64 and aarch64
@@ -619,6 +649,30 @@ no corpus yet for a gap to fail.
   stress run's included, would find `openat` and `execve` failing with `EIO`.
 - **`execve` does not end a process's other threads**, and refuses instead.
 - **No `dup`, `mprotect`, `/proc`, or console input.**
+
+### Waiting on many descriptors
+
+`poll` and `ppoll`, `select` and `pselect6`, and `epoll_create1`, `epoll_ctl`, `epoll_wait` and
+`epoll_pwait` are answered over the same readiness the native `object_wait_any` uses. arm64 has no
+plain `poll` or `select`; the forms that take a signal mask are what a program finds there, and
+both are implemented.
+
+What each descriptor reports: standard input is always readable, since it answers the end of file
+at once; the console is writable; a file is readable or writable as it was opened; a pipe's read
+end is readable with bytes queued and hangs up once no writer is left; its write end is writable
+with room and errors once no reader is; a socket is readable with bytes queued, with the peer's
+close, or with a connection to accept, and writable with room in its send ring. A descriptor that
+names nothing is `POLLNVAL` on its own entry rather than `EBADF` for the call, as Linux reports it.
+
+`ppoll`, `pselect6` and `epoll_pwait` wear the mask they are given for the duration of the wait, so
+a signal a program blocks outside the wait can still end it; a signal with a handler ends any of
+them with `EINTR`.
+
+Level-triggered only: `EPOLLET` and `EPOLLONESHOT` are refused with `EINVAL` rather than accepted
+and quietly given level-triggered behaviour, which would leave a program waiting for an edge that
+never comes. The limits are the personality's own — a `select` bitmap reaches 64 descriptors, a
+process holds four `epoll` sets of eight members each — and a set that names more is refused rather
+than silently truncated.
 
 ### The tag
 
