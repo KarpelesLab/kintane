@@ -356,3 +356,98 @@ impl Process {
         call::process_wait(self.handle, Handle(0), 0, timeout_ns)
     }
 }
+
+// ---- sockets ------------------------------------------------------------------------------
+
+/// A TCP connection: a socket handle, connected.
+pub struct TcpStream {
+    handle: Handle,
+}
+
+/// A socket listening for connections.
+pub struct TcpListener {
+    handle: Handle,
+}
+
+/// A new stream socket, closed again if `then` fails, so a failed setup leaks no handle.
+fn socket_then(then: impl FnOnce(Handle) -> Result<(), Error>) -> Result<Handle, Error> {
+    let handle = Handle(call::socket_create(abi::socket::STREAM)? as u32);
+    match then(handle) {
+        Ok(()) => Ok(handle),
+        Err(e) => {
+            let _ = call::handle_close(handle);
+            Err(e)
+        }
+    }
+}
+
+impl TcpStream {
+    /// Connect to `ip`:`port`, waiting up to `timeout_ns` for the handshake.
+    pub fn connect(ip: [u8; 4], port: u16, timeout_ns: u64) -> Result<TcpStream, Error> {
+        let address = abi::socket::address(ip, port);
+        socket_then(|h| call::socket_connect(h, address, timeout_ns).map(|_| ()))
+            .map(|handle| TcpStream { handle })
+    }
+
+    pub fn handle(&self) -> Handle {
+        self.handle
+    }
+
+    /// Queue what fits of `bytes`, waiting up to `timeout_ns` for room. Returns how much.
+    pub fn send(&self, bytes: &[u8], timeout_ns: u64) -> Result<usize, Error> {
+        call::socket_send(self.handle, UserPtr(bytes.as_ptr() as u64), bytes.len(), timeout_ns)
+            .map(|n| n as usize)
+    }
+
+    /// Queue all of `bytes`, each piece waiting up to `timeout_ns` for room.
+    pub fn send_all(&self, bytes: &[u8], timeout_ns: u64) -> Result<(), Error> {
+        let mut sent = 0;
+        // `get` rather than a range slice: see the note on slice indexing above.
+        while let Some(rest) = bytes.get(sent..) {
+            if rest.is_empty() {
+                break;
+            }
+            sent += self.send(rest, timeout_ns)?;
+        }
+        Ok(())
+    }
+
+    /// Receive into `buf`, waiting up to `timeout_ns` for something. Zero is the end of the
+    /// stream.
+    pub fn recv(&self, buf: &mut [u8], timeout_ns: u64) -> Result<usize, Error> {
+        call::socket_recv(self.handle, UserPtr(buf.as_mut_ptr() as u64), buf.len(), timeout_ns)
+            .map(|n| n as usize)
+    }
+
+    /// Close the sending half, waiting up to `timeout_ns` for the peer to acknowledge it.
+    pub fn shutdown(&self, timeout_ns: u64) -> Result<(), Error> {
+        call::socket_shutdown(self.handle, timeout_ns).map(|_| ())
+    }
+
+    /// Let go of the connection. The kernel closes it in order, without the caller waiting.
+    pub fn close(self) -> Result<(), Error> {
+        call::handle_close(self.handle).map(|_| ())
+    }
+}
+
+impl TcpListener {
+    /// Listen on `port`.
+    pub fn bind(port: u16) -> Result<TcpListener, Error> {
+        socket_then(|h| {
+            call::socket_bind(h, abi::socket::address([0; 4], port))?;
+            call::socket_listen(h, 0).map(|_| ())
+        })
+        .map(|handle| TcpListener { handle })
+    }
+
+    /// Wait up to `timeout_ns` for a connection.
+    pub fn accept(&self, timeout_ns: u64) -> Result<TcpStream, Error> {
+        call::socket_accept(self.handle, timeout_ns).map(|h| TcpStream {
+            handle: Handle(h as u32),
+        })
+    }
+
+    pub fn close(self) -> Result<(), Error> {
+        call::handle_close(self.handle).map(|_| ())
+    }
+}

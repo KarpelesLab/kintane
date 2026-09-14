@@ -8,8 +8,10 @@
 use crate::wire::FRAME_MAX;
 
 /// Buffers in the pool. A poll holds two at most, one frame received and one reply being
-/// built; the rest are headroom for a caller that sends while a poll is not running.
-pub const BUFFERS: usize = 4;
+/// built, and two more are headroom for a caller that sends while a poll is not running.
+/// Beyond those four, two per TCP connection: its receive and send rings, held for as long as
+/// the connection carries data (see `tcp`).
+pub const BUFFERS: usize = 4 + 2 * crate::tcp::CONNECTIONS;
 
 pub struct Pool {
     buffers: [[u8; FRAME_MAX]; BUFFERS],

@@ -770,7 +770,7 @@ lists, the nightly job iterates, and the smoke run replays:
 | `menu` | the boot menu's entry list, and the menu it drives | built valid, then one mistake a person makes |
 | `pci` | configuration space, as devices answer enumeration | a machine with bridges and buses laid out on purpose |
 | `virtio-ring` | a used ring, as a hostile device writes it | a device script: heads, lengths, index jumps |
-| `net` | Ethernet frames carrying ARP, IPv4, ICMP and UDP, and the stack given one | seeded: an ARP reply, an echo request and a datagram with correct checksums; or built with the stack's own writers; then mutated |
+| `net` | Ethernet frames carrying ARP, IPv4, ICMP, UDP and TCP, and the stack given one with a TCP listener open, then its timers run | seeded: an ARP reply, an echo request, a datagram and a TCP SYN for the listener, with correct checksums; or built with the stack's own writers; then mutated |
 | `syscall` | numbers and argument registers | drawn from `abi::TABLE`, so a new call is fuzzed without a new target |
 
 A target's `run` must answer every input: a value or an error, never a panic, never a
@@ -1071,23 +1071,46 @@ on aarch64, and a modern-only `virtio-net-pci` function on the PCs, at slot `0x1
 The network is
 
 ```
--netdev user,id=kt_net,hostfwd=udp:127.0.0.1:<port>-:5555
+-netdev user,id=kt_net,hostfwd=udp:127.0.0.1:<udp>-:5555
+-chardev socket,id=kt_relay_out,host=127.0.0.1,port=<out>
+-chardev socket,id=kt_relay_in,host=127.0.0.1,port=<in>
+-object filter-redirector,id=kt_net_in,netdev=kt_net,queue=rx,indev=kt_relay_in
+-object filter-redirector,id=kt_net_out,netdev=kt_net,queue=rx,outdev=kt_relay_out
 ```
 
-where `<port>` is a free loopback UDP port kbuild picks for the run. Nothing leaves the host.
+where the ports are free loopback ports kbuild picks for the run. Nothing leaves the host.
 QEMU's user-mode stack answers ARP and echo requests for its gateway, 10.0.2.2, itself, and
-the only other party is kbuild. For the length of the run a thread in `kbuild/src/qemu.rs`
-(`udp_peer`) sends `kintane-udp-probe` to the forwarded port four times a second, and
-answers every `kintane-udp-echo <n>` the guest sends back with `kintane-udp-ack <n>`. Like
-the serial probes it answers and never judges: the verdict is the exit code. The resolver at
-10.0.2.3 is not used, because it forwards to the host's, which an offline machine lacks.
+the only other party is kbuild, in three threads of `kbuild/src/qemu.rs`:
 
-The boot gates on two lines ([architecture.md](architecture.md#net--the-network-stack-and-virtio-net)):
+- `udp_peer` sends `kintane-udp-probe` to the forwarded port four times a second, each followed
+  by `kintane-tcp-port <tcp>`, and answers every `kintane-udp-echo <n>` the guest sends back with
+  `kintane-udp-ack <n>`.
+- `tcp_service` listens on the loopback port `<tcp>`. The guest reaches it by connecting to the
+  gateway's address, which QEMU's user network turns into a connection to the host's loopback
+  interface. It reads `kintane-tcp-request <mode> <tag>` and writes back
+  `kintane-tcp-reply <mode> <tag>`. It closes first for `peer-closes`, and after the guest for
+  `guest-closes`.
+- `relay` sits between the card and QEMU's network. The two filters hand every frame the guest
+  transmits to kbuild on one socket and take it back on the other before the network sees it.
+  The injecting filter is declared first, because a guest's frames pass a network's filters last
+  to first. The relay passes every frame but one kind: the first data segment of each connection
+  to `<tcp>`, which it drops the first time it sees it. That is what lets a check require a
+  retransmission rather than hope for one.
+
+Like the serial probes, all three answer and never judge: the verdict is the exit code. The
+resolver at 10.0.2.3 is not used, because it forwards to the host's, which an offline machine
+lacks.
+
+The boot gates on three lines ([architecture.md](architecture.md#net--the-network-stack-and-virtio-net)):
 
 ```
   nic        virtio-net 52:54:00:12:34:56, 8 receive buffers posted ok
   net        line 78; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555, 3 round trips;
-             9 frames in, 8 out, 12 interrupts, 0 polled, 0 stack buffers held ok
+             tcp port 51092, closed by the kernel [syn-sent established fin-wait-1 fin-wait-2
+             time-wait] and by kbuild [syn-sent established close-wait last-ack], 2 data
+             retransmits; 46 frames in, 21 out, 50 interrupts, 0 polled, 0 stack buffers held ok
+  sockets    tcp-client connected, sent, read its reply to kbuild's close; 1 established,
+             1 data retransmits; closed in order, every buffer back; 0 objects left, 0 frames left ok
 ```
 
 That is aarch64, where every frame arrives by interrupt. i686 reads the same on line 10,
@@ -1096,6 +1119,23 @@ message-signalled interrupts, a card that came up on anything but MSI-X fails wi
 IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT`. Every wait is bounded by the clock: 5 s for
 the gateway, 3 s for each reply, 15 s for kbuild's first probe. A broken path fails the boot
 rather than timing it out.
+
+The TCP part of `net` makes two connections to `tcp_service`, each step bounded at 10 s. The
+first is closed by the kernel first and must pass through FIN-WAIT-1 to TIME-WAIT. The second
+is closed by kbuild first and must pass through CLOSE-WAIT and LAST-ACK to CLOSED, and be
+reaped. Each must have had a data segment retransmitted, since the relay dropped its first.
+Then the check lingers 3 s, and no segment may arrive twice or out of order, and no reset may
+be sent or received: a segment the kernel failed to acknowledge would come again, since QEMU's
+TCP retransmits after a second or so. Every buffer must be back afterwards, as before.
+`sockets`, on x86_64 and aarch64, runs `user/tcp-client` over the socket calls on the scheduler
+([userspace-abi.md](userspace-abi.md)); i686 has no userspace, and gates on the TCP part of
+`net` alone.
+
+The boot counter test, which resets one QEMU several times, found a fault the single boots
+could not. Every boot opened its first connections from port 49152 again, with nearly the same
+initial sequence numbers, and QEMU's TCP still held those connections from the boot before. A
+later boot's round was refused, and the next boot's program could not connect. Ephemeral ports
+now start from the clock at the first connection.
 
 On MSI-X the card first took no interrupts at all. Its table entry was written and unmasked,
 both queues read back vector 0, and QEMU's trace showed `virtio_notify` for its queues, but
@@ -1106,13 +1146,29 @@ before programming a function's message.
 
 Host tests, without QEMU:
 
-- `kernel/net`: 21 tests against a simulated gateway. They cover RFC 1071 checksums, IPv4
+- `kernel/net`: 45 tests. 21 are against a simulated gateway, and cover RFC 1071 checksums, IPv4
   lengths, fragments and bad checksums refused and counted, and the UDP pseudo-header. For
   ARP: resolution through the gateway and its retry limit, a reply with the wrong operation
   ignored, and expiry followed by a new request. Then echo replies matched by sequence
   number, a UDP round trip, the stack answering ARP and pings addressed to it and ignoring
   frames for other hosts, a refused send holding no buffer, a full inbox counted, a flood
   handled in bounded polls, and the pool refusing a second give.
+- `kernel/net`'s TCP: the other 24, against a scripted peer that spells out every segment it
+  sends, so loss is a segment it never answers, duplication one it delivers twice, and
+  reordering two it delivers out of turn. They cover the wire format (the checksum over the
+  pseudo-header, and a bad data offset or option length refused) and a round trip closed by
+  each side and by both at once. For a listener: an accepted connection and a bounded backlog.
+  Loss: a lost data segment and a lost SYN sent again on the timer, with the timeout doubling,
+  and go-back-N from the oldest unacknowledged byte. A duplicated segment is acknowledged and
+  delivered once, an overlapping one trimmed, reordered segments repaired by retransmission,
+  and a FIN ahead of missing data held back. Retries run out into a reset. Sequence checks: a
+  wrong acknowledgement to a SYN, a refused connection, only an exact reset obeyed, an
+  acknowledgement for unsent data ignored, and a reset for a segment that matches nothing.
+  Memory: the receive window shrinking to zero and announced again, the peer's window and
+  segment size respected with a shut window probed, two pool buffers per connection with the
+  pool's bound, a stale connection name refused, and unread data turning a close into a reset.
+- `kbuild`: the relay drops each connection's first data segment once and passes everything
+  else.
 - `drivers/net/virtio-net`: 16 tests against the shared fake device on both queues, three of
   them for MSI-X: both queues on one vector with the status register left unread, a refused
   vector failing bring-up, and no vector without one. They cover
@@ -1134,6 +1190,24 @@ kbuild's probes keep arriving. 60 s on `aarch64-virt-smp`, four CPUs, passed all
 with 1,536 echo replies, 1,536 round trips and 2 retries, beside 255,650 disk completions by
 interrupt and none polled. The 20-second runs pass on
 `x86_64-qemu`, `i686-qemu`, `aarch64-virt`, both SMP presets at four CPUs and both at eight.
+
+A `tcp` workload runs beside it, making TCP round trips with `tcp_service` through the same
+card and stack. Each round connects, sends a request, reads the reply and closes: the kernel
+closes first on odd rounds, and kbuild on even ones. The relay drops each connection's first
+data segment, so every round retransmits. Each step waits at most 2 s. A failed round is tried
+twice more and a third failure fails the run, and the heartbeat counts retries and names the
+reason for the latest. At every audit no connection may hold a ring, and the pool's books must
+agree with what connections hold. 60 s at four CPUs passed all 60 audits on both SMP presets,
+neither retrying a round: `aarch64-virt-smp` made 154 round trips with 154 data retransmits,
+and `x86_64-qemu-smp` 162 with 163.
+
+The first 60-second runs passed too, but retried 7 rounds on `x86_64-qemu-smp` (before the
+heartbeat named a reason) and 2 on `aarch64-virt-smp`. The recorded reason was `a connection
+did not end where its close order leads`, and the fault was in the round's bookkeeping, not in
+TCP. On a round kbuild closes first, the connection's states were read only by the wait after
+the kernel's close. QEMU's acknowledgement of the FIN could arrive, and the connection be closed
+and reaped, before that wait first looked, so LAST-ACK was never seen. The status is now read
+under the same lock as the close.
 
 The workload is no longer paced: it sleeps 1 ms between polls for a reply and between
 rounds. For a while it slept 5 ms and 25 ms. At one millisecond each on a single CPU, it took
@@ -1164,8 +1238,19 @@ Falsified, each mutation confirmed applied, then restored:
 | The platform does not make a function a bus master before programming its message | `x86_64-qemu` | the disk still passes `block irq` on MSI-X, because SeaBIOS made it a bus master; the card takes `0 interrupts` and fails with `THE GATEWAY NEVER ANSWERED AN ARP REQUEST`. The host test `a_bus_master_keeps_the_rest_of_its_command_register` covers the register write |
 | `recv` drains the receive queue even in interrupt-driven mode | host test | `in_interrupt_mode_only_the_handler_collects` fails. **Not observable under QEMU**: `aarch64-virt` and `i686-qemu` both passed with `0 polled`, because the card completes and interrupts before the waiter first looks, so the handler always collects first. The check is sound, but QEMU cannot make the waiter win |
 
-**Not covered.** TCP, fragment reassembly, IPv6, DHCP and a socket API do not exist. The
-only network card driver is virtio-net, and it has run only under QEMU.
+The TCP checks, falsified the same way, each run on `x86_64-qemu`:
+
+| Mutation | What caught it |
+|---|---|
+| Every data segment sent with its sequence number one too high | `NO TCP REPLY ARRIVED`: QEMU's TCP never takes the request. `sockets` fails too, the program exiting `0x7c05` when its receive runs out |
+| Pure acknowledgements never sent | **only the linger**: both rounds completed, because data and FIN segments carry acknowledgements. Then `1 segments repeated or reset` and `THE PEER SENT A SEGMENT AGAIN OR A RESET WAS EXCHANGED: AN ACKNOWLEDGEMENT WENT MISSING`. `sockets` alone passed, since its program looks at nothing after its close |
+| The retransmission timer runs out without going back to the oldest unacknowledged byte | the request the relay dropped is never sent again: `NO TCP REPLY ARRIVED`, and `sockets` reports `0 data retransmits, NONE, though kbuild drops the first data segment` |
+| A finished connection's send ring never given back to the pool | both rounds passed, then `2 stack buffers held, A STACK BUFFER WAS NOT GIVEN BACK`; `sockets` fails with `THE CONNECTION NEVER FINISHED CLOSING, OR A BUFFER IS MISSING` |
+
+**Not covered.** Fragment reassembly, IPv6, DHCP, TCP congestion control, an out-of-order queue
+and Linux socket calls do not exist. A socket waiter is not woken by the card's interrupt; it
+looks every 2 ms. `listen` and `accept` are host-tested only: no boot connects to the guest.
+The only network card driver is virtio-net, and it has run only under QEMU.
 
 ### 3. Boot and integration tests
 
@@ -1212,7 +1297,9 @@ threads at mixed priorities (`kernel/main/src/stress.rs`):
 - **vm** — demand paging, copy-on-write sharing and 2 MiB pages on a kernel `Vm`;
 - **pages** — buddy allocator churn on a pool of its own;
 - **net** — echo requests to the gateway and UDP round trips with kbuild, on a machine with a
-  network card ([2g](#2g-network)).
+  network card ([2g](#2g-network));
+- **tcp** — TCP round trips with kbuild, closed from each side in turn and each with a
+  retransmission, on a machine with a network card ([2g](#2g-network)).
 
 Every second of guest time the auditor stops every workload at a checkpoint, where it
 holds nothing that would make the books inexact, and checks them:
@@ -1224,6 +1311,7 @@ holds nothing that would make the books inexact, and checks them:
 - `Buddy::check` passes, with every page free;
 - the network stack's pool is full, and every receive buffer is with the card or holding a
   frame;
+- no TCP connection holds a ring, and the pool's books agree with what connections hold;
 - `Threads::check` passes, and nothing was recorded as broken;
 - no lock-order violation;
 - every workload made progress since the last audit.

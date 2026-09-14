@@ -270,6 +270,88 @@ impl Handler for Mock {
         self.calls += 1;
         Ok(self.calls as u64)
     }
+
+    fn socket_create(&mut self, kind: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        self.last = kind;
+        if kind == abi::socket::STREAM {
+            Ok(1)
+        } else {
+            Err(Error::InvalidArgument)
+        }
+    }
+
+    fn socket_bind(&mut self, socket: Handle, address: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = socket;
+        self.last = address;
+        if abi::socket::well_formed(address) {
+            Ok(0)
+        } else {
+            Err(Error::InvalidArgument)
+        }
+    }
+
+    fn socket_connect(
+        &mut self,
+        socket: Handle,
+        address: u64,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (socket, timeout_ns);
+        self.last = address;
+        if timeout_ns == 0 {
+            Err(Error::ShouldWait)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn socket_listen(&mut self, socket: Handle, backlog: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = socket;
+        self.last = backlog;
+        Ok(0)
+    }
+
+    fn socket_accept(&mut self, socket: Handle, timeout_ns: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = socket;
+        self.last = timeout_ns;
+        Err(Error::TimedOut)
+    }
+
+    fn socket_send(
+        &mut self,
+        socket: Handle,
+        bytes: UserPtr,
+        len: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (socket, bytes, timeout_ns);
+        Ok(len.min(512) as u64)
+    }
+
+    fn socket_recv(
+        &mut self,
+        socket: Handle,
+        buf: UserPtr,
+        cap: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = (socket, buf, timeout_ns);
+        Ok(cap.min(512) as u64 / 2)
+    }
+
+    fn socket_shutdown(&mut self, socket: Handle, timeout_ns: u64) -> Result<u64, Error> {
+        self.calls += 1;
+        let _ = socket;
+        self.last = timeout_ns;
+        Ok(0)
+    }
 }
 
 /// Each record is a number and six argument words: 8 bytes for the number, 48 for the

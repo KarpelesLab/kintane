@@ -182,6 +182,71 @@ impl Handler for Recorder {
         self.calls.push(("clock_now", vec![]));
         Ok(1)
     }
+    fn socket_create(&mut self, kind: u64) -> Result<u64, Error> {
+        self.calls.push(("socket_create", vec![kind]));
+        Ok(1)
+    }
+    fn socket_bind(&mut self, socket: Handle, address: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("socket_bind", vec![u64::from(socket.0), address]));
+        Ok(0)
+    }
+    fn socket_connect(
+        &mut self,
+        socket: Handle,
+        address: u64,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls
+            .push(("socket_connect", vec![u64::from(socket.0), address, timeout_ns]));
+        Ok(0)
+    }
+    fn socket_listen(&mut self, socket: Handle, backlog: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("socket_listen", vec![u64::from(socket.0), backlog]));
+        Ok(0)
+    }
+    fn socket_accept(&mut self, socket: Handle, timeout_ns: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("socket_accept", vec![u64::from(socket.0), timeout_ns]));
+        Err(Error::TimedOut)
+    }
+    fn socket_send(
+        &mut self,
+        socket: Handle,
+        bytes: UserPtr,
+        len: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls
+            .push(("socket_send", vec![u64::from(socket.0), bytes.0, len as u64, timeout_ns]));
+        Ok(len as u64)
+    }
+    fn socket_recv(
+        &mut self,
+        socket: Handle,
+        buf: UserPtr,
+        cap: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        self.calls
+            .push(("socket_recv", vec![u64::from(socket.0), buf.0, cap as u64, timeout_ns]));
+        Ok(0)
+    }
+    fn socket_shutdown(&mut self, socket: Handle, timeout_ns: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("socket_shutdown", vec![u64::from(socket.0), timeout_ns]));
+        Ok(0)
+    }
+}
+
+#[test]
+fn a_socket_address_is_one_word_and_comes_apart_again() {
+    let a = socket::address([10, 0, 2, 2], 5555);
+    assert_eq!(a, 0x0a00_0202_15b3);
+    assert_eq!((socket::ip(a), socket::port(a)), ([10, 0, 2, 2], 5555));
+    assert!(socket::well_formed(a));
+    assert!(!socket::well_formed(a | 1 << 48));
 }
 
 #[test]

@@ -48,6 +48,19 @@ pub const ICMP_ECHO_REQUEST: u8 = 8;
 
 pub const UDP_HEADER: usize = 8;
 
+pub const PROTO_TCP: u8 = 6;
+/// The TCP header without options.
+pub const TCP_HEADER: usize = 20;
+pub const TCP_FIN: u8 = 0x01;
+pub const TCP_SYN: u8 = 0x02;
+pub const TCP_RST: u8 = 0x04;
+pub const TCP_PSH: u8 = 0x08;
+pub const TCP_ACK: u8 = 0x10;
+/// The maximum segment size option, the one option this stack writes or reads.
+const TCP_OPT_END: u8 = 0;
+const TCP_OPT_NOP: u8 = 1;
+const TCP_OPT_MSS: u8 = 2;
+
 /// Why bytes were not a packet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WireError {
@@ -71,6 +84,9 @@ pub enum WireError {
     NotEcho,
     /// A UDP length field shorter than its header or longer than the packet.
     BadUdpLength,
+    /// A TCP data offset shorter than its header or longer than the segment, or an option
+    /// whose length runs past the header.
+    BadTcpHeader,
     /// The caller's buffer cannot hold what was asked for.
     TooLarge,
 }
@@ -314,13 +330,13 @@ pub struct Udp<'a> {
     pub payload: &'a [u8],
 }
 
-/// The IPv4 pseudo-header UDP's checksum covers.
-fn pseudo_header(src: Ipv4Addr, dst: Ipv4Addr, udp_len: u16) -> [u8; 12] {
+/// The IPv4 pseudo-header UDP's and TCP's checksums cover.
+fn pseudo_header(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, len: u16) -> [u8; 12] {
     let mut h = [0u8; 12];
     h[0..4].copy_from_slice(&src);
     h[4..8].copy_from_slice(&dst);
-    h[9] = PROTO_UDP;
-    h[10..12].copy_from_slice(&udp_len.to_be_bytes());
+    h[9] = protocol;
+    h[10..12].copy_from_slice(&len.to_be_bytes());
     h
 }
 
@@ -336,7 +352,9 @@ pub fn parse_udp(p: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Result<Udp<'_>, Wire
     if n < UDP_HEADER || n > p.len() {
         return Err(WireError::BadUdpLength);
     }
-    if be16(p, 6).ok_or(short)? != 0 && checksum(&[&pseudo_header(src, dst, len), &p[..n]]) != 0 {
+    if be16(p, 6).ok_or(short)? != 0
+        && checksum(&[&pseudo_header(src, dst, PROTO_UDP, len), &p[..n]]) != 0
+    {
         return Err(WireError::BadChecksum);
     }
     Ok(Udp {
@@ -363,13 +381,140 @@ pub fn write_udp(
     d[4..6].copy_from_slice(&len.to_be_bytes());
     d[6..8].copy_from_slice(&[0, 0]);
     d[UDP_HEADER..].copy_from_slice(payload);
-    let sum = match checksum(&[&pseudo_header(src, dst, len), d]) {
+    let sum = match checksum(&[&pseudo_header(src, dst, PROTO_UDP, len), d]) {
         // Zero on the wire means "no checksum", so a sum that works out to zero is sent as
         // its other ones'-complement representation (RFC 768).
         0 => 0xffff,
         s => s,
     };
     d[6..8].copy_from_slice(&sum.to_be_bytes());
+    Ok(n)
+}
+
+/// A TCP segment's header fields, and a view of its payload.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tcp<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    /// The low eight flag bits: [`TCP_FIN`], [`TCP_SYN`], [`TCP_RST`], [`TCP_PSH`],
+    /// [`TCP_ACK`], and URG, ECE and CWR, which this stack ignores.
+    pub flags: u8,
+    pub window: u16,
+    /// The maximum segment size option, where the segment carries a well-formed one.
+    pub mss: Option<u16>,
+    pub payload: &'a [u8],
+}
+
+/// Parse a TCP segment carried from `src` to `dst`. The checksum, which TCP makes mandatory,
+/// is verified over the pseudo-header before any field is trusted, and every option's length
+/// is checked against the header it sits in.
+pub fn parse_tcp(p: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Result<Tcp<'_>, WireError> {
+    if p.len() < TCP_HEADER {
+        return Err(WireError::Short);
+    }
+    let len = u16::try_from(p.len()).map_err(|_| WireError::BadTcpHeader)?;
+    let short = WireError::Short;
+    let offset = usize::from(*p.get(12).ok_or(short)? >> 4) * 4;
+    if offset < TCP_HEADER || offset > p.len() {
+        return Err(WireError::BadTcpHeader);
+    }
+    if checksum(&[&pseudo_header(src, dst, PROTO_TCP, len), p]) != 0 {
+        return Err(WireError::BadChecksum);
+    }
+    let mut mss = None;
+    let mut at = TCP_HEADER;
+    while at < offset {
+        match p[at] {
+            TCP_OPT_END => break,
+            TCP_OPT_NOP => at += 1,
+            kind => {
+                let n = usize::from(*p.get(at + 1).ok_or(WireError::BadTcpHeader)?);
+                if n < 2 || at + n > offset {
+                    return Err(WireError::BadTcpHeader);
+                }
+                if kind == TCP_OPT_MSS && n == 4 {
+                    mss = be16(p, at + 2);
+                }
+                at += n;
+            }
+        }
+    }
+    Ok(Tcp {
+        src_port: be16(p, 0).ok_or(short)?,
+        dst_port: be16(p, 2).ok_or(short)?,
+        seq: u32::from_be_bytes(p.get(4..8).ok_or(short)?.try_into().map_err(|_| short)?),
+        ack: u32::from_be_bytes(p.get(8..12).ok_or(short)?.try_into().map_err(|_| short)?),
+        flags: *p.get(13).ok_or(short)?,
+        window: be16(p, 14).ok_or(short)?,
+        mss,
+        payload: &p[offset..],
+    })
+}
+
+/// The header fields of a segment to write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TcpHeader {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub window: u16,
+    /// Written as the one option, padded to a whole header word; on a SYN only, by custom.
+    pub mss: Option<u16>,
+}
+
+/// The length of the header [`write_tcp`] writes for `h`, options included.
+pub const fn tcp_header_len(h: &TcpHeader) -> usize {
+    TCP_HEADER + if h.mss.is_some() { 4 } else { 0 }
+}
+
+/// Write a TCP segment, with its checksum, into `buf`; returns its length.
+pub fn write_tcp(
+    buf: &mut [u8],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    h: &TcpHeader,
+    payload: &[u8],
+) -> Result<usize, WireError> {
+    let header = tcp_header_len(h);
+    buf.get_mut(header..header + payload.len())
+        .ok_or(WireError::TooLarge)?
+        .copy_from_slice(payload);
+    write_tcp_header(buf, src, dst, h, payload.len())
+}
+
+/// Write a TCP header, and the checksum, in front of `payload_len` bytes the caller has
+/// already placed at [`tcp_header_len`] in `buf`: how a payload copied straight out of a
+/// connection's ring is sent without a second copy. Returns the segment's length.
+pub fn write_tcp_header(
+    buf: &mut [u8],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    h: &TcpHeader,
+    payload_len: usize,
+) -> Result<usize, WireError> {
+    let header = tcp_header_len(h);
+    let n = header + payload_len;
+    let len = u16::try_from(n).map_err(|_| WireError::TooLarge)?;
+    let s = buf.get_mut(..n).ok_or(WireError::TooLarge)?;
+    s[0..2].copy_from_slice(&h.src_port.to_be_bytes());
+    s[2..4].copy_from_slice(&h.dst_port.to_be_bytes());
+    s[4..8].copy_from_slice(&h.seq.to_be_bytes());
+    s[8..12].copy_from_slice(&h.ack.to_be_bytes());
+    s[12] = ((header / 4) as u8) << 4;
+    s[13] = h.flags;
+    s[14..16].copy_from_slice(&h.window.to_be_bytes());
+    s[16..20].copy_from_slice(&[0, 0, 0, 0]);
+    if let Some(mss) = h.mss {
+        s[20] = TCP_OPT_MSS;
+        s[21] = 4;
+        s[22..24].copy_from_slice(&mss.to_be_bytes());
+    }
+    let sum = checksum(&[&pseudo_header(src, dst, PROTO_TCP, len), s]);
+    s[16..18].copy_from_slice(&sum.to_be_bytes());
     Ok(n)
 }
 
@@ -380,6 +525,7 @@ pub enum Frame<'a> {
     Arp(Arp),
     Echo(Ipv4<'a>, Echo<'a>),
     Udp(Ipv4<'a>, Udp<'a>),
+    Tcp(Ipv4<'a>, Tcp<'a>),
     /// An IPv4 packet for a protocol this stack does not speak.
     OtherIpv4(Ipv4<'a>),
     /// An Ethernet frame of a type this stack does not speak.
@@ -396,6 +542,7 @@ pub fn parse_frame(frame: &[u8]) -> Result<(Ethernet<'_>, Frame<'_>), WireError>
             match ip.protocol {
                 PROTO_ICMP => Frame::Echo(ip, parse_icmp_echo(ip.payload)?),
                 PROTO_UDP => Frame::Udp(ip, parse_udp(ip.payload, ip.src, ip.dst)?),
+                PROTO_TCP => Frame::Tcp(ip, parse_tcp(ip.payload, ip.src, ip.dst)?),
                 _ => Frame::OtherIpv4(ip),
             }
         }

@@ -1144,15 +1144,15 @@ outstanding together at least once in a run.
 ### `net` — the network stack, and virtio-net
 
 One network card driver and enough IPv4 to prove it. `kernel/net` is Ethernet, ARP, IPv4,
-ICMP echo and UDP, host-tested against a simulated gateway. `drivers/net/virtio-net` is the
-card. The boot's `net` check drives both against QEMU's user-mode network. What it is not:
+ICMP echo, UDP and TCP, host-tested against a simulated gateway and a scripted TCP peer.
+`drivers/net/virtio-net` is the card. The boot's `net` check drives both against QEMU's
+user-mode network, and sockets put TCP behind handles. What it is not:
 
-- **No TCP.** Out of scope for this slice.
 - **No fragment reassembly.** A fragment is refused and counted (`WireError::Fragmented`),
   and a datagram that does not fit one 1500-byte frame is not sent.
-- **No socket API and no blocking calls.** The stack is `&mut self`, driven by whoever holds
-  it: the boot check and the stress workload poll it under one lock. A socket layer waits
-  for Phase 6a's blocking calls.
+- **No interrupt-driven socket waits.** The stack is `&mut self`, driven by whoever holds it
+  under one lock: the boot check, the stress workloads, and the socket calls, whose waiting
+  threads block and look at the network every 2 ms. A frame's interrupt wakes none of them.
 - **No IPv6, DHCP, DNS or routing table.** One static address, a netmask and a gateway.
 
 #### `kernel/net`
@@ -1165,11 +1165,14 @@ card. The boot's `net` check drives both against QEMU's user-mode network. What 
 - **`arp::Cache`:** eight entries, each expiring 60 s after it was learned. A full cache replaces
   the entry closest to expiry. The stack learns only from ARP messages addressed to its own
   address, answers requests for it, and sends a request at most every 200 ms.
-- **`pool::Pool`:** four frame-sized buffers, and books for them: taken, returned, held. `poll`
-  takes a receive buffer and a reply buffer for each frame and gives both back before the
-  next. A send takes one and gives it back whether or not the card took the frame. A second
+- **`pool::Pool`:** twelve frame-sized buffers, and books for them: taken, returned, held. Four
+  carry frames: `poll` takes a receive buffer and a reply buffer for each frame and gives both
+  back before the next, and a send takes one and gives it back whether or not the card took
+  the frame. The other eight are two per TCP connection, its receive and send rings. A second
   give of the same buffer is refused. `balanced` (nothing held, as many returned as taken) is
-  what the boot check and every stress audit require.
+  what the boot check and every stress audit require with no connection open, and
+  `books_consistent` (everything held is a connection's ring) is what the fuzzer requires with
+  connections open.
 - **No allocation on receive.** A frame is copied from the card into a pool buffer and handled
   there. A datagram's payload, up to 256 bytes, is copied into a four-slot inbox, and a full
   inbox drops and counts. Echo replies go into an eight-entry ring that the sender matches by
@@ -1179,7 +1182,57 @@ card. The boot's `net` check drives both against QEMU's user-mode network. What 
   tests' gateway and the fuzzer's one-frame card.
 
 The stack takes `now`, in nanoseconds, from its caller rather than reading a clock, which is
-what lets the host tests expire an ARP entry without waiting a minute.
+what lets the host tests expire an ARP entry without waiting a minute, and run a TCP
+connection's retransmission timer to exhaustion in microseconds.
+
+#### TCP (`kernel/net/src/tcp.rs`)
+
+Exactly what is implemented:
+
+- **Every RFC 793 state.** An active open, a passive one through `listen` and `accept`, and a
+  simultaneous open. Data both ways with cumulative acknowledgements. An orderly close begun by
+  either end or both (FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT; CLOSE-WAIT, LAST-ACK). Resets
+  sent for segments no connection takes, and received.
+- **Sequence checks.** A segment must overlap the receive window, or it is answered with an
+  acknowledgement and dropped; with the window shut, only one at exactly the next expected byte
+  passes, so acknowledgements and resets are still seen. A reset ends a connection only at
+  exactly the next expected byte, and an in-window reset or a SYN on a synchronised connection
+  gets a challenge acknowledgement (RFC 5961). An acknowledgement for data never sent is
+  answered and ignored. A segment overlapping what arrived is trimmed.
+- **Retransmission on a timer.** One timer per connection, armed while a SYN, data or a FIN is
+  unacknowledged and restarted when new data is acknowledged. When it runs out, sending goes back
+  to the oldest unacknowledged byte (go-back-N) and the timeout doubles from 300 ms up to 4 s;
+  after seven in a row the connection is reset and reports `TimedOut`.
+- **A fixed receive window**: the free space of a connection's 1514-byte receive ring, never
+  scaled, announced again when a read reopens it past a segment. **The peer's window is
+  respected**, and a shut one is probed a byte at a time on the timer. **The MSS option** is sent
+  on a SYN (1460) and honoured; 536 when the peer sends none.
+
+Exactly what is not: **no congestion control** — no slow start, congestion window, fast
+retransmit, fast recovery or Nagle. The stated minimum is that nothing is sent beyond the
+peer's window or more than one segment at a time, a timeout resends one segment from the oldest
+unacknowledged byte, and consecutive timeouts back off exponentially. **No RTT estimation**; no
+out-of-order queue, so a reordered segment is dropped and the sender's retransmission fills the
+gap; no delayed acknowledgements, urgent data, SACK, timestamps or window scaling. TIME-WAIT is
+1 s rather than four minutes, and a released connection in TIME-WAIT is given up early when
+every slot is needed. Initial sequence numbers are the clock mixed with the ports, not RFC 6528's
+keyed hash, so they are predictable. Ephemeral ports start from the clock at the first connection
+and are then taken in turn, so a machine that restarts does not reuse the ports its last boot
+closed.
+
+Memory is bounded: four connection slots, listeners included, and two pool buffers for each
+connection that carries data, taken when it opens and given back when it is over and its
+owner has let go. A connection in TIME-WAIT has given its buffers back already. A SYN for a
+listener holds no buffer until its connection is made, and one that finds the pool empty or the
+two-connection backlog full is dropped for the peer to send again. The receive path still does
+not allocate: `poll` handles a segment in its frame buffer and says what payload to copy into
+which ring, and copies it before giving the frame back.
+
+Sockets (`kernel/main/src/sockets.rs`) put a connection behind a `Socket` object in the object
+store, with rights: `WRITE` to connect, bind, listen, send and shut down, `READ` to receive and
+accept. The calls are in [userspace-abi.md](userspace-abi.md). A socket whose last handle goes
+closes its connection in order. The native calls block on a wait queue with a timeout; see the
+stated gap above.
 
 #### virtio-net (`drivers/net/virtio-net`) and `drivers/virtio`
 

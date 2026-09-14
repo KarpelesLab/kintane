@@ -159,6 +159,7 @@ pub enum ObjectType {
     DeviceResource,
     Completion,
     Job,
+    Socket,
 }
 
 impl ObjectType {
@@ -175,6 +176,7 @@ impl ObjectType {
             ObjectType::DeviceResource => "device-resource",
             ObjectType::Completion => "completion",
             ObjectType::Job => "job",
+            ObjectType::Socket => "socket",
         }
     }
 }

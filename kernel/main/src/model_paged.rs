@@ -139,6 +139,18 @@ pub fn sibling_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// A native program talking TCP through the socket calls. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
+    crate::sockets::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// The Linux program again, with the scheduler: pipes, `fork`, `execve`, `wait4`, a thread
 /// and a futex. Passed, silently, without the personality.
 #[cfg(CONFIG_USERSPACE)]

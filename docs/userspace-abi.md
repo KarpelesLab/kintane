@@ -143,6 +143,40 @@ and the calls numbered 17–26 are built on them:
 Every waiting call takes a timeout in nanoseconds: zero polls and answers `ShouldWait`,
 `u64::MAX` waits for as long as it takes, and anything else ends in `TimedOut` (error 13).
 
+**Sockets.** Calls 27–34 put the kernel's TCP (`kernel/net`, described in
+`docs/architecture.md`) behind handles. A socket is a `Socket` object in the store, and an
+address is one word: the IPv4 address in bits 47..16 and the port in bits 15..0
+(`abi::socket::address`).
+
+- **`socket_create(STREAM)`** makes a socket with every right, neither bound nor connected.
+- **`socket_connect`** (`WRITE`) begins the handshake and waits for it: `PeerClosed` if the peer
+  refused, `TimedOut` if it never answered. A socket connects from an ephemeral port.
+- **`socket_bind`** and **`socket_listen`** (`WRITE`) make a listener on the bound port.
+  **`socket_accept`** (`READ`) waits for a connection and returns a new socket with every right.
+- **`socket_send`** (`WRITE`) queues up to 512 bytes, waiting for room for at least one.
+  **`socket_recv`** (`READ`) waits for data and returns up to 512 bytes, and zero at the end of
+  the stream. Either on a socket that is not connected is `InvalidArgument`.
+- **`socket_shutdown`** (`WRITE`) sends a FIN after what is queued and waits for the peer to
+  acknowledge everything. Closing the handle closes the connection in order without waiting,
+  or resets it if data arrived that was never read.
+- A socket call that waits is blocked on a wait queue, but nothing wakes that queue when a frame
+  arrives: the waiter looks at the network every 2 ms until its timeout. The card's interrupt
+  does not reach socket waiters yet.
+
+`lib/rt` wraps the calls as `TcpStream` and `TcpListener`. There is no Linux socket call;
+`kernel/main/src/sockets.rs` lists where `socket`, `bind`, `listen`, `accept`, `connect`,
+`send`, `recv`, `shutdown` and `close` would land on these.
+
+**What the socket check proves** (`kernel/main/src/sockets.rs`, the `sockets` banner line, on
+every x86_64 and aarch64 preset with a network card). `user/tcp-client`, a native program with
+the ABI note, is given the console and the address of kbuild's TCP service. It checks that a
+socket that is not connected refuses to send. Then it connects through QEMU's user network,
+sends a request, reads the reply until kbuild closes, and closes its socket. kbuild drops the
+connection's first data segment once, so the reply arrives only because the kernel sent the
+request again. The kernel requires the program's success code, a data retransmission while it
+ran, the connection it let go of closed in order with every stack buffer back, and every object
+and frame back.
+
 **Threads.** `thread_create` starts further threads in a process, each with a four-page
 user stack of its own, up to three beyond the first over the process's life. Two threads of
 one process may be in the kernel on two CPUs at once, so a system call takes its process's
@@ -299,6 +333,7 @@ async later is a mistake that is very hard to undo.
 | `DeviceResource` | MMIO range / DMA capability, granted to a driver |
 | `Completion` | a completion queue |
 | `Job` | a resource-accounting and lifetime group of processes |
+| `Socket` | a TCP connection or listener of the kernel's network stack |
 
 ## Syscall surface
 

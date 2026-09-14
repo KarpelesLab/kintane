@@ -11,13 +11,23 @@
 //! * datagrams make the round trip to kbuild and back: kbuild forwards a loopback UDP port to the
 //!   guest's [`PORT`] and sends [`PROBE`] to it, the kernel answers the address the probe came from
 //!   with numbered [`ECHO`]s, and kbuild's [`ACK`] for each must come back;
+//! * TCP carries a request and its reply both ways over two connections to kbuild's TCP service,
+//!   whose port kbuild announces alongside its probes ([`TCP_ANNOUNCE`]). QEMU turns a connection
+//!   to the gateway's address into one to the host's loopback interface. The first connection is
+//!   closed by the kernel first and must pass through FIN-WAIT-1 to TIME-WAIT; the second is closed
+//!   by kbuild first and must pass through CLOSE-WAIT and LAST-ACK to CLOSED. kbuild relays every
+//!   frame the card sends to QEMU's network and drops the first data segment of each connection
+//!   once, so each must have had a data segment retransmitted. After both, the check lingers
+//!   [`LINGER_NS`], and nothing the peer sends may arrive twice or be refused: a segment the kernel
+//!   failed to acknowledge would come again;
 //! * every stack buffer is back in its pool, every receive buffer is with the card or holding a
 //!   frame, and nothing is outstanding on the transmit queue;
 //! * where the platform wired the card's interrupt, every frame was collected by the handler and
 //!   none by polling.
 //!
-//! The started card and stack outlive the check: the stress run's network workload uses them
-//! through [`nic`], [`ping`] and [`udp_round`].
+//! The started card and stack outlive the check: the stress run's network workloads use them
+//! through [`nic`], [`ping`], [`udp_round`] and [`tcp_round`], and the socket calls through
+//! [`with_stack`].
 //!
 //! # Offline
 //!
@@ -40,7 +50,8 @@ use core::sync::atomic::Ordering;
 use arch::Cpu;
 use hal::{Arch, EarlyConsole, PhysAddr};
 use mm::phys::FrameAllocator;
-use net::{Config, Ipv4Addr, Mac, Stack};
+use net::tcp::State;
+use net::{Config, Conn, Ipv4Addr, Mac, Stack, TcpError};
 use sync::{LockClass, SpinLock};
 use time::Clock;
 use virtio::mem::Dma;
@@ -65,6 +76,15 @@ pub const PROBE: &[u8] = b"kintane-udp-probe";
 pub const ECHO: &[u8] = b"kintane-udp-echo ";
 pub const ACK: &[u8] = b"kintane-udp-ack ";
 
+/// What kbuild's TCP service is told and answers, and the datagram that tells the kernel which
+/// port it is on: `kbuild/src/qemu.rs` has the same three. A request is
+/// `kintane-tcp-request <mode> <tag>` and a newline, and its reply is the same line with `reply`
+/// for `request`. The mode `guest-closes` has kbuild wait for the kernel's close before its own,
+/// and `peer-closes` has kbuild close as soon as it has replied.
+pub const TCP_ANNOUNCE: &[u8] = b"kintane-tcp-port ";
+pub const TCP_REQUEST: &[u8] = b"kintane-tcp-request ";
+pub const TCP_REPLY: &[u8] = b"kintane-tcp-reply ";
+
 /// The identifier the kernel's echo requests carry.
 pub const PING_ID: u16 = 0x4b54;
 
@@ -77,6 +97,11 @@ const REPLY_NS: u64 = 3_000_000_000;
 /// kbuild probes four times a second from the moment QEMU starts, so a probe is normally
 /// already waiting. The bound is for a run with nobody on the other end.
 const PROBE_NS: u64 = 15_000_000_000;
+/// The longest one TCP round may take: a handshake, a retransmission or two, and a close.
+const TCP_NS: u64 = 10_000_000_000;
+/// How long the check keeps listening after its TCP rounds, for anything the peer sends again.
+/// QEMU's TCP retransmits no sooner than a second.
+pub const LINGER_NS: u64 = 3_000_000_000;
 
 /// SAFETY INVARIANT: written once, by [`bring_up`], before `STARTED` is set; read only after
 /// it is set, through [`nic`].
@@ -97,6 +122,56 @@ static STACK_CLASS: LockClass = LockClass::new("kernel.net");
 /// and the port. Zero until the check has heard from it.
 static PEER_ADDR: AtomicU32 = AtomicU32::new(0);
 static PEER_PORT: AtomicU32 = AtomicU32::new(0);
+/// The port kbuild's TCP service listens on, on the host's loopback interface, as its
+/// announcement said. Zero until one has arrived.
+static TCP_PORT: AtomicU32 = AtomicU32::new(0);
+
+/// kbuild's TCP port, once it has announced it.
+pub fn tcp_port() -> Option<u16> {
+    let port = TCP_PORT.load(Ordering::Acquire);
+    (port != 0).then_some(port as u16)
+}
+
+/// Run `f` on the stack, after polling it, on the scheduler's clock: for the socket calls,
+/// which run once the check is over. `None` without a started card.
+///
+/// The stack's lock is held for the poll and `f`, with interrupts masked; see [`STACK`].
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "the socket calls are its only users")
+)]
+pub fn with_stack<R>(f: impl FnOnce(&mut Stack, &VirtioNet<Locks>, u64) -> R) -> Option<R> {
+    let card = nic()?;
+    let t = crate::timekeeping::now().as_nanos();
+    let mut s = STACK.lock_irqsave();
+    s.poll(card, t);
+    Some(f(&mut s, card, t))
+}
+
+/// Remember kbuild's TCP port if `datagram` announces it.
+fn note(datagram: &[u8]) {
+    let Some(digits) = datagram.strip_prefix(TCP_ANNOUNCE) else {
+        return;
+    };
+    let mut port: u32 = 0;
+    for &d in digits {
+        if !d.is_ascii_digit() || port > u32::from(u16::MAX) {
+            return;
+        }
+        port = port * 10 + u32::from(d - b'0');
+    }
+    if port != 0 && port <= u32::from(u16::MAX) {
+        TCP_PORT.store(port, Ordering::Release);
+    }
+}
+
+/// Take every datagram waiting on [`PORT`], remembering an announcement among them.
+fn drain(s: &mut Stack) {
+    let mut got = [0u8; net::stack::UDP_MAX];
+    while let Some((_, _, len)) = s.udp_recv(PORT, &mut got) {
+        note(got.get(..len).unwrap_or(&[]));
+    }
+}
 
 /// The started card, once [`bring_up`] has brought it up.
 pub fn nic() -> Option<&'static VirtioNet<Locks>> {
@@ -356,6 +431,64 @@ fn exchange(
     c.write_str(", ");
     write_usize(c, ROUNDS as usize);
     c.write_str(" round trips");
+
+    let Some(port) = wait(card, PROBE_NS, now, spin, |s, _| {
+        drain(s);
+        tcp_port()
+    }) else {
+        return Some("KBUILD NEVER ANNOUNCED ITS TCP PORT");
+    };
+    c.write_str("; tcp port ");
+    write_usize(c, port as usize);
+    let before = STACK.lock_irqsave().tcp_counters();
+    let guest = match tcp_round(card, port, true, 1, TCP_NS, now, spin) {
+        Ok(round) => round,
+        Err(why) => return Some(why),
+    };
+    let peer = match tcp_round(card, port, false, 2, TCP_NS, now, spin) {
+        Ok(round) => round,
+        Err(why) => return Some(why),
+    };
+    // Anything the peer has to send again, for want of an acknowledgement, arrives in here.
+    let _ = wait(card, LINGER_NS, now, spin, |s, _| {
+        drain(s);
+        None::<()>
+    });
+    let after = STACK.lock_irqsave().tcp_counters();
+    c.write_str(", closed by the kernel [");
+    write_states(c, guest.visited);
+    c.write_str("] and by kbuild [");
+    write_states(c, peer.visited);
+    c.write_str("], ");
+    write_usize(c, (guest.retransmits + peer.retransmits) as usize);
+    c.write_str(" data retransmits");
+
+    let through = |round: &TcpRound, states: &[State]| {
+        round.closed && states.iter().all(|s| round.visited & s.bit() != 0)
+    };
+    if !through(&guest, &[State::Established, State::FinWait1, State::TimeWait]) {
+        return Some("THE KERNEL'S CLOSE DID NOT PASS THROUGH FIN-WAIT-1 TO TIME-WAIT");
+    }
+    if !through(&peer, &[State::Established, State::CloseWait, State::LastAck]) {
+        return Some("KBUILD'S CLOSE DID NOT PASS THROUGH CLOSE-WAIT AND LAST-ACK TO CLOSED");
+    }
+    if guest.retransmits == 0 || peer.retransmits == 0 {
+        return Some(
+            "A CONNECTION RETRANSMITTED NO DATA, THOUGH KBUILD DROPS THE FIRST SEGMENT OF EACH",
+        );
+    }
+    let again = (after.duplicates - before.duplicates)
+        + (after.out_of_order - before.out_of_order)
+        + (after.resets_sent - before.resets_sent)
+        + (after.resets_received - before.resets_received);
+    if again != 0 {
+        c.write_str(", ");
+        write_usize(c, again as usize);
+        c.write_str(" segments repeated or reset");
+        return Some(
+            "THE PEER SENT A SEGMENT AGAIN OR A RESET WAS EXCHANGED: AN ACKNOWLEDGEMENT WENT MISSING",
+        );
+    }
     None
 }
 
@@ -436,6 +569,7 @@ pub fn udp_round(
             if (from, port) == peer && got.get(..len) == ack.get(..ack_len) {
                 return Some(());
             }
+            note(got.get(..len).unwrap_or(&[]));
         }
         None
     })
@@ -449,8 +583,235 @@ fn take_probe(s: &mut Stack) -> Option<(Ipv4Addr, u16)> {
         if got.get(..len) == Some(PROBE) {
             return Some((from, port));
         }
+        note(got.get(..len).unwrap_or(&[]));
     }
     None
+}
+
+/// What one TCP round with kbuild showed.
+#[derive(Clone, Copy)]
+pub struct TcpRound {
+    /// Every state the connection was seen in, as `net::tcp::State` bits.
+    pub visited: u16,
+    /// Data segments sent again during the round.
+    pub retransmits: u64,
+    /// The connection reached the end its close order leads to: TIME-WAIT for the kernel's
+    /// close, CLOSED and reaped for kbuild's.
+    pub closed: bool,
+}
+
+/// Connect to kbuild's TCP service on `port`, send request `n` in the mode `guest_closes`
+/// names, check the reply, and close in that order. The connection is aborted if anything
+/// fails, so a failed round holds no buffer.
+pub fn tcp_round(
+    card: &VirtioNet<Locks>,
+    port: u16,
+    guest_closes: bool,
+    n: u32,
+    timeout_ns: u64,
+    now: &mut dyn FnMut() -> u64,
+    pause: fn(),
+) -> Result<TcpRound, &'static str> {
+    let mode: &[u8] = if guest_closes {
+        b"guest-closes "
+    } else {
+        b"peer-closes "
+    };
+    let mut request = [0u8; 64];
+    let request_len = line(&mut request, TCP_REQUEST, mode, n);
+    let mut reply = [0u8; 64];
+    let reply_len = line(&mut reply, TCP_REPLY, mode, n);
+    let before = STACK.lock_irqsave().tcp_counters().data_retransmits;
+    let t = now();
+    let conn = STACK
+        .lock_irqsave()
+        .tcp_connect(card, GATEWAY, port, t)
+        .map_err(|_| "NO TCP CONNECTION COULD BE OPENED")?;
+    let result = tcp_exchange(
+        card,
+        conn,
+        guest_closes,
+        &request[..request_len],
+        &reply[..reply_len],
+        timeout_ns,
+        now,
+        pause,
+    );
+    if result.is_err() {
+        let t = now();
+        // Already gone, or closing: either way nothing is left holding a buffer.
+        let _ = STACK.lock_irqsave().tcp_abort(card, conn, t);
+    }
+    let mut round = result?;
+    round.retransmits = STACK.lock_irqsave().tcp_counters().data_retransmits - before;
+    Ok(round)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tcp_exchange(
+    card: &VirtioNet<Locks>,
+    conn: Conn,
+    guest_closes: bool,
+    request: &[u8],
+    reply: &[u8],
+    timeout_ns: u64,
+    now: &mut dyn FnMut() -> u64,
+    pause: fn(),
+) -> Result<TcpRound, &'static str> {
+    let mut visited = 0u16;
+    let mut queued = 0;
+    wait(card, timeout_ns, now, pause, |s, t| {
+        let Some(st) = s.tcp_status(conn) else {
+            return Some(Err("THE TCP CONNECTION VANISHED BEFORE ITS REQUEST WAS SENT"));
+        };
+        visited |= st.visited;
+        if st.error.is_some() {
+            return Some(Err("THE TCP CONNECTION WAS REFUSED, RESET OR TIMED OUT"));
+        }
+        if st.state != State::Established {
+            return None;
+        }
+        match s.tcp_send(card, conn, request.get(queued..).unwrap_or(&[]), t) {
+            Ok(n) => {
+                queued += n;
+                (queued == request.len()).then_some(Ok(()))
+            }
+            Err(TcpError::WouldBlock) => None,
+            Err(_) => Some(Err("THE TCP REQUEST COULD NOT BE QUEUED")),
+        }
+    })
+    .ok_or("THE TCP CONNECTION WAS NEVER ESTABLISHED")??;
+
+    let mut got = [0u8; 64];
+    let mut len = 0;
+    wait(card, timeout_ns, now, pause, |s, t| {
+        loop {
+            if len >= reply.len() {
+                return Some(Ok(()));
+            }
+            let room = got.get_mut(len..reply.len()).unwrap_or(&mut []);
+            match s.tcp_recv(card, conn, room, t) {
+                Ok(0) => return Some(Err("KBUILD CLOSED BEFORE ITS TCP REPLY WAS COMPLETE")),
+                Ok(n) => len += n,
+                Err(TcpError::WouldBlock) => return None,
+                Err(_) => return Some(Err("THE TCP CONNECTION FAILED BEFORE THE REPLY")),
+            }
+        }
+    })
+    .ok_or("NO TCP REPLY ARRIVED")??;
+    if got.get(..reply.len()) != Some(reply) {
+        return Err("THE TCP REPLY WAS NOT THE ONE ASKED FOR");
+    }
+
+    if !guest_closes {
+        // kbuild closes once it has replied: the end of the stream comes first.
+        wait(card, timeout_ns, now, pause, |s, t| {
+            let mut rest = [0u8; 8];
+            if let Some(st) = s.tcp_status(conn) {
+                visited |= st.visited;
+            }
+            match s.tcp_recv(card, conn, &mut rest, t) {
+                Ok(0) => Some(Ok(())),
+                Ok(_) => Some(Err("KBUILD SENT MORE THAN ITS TCP REPLY")),
+                Err(TcpError::WouldBlock) => None,
+                Err(_) => Some(Err("THE TCP CONNECTION FAILED BEFORE KBUILD CLOSED IT")),
+            }
+        })
+        .ok_or("KBUILD NEVER CLOSED ITS END")??;
+    }
+    let t = now();
+    {
+        let mut s = STACK.lock_irqsave();
+        s.tcp_close(card, conn, t)
+            .map_err(|_| "THE TCP CONNECTION COULD NOT BE CLOSED")?;
+        // Seen under the same lock as the close, which sent the FIN: the peer's acknowledgement
+        // can arrive before the wait below first looks, and a connection closed and reaped by
+        // then would never have been seen in LAST-ACK.
+        if let Some(st) = s.tcp_status(conn) {
+            visited |= st.visited;
+        }
+    }
+    let mut failed = false;
+    let over = wait(card, timeout_ns, now, pause, |s, _| match s.tcp_status(conn) {
+        Some(st) => {
+            visited |= st.visited;
+            failed |= st.error.is_some();
+            (guest_closes && st.state == State::TimeWait).then_some(())
+        }
+        // Reaped: closed, and its buffers given back.
+        None => Some(()),
+    });
+    let closed = over.is_some()
+        && !failed
+        && if guest_closes {
+            visited & State::TimeWait.bit() != 0
+        } else {
+            visited & State::LastAck.bit() != 0
+        };
+    Ok(TcpRound {
+        visited,
+        retransmits: 0,
+        closed,
+    })
+}
+
+/// `prefix`, `mode`, `n` in decimal and a newline. Returns the length written.
+fn line(buf: &mut [u8; 64], prefix: &[u8], mode: &[u8], n: u32) -> usize {
+    let mut number = [0u8; 32];
+    let digits = numbered(&mut number, b"", n);
+    let mut at = 0;
+    for part in [prefix, mode, &number[..digits], b"\n"] {
+        for &b in part {
+            if let Some(slot) = buf.get_mut(at) {
+                *slot = b;
+                at += 1;
+            }
+        }
+    }
+    at
+}
+
+/// The TCP states in `visited`, in the order a connection passes through them.
+fn write_states(c: &dyn EarlyConsole, visited: u16) {
+    const NAMES: [(State, &str); 10] = [
+        (State::SynSent, "syn-sent"),
+        (State::SynReceived, "syn-received"),
+        (State::Established, "established"),
+        (State::FinWait1, "fin-wait-1"),
+        (State::FinWait2, "fin-wait-2"),
+        (State::Closing, "closing"),
+        (State::TimeWait, "time-wait"),
+        (State::CloseWait, "close-wait"),
+        (State::LastAck, "last-ack"),
+        (State::Closed, "closed"),
+    ];
+    let mut first = true;
+    for (state, name) in NAMES {
+        if visited & state.bit() != 0 {
+            if !first {
+                c.write_str(" ");
+            }
+            c.write_str(name);
+            first = false;
+        }
+    }
+}
+
+/// No TCP connection holds a ring, and the pool's books agree with what connections hold:
+/// what a moment with no TCP connection in use must show. A connection in TIME-WAIT holds
+/// none, and is allowed.
+pub fn tcp_audit() -> Result<(), &'static str> {
+    if nic().is_none() {
+        return Ok(());
+    }
+    let s = STACK.lock_irqsave();
+    if s.tcp_rings_held() != 0 {
+        return Err("a TCP connection holds its buffers with nothing using it (a leak)");
+    }
+    if !s.books_consistent() {
+        return Err("the pool's books do not match the buffers TCP connections hold");
+    }
+    Ok(())
 }
 
 /// The stack's pool full, the card's receive buffers all accounted for and nothing on its
