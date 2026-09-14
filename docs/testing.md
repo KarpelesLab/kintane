@@ -1676,9 +1676,9 @@ With only other agents' work loading the host, the old window also failed 2 runs
 
 **Other bounds that are still durations**, and why each stays:
 
-- `sleep`'s 500 ms lateness and the boot `sleep` check's three slices: lateness *is* wall
-  time, and what they check. Beside a second soak on the same host, a two-hour run on
-  `x86_64-qemu-smp` at eight CPUs reached 284 ms of it, and one on `aarch64-virt-smp` 89 ms;
+- the boot `sleep` check's three slices: lateness *is* wall time, and what it checks. The
+  stress run's sleeper no longer fails on lateness alone — see
+  [a late wake-up](#a-late-wake-up-is-the-schedulers-only-if-it-passed-the-sleeper-over);
 - `waits`' 10 s and 5 s patience and `procs::wait_exit`'s 1 s drain in the boot check:
   generous bounds on something that normally takes milliseconds;
 - `PARK_WITHIN`'s 3 s and the audit's `STALL_WAIT`: these now judge only a workload the
@@ -1958,6 +1958,30 @@ missed an iteration in an audit interval at all.
 | heap A runs but never records an iteration, with `STALL_WAIT` raised so only the slice bound can fire | `a workload ran its slices without progress: heap A`, at 6 s |
 | The sleeper blocks for ten seconds, so it cannot answer a park request | `a workload did not reach a checkpoint: sleep`, at 1 s |
 | The sleeper parks and sleeps as usual but never records an iteration | `a workload made no progress: sleep`, at 4 s |
+
+#### A late wake-up is the scheduler's only if it passed the sleeper over
+
+The sleep workload failed the run on any wake more than half a second after its deadline.
+That is wall time, and under an emulator the guest's clock follows the host's: a vCPU the host
+stops running wakes late with nothing wrong in the kernel. A two-hour soak on
+`aarch64-virt-smp` at eight CPUs died this way at 453 seconds, beside a second soak, with the
+host at load 19 — the run's worst lateness was 437 ms by then, against a 500 ms bound.
+
+What the kernel answers for is what it did with the interrupts it took. The sleeper is the
+most urgent workload, so an interrupt that found it ready and ran something no more urgent is
+the scheduler failing to reach it. A wake-up past `MAX_LATE` is now looked into rather than
+failed outright: with `LATE_PASSES` slices passed over while ready, it fails and says so; with
+none, nobody ran on that CPU at all, which is the host, and it is counted and printed in the
+heartbeat as `late with the CPU elsewhere`. Waking *before* a deadline still fails outright,
+which is the half of the check an emulator cannot forge.
+
+| Mutation | Result |
+|---|---|
+| Every wake over a millisecond late, and all of it blamed on the scheduler (`LATE_PASSES` 0) | `a sleep woke late after the scheduler passed it over while ready`, at 1 s |
+| Every wake over a millisecond late, judged as built | the run **passes**: 453 late wakes, worst 733 ms, every one counted as the CPU being elsewhere and none blamed on the scheduler |
+
+The second is the point of the change: on a host running two soaks and five other jobs, three
+quarters of a second of lateness was reported and not one wake-up was the scheduler's doing.
 
 #### A slow shootdown is not a broken one
 
