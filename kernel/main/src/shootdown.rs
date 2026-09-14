@@ -14,10 +14,14 @@
 //! * **Initiators are serialised by [`SERIAL`], taken with `try_lock` in a loop that answers any
 //!   request addressed to the waiting CPU.** Two CPUs starting a shootdown at once therefore cannot
 //!   each wait for the other's answer.
-//! * **No lock held across a shootdown may be waited for with interrupts masked.** A CPU spinning
-//!   masked for a lock the initiator holds can never take the IPI. The kernel `Vm` locks are taken
-//!   with interrupts masked, and are safe only because one thread and its own page faults use each
-//!   `Vm`. That rule is written in `docs/memory-model.md`.
+//! * **No lock held across a shootdown may be waited for with interrupts masked, unless the wait
+//!   answers requests itself.** A CPU spinning masked for a lock the initiator holds can never take
+//!   the IPI, so a lock whose holder may shoot down must be waited for with a spin that calls
+//!   [`service_here`] (`SpinLock::lock_irqsave_with`, or the process locks' own loop). [`SERIAL`]
+//!   is waited for that way here, and so are each process's lock and the frame lock in `userproc`.
+//!   The stress run's kernel `Vm` lock is taken with a plain masked spin, and is safe only because
+//!   one thread and its own page faults use that `Vm` and the audit takes it once that thread has
+//!   parked. That rule is written in `docs/memory-model.md`.
 //!
 //! A wait that goes on far longer than a TCG-emulated IPI should take is counted as a
 //! stall and continues. It does not give up: a shootdown that returned without every
@@ -54,7 +58,7 @@ use mm::tlb::{Mask, Shootdown, bit};
 use sync::SpinLock;
 use sync::lockdep::LockClass;
 
-use crate::{Check, Live, kheap, mp, write_usize};
+use crate::{AtomicU64, Check, Live, kheap, mp, write_usize};
 
 static STATE: Shootdown = Shootdown::new();
 
@@ -68,6 +72,11 @@ static MISMATCHES: AtomicUsize = AtomicUsize::new(0);
 
 /// Waits that took far longer than an IPI should.
 static STALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// The longest any request waited for its answers, and the total over every request, in
+/// nanoseconds of the kernel's clock: under TCG that is mostly what emulated IPIs cost.
+static WORST_NS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Spins of the wait loop before a wait counts as stalled: seconds under TCG.
 const STALL_SPINS: usize = 1 << 26;
@@ -85,6 +94,13 @@ pub fn stats() -> (usize, usize, usize) {
         STATE.flushes(),
         MISMATCHES.load(Ordering::Relaxed) + STALLS.load(Ordering::Relaxed),
     )
+}
+
+/// The mean and the worst wait for a request's answers since boot, in microseconds.
+pub fn latency_us() -> (u64, u64) {
+    let total = TOTAL_NS.load(Ordering::Relaxed);
+    let mean = total.checked_div(STATE.requests() as u64).unwrap_or(0);
+    (mean / 1000, WORST_NS.load(Ordering::Relaxed) / 1000)
 }
 
 /// Every online CPU but `me`.
@@ -153,6 +169,7 @@ fn shoot(addr: Option<usize>) {
         // Unreachable while `SERIAL` serialises requests: the previous one finished.
         MISMATCHES.fetch_add(1, Ordering::Relaxed);
     }
+    let asked = crate::timekeeping::now();
     for cpu in 0..mp::CPUS {
         if targets & bit(cpu).unwrap_or(0) != 0 {
             Cpu::send_ipi(cpu, Ipi::TlbFlush);
@@ -166,6 +183,11 @@ fn shoot(addr: Option<usize>) {
         }
         core::hint::spin_loop();
     }
+    let waited = crate::timekeeping::now()
+        .saturating_duration_since(asked)
+        .as_nanos();
+    TOTAL_NS.fetch_add(waited, Ordering::Relaxed);
+    WORST_NS.fetch_max(waited, Ordering::Relaxed);
     // The books, against the online set computed again rather than the mask sent: a
     // targeting mistake above would otherwise agree with itself.
     let expected = others(me);

@@ -110,6 +110,19 @@ impl<T, A: Arch + HasCas> SpinLock<T, A> {
     ///
     /// Leaves interrupts alone; see the type's documentation for when that is wrong.
     pub fn lock(&self) -> SpinGuard<'_, T, A> {
+        self.lock_with(|| {})
+    }
+
+    /// Take the lock, calling `on_spin` on every turn of the wait.
+    ///
+    /// For a waiter that must keep answering something while it spins. A CPU waiting with
+    /// interrupts masked cannot take an interrupt, so if the lock's holder may in turn be
+    /// waiting on that CPU — for its answer to a TLB shootdown, say — the wait must answer
+    /// it here, or the two wait for each other. `on_spin` runs with the ticket drawn and the
+    /// lock not yet held, so it must not take this lock.
+    ///
+    /// Leaves interrupts alone, like [`SpinLock::lock`].
+    pub fn lock_with(&self, mut on_spin: impl FnMut()) -> SpinGuard<'_, T, A> {
         // Before drawing a ticket: re-taking a held lock is caught here and stops the
         // CPU, instead of spinning for ever below. A no-op without a class.
         lockdep::acquire::<A>(&self.class, self.instance());
@@ -131,6 +144,7 @@ impl<T, A: Arch + HasCas> SpinLock<T, A> {
         // TCG does not model aarch64's memory model — and would corrupt data on real
         // ARM silicon. See `docs/testing.md#what-qemu-will-not-catch`.
         while self.now_serving.load(Ordering::Acquire) != ticket {
+            on_spin();
             // A hint, not a barrier: `yield` on aarch64, `pause` on x86. It exists to
             // stop the core burning issue slots and power while it waits.
             spin_loop();
@@ -184,6 +198,17 @@ impl<T, A: Arch + HasCas> SpinLock<T, A> {
         let irq = IrqGuard::mask();
         SpinIrqGuard {
             guard: self.lock(),
+            _irq: irq,
+        }
+    }
+
+    /// [`SpinLock::lock_irqsave`], calling `on_spin` on every turn of the wait: masked
+    /// first, then spinning as [`SpinLock::lock_with`] does. The form for a lock whose holder
+    /// may wait, with interrupts masked, for something only the waiting CPU can do.
+    pub fn lock_irqsave_with(&self, on_spin: impl FnMut()) -> SpinIrqGuard<'_, T, A> {
+        let irq = IrqGuard::mask();
+        SpinIrqGuard {
+            guard: self.lock_with(on_spin),
             _irq: irq,
         }
     }
@@ -393,6 +418,51 @@ mod tests {
             *g = seen.wrapping_add(1);
             assert_eq!(*g, expected);
         }
+        assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn lock_with_calls_on_spin_only_while_it_waits_full() {
+        let lock: SpinLock<u32, MockFull> = SpinLock::new(0);
+
+        // Free: taken at once, and the wait never turns.
+        let mut spins = 0usize;
+        drop(lock.lock_with(|| spins += 1));
+        assert_eq!(spins, 0);
+
+        // Held: the holder lets go only from inside the waiter's spin, so the waiter gets
+        // the lock only because its spin ran.
+        let held = core::cell::Cell::new(Some(lock.lock()));
+        let mut g = lock.lock_with(|| {
+            spins += 1;
+            if spins == 3 {
+                drop(held.take());
+            }
+        });
+        *g = 7;
+        drop(g);
+        assert_eq!(spins, 3);
+        assert!(!lock.is_locked());
+        assert_eq!(*lock.lock(), 7);
+    }
+
+    #[test]
+    fn lock_irqsave_with_masks_before_it_waits_full() {
+        let _s = serial();
+        assert!(interrupts_enabled::<MockFull>());
+
+        let lock: SpinLock<u32, MockFull> = SpinLock::new(0);
+        let held = core::cell::Cell::new(Some(lock.lock()));
+        let mut masked_while_waiting = true;
+        {
+            let _g = lock.lock_irqsave_with(|| {
+                masked_while_waiting &= !interrupts_enabled::<MockFull>();
+                drop(held.take());
+            });
+            assert!(!interrupts_enabled::<MockFull>());
+        }
+        assert!(masked_while_waiting);
+        assert!(interrupts_enabled::<MockFull>());
         assert!(!lock.is_locked());
     }
 

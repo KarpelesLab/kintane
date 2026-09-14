@@ -368,6 +368,13 @@ fn lock(slot: usize) -> Option<Held> {
 static FRAMES: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 /// Exclusion for [`FRAMES`]. Held for one frame operation or one `Vm` call and never
 /// across a context switch, so it orders below the scheduler's lock and above nothing.
+///
+/// Its holder may shoot down TLBs: a `Vm` call that unmaps or write-protects a page waits,
+/// with interrupts masked, for every other CPU to flush. So a CPU waiting for this lock
+/// answers shootdowns while it spins (see `shootdown`), which is why it is taken only through
+/// [`with_frames`] and [`set_frames`] and never with a plain `lock_irqsave`: a thread faulting
+/// on another CPU spins for it masked, and a spin that did not answer would never let the
+/// holder finish.
 static FRAME_CLASS: sync::lockdep::LockClass = sync::lockdep::LockClass::new("userproc.frames");
 static FRAME_LOCK: sync::SpinLock<(), Cpu> = sync::SpinLock::with_class((), &FRAME_CLASS);
 /// The share-count slots each process's `Vm` borrows: one store per slot, since two
@@ -597,7 +604,7 @@ pub(crate) fn with_frames<R>(f: impl FnOnce(&mut KernelFrames<'static>) -> R) ->
     if ptr.is_null() {
         return None;
     }
-    let _guard = FRAME_LOCK.lock_irqsave();
+    let _guard = FRAME_LOCK.lock_irqsave_with(mp::answer_shootdowns);
     // SAFETY: see `FRAMES`: the pointer is the boot allocator, live while any process is,
     // and the lock makes this borrow the only one. The direct map is the kernel's, which
     // every process's space maps identically.
@@ -888,11 +895,6 @@ pub(crate) fn start_linux(
 /// [`start_linux`] without starting the thread: build the process, install it, lay out its
 /// start, and return how its first thread enters it, for `spawn::start_thread`. `None` has
 /// torn down whatever it built.
-///
-/// A caller starting several processes prepares them all before starting any. Installing a
-/// program protects its segments, which shoots down TLBs holding the frame lock with
-/// interrupts masked, and a thread already running on another CPU may be spinning, masked,
-/// for that same lock in a fault: neither could go on (see `shootdown`).
 #[cfg_attr(
     not(CONFIG_ABI_LINUX),
     expect(dead_code, reason = "used only by the Linux personality")
@@ -2376,7 +2378,7 @@ impl KernelEnd {
 /// # Safety invariant
 /// `frames` must outlive every process built while it is installed.
 pub(crate) fn set_frames(frames: &mut FrameAllocator<'static, Cpu>) {
-    let _guard = FRAME_LOCK.lock_irqsave();
+    let _guard = FRAME_LOCK.lock_irqsave_with(mp::answer_shootdowns);
     FRAMES.store((frames as *mut FrameAllocator<'static, Cpu>).cast(), Ordering::Relaxed);
 }
 

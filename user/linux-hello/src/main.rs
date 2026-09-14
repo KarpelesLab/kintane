@@ -14,7 +14,9 @@
 //! * `rich`: [`rich`], a pipe, `fork`, `execve`, `wait4`, and a thread sharing a futex-guarded
 //!   counter;
 //! * `child`: what `rich`'s child `execve`s into, which writes to the pipe it inherited;
-//! * `tls`: [`tls`], a thread pointer checked across a hundred yields, run two at a time.
+//! * `tls`: [`tls`], a thread pointer checked across a hundred yields, run two at a time;
+//! * `churn`: [`churn`], anonymous pages mapped, faulted in and unmapped, over and over, run two at
+//!   a time on two CPUs.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -51,6 +53,7 @@ const SUCCESS: u64 = 42;
 const RICH_SUCCESS: u64 = 43;
 const TLS_SUCCESS: u64 = 44;
 const CHILD_SUCCESS: u64 = 45;
+const CHURN_SUCCESS: u64 = 46;
 
 /// What the program says on standard output.
 const HELLO: &[u8] = b"hello from linux\n";
@@ -159,6 +162,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"rich" => rich(),
         b"child" => child(),
         b"tls" => tls(),
+        b"churn" => churn(),
         _ => hello(&s),
     }
 }
@@ -535,6 +539,33 @@ fn tls() -> ! {
         expect(sys::tls_word() == mark, 91);
     }
     exit(TLS_SUCCESS)
+}
+
+// ---- churn: page faults and unmaps, while another CPU does the same ----------------------
+
+/// Times `churn` maps, faults in and unmaps its pages.
+const CHURN_ROUNDS: u64 = 200;
+/// Pages in each mapping.
+const CHURN_PAGES: u64 = 8;
+
+fn churn() -> ! {
+    for round in 0..CHURN_ROUNDS {
+        // 95: a fresh anonymous mapping, with nothing in it yet.
+        let at = map(CHURN_PAGES * PAGE);
+        expect(at > 0, 95);
+        // 96: every page faulted in by a write, and reading back what was written.
+        for i in 0..CHURN_PAGES {
+            let page = (at as u64 + i * PAGE) as *mut u64;
+            // SAFETY: a page of the mapping just made, readable and writable.
+            unsafe { page.write(round << 8 | i) };
+            // SAFETY: as above.
+            expect(unsafe { page.read() } == round << 8 | i, 96);
+        }
+        // 97: unmapped again, which takes the page from every other CPU's cache too.
+        let unmapped = sys::call(sys::MUNMAP, [at as u64, CHURN_PAGES * PAGE, 0, 0, 0, 0]);
+        expect(unmapped == 0, 97);
+    }
+    exit(CHURN_SUCCESS)
 }
 
 #[panic_handler]

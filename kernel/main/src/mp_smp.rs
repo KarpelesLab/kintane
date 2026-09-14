@@ -68,6 +68,11 @@ pub fn shootdown_stats() -> (usize, usize, usize) {
     crate::shootdown::stats()
 }
 
+/// The mean and the worst wait for a shootdown's answers since boot, in microseconds.
+pub fn shootdown_latency_us() -> (u64, u64) {
+    crate::shootdown::latency_us()
+}
+
 /// Answer any TLB shootdown addressed to this CPU, from a lock's spin loop with interrupts
 /// masked: the lock's holder may be waiting, masked too, for this CPU's flush.
 #[cfg_attr(

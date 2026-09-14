@@ -995,7 +995,7 @@ On `aarch64-virt` it read 42 futex waits blocked and 42 woken.
 
 **In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
 the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.
-It builds and installs both processes before starting either, then pins both to one CPU, a
+It starts each process as it builds it and pins both to one CPU, a
 different one each pair. Each sets its own thread pointer to a block marked with its pid and checks
 it after each of 100 yields, then exits with 44. A process that reads another's mark exits 91 and
 fails the audit, and so does a pair that is not over in 10 s or that leaves a frame behind. The
@@ -1015,9 +1015,48 @@ Three versions came before this one, and the stress run found something wrong wi
   first process's thread was faulting on another CPU, spinning with interrupts masked for the
   frame lock, while the auditor installed the second process, whose segment protection shoots down
   TLBs holding that lock. `shootdown.rs` forbids waiting masked for a lock held across a shootdown.
-  `userproc::prepare_linux` now builds a process without starting it, and the same hazard for
-  `fork` and `execve` on a multiprocessor is written down in
-  [userspace-abi.md](userspace-abi.md#as-built--static-programs-x86_64-and-aarch64) as open.
+  For a round the pair built and installed both processes before starting either. In the ninth
+  round the frame lock's wait was made to answer shootdowns, and the pair starts each process as
+  it builds it again; see [the frame lock under shootdowns](#the-frame-lock-under-shootdowns).
+
+#### The frame lock under shootdowns
+
+Every process's `Vm` operations share one frame lock, and an unmap, a write-protect, a program
+install, `fork` and `execve` all shoot down TLBs holding it. A thread faulting on another CPU
+waits for that lock with interrupts masked, so unless its wait answers the shootdown, the two
+CPUs wait for each other, and every CPU that needs either stops after them.
+
+**The churning pair.** Every fourth audit interval, halfway between thread-pointer pairs, and
+only on more than one CPU, the auditor starts the program as `hello churn`, pinned to one CPU. It
+lets it run 20 ms, then builds, installs and starts a second, pinned to the next CPU, so the second
+install shoots down while the first faults. Each maps eight anonymous pages, writes and reads back
+every one, and unmaps them, 200 times, then exits with 46. A process that cannot map, gets back
+the wrong value, or cannot unmap exits 95, 96 or 97 and fails the audit, and so does a pair that is
+not over in 10 s or that leaves a frame behind. The heartbeat counts `churning pairs`.
+
+| Lock (40 s stress runs) | `x86_64-qemu-smp` 4 CPUs | 8 CPUs | `aarch64-virt-smp` 4 CPUs | 8 CPUs |
+|---|---|---|---|---|
+| Plain masked spin, the pair workaround in place (base `8bfa611` plus the cycle) | watchdog after heartbeat 2 | watchdog after heartbeat 2 | watchdog after heartbeat 2 | `a churning process's thread did not end` at 18 s |
+| Plain masked spin, final code (the fix reverted) | `a churning process's thread did not end` at 18 s | the same | the same | watchdog, no heartbeat in 180 s |
+| Answering wait (`lock_irqsave_with`) | 41 audit lines, 10 churning pairs, 10 Linux pairs | the same | the same | the same |
+
+Eight runs of eight hung with the plain spin, each at the first churning pair or, on
+`aarch64-virt-smp` at 8 CPUs with the final code, already on the boot path; four of four passed
+with the answering wait. A hang is caught by one of two bounds: the pair's 10 s patience, when the
+auditor's own CPU is not one of the stuck two, and otherwise kbuild's heartbeat watchdog.
+
+The heartbeat's shootdown count now carries the mean and worst wait for answers. Those numbers
+are QEMU's and the host's, not the protocol's; see
+[architecture.md](architecture.md#tlb-shootdown). In the passing runs above: mean 31 us and worst
+36 ms (`x86_64-qemu-smp`, 4 CPUs), 174 us and 42 ms (8 CPUs), 26 us and 4 ms (`aarch64-virt-smp`,
+4 CPUs), 114 us and 103 ms (8 CPUs). Before the fix the same runs showed means of 23–144 us over
+their first two intervals, before they hung.
+
+**Not reproduced here:** `fork` and `execve` against a fault. The stress run has no namespace
+for `execve`, and a forked child keeps its process slot and its pool stack until the tree is torn
+down, so a fork loop would run out of both within a few forks. They take the frame lock through
+the same `with_frames`, and the churning pair exercises its wait with the two operations the
+stress run can repeat: installs and unmaps.
 
 During this branch's verification, 20 s single-CPU stress runs also failed as the round-7 notes
 describe: `x86_64-qemu` with "user process: a process made no progress", and `i686-qemu` with
@@ -1492,7 +1531,8 @@ workloads spread across them. Two more checks join the audit there:
 - **Spread.** The two heap workloads never block, so only balancing moves them off the CPU that
   spawned them. If both ran on a single CPU for a whole interval, the audit fails.
 - **Shootdowns.** Every TLB shootdown since boot was answered by exactly the online CPUs other than
-  the initiator, and none stalled.
+  the initiator, and none stalled. The heartbeat also reports how long they waited for their
+  answers, mean and worst.
 
 The heartbeat adds iterations per CPU, migrations, pulls, reschedule IPIs and shootdowns:
 
