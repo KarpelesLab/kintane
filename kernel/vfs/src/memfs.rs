@@ -129,6 +129,23 @@ impl<'a, const NODES: usize> MemFs<'a, NODES> {
         Ok(index as NodeId)
     }
 
+    /// Free a node: a directory only once it is empty, and never the root.
+    fn remove(&mut self, index: usize) -> Result<(), Error> {
+        if index == ROOT as usize {
+            return Err(Error::BadPath);
+        }
+        let has_children = self
+            .nodes
+            .iter()
+            .enumerate()
+            .any(|(i, n)| i != index && n.used && n.parent == index);
+        if self.nodes[index].kind == Kind::Dir && has_children {
+            return Err(Error::NotEmpty);
+        }
+        self.nodes[index] = Node::EMPTY;
+        Ok(())
+    }
+
     fn find(&self, parent: usize, name: &[u8]) -> Option<usize> {
         self.nodes
             .iter()
@@ -192,10 +209,8 @@ impl<const NODES: usize> FileSystem for MemFs<'_, NODES> {
             return Err(Error::IsADirectory);
         }
         let at = usize::try_from(offset).map_err(|_| Error::OutOfRange)?;
-        let data = n
-            .data
-            .as_mut()
-            .ok_or(Error::Corrupt("a file with no storage"))?;
+        // A file made by `create` has no storage lent to it, so it has no room.
+        let data = n.data.as_mut().ok_or(Error::Full)?;
         if at > n.len {
             // Writing past the end would leave a hole whose contents nobody decided on.
             return Err(Error::OutOfRange);
@@ -207,6 +222,67 @@ impl<const NODES: usize> FileSystem for MemFs<'_, NODES> {
         data[at..end].copy_from_slice(from);
         n.len = n.len.max(end);
         Ok(from.len())
+    }
+
+    fn create(&mut self, dir: NodeId, name: &[u8], kind: Kind) -> Result<NodeId, Error> {
+        let parent = self.slot(dir)?;
+        if self.nodes[parent].kind == Kind::Dir && self.find(parent, name).is_some() {
+            return Err(Error::Exists);
+        }
+        self.make(dir, name, kind).map(|i| i as NodeId)
+    }
+
+    fn truncate(&mut self, node: NodeId, len: u64) -> Result<(), Error> {
+        let index = self.slot(node)?;
+        let n = &mut self.nodes[index];
+        if n.kind != Kind::File {
+            return Err(Error::IsADirectory);
+        }
+        let len = usize::try_from(len).map_err(|_| Error::Full)?;
+        if len > n.len {
+            let data = n.data.as_mut().ok_or(Error::Full)?;
+            if len > data.len() {
+                return Err(Error::Full);
+            }
+            data[n.len..len].fill(0);
+        }
+        n.len = len;
+        Ok(())
+    }
+
+    fn unlink(&mut self, dir: NodeId, name: &[u8]) -> Result<(), Error> {
+        let dir = self.slot(dir)?;
+        if self.nodes[dir].kind != Kind::Dir {
+            return Err(Error::NotADirectory);
+        }
+        let victim = self.find(dir, name).ok_or(Error::NotFound)?;
+        self.remove(victim)
+    }
+
+    fn rename(&mut self, dir: NodeId, from: &[u8], to: &[u8]) -> Result<(), Error> {
+        let dir = self.slot(dir)?;
+        if self.nodes[dir].kind != Kind::Dir {
+            return Err(Error::NotADirectory);
+        }
+        if to.is_empty() || to.len() > MAX_NAME || to.contains(&b'/') {
+            return Err(Error::BadPath);
+        }
+        let source = self.find(dir, from).ok_or(Error::NotFound)?;
+        if let Some(target) = self.find(dir, to) {
+            if target != source {
+                match (self.nodes[source].kind, self.nodes[target].kind) {
+                    (Kind::File, Kind::Dir) => return Err(Error::IsADirectory),
+                    (Kind::Dir, Kind::File) => return Err(Error::NotADirectory),
+                    _ => {}
+                }
+                self.remove(target)?;
+            }
+        }
+        let n = &mut self.nodes[source];
+        n.name = [0; MAX_NAME];
+        n.name[..to.len()].copy_from_slice(to);
+        n.name_len = to.len();
+        Ok(())
     }
 
     fn readdir(&mut self, dir: NodeId, index: usize) -> Result<Option<Entry>, Error> {

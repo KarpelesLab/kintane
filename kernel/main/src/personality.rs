@@ -119,12 +119,14 @@ enum Descriptor {
     Stdin,
     /// The console, through a handle in the process's own table.
     Console(Handle),
-    /// An open file in the namespace, with what `fstat` reports of it.
+    /// An open file in the namespace, with what `fstat` reports of it that the namespace does
+    /// not, and what it was opened for.
     File {
         fd: vfs::Fd,
         kind: FileKind,
-        len: u64,
         ino: u64,
+        readable: bool,
+        writable: bool,
     },
     /// The read end of pipe `n`.
     PipeRead(usize),
@@ -311,6 +313,16 @@ fn dispatch(
         Call::Getpeername => socket::name(slot, a0, a1, a2, true),
         Call::Setsockopt => socket::setsockopt(slot, a0, a1, a2, a3, a4),
         Call::Getsockopt => socket::getsockopt(slot, a0, a1, a2, a3, a4),
+        Call::Open => openat(slot, linux::AT_FDCWD as u64, a0, a1),
+        Call::Lseek => lseek(slot, a0, a1, a2),
+        Call::Ftruncate => ftruncate(slot, a0, a1),
+        Call::Fsync => fsync(slot, a0),
+        Call::Unlink => unlinkat(slot, linux::AT_FDCWD as u64, a0, 0),
+        Call::Unlinkat => unlinkat(slot, a0, a1, a2),
+        Call::Mkdir => mkdirat(slot, linux::AT_FDCWD as u64, a0),
+        Call::Mkdirat => mkdirat(slot, a0, a1),
+        Call::Rename => renameat(slot, linux::AT_FDCWD as u64, a0, linux::AT_FDCWD as u64, a1),
+        Call::Renameat => renameat(slot, a0, a1, a2, a3),
     }
 }
 
@@ -392,7 +404,9 @@ fn read(slot: usize, fd: u64, buf: u64, count: u64) -> Result<u64, Failure> {
     let count = usize::try_from(count).unwrap_or(MAX_IO).min(MAX_IO);
     match d {
         Descriptor::Stdin => Ok(0),
-        Descriptor::File { fd, .. } => read_file(fd, buf, count),
+        Descriptor::File {
+            fd, readable: true, ..
+        } => read_file(fd, buf, count),
         Descriptor::PipeRead(pipe) => read_pipe(slot, pipe, buf, count, nonblock),
         Descriptor::Socket(i) => socket::recv(slot, i, nonblock, buf, count),
         _ => Err(Failure::BadDescriptor),
@@ -425,7 +439,10 @@ fn write(slot: usize, fd: u64, buf: u64, count: u64) -> Result<u64, Failure> {
         Descriptor::Console(handle) => write_console(slot, handle, buf, count),
         Descriptor::PipeWrite(pipe) => write_pipe(slot, pipe, buf, count, nonblock),
         Descriptor::Socket(i) => socket::send(slot, i, nonblock, buf, count),
-        // Standard input is not open for writing, and every file is open read-only.
+        Descriptor::File {
+            fd, writable: true, ..
+        } => write_file(fd, buf, count),
+        // Standard input is not open for writing, and neither is a file opened to read.
         _ => Err(Failure::BadDescriptor),
     }
 }
@@ -471,7 +488,10 @@ fn close(slot: usize, fd: u64) -> Result<u64, Failure> {
 fn fstat(slot: usize, fd: u64, out: u64) -> Result<u64, Failure> {
     let (d, _) = descriptor_of(slot, fd)?;
     let (kind, len, ino) = match d {
-        Descriptor::File { kind, len, ino, .. } => (kind, len, ino),
+        // The size now, not at open: the process may have written since.
+        Descriptor::File { fd, kind, ino, .. } => {
+            (kind, with_ns(|ns| ns.fstat(fd).map_err(failure))?.len, ino)
+        }
         Descriptor::PipeRead(pipe) | Descriptor::PipeWrite(pipe) => {
             (FileKind::Fifo, 0, PIPE_INODES + pipe as u64)
         }
@@ -484,34 +504,35 @@ fn fstat(slot: usize, fd: u64, out: u64) -> Result<u64, Failure> {
 }
 
 fn openat(slot: usize, dirfd: u64, path: u64, flags: u64) -> Result<u64, Failure> {
-    // Read the path one byte in, so a relative one can be made absolute in place: the
-    // working directory is the root.
+    use linux::{O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
     let mut name = [0u8; PATH_MAX + 1];
-    let n = copy_path(path, &mut name[1..])?;
-    let path = match name.get(1) {
-        Some(b'/') => &name[1..=n],
-        _ if n == 0 => return Err(Failure::NotFound),
-        _ if dirfd as i64 != linux::AT_FDCWD => {
-            // Relative to a descriptor: none of them is a directory.
-            locked(slot, |_, s| descriptor(s, dirfd))?;
-            return Err(Failure::NotADirectory);
-        }
-        _ => {
-            name[0] = b'/';
-            &name[..=n]
-        }
+    let n = absolute_path(slot, dirfd, path, &mut name)?;
+    let path = path_str(&name, n)?;
+    let (readable, writable) = match flags & O_ACCMODE {
+        O_RDONLY => (true, false),
+        O_WRONLY => (false, true),
+        O_RDWR => (true, true),
+        _ => return Err(Failure::InvalidArgument),
     };
-    if flags & linux::O_ACCMODE != linux::O_RDONLY {
-        return Err(Failure::ReadOnly);
-    }
-    // A name the volume cannot hold is a name it does not have.
-    let path = core::str::from_utf8(path).map_err(|_| Failure::NotFound)?;
+    let how = vfs::OpenFlags {
+        write: writable,
+        create: flags & O_CREAT != 0,
+        exclusive: flags & O_CREAT != 0 && flags & O_EXCL != 0,
+        truncate: writable && flags & O_TRUNC != 0,
+        append: writable && flags & O_APPEND != 0,
+    };
     let (fd, stat) = with_ns(|ns| {
-        let stat = ns.stat(path).map_err(failure)?;
-        if flags & ABI.o_directory() != 0 && stat.kind != Kind::Dir {
+        if flags & ABI.o_directory() != 0 && ns.stat(path).map_err(failure)?.kind != Kind::Dir {
             return Err(Failure::NotADirectory);
         }
-        Ok((ns.open(path).map_err(failure)?, stat))
+        let fd = ns.open_with(path, how).map_err(failure)?;
+        match ns.fstat(fd) {
+            Ok(stat) => Ok((fd, stat)),
+            Err(e) => {
+                let _ = ns.close(fd);
+                Err(failure(e))
+            }
+        }
     })?;
     let file = Descriptor::File {
         fd,
@@ -519,14 +540,157 @@ fn openat(slot: usize, dirfd: u64, path: u64, flags: u64) -> Result<u64, Failure
             Kind::File => FileKind::Regular,
             Kind::Dir => FileKind::Directory,
         },
-        len: stat.len,
         ino: inode(path),
+        readable,
+        writable,
     };
     let placed = locked(slot, |_, s| s.place(file, flags));
     if placed.is_err() {
         let _ = with_ns(|ns| ns.close(fd).map_err(failure));
     }
     placed.map(|i| i as u64)
+}
+
+/// Read the NUL-terminated path at user address `path` into `name`, made absolute: the
+/// working directory is the root, and a path relative to a descriptor is refused, since no
+/// descriptor here is a directory. Returns its length in `name`.
+fn absolute_path(
+    slot: usize,
+    dirfd: u64,
+    path: u64,
+    name: &mut [u8; PATH_MAX + 1],
+) -> Result<usize, Failure> {
+    // Read one byte in, so a relative path can be made absolute in place.
+    let n = copy_path(path, &mut name[1..])?;
+    if n == 0 {
+        return Err(Failure::NotFound);
+    }
+    if name[1] == b'/' {
+        name.copy_within(1..=n, 0);
+        return Ok(n);
+    }
+    if dirfd as i64 != linux::AT_FDCWD {
+        locked(slot, |_, s| descriptor(s, dirfd))?;
+        return Err(Failure::NotADirectory);
+    }
+    name[0] = b'/';
+    Ok(n + 1)
+}
+
+/// A path read by [`absolute_path`], as the namespace takes one. A name the volume cannot
+/// hold is a name it does not have.
+fn path_str(name: &[u8], len: usize) -> Result<&str, Failure> {
+    core::str::from_utf8(&name[..len]).map_err(|_| Failure::NotFound)
+}
+
+/// The file a descriptor names, or the failure Linux gives a call that needs one.
+fn file_of(slot: usize, fd: u64, otherwise: Failure) -> Result<(vfs::Fd, bool), Failure> {
+    match descriptor_of(slot, fd)?.0 {
+        Descriptor::File { fd, writable, .. } => Ok((fd, writable)),
+        _ => Err(otherwise),
+    }
+}
+
+fn write_file(fd: vfs::Fd, buf: u64, count: usize) -> Result<u64, Failure> {
+    with_ns(|ns| {
+        let mut chunk = [0u8; 256];
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(chunk.len());
+            // SAFETY: as in `to_user`.
+            unsafe { Cpu::copy_from_user(&mut chunk[..n], user_at(buf, done)?) }
+                .map_err(|_| Failure::Fault)?;
+            match ns.write(fd, &chunk[..n]) {
+                Ok(wrote) => {
+                    done += wrote;
+                    if wrote < n {
+                        break;
+                    }
+                }
+                // What was written stays written, and a short count says so, as Linux does.
+                Err(_) if done > 0 => break,
+                Err(e) => return Err(failure(e)),
+            }
+        }
+        Ok(done as u64)
+    })
+}
+
+fn lseek(slot: usize, fd: u64, offset: u64, whence: u64) -> Result<u64, Failure> {
+    let (fd, _) = file_of(slot, fd, Failure::IllegalSeek)?;
+    let whence = match whence {
+        linux::SEEK_SET => vfs::Whence::Start,
+        linux::SEEK_CUR => vfs::Whence::Current,
+        linux::SEEK_END => vfs::Whence::End,
+        _ => return Err(Failure::InvalidArgument),
+    };
+    with_ns(|ns| {
+        ns.seek(fd, whence, offset as i64)
+            .map_err(|_| Failure::InvalidArgument)
+    })
+}
+
+fn ftruncate(slot: usize, fd: u64, len: u64) -> Result<u64, Failure> {
+    let (fd, writable) = file_of(slot, fd, Failure::InvalidArgument)?;
+    // Linux's answer to a descriptor not open for writing.
+    if !writable || (len as i64) < 0 {
+        return Err(Failure::InvalidArgument);
+    }
+    with_ns(|ns| ns.truncate(fd, len).map_err(failure))?;
+    Ok(0)
+}
+
+fn fsync(slot: usize, fd: u64) -> Result<u64, Failure> {
+    let (fd, _) = file_of(slot, fd, Failure::InvalidArgument)?;
+    with_ns(|ns| ns.fsync(fd).map_err(failure))?;
+    Ok(0)
+}
+
+fn unlinkat(slot: usize, dirfd: u64, path: u64, flags: u64) -> Result<u64, Failure> {
+    if flags & !linux::AT_REMOVEDIR != 0 {
+        return Err(Failure::InvalidArgument);
+    }
+    let mut name = [0u8; PATH_MAX + 1];
+    let n = absolute_path(slot, dirfd, path, &mut name)?;
+    let path = path_str(&name, n)?;
+    with_ns(|ns| {
+        let kind = ns.stat(path).map_err(failure)?.kind;
+        match (kind, flags & linux::AT_REMOVEDIR != 0) {
+            (Kind::Dir, false) => Err(Failure::IsADirectory),
+            (Kind::File, true) => Err(Failure::NotADirectory),
+            _ => ns.unlink(path).map_err(failure),
+        }
+    })?;
+    Ok(0)
+}
+
+fn mkdirat(slot: usize, dirfd: u64, path: u64) -> Result<u64, Failure> {
+    let mut name = [0u8; PATH_MAX + 1];
+    let n = absolute_path(slot, dirfd, path, &mut name)?;
+    let path = path_str(&name, n)?;
+    with_ns(|ns| ns.mkdir(path).map_err(failure))?;
+    Ok(0)
+}
+
+fn renameat(slot: usize, from_dir: u64, from: u64, to_dir: u64, to: u64) -> Result<u64, Failure> {
+    let mut old = [0u8; PATH_MAX + 1];
+    let n = absolute_path(slot, from_dir, from, &mut old)?;
+    let old = path_str(&old, n)?;
+    let mut new = [0u8; PATH_MAX + 1];
+    let n = absolute_path(slot, to_dir, to, &mut new)?;
+    let new = path_str(&new, n)?;
+    // The namespace renames only within a directory. Across two, Linux's answer for a
+    // rename the filesystem cannot do is `EXDEV`, which a program handles by copying.
+    fn parent(p: &str) -> Option<&str> {
+        let p = p.trim_end_matches('/');
+        p.rfind('/').map(|cut| &p[..cut])
+    }
+    match (parent(old), parent(new)) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => {}
+        _ => return Err(Failure::CrossDevice),
+    }
+    with_ns(|ns| ns.rename(old, new).map_err(failure))?;
+    Ok(0)
 }
 
 /// Copy a NUL-terminated string from user address `at` into `into`, a page at a time so a
@@ -645,6 +809,8 @@ fn failure(e: vfs::Error) -> Failure {
         E::OutOfRange => Failure::InvalidArgument,
         E::ReadOnly => Failure::ReadOnly,
         E::Full | E::MountFull => Failure::NoSpace,
+        E::Exists => Failure::Exists,
+        E::NotEmpty => Failure::NotEmpty,
         E::Corrupt(_) | E::Device(_) => Failure::Io,
     }
 }
@@ -1474,6 +1640,7 @@ const ENVP: [&[u8]; 1] = [b"HOME=/"];
 const HELLO_ARGV: [&[u8]; 1] = [b"hello"];
 const RICH_ARGV: [&[u8]; 2] = [b"hello", b"rich"];
 const TLS_ARGV: [&[u8]; 2] = [b"hello", b"tls"];
+const FILES_ARGV: [&[u8]; 2] = [b"hello", b"files"];
 
 /// Reserve a new program's break and lay out its start-up stack, in process `p`, whose space
 /// is loaded. Its stack pointer and the start of its break.
@@ -1571,6 +1738,13 @@ const PROGRAM_PAGES: usize = 64;
 const HELLO_SUCCESS: u64 = 42;
 const RICH_SUCCESS: u64 = 43;
 const TLS_SUCCESS: u64 = 44;
+const FILES_SUCCESS: u64 = 50;
+
+/// What the files mode left, read back.
+///
+/// SAFETY INVARIANT: borrowed only by [`run_hello`], once, on the boot path.
+static OUT_BUF: SyncUnsafeCell<[u8; testdisk::LINUX_OUT_LEN + 1]> =
+    SyncUnsafeCell::new([0; testdisk::LINUX_OUT_LEN + 1]);
 /// What it writes to standard output.
 const HELLO_OUTPUT: &[u8] = b"hello from linux\n";
 /// The call it makes that the personality does not implement.
@@ -1654,6 +1828,21 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
     let open = ns.open_count();
     let _ = ns.unmount("/");
     drop(ns);
+    // The volume after the program wrote it, walked from its tables: nothing lost, the tables
+    // the same, nothing waiting in the cache.
+    // SAFETY: boot, as above; the namespace that borrowed the volume is gone.
+    let consistent = match unsafe { crate::fs::volume() } {
+        Some(v) => {
+            v.dirty_blocks() == 0
+                && matches!(crate::fs::consistency(v), Ok(k) if k.lost == 0 && k.fats_differ == 0)
+        }
+        None => false,
+    };
+    c.write_str(if consistent {
+        ", the volume consistent"
+    } else {
+        ", THE VOLUME IS NOT CONSISTENT"
+    });
     let held = if kept {
         PROGRAM_PAGES
     } else {
@@ -1671,7 +1860,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
         write_usize(c, leaked);
         c.write_str(" FRAMES LEAKED");
     }
-    Check::from_ok(ok && open == 0 && leaked == 0)
+    Check::from_ok(ok && open == 0 && leaked == 0 && consistent)
 }
 
 /// Run the program in its hello mode and grade it. Returns whether it passed and whether the
@@ -1750,9 +1939,36 @@ fn run_hello(
     } else {
         "             NATIVE INIT BROKEN"
     });
+
+    // The same program writing the disk: files, a directory, a rename, removals, and a file
+    // left for kbuild to read after the guest exits.
+    NS.store(core::ptr::from_mut(ns).cast(), Ordering::Relaxed);
+    let files = userproc::run_linux(frames, &program, start_with(&FILES_ARGV));
+    NS.store(core::ptr::null_mut(), Ordering::Relaxed);
+    c.write_str("; files mode exit ");
+    match files {
+        Some(code) => write_hex(c, code),
+        None => c.write_str("(none)"),
+    }
+    // SAFETY: the one borrow of `OUT_BUF`; see its invariant.
+    let out = unsafe { &mut *OUT_BUF.get() };
+    let written = matches!(
+        ns.read_all(testdisk::LINUX_OUT_PATH, out),
+        Ok(n) if n == testdisk::LINUX_OUT_LEN
+            && out[..n]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == testdisk::out_byte(testdisk::LINUX_OUT_SEED, i))
+    );
+    let files_ok = files == Some(FILES_SUCCESS) && written;
+    c.write_str(match (files == Some(FILES_SUCCESS), written) {
+        (true, true) => " ok, /KINTANE/LINUX.OUT read back",
+        (true, false) => ", /KINTANE/LINUX.OUT IS NOT WHAT IT WROTE",
+        _ => " WRONG",
+    });
     // Kept for the checks that run the program with the scheduler, which is only worth
     // doing with a program that passed here.
-    let pass = exit_ok && output_ok && logged_ok && native_ok;
+    let pass = exit_ok && output_ok && logged_ok && native_ok && files_ok;
     if pass {
         KEPT_LEN.store(n, Ordering::Release);
         KEPT.store(buf.as_ptr().cast_mut(), Ordering::Release);

@@ -6,7 +6,8 @@ fn a_request_reads_back_as_itself() {
     assert_eq!(
         parse_request(m.as_bytes()),
         Some(Request::Open {
-            path: b"/HELLO.TXT"
+            path: b"/HELLO.TXT",
+            flags: 0
         })
     );
     let m = read(3, 40);
@@ -23,6 +24,7 @@ fn a_reply_reads_back_as_itself() {
         Some(Reply {
             status: Status::Ok,
             a: 2,
+            b: 0,
             data: b"hello"
         })
     );

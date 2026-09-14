@@ -20,6 +20,8 @@
 //! * `signals`: [`signals`], handlers, masks, `EINTR`, `SIGCHLD`, `SIGPIPE` and default actions.
 //! * `tcp <port>`: [`tcp`], a TCP client of kbuild's service on `<port>`, blocking and not;
 //! * `serve`: [`serve`], a TCP server kbuild connects to through a port QEMU forwards.
+//! * `files`: [`files`], writing the test disk: create, write, append, truncate, directories,
+//!   rename and remove, and a file left for kbuild to read after the guest exits.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -57,6 +59,7 @@ const RICH_SUCCESS: u64 = 43;
 const TLS_SUCCESS: u64 = 44;
 const CHILD_SUCCESS: u64 = 45;
 const CHURN_SUCCESS: u64 = 46;
+const FILES_SUCCESS: u64 = 50;
 
 /// What the program says on standard output.
 const HELLO: &[u8] = b"hello from linux\n";
@@ -172,6 +175,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"signals" => signals(),
         b"tcp" => tcp(s.arg),
         b"serve" => serve(),
+        b"files" => files(),
         _ => hello(&s),
     }
 }
@@ -1169,4 +1173,189 @@ fn serve() -> ! {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     exit(101)
+}
+
+// ---- files: writing the test disk --------------------------------------------------------
+
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
+const O_TRUNC: u64 = 0o1000;
+const O_APPEND: u64 = 0o2000;
+const SEEK_SET: u64 = 0;
+const SEEK_END: u64 = 2;
+const AT_REMOVEDIR: u64 = 0x200;
+const EEXIST: i64 = 17;
+const EXDEV: i64 = 18;
+const EISDIR: i64 = 21;
+const ENAMETOOLONG: i64 = 36;
+
+const TEMP: &[u8] = b"/KINTANE/LXTMP.TXT\0";
+const RENAMED: &[u8] = b"/KINTANE/LXREN.TXT\0";
+const DIR: &[u8] = b"/KINTANE/LXDIR\0";
+const INTO_DIR: &[u8] = b"/KINTANE/LXDIR/X.TXT\0";
+const BAD_NAME: &[u8] = b"/KINTANE/NOT.AN.83\0";
+/// What this mode leaves on the disk for kbuild to read after the guest exits; mirrors
+/// `LINUX_OUT_PATH`, `LINUX_OUT_LEN` and `out_byte` in `kernel/block/src/testdisk.rs`.
+const OUT: &[u8] = b"/KINTANE/LINUX.OUT\0";
+const OUT_LEN: usize = 2000;
+const OUT_SEED: u8 = 0x4c;
+
+fn out_byte(seed: u8, i: usize) -> u8 {
+    let x = (i as u32).wrapping_mul(2_654_435_761) ^ u32::from(seed).wrapping_mul(0x9E37_79B9);
+    (x >> 23) as u8 ^ seed
+}
+
+fn openat(path: &[u8], flags: u64) -> i64 {
+    sys::call(sys::OPENAT, [AT_FDCWD, path.as_ptr() as u64, flags, 0o644, 0, 0])
+}
+
+/// Write all of `bytes`, in pieces that start and end anywhere.
+fn write_all(fd: u64, bytes: &[u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        let take = (bytes.len() - done).min(700);
+        let n = sys::call(sys::WRITE, [fd, bytes[done..].as_ptr() as u64, take as u64, 0, 0, 0]);
+        if n <= 0 {
+            return false;
+        }
+        done += n as usize;
+    }
+    true
+}
+
+fn read_exact(fd: u64, into: &mut [u8]) -> bool {
+    let mut done = 0;
+    while done < into.len() {
+        let n = sys::call(
+            sys::READ,
+            [
+                fd,
+                into[done..].as_mut_ptr() as u64,
+                (into.len() - done) as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        if n <= 0 {
+            return false;
+        }
+        done += n as usize;
+    }
+    true
+}
+
+/// `st_size`, which both architectures' `struct stat` keep at byte 48.
+fn size_of_fd(fd: u64) -> i64 {
+    let mut stat = [0u8; 144];
+    if sys::call(sys::FSTAT, [fd, stat.as_mut_ptr() as u64, 0, 0, 0, 0]) != 0 {
+        return -1;
+    }
+    i64::from_le_bytes([
+        stat[48], stat[49], stat[50], stat[51], stat[52], stat[53], stat[54], stat[55],
+    ])
+}
+
+/// Create, write, read back, append, truncate, make a directory, rename and remove, through
+/// Linux's calls on the test disk; then leave [`OUT`] for kbuild. Exits [`FILES_SUCCESS`] or
+/// the step that was wrong, from 80.
+fn files() -> ! {
+    let mut data = [0u8; 3000];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = out_byte(0x11, i);
+    }
+    // 80–82: create exclusively, write, and a second exclusive create is refused.
+    let fd = openat(TEMP, O_WRONLY | O_CREAT | O_EXCL);
+    expect(fd >= 0, 80);
+    let fd = fd as u64;
+    expect(write_all(fd, &data), 81);
+    expect(openat(TEMP, O_WRONLY | O_CREAT | O_EXCL) == -EEXIST, 82);
+    expect(call1(sys::CLOSE, fd) == 0, 83);
+
+    // 84–86: read back, a write on a read-only descriptor, and the size seen from the end.
+    let fd = openat(TEMP, 0);
+    expect(fd >= 0, 84);
+    let fd = fd as u64;
+    let mut back = [0u8; 3000];
+    expect(read_exact(fd, &mut back) && back == data, 84);
+    expect(sys::call(sys::WRITE, [fd, data.as_ptr() as u64, 1, 0, 0, 0]) == -EBADF, 85);
+    expect(sys::call(sys::LSEEK, [fd, 0, SEEK_END, 0, 0, 0]) == 3000, 86);
+    expect(call1(sys::CLOSE, fd) == 0, 86);
+
+    // 87: appending writes at the end, and fstat sees the new size.
+    let fd = openat(TEMP, O_WRONLY | O_APPEND);
+    expect(fd >= 0, 87);
+    let fd = fd as u64;
+    expect(write_all(fd, b"tail") && size_of_fd(fd) == 3004, 87);
+    expect(call1(sys::CLOSE, fd) == 0, 87);
+
+    // 88: ftruncate shortens, and what is left reads back.
+    let fd = openat(TEMP, O_RDWR);
+    expect(fd >= 0, 88);
+    let fd = fd as u64;
+    expect(sys::call(sys::FTRUNCATE, [fd, 100, 0, 0, 0, 0]) == 0, 88);
+    expect(size_of_fd(fd) == 100, 88);
+    expect(sys::call(sys::LSEEK, [fd, 0, SEEK_SET, 0, 0, 0]) == 0, 88);
+    let mut short = [0u8; 100];
+    expect(read_exact(fd, &mut short) && short[..] == data[..100], 88);
+    expect(call1(sys::CLOSE, fd) == 0, 88);
+
+    // 89: O_TRUNC empties.
+    let fd = openat(TEMP, O_WRONLY | O_TRUNC);
+    expect(fd >= 0 && size_of_fd(fd as u64) == 0, 89);
+    expect(call1(sys::CLOSE, fd as u64) == 0, 89);
+
+    // 90: a directory, and making it twice is refused.
+    let mkdir =
+        |path: &[u8]| sys::call(sys::MKDIRAT, [AT_FDCWD, path.as_ptr() as u64, 0o755, 0, 0, 0]);
+    expect(mkdir(DIR) == 0 && mkdir(DIR) == -EEXIST, 90);
+
+    // 91–92: rename within a directory; across two is `EXDEV`.
+    let rename = |from: &[u8], to: &[u8]| {
+        sys::call(
+            sys::RENAMEAT,
+            [
+                AT_FDCWD,
+                from.as_ptr() as u64,
+                AT_FDCWD,
+                to.as_ptr() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    expect(rename(TEMP, RENAMED) == 0, 91);
+    expect(openat(TEMP, 0) == -ENOENT, 91);
+    expect(rename(RENAMED, INTO_DIR) == -EXDEV, 92);
+
+    // 93–94: a directory is removed only as one; a file is removed and gone.
+    let unlink = |path: &[u8], flags: u64| {
+        sys::call(sys::UNLINKAT, [AT_FDCWD, path.as_ptr() as u64, flags, 0, 0, 0])
+    };
+    expect(unlink(DIR, 0) == -EISDIR, 93);
+    expect(unlink(DIR, AT_REMOVEDIR) == 0, 93);
+    expect(unlink(RENAMED, 0) == 0 && openat(RENAMED, 0) == -ENOENT, 94);
+
+    // 95: what kbuild reads after the guest exits, through `open` where the architecture has
+    // one, made durable with `fsync`.
+    let flags = O_WRONLY | O_CREAT | O_TRUNC;
+    let fd = match sys::OPEN {
+        Some(nr) => sys::call(nr, [OUT.as_ptr() as u64, flags, 0o644, 0, 0, 0]),
+        None => openat(OUT, flags),
+    };
+    expect(fd >= 0, 95);
+    let fd = fd as u64;
+    let mut out = [0u8; OUT_LEN];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = out_byte(OUT_SEED, i);
+    }
+    expect(write_all(fd, &out), 95);
+    expect(call1(sys::FSYNC, fd) == 0, 95);
+    expect(call1(sys::CLOSE, fd) == 0, 95);
+
+    // 96: a name FAT cannot hold is refused, not shortened.
+    expect(openat(BAD_NAME, O_WRONLY | O_CREAT) == -ENAMETOOLONG, 96);
+    exit(FILES_SUCCESS)
 }

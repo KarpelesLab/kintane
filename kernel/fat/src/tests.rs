@@ -389,12 +389,24 @@ fn a_directory_is_not_a_file_and_a_file_is_not_a_directory() {
 }
 
 #[test]
-fn writing_is_refused_rather_than_pretended() {
-    let v = volume(&[("hello.txt", b"hello")]);
+fn a_volume_another_writer_built_is_written_in_place() {
+    // One table copy, as this builder writes: the driver keeps every copy there is.
+    let v = volume(&[("hello.txt", b"hello"), ("sub/nested.txt", b"nested")]);
     mounted!(disk, fat, v);
     let root = fat.root();
     let node = fat.lookup(root, b"hello.txt").unwrap();
-    assert_eq!(fat.write_at(node, 0, b"x").unwrap_err(), Error::ReadOnly);
+    assert_eq!(fat.write_at(node, 5, b", world").unwrap(), 7);
+    let sub = fat.lookup(root, b"sub").unwrap();
+    let made = fat.create(sub, b"made.txt", Kind::File).unwrap();
+    fat.write_at(made, 0, b"made here").unwrap();
+    fat.sync().unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(fat.read_at(node, 0, &mut buf).unwrap(), 12);
+    assert_eq!(&buf[..12], b"hello, world");
+    assert_eq!(fat.read_at(made, 0, &mut buf).unwrap(), 9);
+    let mut seen = vec![0u8; 1024];
+    let c = fat.check_consistency(&mut seen).unwrap();
+    assert_eq!((c.files, c.dirs, c.lost, c.fats_differ), (3, 1, 0, 0));
 }
 
 #[test]

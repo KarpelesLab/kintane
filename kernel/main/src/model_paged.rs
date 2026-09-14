@@ -228,6 +228,19 @@ pub fn files_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// The file server writes the disk for a process on a writable connection and refuses it on a
+/// read-only one. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn files_write_check(c: &dyn EarlyConsole) -> Check {
+    crate::fileserver::write_check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn files_write_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// Run a process whose second thread spins in user mode on another CPU, end it, and require
 /// the spinner stopped. `Ok` without USERSPACE.
 #[cfg(CONFIG_USERSPACE)]

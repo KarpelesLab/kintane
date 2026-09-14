@@ -136,11 +136,21 @@ pub enum Call {
     Getpeername,
     Setsockopt,
     Getsockopt,
+    Open,
+    Lseek,
+    Ftruncate,
+    Fsync,
+    Unlink,
+    Unlinkat,
+    Mkdir,
+    Mkdirat,
+    Rename,
+    Renameat,
 }
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 43] = [
+    pub const ALL: [Call; 53] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -184,6 +194,16 @@ impl Call {
         Call::Getpeername,
         Call::Setsockopt,
         Call::Getsockopt,
+        Call::Open,
+        Call::Lseek,
+        Call::Ftruncate,
+        Call::Fsync,
+        Call::Unlink,
+        Call::Unlinkat,
+        Call::Mkdir,
+        Call::Mkdirat,
+        Call::Rename,
+        Call::Renameat,
     ];
 
     /// The name the tables give it.
@@ -232,6 +252,16 @@ impl Call {
             Call::Getpeername => "getpeername",
             Call::Setsockopt => "setsockopt",
             Call::Getsockopt => "getsockopt",
+            Call::Open => "open",
+            Call::Lseek => "lseek",
+            Call::Ftruncate => "ftruncate",
+            Call::Fsync => "fsync",
+            Call::Unlink => "unlink",
+            Call::Unlinkat => "unlinkat",
+            Call::Mkdir => "mkdir",
+            Call::Mkdirat => "mkdirat",
+            Call::Rename => "rename",
+            Call::Renameat => "renameat",
         }
     }
 
@@ -282,6 +312,16 @@ impl Call {
             Call::Getpeername => (52, 205),
             Call::Setsockopt => (54, 208),
             Call::Getsockopt => (55, 209),
+            Call::Open => (2, NONE),
+            Call::Lseek => (8, 62),
+            Call::Ftruncate => (77, 46),
+            Call::Fsync => (74, 82),
+            Call::Unlink => (87, NONE),
+            Call::Unlinkat => (263, 35),
+            Call::Mkdir => (83, NONE),
+            Call::Mkdirat => (258, 34),
+            Call::Rename => (82, NONE),
+            Call::Renameat => (264, 38),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,
@@ -331,6 +371,19 @@ pub const AT_FDCWD: i64 = -100;
 /// `open`'s access mode bits, and read-only.
 pub const O_ACCMODE: u64 = 3;
 pub const O_RDONLY: u64 = 0;
+pub const O_WRONLY: u64 = 1;
+pub const O_RDWR: u64 = 2;
+/// `open`'s creation and file-status flags, the same on both architectures.
+pub const O_CREAT: u64 = 0o100;
+pub const O_EXCL: u64 = 0o200;
+pub const O_TRUNC: u64 = 0o1000;
+pub const O_APPEND: u64 = 0o2000;
+/// `unlinkat`'s "remove a directory".
+pub const AT_REMOVEDIR: u64 = 0x200;
+/// `lseek`'s origins.
+pub const SEEK_SET: u64 = 0;
+pub const SEEK_CUR: u64 = 1;
+pub const SEEK_END: u64 = 2;
 /// `open`'s and `pipe2`'s "close on `execve`", the same on both architectures.
 pub const O_CLOEXEC: u64 = 0o2000000;
 /// `open`'s and `pipe2`'s "never block", the same on both architectures.
@@ -464,15 +517,19 @@ pub mod errno {
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
+    pub const EEXIST: i64 = 17;
+    pub const EXDEV: i64 = 18;
     pub const ENOTDIR: i64 = 20;
     pub const EISDIR: i64 = 21;
     pub const EINVAL: i64 = 22;
     pub const EMFILE: i64 = 24;
     pub const ENOSPC: i64 = 28;
+    pub const ESPIPE: i64 = 29;
     pub const EROFS: i64 = 30;
     pub const EPIPE: i64 = 32;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
+    pub const ENOTEMPTY: i64 = 39;
     pub const ENOTSOCK: i64 = 88;
     pub const ENOPROTOOPT: i64 = 92;
     pub const EPROTONOSUPPORT: i64 = 93;
@@ -520,6 +577,14 @@ pub enum Failure {
     Io,
     /// No room left on the volume.
     NoSpace,
+    /// A creation named something that already exists.
+    Exists,
+    /// A directory to remove, or to replace by a rename, is not empty.
+    NotEmpty,
+    /// A rename between directories, which no filesystem here can do atomically.
+    CrossDevice,
+    /// A seek on a descriptor that has no position: a pipe or the console.
+    IllegalSeek,
     /// Not now: a futex whose value has already changed, a non-blocking descriptor with
     /// nothing to give, or no process slot or thread for a `fork` or `clone`.
     TryAgain,
@@ -587,6 +652,10 @@ pub const fn errno(f: Failure) -> i64 {
         Failure::AccessDenied => EACCES,
         Failure::Io => EIO,
         Failure::NoSpace => ENOSPC,
+        Failure::Exists => EEXIST,
+        Failure::NotEmpty => ENOTEMPTY,
+        Failure::CrossDevice => EXDEV,
+        Failure::IllegalSeek => ESPIPE,
         // Linux's own answer to a `fork` past the process limit, as well as to the futex and
         // non-blocking cases.
         Failure::TryAgain => EAGAIN,

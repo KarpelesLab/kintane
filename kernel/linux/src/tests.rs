@@ -22,7 +22,15 @@ fn every_dispatched_number_has_the_name_the_table_gives_it() {
 
 #[test]
 fn aarch64_has_no_call_its_architecture_left_out() {
-    for call in [Call::Fork, Call::Pipe, Call::ArchPrctl] {
+    for call in [
+        Call::Fork,
+        Call::Pipe,
+        Call::ArchPrctl,
+        Call::Open,
+        Call::Unlink,
+        Call::Mkdir,
+        Call::Rename,
+    ] {
         assert_eq!(call.number(Abi::Aarch64), None, "{call:?}");
     }
     // x86_64's number for `read` is `io_setup` on aarch64, which the personality does not
@@ -74,6 +82,10 @@ fn errors_travel_as_negated_linux_numbers() {
         Failure::AccessDenied,
         Failure::Io,
         Failure::NoSpace,
+        Failure::Exists,
+        Failure::NotEmpty,
+        Failure::CrossDevice,
+        Failure::IllegalSeek,
         Failure::TryAgain,
         Failure::NoChild,
         Failure::BrokenPipe,

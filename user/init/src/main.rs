@@ -28,6 +28,8 @@
 //!   mode for ever, and the first ends the process under it. See [`spin`].
 //! * [`MODE_FILES`] reads a file through the kernel's file server, as a process that is not the
 //!   first the server has served; see [`files`].
+//! * [`MODE_WRITE`] writes the test disk through the file server on one connection, and is refused
+//!   on another the kernel made read-only; see [`write_files`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -60,6 +62,8 @@ const MODE_SPIN: usize = 8;
 const MODE_SPINNER: usize = 9;
 /// Read a file through the kernel's file server; see [`files`].
 const MODE_FILES: usize = 10;
+/// Write files through the kernel's file server; see [`write_files`].
+const MODE_WRITE: usize = 11;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -104,6 +108,7 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_SPIN => spin(handle(a)),
         MODE_SPINNER => spinner(handle(a)),
         MODE_FILES => files(handle(a), handle(b)),
+        MODE_WRITE => write_files(handle(a), handle(b), handle(c)),
         _ => 0xbad0,
     };
     exit(code)
@@ -718,6 +723,158 @@ fn read_through_the_service(console: Handle, files: Handle) -> Result<(), u64> {
     }
     let _ = rt::print(console, b"init: through the file service: ");
     let _ = rt::print(console, contents.get(..len).unwrap_or(&[]));
+    Ok(())
+}
+
+/// [`MODE_WRITE`]'s exit code when every step behaved. Mirrors `kernel/main/src/fileserver.rs`.
+const WRITE_SUCCESS: u64 = 0x6f;
+/// What the write mode leaves on the disk; mirrors `NATIVE_OUT_PATH`, `NATIVE_OUT_LEN`,
+/// `NATIVE_OUT_SEED` and `out_byte` in `kernel/block/src/testdisk.rs`.
+const NATIVE_OUT: &[u8] = b"/KINTANE/NATIVE.OUT";
+const NATIVE_OUT_LEN: usize = 1000;
+const NATIVE_OUT_SEED: u8 = 0x4e;
+/// The seed of the bytes the write mode writes and removes again.
+const TEMP_SEED: u8 = 0x21;
+const TEMP_LEN: usize = 1200;
+
+fn out_byte(seed: u8, i: usize) -> u8 {
+    let x = (i as u32).wrapping_mul(2_654_435_761) ^ u32::from(seed).wrapping_mul(0x9E37_79B9);
+    (x >> 23) as u8 ^ seed
+}
+
+/// Write the test disk through the file server: `rw` is a connection that may write, `ro` one
+/// that may not. Returns [`WRITE_SUCCESS`], or `0x900 + step` for the first step that did not
+/// behave.
+fn write_files(console: Handle, rw: Handle, ro: Handle) -> u64 {
+    match write_through_the_service(rw, ro) {
+        Ok(()) => {
+            // The kernel's check goes on with the same line.
+            let _ = rt::print(console, b"init: wrote the disk through the file service; ");
+            WRITE_SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+/// Send `request` and require `want`: the reply's `a` and `b`, or `step`.
+fn expect_status(
+    service: Handle,
+    request: Option<vfsproto::Message>,
+    want: vfsproto::Status,
+    step: u64,
+    buf: &mut [u8; vfsproto::MESSAGE],
+) -> Result<(u8, u8), u64> {
+    let request = request.ok_or(step)?;
+    match ask(service, request.as_bytes(), buf) {
+        Some(r) if r.status == want => Ok((r.a, r.b)),
+        _ => Err(step),
+    }
+}
+
+/// Write `len` bytes of `seed`'s to `file`, a message at a time.
+fn write_seeded(
+    service: Handle,
+    file: u8,
+    seed: u8,
+    len: usize,
+    step: u64,
+    buf: &mut [u8; vfsproto::MESSAGE],
+) -> Result<(), u64> {
+    let mut chunk = [0u8; vfsproto::PAYLOAD];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(vfsproto::PAYLOAD);
+        for (i, b) in chunk.iter_mut().take(n).enumerate() {
+            *b = out_byte(seed, done + i);
+        }
+        let data = chunk.get(..n).ok_or(step)?;
+        let (_, wrote) = expect_status(service, vfsproto::write(file, data), OK, step, buf)?;
+        if usize::from(wrote) != n {
+            return Err(step);
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Read `file` from where it is to its end, requiring `seed`'s bytes. How many there were.
+fn read_seeded(
+    service: Handle,
+    file: u8,
+    seed: u8,
+    step: u64,
+    buf: &mut [u8; vfsproto::MESSAGE],
+) -> Result<usize, u64> {
+    let mut offset = 0usize;
+    loop {
+        let reply = match ask(service, vfsproto::read(file, 60).as_bytes(), buf) {
+            Some(r) if r.status == OK => r,
+            _ => return Err(step),
+        };
+        if reply.data.is_empty() {
+            return Ok(offset);
+        }
+        for (i, &b) in reply.data.iter().enumerate() {
+            if b != out_byte(seed, offset + i) {
+                return Err(step);
+            }
+        }
+        offset += reply.data.len();
+    }
+}
+
+const OK: vfsproto::Status = vfsproto::Status::Ok;
+
+fn write_through_the_service(rw: Handle, ro: Handle) -> Result<(), u64> {
+    use vfsproto::{Status, flags};
+    const TEMP: &[u8] = b"/KINTANE/NWTMP.TXT";
+    const RENAMED: &[u8] = b"/KINTANE/NWREN.TXT";
+    const DIR: &[u8] = b"/KINTANE/NWDIR";
+    let mut buf = [0u8; vfsproto::MESSAGE];
+    let b = &mut buf;
+
+    // 1–2: create exclusively and write, a message at a time.
+    let create = flags::WRITE | flags::CREATE | flags::EXCLUSIVE;
+    let (file, _) = expect_status(rw, vfsproto::open_with(TEMP, create), OK, 0x901, b)?;
+    write_seeded(rw, file, TEMP_SEED, TEMP_LEN, 0x902, b)?;
+    // 3–4: back to the start, and every byte reads back.
+    expect_status(rw, Some(vfsproto::seek(file, 0)), OK, 0x903, b)?;
+    if read_seeded(rw, file, TEMP_SEED, 0x904, b)? != TEMP_LEN {
+        return Err(0x904);
+    }
+    // 5: truncated, only what is left reads back.
+    expect_status(rw, Some(vfsproto::truncate(file, 90)), OK, 0x905, b)?;
+    expect_status(rw, Some(vfsproto::seek(file, 0)), OK, 0x905, b)?;
+    if read_seeded(rw, file, TEMP_SEED, 0x905, b)? != 90 {
+        return Err(0x905);
+    }
+    // 6: a second exclusive create is refused.
+    expect_status(rw, vfsproto::open_with(TEMP, create), Status::Exists, 0x906, b)?;
+    expect_status(rw, Some(vfsproto::close(file)), OK, 0x906, b)?;
+    // 7: a directory, made once.
+    expect_status(rw, vfsproto::mkdir(DIR), OK, 0x907, b)?;
+    expect_status(rw, vfsproto::mkdir(DIR), Status::Exists, 0x907, b)?;
+    // 8: renamed, the old name is gone.
+    expect_status(rw, vfsproto::rename(TEMP, RENAMED), OK, 0x908, b)?;
+    expect_status(rw, vfsproto::open(TEMP), Status::NotFound, 0x908, b)?;
+    // 9: both removed.
+    expect_status(rw, vfsproto::unlink(DIR), OK, 0x909, b)?;
+    expect_status(rw, vfsproto::unlink(RENAMED), OK, 0x909, b)?;
+    expect_status(rw, vfsproto::open(RENAMED), Status::NotFound, 0x909, b)?;
+    // 10: the read-only connection writes nothing, whatever it asks.
+    expect_status(ro, vfsproto::mkdir(b"/KINTANE/NOPE"), Status::ReadOnly, 0x90a, b)?;
+    let make = flags::WRITE | flags::CREATE;
+    expect_status(ro, vfsproto::open_with(NATIVE_OUT, make), Status::ReadOnly, 0x90a, b)?;
+    // 11: a file opened to read is not written, even on the writable connection.
+    let (hello, _) = expect_status(rw, vfsproto::open(b"/HELLO.TXT"), OK, 0x90b, b)?;
+    expect_status(rw, vfsproto::write(hello, b"x"), Status::ReadOnly, 0x90b, b)?;
+    expect_status(rw, Some(vfsproto::close(hello)), OK, 0x90b, b)?;
+    // 12: the file kbuild reads after the guest exits, synced.
+    let replace = flags::WRITE | flags::CREATE | flags::TRUNCATE;
+    let (out, _) = expect_status(rw, vfsproto::open_with(NATIVE_OUT, replace), OK, 0x90c, b)?;
+    write_seeded(rw, out, NATIVE_OUT_SEED, NATIVE_OUT_LEN, 0x90c, b)?;
+    expect_status(rw, Some(vfsproto::sync()), OK, 0x90c, b)?;
+    expect_status(rw, Some(vfsproto::close(out)), OK, 0x90c, b)?;
     Ok(())
 }
 

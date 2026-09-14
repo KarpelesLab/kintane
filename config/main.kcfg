@@ -706,8 +706,9 @@ config QEMU_BLOCK_TEST
         device, and gate the boot on the block check: the driver reads sectors
         whose contents are a function of their position, writes and reads
         back a scratch area, flushes, and must refuse a read past the end
-        with no request or descriptor left outstanding. The image is attached
-        with snapshot=on, so a run's writes never reach the file.
+        with no request or descriptor left outstanding. Each run writes a
+        fresh copy of the image, which kbuild reads back after the guest exits:
+        the volume must be consistent and hold what the writing checks wrote.
 
         The disk also holds a FAT16 volume, and the boot gates on the fs
         check too: it mounts the volume, reads files back through a block
@@ -724,6 +725,17 @@ config QEMU_BLOCK_TEST
         way. Needs MM_PAGED, because the check maps the driver's DMA region
         through the kernel's direct map.
 
+
+config FS_CRASH_TEST
+    bool "Write the test disk's volume for ever, for kbuild crashtest"
+    depends on QEMU_BLOCK_TEST
+    help
+        Once the fs check has mounted the test disk's volume, write it for
+        ever instead of going on with the boot: files appended to,
+        overwritten, truncated, renamed over each other and removed, a
+        directory made and removed, a sync now and then. kbuild crashtest
+        kills QEMU at random points of this and checks every image it leaves.
+        No preset sets it: a kernel with it never finishes booting.
 config QEMU_NET_TEST
     bool "A virtio-net card on QEMU's user-mode network"
     depends on QEMU_EXIT && MM_PAGED

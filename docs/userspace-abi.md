@@ -314,6 +314,15 @@ appealing and, in practice, `ioctl` is where it goes to die. A filesystem-like
 namespace exists as a *service*, built on channels, for the things that genuinely are
 hierarchical name lookups.
 
+That service is the file server (`lib/vfsproto`, answered by `kernel/main/src/fileserver.rs`), and a
+native program writes files through it: there is no native system call for a file. One message is
+one operation — `open` with flags (write, create, exclusive, truncate, append), `read`, `write`,
+`seek`, `truncate`, `unlink`, `mkdir`, `rename` within a directory, `sync` and `close` — and the
+right to change the volume belongs to the connection. The kernel makes each connection writable or
+not when it hands the program its end, and a read-only connection is answered `ReadOnly` for every
+request that would write, whatever it asks for. A file opened without the write flag is read-only on
+either kind.
+
 ### Asynchronous by default, with synchronous convenience
 
 The primitive is submit-and-complete against a completion queue. Blocking calls are a
@@ -397,9 +406,9 @@ process, its descriptors or its mappings, and waits on the kernel's wait queues 
 so that another thread of the process can make the call that ends the wait.
 
 **The numbers and the tables.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 74 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
+`syscall_64.tbl`, in its format: 93 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
 the generic table arm64 numbers its calls by, in the format of Linux's `scripts/syscall.tbl`:
-78 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
+89 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
 each with its number under each `linux::Abi`; a host test pins every number to its name in
 that ABI's table, and the kernel reads a table at run time only to name a call it does not
 implement. The kernel picks the ABI from its port's ELF machine at compile time, and dispatches
@@ -414,7 +423,11 @@ until someone decides what Linux calls it. Filesystem errors map onto `Failure` 
 |---|---|---|
 | a path the volume cannot represent (`vfs::BadPath`) | `ENAMETOOLONG` | a FAT 8.3 name that does not fit is, from the program's side, a name too long |
 | a name that is not UTF-8 | `ENOENT` | the volume cannot hold it, so it has no such file |
-| an open for writing | `EROFS` | every file is on a read-only view |
+| a name that exists, for `O_CREAT|O_EXCL`, `mkdirat` or a rename onto a directory | `EEXIST` | |
+| a directory to remove, or to rename over, that is not empty | `ENOTEMPTY` | |
+| a rename between two directories | `EXDEV` | the namespace renames only within one directory, and a program meets `EXDEV` across filesystems anyway and copies |
+| `lseek` on a pipe or the console | `ESPIPE` | |
+| `ftruncate` on a descriptor not open for writing | `EINVAL` | Linux's own answer |
 | an executable mapping | `EACCES` | W^X is never granted, and Linux uses `EACCES` for protections the object refuses |
 | a volume or mount table full | `ENOSPC` | |
 | a corrupt volume or a device failure | `EIO` | |
@@ -434,8 +447,13 @@ already holds rather than a second authority:
 - 1 and 2 are two console handles in the process's own handle table. A write through either is
   checked against the handle's rights exactly as the native `debug_write` is, and `close`
   closes the handle.
-- `openat` opens a file in the filesystem namespace the process was started with, at the
-  lowest free number.
+- `openat`, and `open` on x86_64, open a file in the filesystem namespace the process was started
+  with, at the lowest free number, for reading, writing or both: `O_CREAT` makes it, `O_EXCL` refuses
+  one that exists, `O_TRUNC` empties it and `O_APPEND` writes every `write` at its end. `write`,
+  `lseek`, `ftruncate`, `fsync` and `fstat` work on it, `fstat` reporting the size now rather than at
+  the open. By path, `mkdirat`, `unlinkat` (a directory only with `AT_REMOVEDIR`) and `renameat`
+  within one directory, and on x86_64 `mkdir`, `unlink` and `rename`. Names are FAT's 8.3, stored in
+  upper case. A forked child does not inherit an open file.
 - `pipe2` makes two ends of one of 4 kernel pipes, each holding 512 bytes. A read of an empty
   pipe blocks on the pipe's wait queue until a writer puts bytes in, or until the last write end
   closes, which is end of file. A write to a full pipe blocks until a reader makes room, and

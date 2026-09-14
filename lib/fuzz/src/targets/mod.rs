@@ -14,6 +14,7 @@ pub mod acpi;
 pub mod aml;
 pub mod bootproto;
 pub mod elf;
+pub mod fat;
 pub mod fdt;
 pub mod menu;
 pub mod module;
@@ -77,6 +78,14 @@ pub const TARGETS: &[Target] = &[
         generate: elf::generate,
         run: elf::run,
         accepts: Some(elf::accepts),
+    },
+    Target {
+        name: "fat",
+        what: "FAT16 volumes, as a disk holds them, and every write the driver makes to one",
+        needs_seeds: true,
+        generate: fat::generate,
+        run: fat::run,
+        accepts: Some(fat::accepts),
     },
     Target {
         name: "module",
