@@ -193,7 +193,10 @@ pub fn tcp_next_deadline() -> Option<u64> {
 #[derive(Clone, Copy)]
 #[cfg_attr(
     not(CONFIG_USERSPACE),
-    expect(dead_code, reason = "only a socket wait reads what the stack's wait saw")
+    expect(
+        dead_code,
+        reason = "only a socket wait reads what the stack's wait saw"
+    )
 )]
 pub struct Seen {
     /// The handler's [`generation`] then.
