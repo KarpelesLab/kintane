@@ -327,6 +327,10 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // hook: a device interrupt taken while it waits must return to it.
     c.write_str("\n  serial     ");
     let serial = serial::check(c);
+    // For the same reason as the serial check, and after it: the disk's interrupt is taken
+    // while this waits, before the tick's hook is installed.
+    c.write_str("\n  block irq  ");
+    let block_irq = block::interrupt_check(c);
     c.write_str("\n  preempt    ");
     // Built on both of the above, so it runs only when both passed. Their failures
     // already gate the verdict, and a scheduler check on a broken switch or a silent
@@ -366,6 +370,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(Check::from_ok(switch_ok))
         .and(clock)
         .and(serial)
+        .and(block_irq)
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))
         .and(smp)

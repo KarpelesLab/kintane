@@ -13,3 +13,9 @@ pub fn check<F, L>(c: &dyn EarlyConsole, _frames: F, _live: L) -> Check {
     c.write_str("\n  block      skipped: needs MM_PAGED");
     Check::Skipped
 }
+
+/// Skipped: no device, so no interrupt to prove.
+pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("skipped: needs MM_PAGED");
+    Check::Skipped
+}

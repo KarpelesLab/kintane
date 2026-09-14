@@ -55,11 +55,19 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         // starts kinboot-efi, which starts the kernel. No -kernel: QEMU's own loader is
         // exactly what this configuration exists to not use.
         let fw = uefi_firmware(log.parent().unwrap_or(Path::new(".")))?;
+        // A 36-bit physical address width, so OVMF's 64-bit PCI window lands below 64 GiB.
+        // OVMF sizes and places that window from the CPU's address width: at TCG's 40 bits
+        // it puts a 64-bit BAR — virtio-pci's is one — at 768 GiB, and the kernel maps
+        // device windows at their physical address, which there is inside x86_64's user
+        // half: a top-level entry every process mirrors, so two processes would share
+        // whatever either maps there. The kernel refuses to build a process over such a
+        // mapping (`userproc::user_half_clear`); this keeps the test machine from needing
+        // to. OVMF's `X-PciMmio64Mb` knob does not help: it sizes the window, not where.
         let mut args = vec![
             s("-machine"),
             s("q35"),
             s("-cpu"),
-            cpu,
+            format!("{cpu},phys-bits=36"),
             s("-m"),
             mem,
             s("-drive"),
@@ -75,7 +83,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             s("-drive"),
             format!("format=raw,snapshot=on,file={}", image.display()),
         ]);
-        args.extend(x86_platform(res, "q35"));
+        args.extend(x86_platform(res, "q35", image));
         args.extend([
             s("-device"),
             s("isa-debug-exit,iobase=0xf4,iosize=0x04"),
@@ -135,7 +143,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 log.display().to_string(),
             ]
             .into_iter()
-            .chain(x86_platform(res, "q35"))
+            .chain(x86_platform(res, "q35", image))
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
@@ -169,7 +177,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 log.display().to_string(),
             ]
             .into_iter()
-            .chain(x86_platform(res, "pc"))
+            .chain(x86_platform(res, "pc", image))
             .chain(x86_boot_media(res, image))
             .collect(),
             success_code: (0x10 << 1) | 1,
@@ -320,11 +328,18 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
 }
 
 /// The processors and devices an x86 guest's firmware describes, beyond the chipset's
-/// own: `-smp` from `QEMU_CPUS`, and with `QEMU_PCI_TEST_DEVICE` a pci-testdev behind a
+/// own: `-smp` from `QEMU_CPUS`, with `QEMU_PCI_TEST_DEVICE` a pci-testdev behind a
 /// bridge (a PCI Express root port on q35, a PCI-to-PCI bridge on pc), which enumeration
-/// finds only by following the bridge. `docs/testing.md` lists what the kernel checks.
-fn x86_platform(res: &Resolution, chipset: &str) -> Vec<String> {
+/// finds only by following the bridge, and with `QEMU_BLOCK_TEST` the test disk on a PCI
+/// virtio-blk function. `docs/testing.md` lists what the kernel checks.
+///
+/// `disable-legacy=on`: the driver speaks virtio 1.x, and a transitional device would
+/// offer the legacy interface as well. Saying so here makes the device modern-only, which
+/// is what the driver's refusal of a legacy device would otherwise turn into a boot
+/// failure — the same trap the memory-mapped transport hit with `force-legacy`.
+fn x86_platform(res: &Resolution, chipset: &str, image: &Path) -> Vec<String> {
     let mut args = vec!["-smp".to_string(), res.int("QEMU_CPUS").max(1).to_string()];
+    args.extend(block_disk(res, image, "virtio-blk-pci,disable-legacy=on"));
     if res.is_on("QEMU_PCI_TEST_DEVICE") {
         let (bridge, device) = if chipset == "q35" {
             ("pcie-root-port,id=kt_bridge,chassis=1", "pci-testdev,bus=kt_bridge")

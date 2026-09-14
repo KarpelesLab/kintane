@@ -115,6 +115,60 @@ impl Model {
             u32::from(at.bus) | (u32::from(secondary) << 8) | (u32::from(subordinate) << 16);
     }
 
+    /// Give the last-added function a capability list: `(id, offset, payload)` each, chained
+    /// in the order given. The status bit that says a list exists is set with it.
+    fn capabilities(&self, caps: &[(u8, u16, u32)]) {
+        let mut fns = self.functions.borrow_mut();
+        let f = fns.last_mut().unwrap();
+        f.config[1] |= 0x0010_0000;
+        f.config[0x34 / 4] = u32::from(caps.first().map_or(0, |c| c.1));
+        for (i, &(id, offset, payload)) in caps.iter().enumerate() {
+            let next = caps.get(i + 1).map_or(0, |c| c.1);
+            f.config[usize::from(offset) / 4] =
+                u32::from(id) | (u32::from(next) << 8) | (payload << 16);
+        }
+    }
+
+    /// Give the last-added function capabilities with whole structures behind them:
+    /// `(id, offset, words)`, chained in order. `words[0]`'s low half is overwritten with
+    /// the id and the next pointer, which is the layout the hardware has.
+    fn capability_words(&self, caps: &[(u8, u16, [u32; 6])]) {
+        let mut fns = self.functions.borrow_mut();
+        let f = fns.last_mut().unwrap();
+        f.config[1] |= 0x0010_0000;
+        f.config[0x34 / 4] = u32::from(caps.first().map_or(0, |c| c.1));
+        for (i, &(id, offset, words)) in caps.iter().enumerate() {
+            let next = caps.get(i + 1).map_or(0, |c| c.1);
+            let base = usize::from(offset) / 4;
+            for (w, value) in words.iter().enumerate() {
+                if base + w < f.config.len() {
+                    f.config[base + w] = *value;
+                }
+            }
+            f.config[base] =
+                (f.config[base] & 0xffff_0000) | u32::from(id) | (u32::from(next) << 8);
+        }
+    }
+
+    /// Write a capability pointer and clear the status bit that says the list exists, which
+    /// `add` sets as firmware leaves a real function.
+    fn raw_capability_pointer(&self, offset: u16) {
+        let mut fns = self.functions.borrow_mut();
+        let f = fns.last_mut().unwrap();
+        f.config[1] &= !0x0010_0000;
+        f.config[0x34 / 4] = u32::from(offset);
+        f.config[usize::from(offset) / 4] = 0x09;
+    }
+
+    /// Point the last-added function's capability list at itself, which a broken device does.
+    fn looping_capability(&self, offset: u16) {
+        let mut fns = self.functions.borrow_mut();
+        let f = fns.last_mut().unwrap();
+        f.config[1] |= 0x0010_0000;
+        f.config[0x34 / 4] = u32::from(offset);
+        f.config[usize::from(offset) / 4] = 0x09 | (u32::from(offset) << 8);
+    }
+
     /// Mark function 0 of `bus:device` as multi-function.
     fn multifunction(&self, bus: u8, device: u8) {
         let mut fns = self.functions.borrow_mut();
@@ -508,12 +562,17 @@ fn functions_become_nodes_under_their_bridges_and_bind_by_compatible() {
     assert!(matches!(tree.node(behind).origin(), Origin::Pci(f) if f.device == 0x0005));
     assert_eq!(tree.mmio_count(behind), 1, "the I/O BAR is not a window");
     assert_eq!(tree.mmio(behind, 0), Ok((0xfea0_0000, 0x1000)));
+    // Its interrupt is the line firmware programmed: pin INTA#, routed to 11. Whether that
+    // line means anything is the platform's decision, not the model's.
+    let spec = tree.interrupt(behind, 0).unwrap();
+    assert_eq!(spec.cells(), &[11]);
     assert_eq!(
-        tree.interrupt(behind, 0),
+        tree.interrupt(behind, 1),
         Err(Error::NoSuchEntry {
             node: behind,
-            index: 0
-        })
+            index: 1
+        }),
+        "a function has one interrupt pin"
     );
     assert_eq!(tree.stdout(), None, "no device tree, no chosen console");
 
@@ -605,6 +664,131 @@ fn the_builder_refuses_unknown_parents_and_full_storage() {
         b.add(far_id, b"b", b"", Origin::Table(&group)),
         Err(Error::UnknownParent { parent: far_id })
     );
+}
+
+#[test]
+fn a_pci_node_has_an_interrupt_only_when_firmware_routed_its_pin() {
+    let m = Model::default();
+    m.endpoint(Address::new(0, 0, 0), (0x8086, 0x29c0), HOST, &[]);
+    // `add` gives every function pin INTA# routed to line 11. Three variations on it.
+    m.endpoint(Address::new(0, 1, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.endpoint(Address::new(0, 2, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.endpoint(Address::new(0, 3, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    {
+        let mut fns = m.functions.borrow_mut();
+        // No interrupt pin at all: the function raises nothing.
+        fns[2].config[15] = 0x0000_000b;
+        // A pin, but firmware left the line unassigned.
+        fns[3].config[15] = 0x0000_01ff;
+    }
+    let fns = enumerate(&m);
+    let mut storage = vec![Node::EMPTY; 16];
+    let mut b = Builder::new(&mut storage).unwrap();
+    let ids: Vec<NodeId> = fns
+        .iter()
+        .map(|f| {
+            b.add(NodeId::ROOT, f.name(), f.compatible(), Origin::Pci(f))
+                .unwrap()
+        })
+        .collect();
+    let tree = b.finish();
+    let routed = ids[1];
+    assert_eq!(tree.interrupt(routed, 0).unwrap().cells(), &[11]);
+    for &id in &ids[2..] {
+        assert_eq!(
+            tree.interrupt(id, 0),
+            Err(Error::NoSuchEntry { node: id, index: 0 }),
+            "no pin, or a line firmware did not assign, is no interrupt"
+        );
+    }
+}
+
+#[test]
+fn a_capability_list_is_walked_in_order() {
+    let m = Model::default();
+    m.endpoint(Address::new(0, 5, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    // A virtio device's vendor capabilities, with a PCI Express and an MSI-X capability
+    // among them that a reader must walk past rather than stop at.
+    m.capabilities(&[
+        (0x09, 0x40, 0),
+        (0x10, 0x50, 0),
+        (0x09, 0x60, 0),
+        (0x11, 0x70, 0),
+    ]);
+    let mut caps = [pci::Capability::EMPTY; 8];
+    let n = pci::capabilities(&m, Address::new(0, 5, 0), &mut caps);
+    assert_eq!(n, 4);
+    let ids: Vec<(u8, u16)> = caps[..n].iter().map(|c| (c.id, c.offset)).collect();
+    assert_eq!(ids, vec![(0x09, 0x40), (0x10, 0x50), (0x09, 0x60), (0x11, 0x70)]);
+}
+
+#[test]
+fn enumeration_records_a_capability_structure_for_the_driver_to_read() {
+    // The property the driver rests on: a driver is handed the `Function`, never the bus,
+    // so a capability's own words have to survive enumeration. virtio's vendor capability
+    // carries the BAR, offset and length of one structure in words the driver reads back.
+    let m = Model::default();
+    m.endpoint(Address::new(0, 4, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.capability_words(&[(
+        0x09,
+        0x40,
+        // cap_len 0x14 and cfg_type 1 in the first word's upper half, then BAR 4, then
+        // the offset and length of the common configuration structure.
+        [0x0114_0000, 0x0000_0004, 0x0000_3000, 0x0000_1000, 0, 0],
+    )]);
+    let fns = enumerate(&m);
+    let f = find(&fns, Address::new(0, 4, 0));
+    let caps = f.capabilities();
+    assert_eq!(caps.len(), 1);
+    assert_eq!(caps[0].id, 0x09);
+    assert_eq!(caps[0].byte(3), 1, "cfg_type");
+    assert_eq!(caps[0].byte(4), 4, "the BAR the structure is in");
+    assert_eq!(caps[0].word(2), 0x3000, "its offset into that BAR");
+    assert_eq!(caps[0].word(3), 0x1000, "its length");
+}
+
+#[test]
+fn a_function_without_the_status_bit_is_not_read_for_capabilities() {
+    // The pointer holds a plausible offset, but the status bit says there is no list.
+    // Following it anyway would invent capabilities out of whatever 0x34 happens to hold.
+    let m = Model::default();
+    m.endpoint(Address::new(0, 6, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.raw_capability_pointer(0x40);
+    let mut caps = [pci::Capability::EMPTY; 8];
+    assert_eq!(pci::capabilities(&m, Address::new(0, 6, 0), &mut caps), 0);
+}
+
+#[test]
+fn a_looping_capability_list_is_read_once_rather_than_for_ever() {
+    let m = Model::default();
+    m.endpoint(Address::new(0, 7, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.looping_capability(0x40);
+    let mut caps = [pci::Capability::EMPTY; 64];
+    // It terminates, at the walk's own bound rather than by filling the caller's slice.
+    let n = pci::capabilities(&m, Address::new(0, 7, 0), &mut caps);
+    assert_eq!(n, 48);
+    assert!(caps[..n].iter().all(|c| c.offset == 0x40));
+}
+
+#[test]
+fn capabilities_stop_when_the_callers_slice_fills() {
+    let m = Model::default();
+    m.endpoint(Address::new(0, 8, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.capabilities(&[(0x09, 0x40, 0), (0x09, 0x50, 0), (0x09, 0x60, 0)]);
+    let mut caps = [pci::Capability::EMPTY; 2];
+    assert_eq!(pci::capabilities(&m, Address::new(0, 8, 0), &mut caps), 2);
+    assert_eq!(caps[1].offset, 0x50);
+}
+
+#[test]
+fn a_capability_pointer_inside_the_header_is_refused() {
+    // 0x20 is a BAR, not a capability: following it would read a base address as a
+    // capability ID and chain onwards from whatever that happened to be.
+    let m = Model::default();
+    m.endpoint(Address::new(0, 9, 0), (0x1af4, 0x1042), ETHERNET, &[]);
+    m.capabilities(&[(0x09, 0x20, 0)]);
+    let mut caps = [pci::Capability::EMPTY; 8];
+    assert_eq!(pci::capabilities(&m, Address::new(0, 9, 0), &mut caps), 0);
 }
 
 #[test]

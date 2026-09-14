@@ -730,6 +730,12 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
         c.write_str("skipped: no kernel address space");
         return Check::Skipped;
     };
+    if !user_half_clear(direct, <Cpu as HasPageTables>::root()) {
+        c.write_str(
+            "REFUSED: the kernel maps something in the user half, which every process would share",
+        );
+        return Check::Failed;
+    }
     let program = match Program::parse(
         INIT_ELF,
         <Cpu as HasUserMode>::ELF_MACHINE,
@@ -829,6 +835,22 @@ fn run(
     exit
 }
 
+/// Whether the kernel's own tables leave the user half empty.
+///
+/// A process root mirrors every top-level entry of the kernel's, and fills its user half in
+/// on top of the zero it expects there. If the kernel maps anything in that half — a device
+/// window firmware placed there, mapped at its physical address as every window is — the
+/// entry is not zero: every process then builds its pages into one shared table, and two
+/// processes see each other's memory. That is refused, rather than a process built on it.
+pub(crate) fn user_half_clear(direct: DirectMap, kernel_root: PhysAddr) -> bool {
+    // SAFETY: the live kernel root, reachable through `direct`; this only reads its entries.
+    let kernel = unsafe { AddressSpace::<Cpu>::from_root(kernel_root, direct) };
+    matches!(
+        kernel.top_level_mapped(<Cpu as HasUserMode>::USER_START, <Cpu as HasUserMode>::USER_END,),
+        Ok(false)
+    )
+}
+
 /// Build an empty process in `slot`: its own address space with the kernel half mirrored,
 /// `program`'s segments and a stack reserved, and its handle table. Returns its root.
 ///
@@ -840,6 +862,9 @@ pub(crate) fn build(slot: usize, program: &Program) -> Option<PhysAddr> {
     }
     let direct = direct();
     let kernel_root = kernel_root();
+    if !user_half_clear(direct, kernel_root) {
+        return None;
+    }
     let mut space = with_frames(|f| AddressSpace::<Cpu>::new(direct, f).ok())??;
     // SAFETY: `kernel_root` is the live kernel root, reachable through `direct`, and its
     // tables outlive this process.

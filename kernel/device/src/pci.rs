@@ -34,10 +34,24 @@
 //!
 //! # What is not here
 //!
-//! Resource assignment: BARs are read as firmware assigned them. Interrupt routing: the
-//! interrupt pin is recorded, and mapping it to a system interrupt needs the ACPI `_PRT`
-//! or the device tree's `interrupt-map`, neither of which is interpreted yet.
-//! Capabilities, MSI, and hot-plug.
+//! Resource assignment: BARs are read as firmware assigned them. MSI, and hot-plug.
+//!
+//! # Capabilities
+//!
+//! A function may carry a linked list of capability structures, which is how it says what
+//! it can do beyond the header: MSI-X, PCI Express, and — for virtio — where in its BARs
+//! each of its register structures lives. [`capabilities`] walks that list. It reads
+//! nothing unless the status register says the list exists, and the walk is bounded by the
+//! number of structures configuration space could hold, so a device whose list loops is
+//! read once rather than for ever.
+//!
+//! # Interrupt routing
+//!
+//! The interrupt pin is recorded here, and turning it into a system interrupt is the
+//! platform's, because the answer is machine knowledge this crate does not have: the ACPI
+//! `_PRT`, which is AML, or the device tree's `interrupt-map`. [`Function::interrupt_line`]
+//! is what firmware routed, which is the answer on a machine whose interrupt controller is
+//! the one firmware routed for. See `docs/architecture.md`.
 
 use core::fmt;
 
@@ -91,9 +105,13 @@ mod reg {
     /// Type 0 header: subsystem vendor and subsystem ID.
     pub const SUBSYSTEM: u16 = 0x2c;
     pub const INTERRUPT: u16 = 0x3c;
+    /// Type 0 header: where the capability list begins, when the status says there is one.
+    pub const CAPABILITY_POINTER: u16 = 0x34;
 
     pub const COMMAND_IO: u32 = 1 << 0;
     pub const COMMAND_MEMORY: u32 = 1 << 1;
+    /// Status bit 4, in the upper half of the command register's word.
+    pub const STATUS_CAPABILITIES: u32 = 1 << 20;
 }
 
 /// The class code of a host bridge, `06/00`.
@@ -155,7 +173,19 @@ pub struct Function {
     original_bars: [u32; 6],
     name: Text<8>,
     compatible: Text<48>,
+    /// The function's capability list, as far as [`MAX_CAPABILITIES`].
+    ///
+    /// Read here, during enumeration, because this is where configuration space is
+    /// reachable: a driver is handed the node its `Origin::Pci` borrows, and has no way
+    /// back to the bus. A device that says where its registers are — which is how virtio
+    /// describes itself — is therefore readable by the driver that binds to it.
+    capabilities: [Capability; MAX_CAPABILITIES],
+    capability_count: u8,
 }
+
+/// Capabilities recorded per function. Long enough for the handful a real device carries:
+/// virtio's five, PCI Express, MSI-X and power management together are under a dozen.
+pub const MAX_CAPABILITIES: usize = 12;
 
 impl Function {
     /// An unused slot, for sizing the caller's storage.
@@ -179,6 +209,8 @@ impl Function {
         original_bars: [0; 6],
         name: Text::EMPTY,
         compatible: Text::EMPTY,
+        capabilities: [Capability::EMPTY; MAX_CAPABILITIES],
+        capability_count: 0,
     };
 
     /// `bb:dd.f`.
@@ -200,6 +232,44 @@ impl Function {
         self.original_bars
             .get(..bar_count(self.header_type))
             .unwrap_or(&[])
+    }
+
+    /// The function's capability list, as enumeration read it.
+    ///
+    /// Empty when the function has none, or when it has more than [`MAX_CAPABILITIES`],
+    /// in which case the first that many are here: a driver looking for its own reads
+    /// what was recorded and finds nothing rather than reading a bus it cannot reach.
+    pub fn capabilities(&self) -> &[Capability] {
+        self.capabilities
+            .get(..usize::from(self.capability_count))
+            .unwrap_or(&[])
+    }
+
+    /// Base address register `number`, as a CPU physical `(base, size)`, if it decodes
+    /// memory and firmware assigned it.
+    ///
+    /// By the register's own number, 0 to 5, which is how a device refers to its BARs:
+    /// virtio's capabilities name one that way. That is *not* [`Self::memory_bar`]'s
+    /// index, which counts only the memory BARs: a device whose BAR 0 decodes I/O — the
+    /// transitional virtio layout — has its first memory BAR at a number greater than its
+    /// index, and claiming by the wrong one maps another device's window.
+    pub fn bar_by_number(&self, number: u8) -> Option<(u64, u64)> {
+        match self.bars.get(usize::from(number))? {
+            Bar::Memory { base, size, .. } if *base != 0 => Some((*base, *size)),
+            _ => None,
+        }
+    }
+
+    /// Which of [`Self::memory_bar`]'s indices BAR `number` is, so a claim made by index
+    /// reaches the register the device named.
+    pub fn memory_bar_index(&self, number: u8) -> Option<usize> {
+        let upto = self.bars.get(..usize::from(number))?;
+        self.bar_by_number(number)?;
+        Some(
+            upto.iter()
+                .filter(|b| matches!(b, Bar::Memory { base, .. } if *base != 0))
+                .count(),
+        )
     }
 
     /// The `index`th memory BAR with an assigned base, as a CPU physical `(base, size)`.
@@ -379,6 +449,90 @@ pub fn verify_restored(cfg: &impl ConfigSpace, functions: &[Function]) -> Result
     Ok(())
 }
 
+/// One capability in a function's list.
+///
+/// `words` is the structure itself, as far as [`CAPABILITY_WORDS`], so a driver can read
+/// its own capability without reaching configuration space: enumeration is the only place
+/// that has it. virtio's vendor capability is five words, which is what fixes the bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Capability {
+    /// 0x05 MSI, 0x09 vendor-specific, 0x10 PCI Express, 0x11 MSI-X.
+    pub id: u8,
+    /// Where the structure begins in configuration space.
+    pub offset: u16,
+    /// The structure's first words, the one holding `id` included.
+    pub words: [u32; CAPABILITY_WORDS],
+}
+
+/// Words of each capability structure that are recorded. virtio's vendor capability is
+/// five, MSI-X's is three.
+pub const CAPABILITY_WORDS: usize = 6;
+
+impl Capability {
+    pub const EMPTY: Capability = Capability {
+        id: 0,
+        offset: 0,
+        words: [0; CAPABILITY_WORDS],
+    };
+
+    /// The byte at `offset` bytes into the structure.
+    pub fn byte(&self, offset: usize) -> u8 {
+        (self.word(offset / 4) >> (8 * (offset % 4))) as u8
+    }
+
+    /// The `index`th word of the structure. Past what was recorded, zero.
+    pub fn word(&self, index: usize) -> u32 {
+        self.words.get(index).copied().unwrap_or(0)
+    }
+}
+
+/// The vendor-specific capability ID, which is how virtio describes where its register
+/// structures live.
+pub const CAP_VENDOR: u8 = 0x09;
+
+/// Every capability of `at`, in list order, written to `out`. Returns how many.
+///
+/// Nothing is read unless the status register says the list exists. The walk stops at the
+/// end of the list, when `out` fills, or after as many structures as configuration space
+/// could hold — the bound that makes a device with a looping list finite rather than a
+/// kernel that does not return.
+pub fn capabilities(cfg: &impl ConfigSpace, at: Address, out: &mut [Capability]) -> usize {
+    if cfg.read(at, reg::COMMAND) & reg::STATUS_CAPABILITIES == 0 {
+        return 0;
+    }
+    // A capability begins on a four-byte boundary, so the pointer's low two bits are
+    // reserved and masked away rather than trusted.
+    let mut offset = (cfg.read(at, reg::CAPABILITY_POINTER) & 0xfc) as u16;
+    let mut n = 0;
+    // Bounded: 0x40..0x100 holds at most 48 four-byte-aligned structures.
+    for _ in 0..48 {
+        let Some(slot) = out.get_mut(n) else { break };
+        if !(0x40..=0xfc).contains(&offset) {
+            break;
+        }
+        let mut words = [0u32; CAPABILITY_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            // A capability that runs past configuration space is read as far as it fits;
+            // the reserved words beyond read all-ones, as an absent register does.
+            let at_word = offset + 4 * i as u16;
+            *w = if at_word <= 0xfc {
+                cfg.read(at, at_word)
+            } else {
+                0
+            };
+        }
+        let word = words[0];
+        *slot = Capability {
+            id: word as u8,
+            offset,
+            words,
+        };
+        n += 1;
+        offset = ((word >> 8) & 0xfc) as u16;
+    }
+    n
+}
+
 fn vendor(cfg: &impl ConfigSpace, at: Address) -> u16 {
     cfg.read(at, reg::ID) as u16
 }
@@ -419,6 +573,9 @@ fn read_function(
     let bars =
         size_bars(cfg, at, count, &original_bars, (class_code, subclass) != CLASS_HOST_BRIDGE);
 
+    let mut capabilities = [Capability::EMPTY; MAX_CAPABILITIES];
+    let capability_count = self::capabilities(cfg, at, &mut capabilities) as u8;
+
     let name = Text::format(format_args!("{at:?}")).ok_or(Error::Text)?;
     let compatible = Text::format(format_args!(
         "pci{vendor:04x},{device:04x}\0pciclass,{class_code:02x}{subclass:02x}{prog_if:02x}\0\
@@ -446,6 +603,8 @@ fn read_function(
         original_bars,
         name,
         compatible,
+        capabilities,
+        capability_count,
     })
 }
 

@@ -11,12 +11,25 @@ use hal::EarlyConsole;
 
 use crate::{ECAM, MadtFacts, write_usize};
 
+/// Whether a PCI function's interrupt-line register can be wired as its interrupt.
+///
+/// Not here. Firmware wrote that register for the 8259A, and this port routes interrupts
+/// through the I/O APIC, where a PCI pin arrives on a different input altogether — on q35,
+/// a global system interrupt from 16 up, level-triggered and active low — and which one is
+/// written only in the ACPI namespace's `_PRT`, as AML. Wiring the register's value would
+/// program an input nothing drives: the handler would be registered, the line enabled, and
+/// no interrupt would ever come. So PCI devices poll on this port until either an AML
+/// interpreter reads `_PRT`, or MSI-X delivers straight to a local APIC and needs no
+/// routing at all. See `docs/architecture.md`, "Interrupt routing".
+pub(crate) const PCI_LINE_TRUSTED: bool = false;
+
 /// Every driver this image carries.
 pub(crate) const DRIVERS: &[&dyn Driver] = &[
     &apic::LOCAL_DRIVER,
     &apic::IO_DRIVER,
     &ECAM,
     &uart16550::DRIVER,
+    &virtio_blk::DRIVER,
 ];
 
 /// Build the controller from what bound and install it and its timer. Returns whether that

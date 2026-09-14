@@ -128,8 +128,8 @@ config NR_CPUS
 config KERNEL_THREAD_SLOTS
     int "Guarded stack slots for kernel threads"
     range 2 256
-    default 12 if STRESS_TEST && DRIVER_ISOLATION
-    default 11 if STRESS_TEST
+    default 13 if STRESS_TEST && DRIVER_ISOLATION
+    default 12 if STRESS_TEST
     default 8
     help
         How many kernel threads may hold a guarded stack at once, not
@@ -630,7 +630,7 @@ config DRIVER_ISOLATION
 config QEMU_BLOCK_TEST
     bool "A virtio-blk disk with a known pattern under QEMU"
     depends on QEMU_EXIT && MM_PAGED
-    default y if ARCH_AARCH64
+    default y if ARCH_AARCH64 || ARCH_X86_64 || ARCH_I686
     help
         Attach a 6 MiB disk image kbuild writes at build time to a virtio-blk
         device, and gate the boot on the block check: the driver reads sectors
@@ -646,6 +646,13 @@ config QEMU_BLOCK_TEST
         On aarch64, where the device is a memory-mapped virtio slot the
         device tree describes. Needs MM_PAGED, because the check maps the
         driver's DMA region through the kernel's direct map.
+
+        The same device over whichever transport the machine has: a
+        memory-mapped virtio slot the device tree describes on aarch64, and a
+        PCI function on the PCs. Which one a build gets is the difference the
+        driver's `Transport` seam exists for, and the check is the same either
+        way. Needs MM_PAGED, because the check maps the driver's DMA region
+        through the kernel's direct map.
 
 config SERIAL_IRQ_TEST
     bool "Prove the console UART receives on interrupt under QEMU"

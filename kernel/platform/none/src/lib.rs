@@ -54,6 +54,11 @@ pub fn console_line() -> Option<u32> {
     None
 }
 
+/// No block device is bound on these ports, so there is no line to report.
+pub fn block_line() -> Option<u32> {
+    None
+}
+
 /// Nothing received: `(interrupts, bytes)`.
 pub fn console_received() -> (u32, u32) {
     (0, 0)

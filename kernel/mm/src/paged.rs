@@ -161,6 +161,25 @@ impl<A: HasPageTables> AddressSpace<A> {
         Ok(())
     }
 
+    /// Whether any top-level entry covering `[start, end)` is present.
+    ///
+    /// For a caller about to [`mirror_top_level`](Self::mirror_top_level) from this space:
+    /// a range it means to fill in on its own must be empty here, or the mirror shares the
+    /// table below it and whatever the caller maps lands in the tables every mirror sees.
+    pub fn top_level_mapped(&self, start: usize, end: usize) -> Result<bool, MapError> {
+        if start >= end {
+            return Ok(false);
+        }
+        let first = level_index::<A>(start, A::LEVELS - 1);
+        let last = level_index::<A>(end - 1, A::LEVELS - 1);
+        for i in first..=last {
+            if self.read(self.root, i)?.is_present() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The direct map these tables are reached through.
     pub fn direct(&self) -> DirectMap {
         self.direct
