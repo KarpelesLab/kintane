@@ -159,13 +159,14 @@ address is one word: the IPv4 address in bits 47..16 and the port in bits 15..0
 - **`socket_shutdown`** (`WRITE`) sends a FIN after what is queued and waits for the peer to
   acknowledge everything. Closing the handle closes the connection in order without waiting,
   or resets it if data arrived that was never read.
-- A socket call that waits is blocked on a wait queue, but nothing wakes that queue when a frame
-  arrives: the waiter looks at the network every 2 ms until its timeout. The card's interrupt
-  does not reach socket waiters yet.
+- A socket call that waits blocks on the socket calls' wait queue. The card's interrupt handler
+  runs the network stack over every frame it collects and wakes that queue, so a waiter looks
+  again when a segment may have moved its connection; otherwise it looks again only when the
+  stack's earliest TCP timer runs out. On a port with no interrupt route for the card, a waiter
+  looks every 2 ms, and each such look is counted as a poll.
 
-`lib/rt` wraps the calls as `TcpStream` and `TcpListener`. There is no Linux socket call;
-`kernel/main/src/sockets.rs` lists where `socket`, `bind`, `listen`, `accept`, `connect`,
-`send`, `recv`, `shutdown` and `close` would land on these.
+`lib/rt` wraps the calls as `TcpStream` and `TcpListener`. The Linux personality's socket calls
+are a layer over the same objects and the same queue (see "The Linux personality" below).
 
 **What the socket check proves** (`kernel/main/src/sockets.rs`, the `sockets` banner line, on
 every x86_64 and aarch64 preset with a network card). `user/tcp-client`, a native program with
@@ -175,7 +176,8 @@ sends a request, reads the reply until kbuild closes, and closes its socket. kbu
 connection's first data segment once, so the reply arrives only because the kernel sent the
 request again. The kernel requires the program's success code, a data retransmission while it
 ran, the connection it let go of closed in order with every stack buffer back, and every object
-and frame back.
+and frame back. Where the card has an interrupt route, it also requires that the program's waits
+were woken by the card's interrupt at least once and never polled.
 
 **Threads.** `thread_create` starts further threads in a process, each with a four-page
 user stack of its own, up to three beyond the first over the process's life. Two threads of
@@ -443,18 +445,36 @@ yet. That falls short of the table below, where every descriptor is a view over 
 process's descriptors close when its last thread ends, as Linux closes them at exit: a pipe's
 reader sees end of file once the last writer's process has ended, not once its parent reaps it.
 
-A socket is the next variant of `Descriptor` in `kernel/main/src/personality.rs`. Its `read`
-and `write` go where a pipe's do, blocking on the socket's own queue, and the table does not
-change shape.
+A socket descriptor names a socket object in the object store — the same kind of object a
+native socket handle names — counted across processes as a pipe's ends are: a `fork`'s copy adds
+one, and `close`, close-on-exec and a process's end take one away. The last one retires the
+object, and the store closes its connection in order. `read` and `write` on a socket are `recv`
+and `send`. Up to 8 sockets exist at once across every Linux process
+(`kernel/main/src/personality/socket.rs`).
+
+**Sockets.** IPv4 TCP byte streams only, over the kernel's TCP. A call that has to wait —
+`connect` for the handshake, `accept` for a connection, a receive for bytes, a send for room —
+waits on the socket calls' queue, which the card's interrupt wakes, as a native socket call
+does. `O_NONBLOCK` on the descriptor, or `MSG_DONTWAIT` on the call, makes it `EAGAIN` instead.
+A wait ends when the process does. Signals will end one with `EINTR`; `interrupted` in
+`personality/socket.rs` is where they plug in, and answers nothing yet.
 
 **The calls.**
 
 | Call | As built |
 |---|---|
-| `read`, `write` | standard input reads end of file; the console takes writes; a file reads through the VFS; a pipe blocks as above. Up to 4096 bytes a call, 512 on a pipe, a short count as Linux allows |
+| `read`, `write` | standard input reads end of file; the console takes writes; a file reads through the VFS; a pipe blocks as above, and a socket is `recv` and `send`. Up to 4096 bytes a call, 512 on a pipe or a socket's receive, a short count as Linux allows |
 | `openat` | `AT_FDCWD` or an absolute path; the working directory is `/`. Read-only (`O_ACCMODE` other than `O_RDONLY` is `EROFS`); `O_DIRECTORY`, in the architecture's own numbering, is honoured, and so is `O_CLOEXEC`; other flags are ignored. A relative path against any other descriptor is `ENOTDIR` |
-| `close`, `fstat` | `fstat` reports a regular file or directory with its size, a FIFO for a pipe end, or a character device for 0–2, in the architecture's own `struct stat`; `st_ino` is a hash of the path |
+| `close`, `fstat` | `fstat` reports a regular file or directory with its size, a FIFO for a pipe end, a socket, or a character device for 0–2, in the architecture's own `struct stat`; `st_ino` is a hash of the path |
 | `pipe2`, `pipe` | `O_CLOEXEC` and `O_NONBLOCK`; any other flag is `EINVAL`. `pipe` is x86_64's only |
+| `socket` | `AF_INET` and `SOCK_STREAM`, protocol 0 or `IPPROTO_TCP`, with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`. Another family is `EAFNOSUPPORT`, another type or protocol `EPROTONOSUPPORT`, another flag `EINVAL`, and a machine with no started card `ENETDOWN` |
+| `connect` | a `struct sockaddr_in`; waits for the handshake, and is `ECONNREFUSED` if the peer refused and `ETIMEDOUT` if it never answered. Non-blocking, it is `EINPROGRESS`, then `EALREADY` until the connection is established, then `EISCONN`; connecting a connected socket is `EISCONN` |
+| `bind`, `listen` | `bind` to a port of this machine's, on `0.0.0.0` or `10.0.2.15`; another address is `EADDRNOTAVAIL`, port 0 `EINVAL`, and a port already listened on `EADDRINUSE` at `listen`. `listen` needs a bound port, and its backlog is ignored |
+| `accept`, `accept4` | wait for a connection and answer a new descriptor, with `SOCK_NONBLOCK` and `SOCK_CLOEXEC` for `accept4`; the peer's address is written when asked for |
+| `sendto`, `recvfrom` | `send` and `recv`, which are these on both architectures. Up to 4096 bytes a send, in 512-byte pieces, waiting for room unless non-blocking; up to 512 bytes a receive, zero at the end of the stream. `MSG_DONTWAIT` and `MSG_NOSIGNAL` only, others `EOPNOTSUPP`. A send's address is ignored, as Linux ignores it on a connected stream, and a receive reports a sender of no bytes. `ENOTCONN` on a socket with no connection; `EPIPE`, with no `SIGPIPE`, after this end shut down |
+| `shutdown` | `SHUT_WR` and `SHUT_RDWR` send a FIN after what is queued; `SHUT_RD` is `EOPNOTSUPP` |
+| `getsockname`, `getpeername` | a connected socket's `10.0.2.15` and port, and its peer; a bound or listening one's `0.0.0.0` and port; `getpeername` without a connection is `ENOTCONN` |
+| `setsockopt`, `getsockopt` | `SO_REUSEADDR`, `SO_KEEPALIVE` and `TCP_NODELAY` are accepted and change nothing: the stack reuses a port as soon as nothing holds it, sends no keepalives, and never delays a segment. `getsockopt` answers `SO_TYPE`, `SO_ERROR` (why a connection failed) and `TCP_NODELAY`. Any other option is `ENOPROTOOPT` |
 | `brk` | moves within a reservation of 64 pages made at start; the answer is the break as it now is, which is the old one when the request cannot be met |
 | `mmap`, `munmap` | anonymous private mappings, readable or read-write, where the kernel chooses. File-backed, shared, `MAP_FIXED` and `PROT_NONE` are `EINVAL`, `PROT_EXEC` is `EACCES`. `munmap` releases exactly one earlier mapping; part of one is `EINVAL` |
 | `arch_prctl` | x86_64 only. `ARCH_SET_FS` only, below the top of the user half; everything else is `EINVAL`. aarch64 has no such call: a program writes `TPIDR_EL0` itself |
@@ -499,8 +519,9 @@ enough for a program, one thread and one child; 8 thread records; 4 pipes; 128 s
 counts across every Linux process. A child's process slot is freed when whatever started the
 process tree tears it down, not by `wait4`.
 
-**Start-up.** `argv` is `["hello"]`, or `["hello", <mode>]` for the modes the scheduled check
-and the stress run start, and `envp` is `["HOME=/"]`. The auxiliary vector carries:
+**Start-up.** `argv` is `["hello"]`, or `["hello", <mode>]` for the modes the scheduled checks
+and the stress run start — `["hello", "tcp", <kbuild's port>]` for the TCP client — and `envp`
+is `["HOME=/"]`. The auxiliary vector carries:
 
 - `AT_PHDR`, by Linux's rule for a static executable;
 - `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ` and `AT_ENTRY`;
@@ -520,7 +541,9 @@ no corpus yet for a gap to fail.
 - **No signals.** A child's exit sends no `SIGCHLD`, a write to a pipe with no reader is `EPIPE`
   with no `SIGPIPE`, and nothing interrupts a blocked call. A thread spinning in user mode, in a
   process another thread has ended, is not stopped until its next system call.
-- **No sockets.** `socket` and the calls after it are logged as unimplemented.
+- **Sockets are IPv4 TCP streams only**, with no `poll`, `select` or `epoll` to wait on several
+  at once, no `SHUT_RD`, no datagram sockets, and options that are accepted without effect, as
+  listed above.
 - **`AT_RANDOM`'s bytes are not secret.** They are a SplitMix64 stream seeded from the
   process's page-table root and entry point. A C library seeds its stack protector from them.
 - **Only the checks have a filesystem namespace.** A Linux process started any other way, the

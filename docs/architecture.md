@@ -1150,10 +1150,26 @@ user-mode network, and sockets put TCP behind handles. What it is not:
 
 - **No fragment reassembly.** A fragment is refused and counted (`WireError::Fragmented`),
   and a datagram that does not fit one 1500-byte frame is not sent.
-- **No interrupt-driven socket waits.** The stack is `&mut self`, driven by whoever holds it
-  under one lock: the boot check, the stress workloads, and the socket calls, whose waiting
-  threads block and look at the network every 2 ms. A frame's interrupt wakes none of them.
+- **No thread of its own.** TCP's timers run when someone runs the stack: the card's handler
+  when a frame arrives, or a waiter whose wait ran to the stack's next timer. A connection
+  nobody waits on — one a program closed and left — retransmits its FIN only when the next
+  frame or socket call comes.
 - **No IPv6, DHCP, DNS or routing table.** One static address, a netmask and a gateway.
+
+**Who runs the stack.** The stack is `&mut self`, driven by whoever holds it under one lock:
+the boot check, the stress workloads, and the socket calls. From the first socket check on
+(`net::serve_by_interrupt`), the card's interrupt handler also runs it over every frame it
+collects, bumps a generation under the lock, and wakes the socket calls' wait queue. A socket
+call that waits is woken by that, or looks again when the stack's earliest TCP timer runs out;
+a kernel thread waiting on the network without a socket, as the stress run's TCP rounds do,
+waits until the generation it read under the lock has moved, so no frame run in between is
+missed. A wake is for everyone waiting on the network, not for one connection: each waiter looks
+at its own connection again and waits on if nothing moved it, so a busy network costs every
+waiter a look per frame. A process's end wakes the queue too, as it wakes every object's. The
+lock is taken with interrupts masked everywhere, so the handler never finds it held on its own
+CPU. On a port with no interrupt route for the card nothing can wake a waiter, and it
+looks every 2 ms, counted as a poll; the `sockets` and `linux net` checks require no polls where
+the card has a route.
 
 #### `kernel/net`
 
