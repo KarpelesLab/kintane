@@ -50,6 +50,15 @@ pub fn shootdown_stats() -> (usize, usize, usize) {
     (0, 0, 0)
 }
 
+/// No shootdowns, so neither a mismatch nor a stall is possible.
+pub fn shootdown_mismatches() -> usize {
+    0
+}
+
+pub fn shootdown_stalls() -> usize {
+    0
+}
+
 /// The mean and the worst wait for a shootdown's answers: none, so zero.
 #[cfg_attr(
     not(CONFIG_MM_PAGED),

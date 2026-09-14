@@ -729,13 +729,16 @@ fn audit(
             );
         }
     }
-    if mp::shootdown_stats().2 != 0 {
-        audit_failed(
-            c,
-            seconds,
-            "tlb shootdown",
-            "a shootdown was answered by the wrong CPUs, or stalled",
-        );
+    // Answers from the wrong CPUs, or books that do not balance, are the kernel's fault and
+    // end the run. A wait that spun a long time is not: the count is the waiting CPU's own
+    // spins, which a host that stops running the CPU it waits for runs up without anything
+    // being wrong here. The eighth of a two-hour soak on aarch64 at eight CPUs failed this
+    // way at 65 s beside another soak, with the mean answer holding at 236 us and the worst
+    // at 92 ms. A shootdown that is never answered still fails the run, because the wait
+    // never returns and the heartbeat stops; the count and the worst wait are in every
+    // heartbeat, so a kernel that grows slower at this shows it there.
+    if mp::shootdown_mismatches() != 0 {
+        audit_failed(c, seconds, "tlb shootdown", "a shootdown was answered by the wrong CPUs");
     }
 }
 
@@ -857,7 +860,9 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         c.write_str(", shootdowns ");
         write_usize(c, shootdowns);
         let (mean_us, worst_us) = mp::shootdown_latency_us();
-        c.write_str(" (answered in mean ");
+        c.write_str(" (stalled waits ");
+        write_usize(c, mp::shootdown_stalls());
+        c.write_str(", answered in mean ");
         write_usize(c, mean_us as usize);
         c.write_str(" us, worst ");
         write_usize(c, worst_us as usize);
