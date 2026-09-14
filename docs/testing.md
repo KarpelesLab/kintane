@@ -2026,6 +2026,12 @@ A message that arrived is proof the wake was not lost. So the slow case exits 0x
 is counted as a *slow exchange*, printed in the heartbeat beside the wait counters; a receive
 that saw nothing at all still exits 0x603 or 0x613 and still fails the run.
 
+Seeing nothing inside the timeout has the same ambiguity one level down: a wake that was lost
+and a sender the host never ran are indistinguishable from inside the program. So a timed-out
+receive now asks once more without waiting. A message already queued was sent and merely not
+collected in time, which is the slow case; an empty channel is a wake that never came. That
+question is the guest's own, and needs no clock to answer.
+
 The wait around that exchange had the same fault: the cycle gave its two threads
 `PAIR_PATIENCE` to finish and called them still alive a lost wake-up, which a 30-minute soak
 hit at 49 s. It is now judged like every other pair wait — `PAIR_SLICES` between the two
@@ -2036,6 +2042,7 @@ threads, with the duration kept only for a pair the scheduler is barely running.
 | The peer never sends, so the wake really is lost | `a waiting process's receive timed out: a wake-up was lost`, at 2 s |
 | The pair reports a slow exchange on a receive that did arrive | the run **passes**, with `slow exchanges 23` in the heartbeat |
 | The pair never stops exchanging, so its threads cannot finish | `a waiting process did not finish: a wake-up was lost`, at 36 s — the wait's own slice bound, not its patience |
+| The peer never sends, so the retry finds an empty channel | `a waiting process's receive timed out: a wake-up was lost`, at 2 s |
 | `LOST_NS` cut to a millisecond | the *boot* `waits` check fails and bring-up stops; it proves nothing about the stress cycle |
 
 #### A slow shootdown is not a broken one
@@ -2097,6 +2104,7 @@ evidence for that fix, not against it.
 | `aarch64-virt-smp`, 8 CPUs | 141 s | `spinning sibling: a spinning thread was never stopped: its process's exit did not reach it` | `spawn::PATIENCE` again: the spinner's CPU was not run, so no interrupt reached it |
 | `aarch64-virt-smp`, 8 CPUs | 49 s | `waiting process: a waiting process did not finish: a wake-up was lost` | `waits::PAIR_PATIENCE`, 5 s, over two threads passing a counter |
 | `aarch64-virt-smp`, 8 CPUs | 64 s | `killed by the heartbeat watchdog: the guest is hung` | kbuild's own 30 s allowance between heartbeats, with the guest still printing them |
+| `aarch64-virt-smp`, 8 CPUs | 39 s | `waiting process's receive timed out: a wake-up was lost` | `WAKE_NS`: from inside the program, a sender the host never ran looks like a lost wake |
 
 Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
 
