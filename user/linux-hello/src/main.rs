@@ -583,12 +583,22 @@ const INBOUND_PORT: u16 = 7777;
 /// kbuild's protocols: `kbuild/src/qemu.rs`.
 const REQUEST: &[u8] = b"kintane-tcp-request peer-closes linux\n";
 const REPLY: &[u8] = b"kintane-tcp-reply peer-closes linux\n";
+const NB_REQUEST: &[u8] = b"kintane-tcp-request peer-closes linux-nonblocking\n";
+const NB_REPLY: &[u8] = b"kintane-tcp-reply peer-closes linux-nonblocking\n";
 const INBOUND: &[u8] = b"kintane-tcp-inbound ";
 const INBOUND_REPLY: &[u8] = b"kintane-tcp-inbound-reply ";
 const INBOUND_VERIFIED: &[u8] = b"kintane-tcp-inbound-verified ";
 
-/// Tries a non-blocking `connect` gets to see its connection established.
+/// Tries a non-blocking `connect` gets to see its connection established, and a non-blocking
+/// read to see its reply arrive.
 const CONNECT_TRIES: u32 = 2_000_000;
+
+/// The port `serve`'s second thread listens on, which nobody connects to; its listener; and the
+/// thread's tid word and whether it has started.
+const IDLE_PORT: u16 = 7778;
+static IDLE_LISTENER: AtomicU64 = AtomicU64::new(0);
+static IDLE_TID: AtomicU32 = AtomicU32::new(u32::MAX);
+static IDLE_STARTED: AtomicU32 = AtomicU32::new(0);
 
 /// `ip`:`port` as a `struct sockaddr_in`.
 fn sockaddr(ip: [u8; 4], port: u16) -> [u8; 16] {
@@ -778,11 +788,75 @@ fn tcp(port_arg: &[u8]) -> ! {
     // 124: no error pending, and nothing to read, which is EAGAIN rather than a wait.
     expect(get_opt(nb, SOL_SOCKET, SO_ERROR) == Some(0), 124);
     expect(sys::call(sys::READ, [nb, buf.as_mut_ptr() as u64, 8, 0, 0, 0]) == -EAGAIN, 124);
-    expect(call1(sys::CLOSE, nb) == 0, 125);
+    // 125: a whole exchange without waiting: EAGAIN until the reply comes, then to kbuild's
+    // close. kbuild closing first leaves no connection in TIME-WAIT, whose timer would wake
+    // every waiter on the network, behind for `serve`'s second thread.
+    expect(write_all(nb, NB_REQUEST), 125);
+    let mut got = 0;
+    let mut tries = 0;
+    loop {
+        let Some(room) = buf.get_mut(got..) else {
+            exit(125)
+        };
+        expect(!room.is_empty() && tries < CONNECT_TRIES, 125);
+        tries += 1;
+        let n = sys::call(sys::READ, [nb, room.as_mut_ptr() as u64, room.len() as u64, 0, 0, 0]);
+        if n == -EAGAIN {
+            yield_now();
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        expect(n > 0, 125);
+        got += n as usize;
+    }
+    expect(buf.get(..got) == Some(NB_REPLY), 125);
+    expect(call1(sys::CLOSE, nb) == 0, 126);
     exit(TCP_SUCCESS)
 }
 
+/// `serve`'s second thread: it waits in `accept` on a listener nobody connects to, and so must
+/// be ended by its process's end, since nothing else will end the wait.
+extern "C" fn idle_acceptor() -> u64 {
+    IDLE_STARTED.store(1, Ordering::Release);
+    let l = IDLE_LISTENER.load(Ordering::Acquire);
+    sys::call(sys::ACCEPT4, [l, 0, 0, 0, 0, 0]);
+    // 142: the wait ended while the process lived.
+    exit(142)
+}
+
 fn serve() -> ! {
+    // 141: a second thread, waiting in `accept` on port 7778, where nobody connects. When the
+    // process ends below, no TCP timer is pending anywhere (every connection before this one was
+    // closed by kbuild first), so only the process's end can end that wait, and the kernel's
+    // check requires every thread of the process to have ended.
+    let idle = socket(SOCK_STREAM);
+    expect(idle >= 3, 141);
+    let idle = idle as u64;
+    let idle_at = sockaddr([0; 4], IDLE_PORT);
+    expect(
+        sys::call(sys::BIND, [idle, idle_at.as_ptr() as u64, idle_at.len() as u64, 0, 0, 0]) == 0
+            && sys::call(sys::LISTEN, [idle, 1, 0, 0, 0, 0]) == 0,
+        141,
+    );
+    IDLE_LISTENER.store(idle, Ordering::Release);
+    let stack = map(4 * PAGE);
+    let block = map(PAGE);
+    expect(stack > 0 && block > 0, 141);
+    let mut parent_tid = 0u32;
+    let tid = sys::clone_thread(
+        (stack as u64) + 4 * PAGE,
+        &raw mut parent_tid,
+        IDLE_TID.as_ptr(),
+        block as u64,
+        idle_acceptor,
+    );
+    expect(tid > 0, 141);
+    while IDLE_STARTED.load(Ordering::Acquire) == 0 {
+        yield_now();
+    }
+
     // 130: a listener, on any of this machine's addresses, at the port kbuild forwards to.
     let l = socket(SOCK_STREAM);
     expect(l >= 3, 130);
@@ -839,6 +913,7 @@ fn serve() -> ! {
     // 140: both sockets close.
     expect(call1(sys::CLOSE, c) == 0, 140);
     expect(call1(sys::CLOSE, l) == 0, 140);
+    // The second thread is still waiting in `accept`: the process's end has to end it.
     exit(SERVE_SUCCESS)
 }
 
