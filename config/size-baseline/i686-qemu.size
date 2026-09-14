@@ -3,7 +3,7 @@ section .bss 196608
 section .data 143360
 section .rodata 36864
 section .stack 32768
-section .text 368640
+section .text 372736
 section .thread_stacks 262144
 crate (anonymous) text 0 rodata 4182 data 0 bss 0
 crate (unmangled) text 7030 rodata 0 data 0 bss 0
@@ -21,11 +21,11 @@ crate fat text 34877 rodata 0 data 0 bss 0
 crate hal text 1412 rodata 0 data 0 bss 0
 crate hwproxy text 327 rodata 0 data 0 bss 0
 crate kalloc text 13235 rodata 0 data 0 bss 0
-crate kintane text 87020 rodata 32 data 31152 bss 103502
+crate kintane text 87037 rodata 32 data 31304 bss 103502
 crate mm text 23195 rodata 0 data 0 bss 0
 crate multiboot text 625 rodata 0 data 0 bss 0
-crate net text 38469 rodata 0 data 0 bss 0
-crate platform text 22225 rodata 88 data 108397 bss 1507
+crate net text 41139 rodata 0 data 0 bss 0
+crate platform text 22214 rodata 88 data 108397 bss 1507
 crate sched text 2357 rodata 0 data 0 bss 0
 crate strip_suffix text 39 rodata 0 data 0 bss 0
 crate sync text 14000 rodata 16 data 800 bss 136
@@ -37,7 +37,7 @@ crate unwind text 2448 rodata 0 data 0 bss 0
 crate vfs text 5017 rodata 0 data 0 bss 0
 crate virtio text 5404 rodata 0 data 0 bss 0
 crate virtio_bind text 2015 rodata 0 data 0 bss 0
-crate virtio_blk text 3221 rodata 8 data 144 bss 4
+crate virtio_blk text 3510 rodata 16 data 304 bss 0
 crate virtio_blk_core text 2822 rodata 0 data 0 bss 0
 crate virtio_net text 6636 rodata 8 data 144 bss 4
-total 1040384
+total 1044480
