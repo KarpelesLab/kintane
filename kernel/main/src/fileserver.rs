@@ -92,6 +92,14 @@ const MODE_FILES: usize = 10;
 const FILES_SUCCESS: u64 = 0x6e;
 const MODE_WRITE: usize = 11;
 const WRITE_SUCCESS: u64 = 0x6f;
+/// `init`'s statfs mode, its code, and where it leaves what the service told it.
+const MODE_STATFS: usize = 13;
+const STATFS_SUCCESS: u64 = 0x71;
+const STATFS_OUT: &str = "/KINTANE/STATFS.BIN";
+/// Clusters the program's answer may be ahead of the volume by: it was told before it wrote
+/// the file that carries the answer, which took a cluster, and the directory holding it may
+/// have grown by one more.
+const STATFS_SLACK: u64 = 8;
 /// The names `init`'s write mode makes and removes again.
 const REMOVED: [&str; 3] = ["/KINTANE/NWTMP.TXT", "/KINTANE/NWREN.TXT", "/KINTANE/NWDIR"];
 
@@ -460,6 +468,12 @@ fn answer(
             done(to.and_then(|to| with_path(from, |ns, from| ns.rename(from, to))))
         }
         Request::Sync => done(with_ns(|ns| ns.sync())),
+        // Read-side, so a read-only connection may ask: what the filesystem covering the path
+        // is, which is the volume the path resolves to rather than the one mounted at `/`.
+        Request::Statfs { path } => match with_path(path, |ns, p| ns.statfs(p)) {
+            Ok(s) => vfsproto::statfs_answer(s.block_size, s.blocks, s.free, s.name_max),
+            Err(e) => vfsproto::status(status_of(e), 0),
+        },
         Request::Close { file } => {
             match files.get_mut(usize::from(file)).and_then(Option::take) {
                 // What a writer wrote reaches the disk by the time its close is answered.
@@ -709,6 +723,133 @@ pub fn write_check(c: &dyn EarlyConsole) -> Check {
         c.write_str(" ok");
     }
     Check::from_ok(code_ok && volume_ok && clean && connected == 2)
+}
+
+/// Run the `files size` check. On the boot thread, after `files write`.
+///
+/// What it proves: a program asked the service what each volume is and was answered; the
+/// answers stand on their own and differ between the two volumes; and what it was told is what
+/// the kernel finds by walking the same volumes. A program cannot count free clusters itself,
+/// so the program's half is that it asked and got a coherent answer, and the kernel's half is
+/// that the answer was true.
+pub fn statfs_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  files size ");
+    let server = match ready(c) {
+        Ok(server) => server,
+        Err(check) => return check,
+    };
+    let Some(program) = userproc::program() else {
+        c.write_str("the init program does not load");
+        return Check::Failed;
+    };
+    let (code, after) = run_checked(&program, server, MODE_STATFS, || {
+        Some([connect_writable(SLOT)?, Handle::from_raw(0)])
+    });
+    let code_ok = code == Some(STATFS_SUCCESS);
+    match code {
+        Some(STATFS_SUCCESS) => {}
+        Some(other) => {
+            c.write_str("init exited ");
+            write_hex(c, other);
+            c.write_str(", WRONG");
+        }
+        None => c.write_str("init NEVER EXITED"),
+    }
+    let told_ok = code_ok && told_the_truth(c);
+    c.write_str("; ");
+    let clean = report(c, &after);
+    if told_ok && clean {
+        c.write_str(" ok");
+    }
+    Check::from_ok(code_ok && told_ok && clean)
+}
+
+/// Read back what the program was told, and hold it against the volumes themselves.
+fn told_the_truth(c: &dyn EarlyConsole) -> bool {
+    let Some(mut volume) = crate::fs::lease(Some(timekeeping::now().saturating_add(PATIENCE)))
+    else {
+        c.write_str("THE VOLUME COULD NOT BE LEASED");
+        return false;
+    };
+    let mut said = [0u8; 2 * vfsproto::STATFS_BYTES];
+    {
+        let mut ns = Vfs::<2, 1>::new();
+        let (first, second) = volume.both();
+        if ns.mount("/", first).is_err() {
+            c.write_str("THE VOLUME COULD NOT BE MOUNTED");
+            return false;
+        }
+        let both = match second {
+            Some(second) => ns.mount(FAT32_AT, second).is_ok(),
+            None => false,
+        };
+        let read = ns.read_all(STATFS_OUT, &mut said);
+        let _ = ns.unmount(FAT32_AT);
+        let _ = ns.unmount("/");
+        if !both {
+            c.write_str("THERE IS NO SECOND VOLUME TO ASK ABOUT");
+            return false;
+        }
+        match read {
+            Ok(n) if n == said.len() => {}
+            _ => {
+                c.write_str("WHAT THE PROGRAM WAS TOLD WAS NOT LEFT BEHIND");
+                return false;
+            }
+        }
+    }
+    let first_ok = agrees(c, "/", &said[..vfsproto::STATFS_BYTES], &mut volume);
+    let (_, second) = volume.both();
+    let second_ok = match second {
+        Some(second) => agrees(c, FAT32_AT, &said[vfsproto::STATFS_BYTES..], second),
+        None => false,
+    };
+    if first_ok && second_ok {
+        c.write_str("both volumes answered for themselves");
+    }
+    first_ok && second_ok
+}
+
+/// Whether what a program was told about `volume` is what the volume is.
+///
+/// Its allocation unit, how many units it has and the longest name it holds cannot change, so
+/// those must match exactly. Its free count can: the program was told before it wrote the file
+/// that carries the answer, so it may be ahead by what that file took and no more. And the
+/// count the driver keeps must be what the walk counts, which is what makes the answer worth
+/// anything.
+fn agrees(c: &dyn EarlyConsole, at: &str, said: &[u8], volume: &mut fat::Fat<'_, '_>) -> bool {
+    use vfs::FileSystem;
+    let Some((block_size, blocks, free, name_max)) = vfsproto::parse_statfs(said) else {
+        c.write_str("WHAT THE PROGRAM WAS TOLD IS NOT AN ANSWER");
+        return false;
+    };
+    let Ok(now) = volume.statfs() else {
+        c.write_str("THE VOLUME WOULD NOT SAY WHAT IT IS");
+        return false;
+    };
+    if block_size != now.block_size || blocks != now.blocks || name_max != now.name_max {
+        c.write_str("THE PROGRAM WAS TOLD SOMETHING ELSE ABOUT ");
+        c.write_str(at);
+        return false;
+    }
+    if free < now.free || free - now.free > STATFS_SLACK {
+        c.write_str("THE FREE COUNT THE PROGRAM WAS TOLD IS NOT THE VOLUME'S: ");
+        c.write_str(at);
+        return false;
+    }
+    match crate::fs::consistency(volume) {
+        Ok(walk) if u64::from(walk.free) == now.free => true,
+        Ok(_) => {
+            c.write_str("THE VOLUME'S FREE COUNT IS NOT WHAT THE WALK COUNTED: ");
+            c.write_str(at);
+            false
+        }
+        Err(e) => {
+            c.write_str("THE VOLUME IS INCONSISTENT: ");
+            c.write_str(crate::fs::describe(e));
+            false
+        }
+    }
 }
 
 /// Read the volume after `init` wrote it: what it left, what it removed, the cache and the

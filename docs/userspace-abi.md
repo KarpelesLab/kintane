@@ -467,7 +467,7 @@ until someone decides what Linux calls it. Filesystem errors map onto `Failure` 
 
 | Failure | errno | Why |
 |---|---|---|
-| a path the volume cannot represent (`vfs::BadPath`) | `ENAMETOOLONG` | a FAT 8.3 name that does not fit is, from the program's side, a name too long |
+| a path the volume cannot represent (`vfs::BadPath`) | `ENAMETOOLONG` | a name the volume will not write — longer than 64 bytes, holding a character the format reserves, or ending in a dot or a space — is, from the program's side, a name too long |
 | a name that is not UTF-8 | `ENOENT` | the volume cannot hold it, so it has no such file |
 | a name that exists, for `O_CREAT|O_EXCL`, `mkdirat` or a rename onto a directory | `EEXIST` | |
 | a directory to remove, or to rename over, that is not empty | `ENOTEMPTY` | |
@@ -498,8 +498,10 @@ already holds rather than a second authority:
   one that exists, `O_TRUNC` empties it and `O_APPEND` writes every `write` at its end. `write`,
   `lseek`, `ftruncate`, `fsync` and `fstat` work on it, `fstat` reporting the size now rather than at
   the open. By path, `mkdirat`, `unlinkat` (a directory only with `AT_REMOVEDIR`) and `renameat`
-  within one directory, and on x86_64 `mkdir`, `unlink` and `rename`. Names are FAT's 8.3, stored in
-  upper case. A forked child does not inherit an open file.
+  within one directory, and on x86_64 `mkdir`, `unlink` and `rename`. A name that is
+  eight-and-three is stored as one, keeping the case it was written in; anything longer, or mixed
+  in case, is kept in long entries with a short alias of its own, and the file answers to either.
+  A forked child does not inherit an open file.
 - `pipe2` makes two ends of one of 4 kernel pipes, each holding 512 bytes. A read of an empty
   pipe blocks on the pipe's wait queue until a writer puts bytes in, or until the last write end
   closes, which is end of file. A write to a full pipe blocks until a reader makes room, and

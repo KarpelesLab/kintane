@@ -15,9 +15,13 @@
 //!   its table were 12 bits wide. The two formats differ in three places and nowhere else: a table
 //!   entry is 16 or 28 bits, the root is a fixed region or a cluster chain, and FAT32 keeps a free
 //!   count in an FSInfo sector ([`Format`]).
-//! * **8.3 names.** Long-name entries are skipped, so a file with one is reachable by its short
-//!   name. A name created or renamed here must be a valid 8.3 name, and is stored in upper case;
-//!   anything else is [`vfs::Error::BadPath`] rather than a name silently shortened.
+//! * **Long names, read and written.** A name that is already eight-and-three is stored as a short
+//!   name, with the two bits that record whether each half was written in lower case, so
+//!   `readme.txt` comes back as it went in. Anything longer, or mixed in case, gets a set of
+//!   long-name entries and a short alias of its own (`lfn`). Only printable ASCII is written: the
+//!   format reserves `"*/:<>?\|`, and a name outside that is [`vfs::Error::BadPath`] rather than
+//!   one silently shortened. A name already on the disk whose characters this cannot represent is
+//!   reported by its short name rather than guessed at.
 //! * **Every field is checked before it is used.** A cluster number outside the table, a chain
 //!   longer than the volume has clusters, a directory entry past the end of its region: each is
 //!   [`vfs::Error::Corrupt`] with the field named. The bytes come from a disk, and a disk is not
@@ -67,8 +71,12 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+mod lfn;
+
 #[cfg(test)]
 mod fat32_tests;
+#[cfg(test)]
+mod lfn_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -107,6 +115,10 @@ const STEP: usize = 32;
 /// Directories a consistency walk descends through before it calls the volume corrupt. A
 /// directory whose chain names an ancestor would otherwise recurse for ever.
 const MAX_DEPTH: usize = 16;
+/// Aliases tried before a long name is refused: `NAME~1` through `NAME~1024`. A directory
+/// holding that many names alike as far as the sixth character is not one this driver will
+/// add another to.
+const MAX_ALIASES: u32 = 1024;
 /// Characters an 8.3 name may hold besides letters and digits.
 const NAME_PUNCTUATION: &[u8] = b"_-!#$%&'()@^{}~";
 /// FSInfo's two signatures and the sector's trailing one, and where each sits.
@@ -738,12 +750,112 @@ impl<'s, 'd> Fat<'s, 'd> {
         }
     }
 
-    /// The entry in `dir` whose name matches `name`.
-    fn find_entry(&mut self, dir: Dir, name: &[u8]) -> Result<Option<(u64, [u8; ENTRY])>, Error> {
+    /// The `n`th name in `dir`, with the long entries before it joined.
+    ///
+    /// A set is used only if it is whole: its ordinals run down to one without a gap, every
+    /// entry carries the checksum of the short entry that follows, and every character is one
+    /// this driver would have written. A set that fails any of those belongs to a name that was
+    /// deleted and partly overwritten, and the short name is reported instead.
+    fn named_at(&mut self, dir: Dir, n: usize) -> Result<Option<Named>, Error> {
+        let mut seen = 0usize;
+        let mut index = 0usize;
+        let mut long = [0u8; vfs::MAX_NAME];
+        // The set being collected: how long the name is, which ordinal comes next, the
+        // checksum every entry of it carries, and where it starts.
+        let mut pending: Option<(usize, u8, u8, usize)> = None;
+        loop {
+            let Some((offset, bytes)) = self.raw_entry(dir, index)? else {
+                return Ok(None);
+            };
+            let at = index;
+            index += 1;
+            if bytes[0] == ENTRY_FREE {
+                return Ok(None);
+            }
+            if bytes[0] == ENTRY_DELETED {
+                pending = None;
+                continue;
+            }
+            if bytes[11] & ATTR_LONG_NAME == ATTR_LONG_NAME {
+                pending = self.collect_long(&bytes, at, pending, &mut long);
+                continue;
+            }
+            if bytes[11] & ATTR_VOLUME_ID != 0 {
+                pending = None;
+                continue;
+            }
+            let (short, short_len) = entry_name(&bytes);
+            if short_len == 0 || &short[..short_len] == b"." || &short[..short_len] == b".." {
+                pending = None;
+                continue;
+            }
+            // A whole set, for this very entry, names it; anything else is the short name with
+            // whichever halves the entry records as lower-case.
+            let mut name = [0u8; vfs::MAX_NAME];
+            let len = match pending.take() {
+                Some((len, 0, sum, start))
+                    if sum == lfn::checksum(&short_bytes(&bytes)) && len > 0 =>
+                {
+                    name[..len].copy_from_slice(&long[..len]);
+                    (len, start)
+                }
+                _ => {
+                    let mut rendered = [0u8; NAME_BYTES];
+                    let len = lfn::rendered(&short_bytes(&bytes), bytes[12], &mut rendered);
+                    name[..len].copy_from_slice(&rendered[..len]);
+                    (len, at)
+                }
+            };
+            if seen == n {
+                return Ok(Some(Named {
+                    set: len.1,
+                    index: at,
+                    offset,
+                    bytes,
+                    name,
+                    len: len.0,
+                }));
+            }
+            seen += 1;
+            pending = None;
+        }
+    }
+
+    /// Take one long entry into the set being collected, or drop the set if it does not
+    /// belong to it. Returns what is pending after it.
+    fn collect_long(
+        &mut self,
+        bytes: &[u8; ENTRY],
+        at: usize,
+        pending: Option<(usize, u8, u8, usize)>,
+        long: &mut [u8; vfs::MAX_NAME],
+    ) -> Option<(usize, u8, u8, usize)> {
+        let ordinal = bytes[0] & !lfn::LAST;
+        let last = bytes[0] & lfn::LAST != 0;
+        if ordinal == 0 || usize::from(ordinal) > lfn::MAX_ENTRIES {
+            return None;
+        }
+        let into = (usize::from(ordinal) - 1) * lfn::CHARS;
+        if last {
+            // The set starts here, and this entry holds the end of the name, so where its
+            // characters stop is how long the name is.
+            let len = lfn::chars_of(bytes, long, into)?;
+            return Some((len, ordinal - 1, bytes[13], at));
+        }
+        let (len, want, sum, start) = pending?;
+        if ordinal != want || bytes[13] != sum {
+            return None;
+        }
+        lfn::chars_of(bytes, long, into)?;
+        Some((len, ordinal - 1, sum, start))
+    }
+
+    /// The name in `dir` that matches `name`, long or short, ignoring case as FAT does.
+    fn find_named(&mut self, dir: Dir, name: &[u8]) -> Result<Option<Named>, Error> {
         let mut n = 0usize;
-        while let Some((offset, bytes)) = self.nth_named(dir, n)? {
-            if name_matches(&bytes, name) {
-                return Ok(Some((offset, bytes)));
+        while let Some(found) = self.named_at(dir, n)? {
+            if found.matches(name) {
+                return Ok(Some(found));
             }
             n += 1;
         }
@@ -980,20 +1092,41 @@ impl<'s, 'd> Fat<'s, 'd> {
         Ok(())
     }
 
-    /// An entry of `dir` free to hold a new name, growing the directory by a cluster when
-    /// every entry is taken. FAT16's root region is fixed, and full is [`Error::Full`];
-    /// FAT32's root is a chain and grows like any other directory.
-    fn free_entry(&mut self, dir: Dir) -> Result<u64, Error> {
-        let mut index = 0usize;
+    /// `count` entries of `dir` in a row, free to hold one name and its long entries, growing
+    /// the directory when there is no such run. FAT16's root region is fixed, and full is
+    /// [`Error::Full`]; FAT32's root is a chain and grows like any other directory.
+    ///
+    /// The index is what a caller writes through, not an offset: a run crosses a cluster
+    /// boundary, where the next entry is somewhere else entirely, and every reader walks a
+    /// directory by index.
+    fn free_slots(&mut self, dir: Dir, count: usize) -> Result<usize, Error> {
         loop {
-            match self.raw_entry(dir, index)? {
-                Some((offset, bytes)) if bytes[0] == ENTRY_FREE || bytes[0] == ENTRY_DELETED => {
-                    return Ok(offset);
+            let mut index = 0usize;
+            let mut run = 0usize;
+            let end = loop {
+                match self.raw_entry(dir, index)? {
+                    Some((_, bytes)) if bytes[0] == ENTRY_FREE || bytes[0] == ENTRY_DELETED => {
+                        run += 1;
+                        index += 1;
+                        if run == count {
+                            return Ok(index - count);
+                        }
+                    }
+                    Some(_) => {
+                        run = 0;
+                        index += 1;
+                    }
+                    None => break index,
                 }
-                Some(_) => index += 1,
-                None => break,
-            }
+            };
+            let _ = end;
+            self.grow_directory(dir)?;
         }
+    }
+
+    /// Add one cluster to a directory that is a chain. [`Error::Full`] for FAT16's root, which
+    /// is a region of a fixed size.
+    fn grow_directory(&mut self, dir: Dir) -> Result<(), Error> {
         let Place::Cluster(first) = self.resolve(dir) else {
             return Err(Error::Full);
         };
@@ -1009,7 +1142,117 @@ impl<'s, 'd> Fat<'s, 'd> {
         self.table_step(&[(cluster, end_of_chain)])?;
         self.table_step(&[(last, cluster)])?;
         self.free_hint = cluster + 1;
-        Ok(self.cluster_offset(cluster))
+        Ok(())
+    }
+
+    /// The short name a new `name` in `dir` is stored under, its case flags, and whether it
+    /// needs long entries.
+    ///
+    /// A name that is already a short one is stored as itself. Anything else gets an alias
+    /// whose number rises until the directory holds no such short name, so an alias never
+    /// takes a name something else already answers to.
+    fn alias_for(&mut self, dir: Dir, name: &[u8]) -> Result<([u8; 11], u8, bool), Error> {
+        lfn::writable_name(name)?;
+        if let Some((short, flags)) = lfn::short_of(name) {
+            return Ok((short, flags, false));
+        }
+        for n in 1..=MAX_ALIASES {
+            let short = lfn::alias(name, n);
+            if self.find_short(dir, &short)?.is_none() {
+                return Ok((short, 0, true));
+            }
+        }
+        // Every alias this would try is taken, which needs a directory holding that many
+        // names differing only past the sixth character.
+        Err(Error::Exists)
+    }
+
+    /// Where `dir` holds an entry whose short name is `short`, if it does.
+    fn find_short(&mut self, dir: Dir, short: &[u8; 11]) -> Result<Option<u64>, Error> {
+        let mut index = 0usize;
+        loop {
+            let Some((offset, bytes)) = self.raw_entry(dir, index)? else {
+                return Ok(None);
+            };
+            index += 1;
+            if bytes[0] == ENTRY_FREE {
+                return Ok(None);
+            }
+            if bytes[0] == ENTRY_DELETED || bytes[11] & ATTR_LONG_NAME == ATTR_LONG_NAME {
+                continue;
+            }
+            if bytes[..11] == short[..] {
+                return Ok(Some(offset));
+            }
+        }
+    }
+
+    /// Entries `name` takes in `dir`, and where a run of them begins.
+    ///
+    /// Taken before anything is written, so an operation that cannot fit is refused with the
+    /// directory as it was.
+    fn slots_for(&mut self, dir: Dir, name: &[u8], long: bool) -> Result<(usize, usize), Error> {
+        let count = if long { lfn::entries_for(name) + 1 } else { 1 };
+        let first = self.free_slots(dir, count)?;
+        Ok((first, count))
+    }
+
+    /// Write `name`'s entries into the run at `first`: its long entries, last piece first as
+    /// the format stores them, then `entry`, whose name bytes and case flags are already set.
+    /// Returns where the short entry sits, which is what names the file.
+    fn write_name_at(
+        &mut self,
+        dir: Dir,
+        name: &[u8],
+        entry: [u8; ENTRY],
+        first: usize,
+        count: usize,
+    ) -> Result<u64, Error> {
+        let total = count - 1;
+        let sum = lfn::checksum(&short_bytes(&entry));
+        for i in 0..total {
+            let piece = lfn::entry(name, total - 1 - i, sum);
+            let at = self.slot_offset(dir, first + i)?;
+            self.write_at_device(at, &piece)?;
+        }
+        let at = self.slot_offset(dir, first + total)?;
+        self.write_at_device(at, &entry)?;
+        self.step();
+        Ok(at)
+    }
+
+    /// Where the `index`th entry of `dir` sits, which a caller that has already claimed the
+    /// slot knows is there.
+    fn slot_offset(&mut self, dir: Dir, index: usize) -> Result<u64, Error> {
+        self.entry_offset(dir, index)?
+            .ok_or(Error::Corrupt("a directory shorter than the slots it gave"))
+    }
+
+    /// Claim room for `name` in `dir` and write it, with `entry` as its short entry.
+    fn write_name_set(
+        &mut self,
+        dir: Dir,
+        name: &[u8],
+        long: bool,
+        entry: [u8; ENTRY],
+    ) -> Result<u64, Error> {
+        let (first, count) = self.slots_for(dir, name, long)?;
+        self.write_name_at(dir, name, entry, first, count)
+    }
+
+    /// Mark every entry of a name's set deleted: its long entries and its short one.
+    ///
+    /// One step, so a crash leaves some of a set deleted, which a reader treats as a broken
+    /// set and skips — it never leaves a long set attached to a different short entry, since
+    /// the checksum in every long entry is the one it was written with.
+    fn delete_name_set(&mut self, dir: Dir, found: &Named) -> Result<(), Error> {
+        for index in found.set..=found.index {
+            if let Some(at) = self.entry_offset(dir, index)? {
+                self.write_at_device(at, &[ENTRY_DELETED])?;
+            }
+        }
+        self.step();
+        Ok(())
     }
 
     fn zero_cluster(&mut self, cluster: u32) -> Result<(), Error> {
@@ -1205,6 +1448,54 @@ fn same_dir(a: Dir, b: Dir) -> bool {
     }
 }
 
+/// A name in a directory: where its entries start, the short entry that holds everything but
+/// the name, and the name a caller sees.
+#[derive(Clone, Copy)]
+struct Named {
+    /// The index of the first entry of the set: the long entries when there are any, else the
+    /// short one. Removing the name marks every entry from here through [`Named::index`].
+    set: usize,
+    /// The index of the short entry within the directory.
+    index: usize,
+    /// Where the short entry sits on the device, which is what a [`NodeId`] names.
+    offset: u64,
+    bytes: [u8; ENTRY],
+    name: [u8; vfs::MAX_NAME],
+    len: usize,
+}
+
+impl Named {
+    fn name(&self) -> &[u8] {
+        self.name.get(..self.len).unwrap_or(&[])
+    }
+
+    /// Whether a caller's name is this one, ignoring case as FAT does.
+    ///
+    /// A file with a long name answers to its short alias as well: the alias is a name of its
+    /// own, which is why one is never given out twice, and every other reader finds a file by
+    /// either.
+    fn matches(&self, want: &[u8]) -> bool {
+        if same_ignoring_case(self.name(), want) {
+            return true;
+        }
+        let mut short = [0u8; NAME_BYTES];
+        let len = lfn::rendered(&short_bytes(&self.bytes), self.bytes[12], &mut short);
+        same_ignoring_case(short.get(..len).unwrap_or(&[]), want)
+    }
+}
+
+/// Whether two names are the same, ignoring case as FAT does.
+fn same_ignoring_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// The eleven name bytes of a short entry.
+fn short_bytes(entry: &[u8; ENTRY]) -> [u8; 11] {
+    let mut out = [0u8; 11];
+    out.copy_from_slice(&entry[..11]);
+    out
+}
+
 /// Where a directory's entries are, once the root is resolved for this volume's format.
 #[derive(Clone, Copy)]
 enum Place {
@@ -1265,18 +1556,6 @@ fn entry_name(entry: &[u8; ENTRY]) -> ([u8; NAME_BYTES], usize) {
     (out, len)
 }
 
-/// Whether a caller's name matches an entry's, ignoring case as FAT does.
-fn name_matches(entry: &[u8; ENTRY], want: &[u8]) -> bool {
-    let (name, len) = entry_name(entry);
-    if len != want.len() {
-        return false;
-    }
-    name[..len]
-        .iter()
-        .zip(want)
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-}
-
 /// `name` as the eleven bytes an entry stores, or [`Error::BadPath`] for anything that is not
 /// a valid 8.3 name. Stored in upper case, which is how FAT keeps a short name.
 pub fn short_name(name: &[u8]) -> Result<[u8; 11], Error> {
@@ -1313,8 +1592,8 @@ impl FileSystem for Fat<'_, '_> {
 
     fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Result<NodeId, Error> {
         let dir = self.dir_of(dir)?;
-        match self.find_entry(dir, name)? {
-            Some((offset, _)) => Ok(offset + 1),
+        match self.find_named(dir, name)? {
+            Some(found) => Ok(found.offset + 1),
             None => Err(Error::NotFound),
         }
     }
@@ -1390,12 +1669,11 @@ impl FileSystem for Fat<'_, '_> {
     }
 
     fn create(&mut self, dir: NodeId, name: &[u8], kind: Kind) -> Result<NodeId, Error> {
-        let short = short_name(name)?;
         let parent = self.dir_of(dir)?;
-        if self.find_entry(parent, name)?.is_some() {
+        if self.find_named(parent, name)?.is_some() {
             return Err(Error::Exists);
         }
-        let slot = self.free_entry(parent)?;
+        let (short, flags, long) = self.alias_for(parent, name)?;
         let entry = match kind {
             Kind::File => self.new_entry(short, ATTR_ARCHIVE, 0, 0),
             Kind::Dir => {
@@ -1425,9 +1703,10 @@ impl FileSystem for Fat<'_, '_> {
                 self.new_entry(short, ATTR_DIRECTORY, cluster, 0)
             }
         };
-        self.write_at_device(slot, &entry)?;
-        self.step();
-        Ok(slot + 1)
+        let mut entry = entry;
+        entry[12] = flags;
+        let at = self.write_name_set(parent, name, long, entry)?;
+        Ok(at + 1)
     }
 
     fn truncate(&mut self, node: NodeId, len: u64) -> Result<(), Error> {
@@ -1465,28 +1744,29 @@ impl FileSystem for Fat<'_, '_> {
 
     fn unlink(&mut self, dir: NodeId, name: &[u8]) -> Result<(), Error> {
         let parent = self.dir_of(dir)?;
-        let (offset, entry) = self.find_entry(parent, name)?.ok_or(Error::NotFound)?;
-        if entry_kind(&entry) == Kind::Dir && !self.is_empty_dir(&entry)? {
+        let found = self.find_named(parent, name)?.ok_or(Error::NotFound)?;
+        if entry_kind(&found.bytes) == Kind::Dir && !self.is_empty_dir(&found.bytes)? {
             return Err(Error::NotEmpty);
         }
-        // The entry first: once it is gone, its chain is lost clusters until it is freed.
-        self.write_at_device(offset, &[ENTRY_DELETED])?;
-        self.step();
-        match self.first_cluster(&entry) {
+        // The entries first: once they are gone, the chain is lost clusters until it is freed.
+        self.delete_name_set(parent, &found)?;
+        match self.first_cluster(&found.bytes) {
             0 => Ok(()),
             first => self.free_chain(first, None),
         }
     }
 
-    /// Within one directory the name is overwritten in place, which one sector holds whole.
+    /// A name is moved by writing its new entries and taking away its old ones, whether or not
+    /// the two directories are the same: a long name takes as many entries as it has
+    /// characters, so the new name rarely fits where the old one sat.
     ///
-    /// Between two directories there is no such entry: the old one must go and a new one must
-    /// appear, and a crash between them leaves one of two states. Writing the new entry first
-    /// would leave two names on one chain — a cross-link, which the walk calls corrupt and
-    /// which no crash here is allowed to cause. So the old entry goes first, and a crash
-    /// leaves the file unreachable: lost clusters, the damage this driver already allows.
-    /// The moved directory's `..` is written last; a crash before it leaves `..` naming the
-    /// old parent, which nothing here resolves and which a walk does not read.
+    /// The room for the new entries is claimed first, so a directory with none is refused with
+    /// the file still where it was. Then the old entries go, then the new ones: writing the new
+    /// name first would leave two names on one chain — a cross-link, which the walk calls
+    /// corrupt and which no crash here is allowed to cause — so a crash between them leaves the
+    /// file unreachable, which is lost clusters, the damage this driver already allows. The
+    /// moved directory's `..` is written last; a crash before it leaves `..` naming the old
+    /// parent, which nothing here resolves and which a walk does not read.
     fn rename(
         &mut self,
         from_dir: NodeId,
@@ -1494,60 +1774,60 @@ impl FileSystem for Fat<'_, '_> {
         to_dir: NodeId,
         to: &[u8],
     ) -> Result<(), Error> {
-        let short = short_name(to)?;
         let source_dir = self.dir_of(from_dir)?;
         let target_dir = self.dir_of(to_dir)?;
-        let (offset, source) = self.find_entry(source_dir, from)?.ok_or(Error::NotFound)?;
+        let found = self.find_named(source_dir, from)?.ok_or(Error::NotFound)?;
+        let source = found.bytes;
         let mut replaced = None;
-        if let Some((target_at, target)) = self.find_entry(target_dir, to)? {
-            if target_at != offset {
-                match (entry_kind(&source), entry_kind(&target)) {
+        let mut target_set = None;
+        if let Some(target) = self.find_named(target_dir, to)? {
+            if target.offset != found.offset {
+                match (entry_kind(&source), entry_kind(&target.bytes)) {
                     (Kind::File, Kind::Dir) => return Err(Error::IsADirectory),
                     (Kind::Dir, Kind::File) => return Err(Error::NotADirectory),
-                    (Kind::Dir, Kind::Dir) if !self.is_empty_dir(&target)? => {
+                    (Kind::Dir, Kind::Dir) if !self.is_empty_dir(&target.bytes)? => {
                         return Err(Error::NotEmpty);
                     }
                     _ => {}
                 }
-                // The target's entry goes first: two entries never share a name, and its
-                // chain is lost clusters until it is freed below.
-                self.write_at_device(target_at, &[ENTRY_DELETED])?;
-                self.step();
-                replaced = Some(self.first_cluster(&target));
+                replaced = Some(self.first_cluster(&target.bytes));
+                target_set = Some(target);
+            } else if found.matches(to) {
+                // The same name in the same place, differing at most in case: nothing to move.
+                return Ok(());
             }
         }
-        if same_dir(source_dir, target_dir) {
-            self.write_at_device(offset, &short)?;
+        let moved = entry_kind(&source) == Kind::Dir;
+        let first = self.first_cluster(&source);
+        // A directory may not move into itself or into anything below it: the chain of parents
+        // from the new directory up must not run through the one being moved.
+        if moved && !same_dir(source_dir, target_dir) && self.below(target_dir, first)? {
+            return Err(Error::BadPath);
+        }
+        let (short, flags, long) = self.alias_for(target_dir, to)?;
+        // The target's entries go first: two names never share a chain, and its own chain is
+        // lost clusters until it is freed below.
+        if let Some(target) = target_set {
+            self.delete_name_set(target_dir, &target)?;
+        }
+        // Room for the new name, claimed before the old name goes.
+        let (slot, count) = self.slots_for(target_dir, to, long)?;
+        self.delete_name_set(source_dir, &found)?;
+        let mut entry = source;
+        entry[..11].copy_from_slice(&short);
+        entry[12] = flags;
+        self.write_name_at(target_dir, to, entry, slot, count)?;
+        if moved && !same_dir(source_dir, target_dir) {
+            // `..` follows the directory to its new parent. The root is cluster 0 there,
+            // whatever cluster a FAT32 root starts at.
+            let up = match target_dir {
+                Dir::Root => 0,
+                Dir::Cluster(c) => c,
+            };
+            let dotdot = self.new_entry(*b"..         ", ATTR_DIRECTORY, up, 0);
+            let at = self.cluster_offset(first) + ENTRY as u64;
+            self.write_at_device(at, &dotdot)?;
             self.step();
-        } else {
-            let moved = entry_kind(&source) == Kind::Dir;
-            let first = self.first_cluster(&source);
-            // A directory may not move into itself or into anything below it: the chain of
-            // parents from the new directory up must not run through the one being moved.
-            if moved && self.below(target_dir, first)? {
-                return Err(Error::BadPath);
-            }
-            // A slot in the new directory before the old entry goes, so a full directory is
-            // refused with the file still where it was.
-            let slot = self.free_entry(target_dir)?;
-            self.write_at_device(offset, &[ENTRY_DELETED])?;
-            self.step();
-            let mut entry = source;
-            entry[..11].copy_from_slice(&short);
-            self.write_at_device(slot, &entry)?;
-            self.step();
-            if moved {
-                // `..` follows the directory to its new parent. The root is cluster 0 there,
-                // whatever cluster a FAT32 root starts at.
-                let up = match target_dir {
-                    Dir::Root => 0,
-                    Dir::Cluster(c) => c,
-                };
-                let dotdot = self.new_entry(*b"..         ", ATTR_DIRECTORY, up, 0);
-                let at = self.cluster_offset(first) + ENTRY as u64;
-                self.write_at_device(at, &dotdot)?;
-                self.step();
-            }
         }
         match replaced {
             Some(first) if first != 0 => self.free_chain(first, None),
@@ -1560,7 +1840,8 @@ impl FileSystem for Fat<'_, '_> {
             block_size: self.bytes_per_cluster(),
             blocks: u64::from(self.clusters),
             free: u64::from(self.free_count),
-            name_max: NAME_BYTES as u32,
+            // A long name's, not a short one's: this driver writes both.
+            name_max: vfs::MAX_NAME as u32,
         })
     }
 
@@ -1575,11 +1856,10 @@ impl FileSystem for Fat<'_, '_> {
 
     fn readdir(&mut self, dir: NodeId, index: usize) -> Result<Option<Entry>, Error> {
         let dir = self.dir_of(dir)?;
-        let Some((offset, bytes)) = self.nth_named(dir, index)? else {
+        let Some(found) = self.named_at(dir, index)? else {
             return Ok(None);
         };
-        let (name, len) = entry_name(&bytes);
-        Entry::new(&name[..len], offset + 1, entry_kind(&bytes)).map(Some)
+        Entry::new(found.name(), found.offset + 1, entry_kind(&found.bytes)).map(Some)
     }
 }
 

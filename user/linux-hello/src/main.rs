@@ -1910,7 +1910,12 @@ const TEMP: &[u8] = b"/KINTANE/LXTMP.TXT\0";
 const RENAMED: &[u8] = b"/KINTANE/LXREN.TXT\0";
 const DIR: &[u8] = b"/KINTANE/LXDIR\0";
 const INTO_DIR: &[u8] = b"/KINTANE/LXDIR/X.TXT\0";
-const BAD_NAME: &[u8] = b"/KINTANE/NOT.AN.83\0";
+/// A name with two dots, which no short directory entry can hold: the volume keeps it in long
+/// entries and gives it back as it was written.
+const LONG_NAME: &[u8] = b"/KINTANE/NOT.AN.83\0";
+/// A component longer than the namespace holds, which is refused whatever it is made of.
+const BAD_NAME: &[u8] =
+    b"/KINTANE/a-name-far-longer-than-any-directory-entry-holds-however-long-its-name-may-be.txt\0";
 /// What this mode leaves on the disk for kbuild to read after the guest exits; mirrors
 /// `LINUX_OUT_PATH`, `LINUX_OUT_LEN` and `out_byte` in `kernel/block/src/testdisk.rs`.
 const OUT: &[u8] = b"/KINTANE/LINUX.OUT\0";
@@ -2060,6 +2065,17 @@ fn files() -> ! {
     expect(unlink(DIR, AT_REMOVEDIR) == 0, 93);
     expect(unlink(RENAMED, 0) == 0 && openat(RENAMED, 0) == -ENOENT, 94);
 
+    // 94: a name no short directory entry can hold is kept in long entries, and comes back by
+    // the name it was made with. Before step 95, so that step's `fsync` makes this create and
+    // this removal durable as well.
+    let made = openat(LONG_NAME, O_WRONLY | O_CREAT);
+    expect(made >= 0, 94);
+    expect(call1(sys::CLOSE, made as u64) == 0, 94);
+    let again = openat(LONG_NAME, 0);
+    expect(again >= 0, 94);
+    expect(call1(sys::CLOSE, again as u64) == 0, 94);
+    expect(unlink(LONG_NAME, 0) == 0, 94);
+
     // 95: what kbuild reads after the guest exits, through `open` where the architecture has
     // one, made durable with `fsync`.
     let flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -2077,7 +2093,8 @@ fn files() -> ! {
     expect(call1(sys::FSYNC, fd) == 0, 95);
     expect(call1(sys::CLOSE, fd) == 0, 95);
 
-    // 96: a name FAT cannot hold is refused, not shortened.
+    // 96: a name longer than the namespace holds is refused, not shortened. It creates
+    // nothing, so nothing is left unwritten after step 95 made everything durable.
     expect(openat(BAD_NAME, O_WRONLY | O_CREAT) == -ENAMETOOLONG, 96);
     exit(FILES_SUCCESS)
 }

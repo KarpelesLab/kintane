@@ -30,6 +30,9 @@
 //! * `unlink` and `mkdir`: the payload is a path.
 //! * `rename`: the payload is the old path, a zero byte, and the new path, which may name another
 //!   directory of the same filesystem.
+//! * `statfs`: the payload is a path; the reply's payload is the filesystem covering it — its
+//!   allocation unit, how many units it has, how many are free and the longest name it holds, as
+//!   [`statfs_answer`] encodes them. A read-side request, so a read-only connection may ask.
 //! * `sync`: nothing; every write so far reaches the disk before the reply.
 //! * `close`: `a` is the file number.
 //!
@@ -84,6 +87,7 @@ pub enum Op {
     Mkdir = 8,
     Rename = 9,
     Sync = 10,
+    Statfs = 11,
 }
 
 /// How a request went.
@@ -254,6 +258,42 @@ pub fn sync() -> Message {
     Message::bare(Op::Sync as u8, 0, 0)
 }
 
+/// A request for what the filesystem covering `path` is. `None` if the path does not fit one
+/// message.
+pub fn statfs(path: &[u8]) -> Option<Message> {
+    Message::new(Op::Statfs as u8, 0, 0, path)
+}
+
+/// Bytes a [`Op::Statfs`] answer takes: three eight-byte counts and a four-byte name length.
+pub const STATFS_BYTES: usize = 28;
+
+/// A reply carrying what a filesystem is.
+pub fn statfs_answer(block_size: u64, blocks: u64, free: u64, name_max: u32) -> Message {
+    let mut payload = [0u8; STATFS_BYTES];
+    for (dst, src) in payload.iter_mut().zip(
+        block_size
+            .to_le_bytes()
+            .iter()
+            .chain(blocks.to_le_bytes().iter())
+            .chain(free.to_le_bytes().iter())
+            .chain(name_max.to_le_bytes().iter()),
+    ) {
+        *dst = *src;
+    }
+    reply(Status::Ok, 0, &payload).unwrap_or(Message::bare(Status::Io as u8, 0, 0))
+}
+
+/// What a [`statfs_answer`] carries: the allocation unit, the units there are, the units free,
+/// and the longest name. `None` for a payload that is not one.
+pub fn parse_statfs(data: &[u8]) -> Option<(u64, u64, u64, u32)> {
+    let eight = |at: usize| -> Option<u64> {
+        let bytes: [u8; 8] = data.get(at..at + 8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
+    };
+    let four: [u8; 4] = data.get(24..28)?.try_into().ok()?;
+    Some((eight(0)?, eight(8)?, eight(16)?, u32::from_le_bytes(four)))
+}
+
 /// A request to close file `file`.
 pub fn close(file: u8) -> Message {
     Message::bare(Op::Close as u8, file, 0)
@@ -287,6 +327,7 @@ pub enum Request<'a> {
     Mkdir { path: &'a [u8] },
     Rename { from: &'a [u8], to: &'a [u8] },
     Sync,
+    Statfs { path: &'a [u8] },
 }
 
 impl Request<'_> {
@@ -297,7 +338,8 @@ impl Request<'_> {
                 flags & (flags::WRITE | flags::CREATE | flags::TRUNCATE) != 0
             }
             Request::Read { .. } | Request::Close { .. } | Request::Seek { .. } => false,
-            Request::Sync => false,
+            // Asking what a filesystem is changes nothing, so a read-only connection may.
+            Request::Sync | Request::Statfs { .. } => false,
             Request::Write { .. }
             | Request::Truncate { .. }
             | Request::Unlink { .. }
@@ -369,6 +411,7 @@ pub fn parse_request(bytes: &[u8]) -> Option<Request<'_>> {
             Some(Request::Rename { from, to })
         }
         10 if bare => Some(Request::Sync),
+        11 if !payload.is_empty() && b == 0 => Some(Request::Statfs { path: payload }),
         _ => None,
     }
 }
