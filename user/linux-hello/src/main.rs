@@ -1153,44 +1153,44 @@ const MAX_IOV: usize = 4;
 /// messages spread over several buffers.
 fn peek_mode(ports: &[u8]) -> ! {
     let (service, tcp_port) = two_ports(ports);
-    // 310: the ports the kernel passed, and a datagram socket connected to kbuild's service.
-    expect(service != 0 && tcp_port != 0, 310);
+    // 220: the ports the kernel passed, and a datagram socket connected to kbuild's service.
+    expect(service != 0 && tcp_port != 0, 220);
     let fd = socket(SOCK_DGRAM | SOCK_CLOEXEC);
-    expect(fd >= 3, 310);
+    expect(fd >= 3, 220);
     let fd = fd as u64;
-    expect(connect(fd, GATEWAY, service) == 0, 310);
-    expect(set_timeout(fd, SO_RCVTIMEO, 2_000_000) == 0, 310);
+    expect(connect(fd, GATEWAY, service) == 0, 220);
+    expect(set_timeout(fd, SO_RCVTIMEO, 2_000_000) == 0, 220);
 
-    // 311: a peeked datagram stays. Two peeks answer the same bytes, and the receive after
+    // 221: a peeked datagram stays. Two peeks answer the same bytes, and the receive after
     //      them answers those bytes again.
-    expect(send_to(fd, UDP_REQUEST, None, 0) == UDP_REQUEST.len() as i64, 311);
+    expect(send_to(fd, UDP_REQUEST, None, 0) == UDP_REQUEST.len() as i64, 221);
     let mut first = [0u8; 64];
     let (a, _) = recv_from(fd, &mut first, MSG_PEEK);
-    expect(a == UDP_REPLY.len() as i64, 311);
-    expect(first.get(..a as usize) == Some(UDP_REPLY), 311);
+    expect(a == UDP_REPLY.len() as i64, 221);
+    expect(first.get(..a as usize) == Some(UDP_REPLY), 221);
     let mut second = [0u8; 64];
     let (b, _) = recv_from(fd, &mut second, MSG_PEEK);
-    expect(b == a && second.get(..b as usize) == Some(UDP_REPLY), 311);
+    expect(b == a && second.get(..b as usize) == Some(UDP_REPLY), 221);
     let mut taken = [0u8; 64];
     let (c, _) = recv_from(fd, &mut taken, 0);
-    expect(c == a && taken.get(..c as usize) == Some(UDP_REPLY), 312);
+    expect(c == a && taken.get(..c as usize) == Some(UDP_REPLY), 222);
 
-    // 313: and it was one datagram, not several: nothing is left to take.
+    // 223: and it was one datagram, not several: nothing is left to take.
     let mut empty = [0u8; 64];
-    expect(recv_from(fd, &mut empty, 0).0 == -EAGAIN, 313);
+    expect(recv_from(fd, &mut empty, 0).0 == -EAGAIN, 223);
 
-    // 314: peeking into a short buffer answers what fits, and with MSG_TRUNC what the datagram
+    // 224: peeking into a short buffer answers what fits, and with MSG_TRUNC what the datagram
     //      had; the datagram is still there afterwards, because neither took it.
-    expect(send_to(fd, UDP_REQUEST, None, 0) == UDP_REQUEST.len() as i64, 314);
+    expect(send_to(fd, UDP_REQUEST, None, 0) == UDP_REQUEST.len() as i64, 224);
     let mut small = [0u8; 4];
     let (fit, _) = recv_from(fd, &mut small, MSG_PEEK);
-    expect(fit == small.len() as i64, 314);
+    expect(fit == small.len() as i64, 224);
     let (whole, _) = recv_from(fd, &mut small, MSG_PEEK | MSG_TRUNC);
-    expect(whole == UDP_REPLY.len() as i64, 314);
+    expect(whole == UDP_REPLY.len() as i64, 224);
     let (after, _) = recv_from(fd, &mut first, 0);
-    expect(after == UDP_REPLY.len() as i64, 314);
+    expect(after == UDP_REPLY.len() as i64, 224);
 
-    // 315: one datagram gathered from two buffers, and the reply scattered into two.
+    // 225: one datagram gathered from two buffers, and the reply scattered into two.
     let (head, tail) = UDP_REQUEST.split_at(8);
     let out = [
         iovec(head.as_ptr() as u64, head.len() as u64),
@@ -1201,7 +1201,7 @@ fn peek_mode(ports: &[u8]) -> ! {
     expect(
         sys::call(sys::SENDMSG, [fd, header.as_ptr() as u64, 0, 0, 0, 0])
             == UDP_REQUEST.len() as i64,
-        315,
+        225,
     );
     let mut part1 = [0u8; 6];
     let mut part2 = [0u8; 64];
@@ -1211,44 +1211,44 @@ fn peek_mode(ports: &[u8]) -> ! {
     ];
     let mut in_header = msghdr_n(&address, false, back.as_ptr() as u64, 2);
     let n = sys::call(sys::RECVMSG, [fd, in_header.as_mut_ptr() as u64, 0, 0, 0, 0]);
-    expect(n == UDP_REPLY.len() as i64, 315);
-    // 316: the reply really is spread over both, in order, not crammed into the first.
-    expect(part1.as_slice() == UDP_REPLY.get(..6).unwrap_or(&[]), 316);
+    expect(n == UDP_REPLY.len() as i64, 225);
+    // 226: the reply really is spread over both, in order, not crammed into the first.
+    expect(part1.as_slice() == UDP_REPLY.get(..6).unwrap_or(&[]), 226);
     let rest = UDP_REPLY.len() - part1.len();
-    expect(part2.get(..rest) == UDP_REPLY.get(part1.len()..), 316);
+    expect(part2.get(..rest) == UDP_REPLY.get(part1.len()..), 226);
 
-    // 317: more buffers than the personality carries is refused, not half sent.
+    // 227: more buffers than the personality carries is refused, not half sent.
     let many = [iovec(first.as_ptr() as u64, 1); MAX_IOV + 1];
     let too_many = msghdr_n(&address, false, many.as_ptr() as u64, many.len() as u64);
     expect(
         sys::call(sys::SENDMSG, [fd, too_many.as_ptr() as u64, 0, 0, 0, 0]) == -EOPNOTSUPP,
-        317,
+        227,
     );
-    expect(call1(sys::CLOSE, fd) == 0, 317);
+    expect(call1(sys::CLOSE, fd) == 0, 227);
 
-    // 318: a stream peek leaves the bytes in the ring, and MSG_WAITALL waits for the whole
+    // 228: a stream peek leaves the bytes in the ring, and MSG_WAITALL waits for the whole
     //      reply rather than the first segment of it.
     let s = socket(SOCK_STREAM | SOCK_CLOEXEC);
-    expect(s >= 3, 318);
+    expect(s >= 3, 228);
     let s = s as u64;
-    expect(connect(s, GATEWAY, tcp_port) == 0, 318);
-    expect(set_timeout(s, SO_RCVTIMEO, 4_000_000) == 0, 318);
+    expect(connect(s, GATEWAY, tcp_port) == 0, 228);
+    expect(set_timeout(s, SO_RCVTIMEO, 4_000_000) == 0, 228);
     let len = REQUEST.len() as u64;
     expect(
         sys::call(sys::SENDTO, [s, REQUEST.as_ptr() as u64, len, 0, 0, 0]) == len as i64,
-        318,
+        228,
     );
     let mut peeked = [0u8; 64];
     let want = REPLY.len();
     let (got, _) = recv_from(s, &mut peeked[..want], MSG_PEEK | MSG_WAITALL);
-    expect(got == want as i64, 318);
-    expect(peeked.get(..want) == Some(REPLY), 318);
-    // 319: and the receive after it reads those same bytes, because the peek took none.
+    expect(got == want as i64, 228);
+    expect(peeked.get(..want) == Some(REPLY), 228);
+    // 229: and the receive after it reads those same bytes, because the peek took none.
     let mut read_back = [0u8; 64];
     let (again, _) = recv_from(s, &mut read_back[..want], MSG_WAITALL);
-    expect(again == want as i64, 319);
-    expect(read_back.get(..want) == Some(REPLY), 319);
-    expect(call1(sys::CLOSE, s) == 0, 319);
+    expect(again == want as i64, 229);
+    expect(read_back.get(..want) == Some(REPLY), 229);
+    expect(call1(sys::CLOSE, s) == 0, 229);
     exit(PEEK_SUCCESS)
 }
 
