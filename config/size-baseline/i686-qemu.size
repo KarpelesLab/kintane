@@ -1,33 +1,36 @@
 # kbuild size report for preset i686-qemu. Rewrite with `kbuild size --preset i686-qemu --update-baseline`.
-section .bss 147456
-section .data 69632
-section .rodata 20480
+section .bss 172032
+section .data 114688
+section .rodata 24576
 section .stack 16384
-section .text 225280
+section .text 253952
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 1993 data 0 bss 0
-crate (unmangled) text 1237 rodata 0 data 0 bss 0
+crate (anonymous) text 0 rodata 2311 data 0 bss 0
+crate (unmangled) text 1274 rodata 0 data 0 bss 0
 crate __rustc text 161 rodata 0 data 0 bss 0
 crate acpi text 6827 rodata 0 data 0 bss 0
 crate arch text 25049 rodata 8 data 312 bss 67660
-crate block text 1959 rodata 0 data 0 bss 0
+crate bcache text 2798 rodata 0 data 0 bss 0
+crate block text 1981 rodata 0 data 0 bss 0
 crate bootinfo text 2511 rodata 0 data 0 bss 0
 crate buildid text 181 rodata 32 data 0 bss 0
 crate cmdline text 1271 rodata 0 data 0 bss 0
-crate core text 7518 rodata 0 data 0 bss 0
-crate device text 20343 rodata 0 data 0 bss 0
+crate core text 8268 rodata 0 data 0 bss 0
+crate device text 22247 rodata 0 data 0 bss 0
+crate fat text 5767 rodata 0 data 0 bss 0
 crate hal text 1395 rodata 0 data 0 bss 0
-crate kalloc text 13235 rodata 0 data 0 bss 0
-crate kintane text 59619 rodata 24 data 3000 bss 53545
+crate kalloc text 13104 rodata 0 data 0 bss 0
+crate kintane text 67218 rodata 24 data 3844 bss 76794
 crate mm text 23154 rodata 0 data 0 bss 0
 crate multiboot text 625 rodata 0 data 0 bss 0
-crate platform text 21288 rodata 80 data 64804 bss 1617
+crate platform text 21450 rodata 80 data 107812 bss 1622
 crate sched text 2357 rodata 0 data 0 bss 0
 crate strip_suffix text 39 rodata 0 data 0 bss 0
-crate sync text 9901 rodata 16 data 800 bss 136
+crate sync text 12115 rodata 16 data 800 bss 136
 crate thread text 4786 rodata 0 data 0 bss 0
 crate time text 3971 rodata 0 data 0 bss 0
 crate uart16550 text 1959 rodata 0 data 208 bss 88
 crate unwind text 2448 rodata 0 data 0 bss 0
-crate virtio_blk text 7465 rodata 8 data 56 bss 0
-total 741376
+crate vfs text 2047 rodata 0 data 0 bss 0
+crate virtio_blk text 11316 rodata 8 data 116 bss 4
+total 843776

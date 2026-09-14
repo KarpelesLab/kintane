@@ -6,7 +6,7 @@ section .stack 16384
 section .stack_guard 4096
 section .text 102400
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 8264 data 16 bss 4536
+crate (anonymous) text 0 rodata 8338 data 16 bss 4536
 crate (unmangled) text 3388 rodata 0 data 0 bss 0
 crate __rustc text 160 rodata 0 data 0 bss 0
 crate arch text 5574 rodata 0 data 0 bss 16525
@@ -16,9 +16,9 @@ crate cmdline text 1292 rodata 0 data 0 bss 0
 crate core text 5868 rodata 0 data 0 bss 0
 crate fdt text 6374 rodata 0 data 0 bss 0
 crate hal text 1444 rodata 0 data 0 bss 0
-crate kalloc text 12132 rodata 0 data 0 bss 0
-crate kintane text 34632 rodata 24 data 3188 bss 37735
-crate mm text 7360 rodata 0 data 0 bss 0
+crate kalloc text 12074 rodata 0 data 0 bss 0
+crate kintane text 34694 rodata 24 data 3188 bss 37735
+crate mm text 7384 rodata 0 data 0 bss 0
 crate platform text 68 rodata 0 data 0 bss 0
 crate sched text 1888 rodata 0 data 0 bss 0
 crate sync text 7208 rodata 16 data 808 bss 136
