@@ -1684,9 +1684,9 @@ With only other agents' work loading the host, the old window also failed 2 runs
 - `PARK_WITHIN`'s 3 s and the audit's `STALL_WAIT`: these now judge only a workload the
   scheduler has barely run, which is the one case no count of its own slices can judge. See
   [the workloads' bounds](#the-workloads-are-judged-by-their-slices-too) below;
-- `personality::PAIR_PATIENCE`'s 10 s, which the Linux pair and churning-pair stress cycles
-  wait for their processes: a duration over work whose speed is the host's to decide, and one
-  a soak has already failed on. It is recorded below rather than changed here;
+- `spawn::PATIENCE`'s 3 s, which `end_threads` waits for each of a process's threads to
+  exit. It is shared with the boot checks and left alone here; it is what says `a ... process's
+  thread did not end` when a pair is still running as the wait gives up;
 - none in the boot `preempt` check any more; see below.
 
 **The boot `preempt` check is judged in interrupts and slices too.** It used to require 12
@@ -2036,18 +2036,28 @@ bound, and none on anything the kernel did wrong. They are why the bounds above 
 | `aarch64-virt-smp`, 8 CPUs | 65 s | `tlb shootdown: ... wrong CPUs, or stalled` | a stall is the *waiting* CPU's own spins; split from mismatches |
 | `aarch64-virt-smp`, 8 CPUs | 453 s | `a sleep woke more than half a second after its deadline` | lateness the host caused; now judged by slices passed over |
 | `aarch64-virt-smp`, 8 CPUs | 108 s | `linux processes: a churning process's thread did not end` | `PAIR_PATIENCE`, 10 s, over two Linux processes each faulting 1,600 pages |
+| `aarch64-virt-smp`, 8 CPUs | 77 s | the same | the same, on final code: which is what settled it |
+| `x86_64-qemu-smp`, 8 CPUs | 159 s | `user process: a process ran its slices after it moved and made no progress` | `RAN_SLICES`, 16, below what healthy runs measure |
 
 Each time the host was carrying two soaks and five other jobs, at load averages of 19 to 25.
 
-**The third is not fixed here.** `PAIR_PATIENCE` bounds the Linux pair and churning-pair
-cycles in `personality.rs`, which belongs to the work that added them; changing it from this
-side would collide. It is the same fault as the rest: two processes mapping, faulting and
-unmapping 1,600 pages between them take as long as the host lets them, and ten seconds of
-guest time is a bet on the host, not a statement about the kernel. **To reproduce:** run
-`kbuild soak --preset aarch64-virt-smp --set QEMU_CPUS=8 --duration 2h` while a second
-eight-CPU soak and several compile jobs run beside it; the churning pair fails within the
-first three minutes. The fix is the one used for the process cycle: judge the pair by the
-slices its threads were given, and keep a duration only for a pair that never runs at all.
+**The pair waits are now judged the same way.** Two processes mapping, faulting and unmapping
+1,600 pages between them take as long as the host lets them, so both cycles wait until their
+threads have been given `PAIR_SLICES` between them, with `PAIR_PATIENCE` left for the one case
+slices cannot judge: threads the scheduler is not running at all. Each thread is counted
+against its own start, because a thread that has ended is reaped and reports no slices.
+
+What the wait does *not* decide is the message: `end_threads` waits `spawn::PATIENCE` for each
+thread afterwards, and that 3 s is what reports `a ... process's thread did not end`. It is
+shared with the boot checks, so it is left alone and listed above. This is also why a mutation
+that makes the pair wait give up at once does not fail the run — `end_threads` still waits,
+and the pair still finishes — so the bound is falsified by a pair that cannot finish rather
+than by a wait that gives up early.
+
+**The last one is the process cycle's own slice bound.** `RAN_SLICES` allowed sixteen slices
+without a pass after a thread was re-pinned; a passing soak had already reported twenty for a
+wait that succeeded, and a 60-second run at eight CPUs needed thirteen. It is now a hundred and
+twenty-eight, derived from those measurements rather than from what looked generous.
 
 ### 4. Hardware — deferred
 
