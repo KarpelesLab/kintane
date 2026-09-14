@@ -1361,12 +1361,18 @@ the only other party is kbuild, in three threads of `kbuild/src/qemu.rs`:
     fragments, each with its own header checksum, at an eight-byte boundary. Put back together
     the datagram is the bytes that were sent, so the guest checks a pattern rather than that
     something arrived;
-  - **reordering**: the first pair of data segments of the first connection to `<tcp>` is
-    swapped — the first is held until the second has gone by;
-  - **duplication**: the segment held back is then sent twice, so the guest must take it once.
+  - **reordering**: the first data segment of the first connection to `<tcp>` is split into two
+    segments, each with its own sequence number and checksums, and the second half is sent
+    first, so the guest holds it until the half in front of it arrives;
+  - **duplication**: the half in front is then sent twice, so the guest must take it once.
 
   The last two happen once per run; fragmentation happens every time, because the guest may not
-  be listening when the first one goes past.
+  be listening when the first one goes past. The relay never holds a frame back waiting for
+  another: an earlier version held the first data segment until the next frame went by, which
+  reordered a pair only when that next frame happened to be the rest of the reply. On
+  `x86_64-qemu-smp` it was an acknowledgement, nothing arrived out of order, and the boot failed
+  a check that was really about frame timing. Splitting one segment cannot be timed out of
+  happening.
 
 Like the serial probes, all three answer and never judge: the verdict is the exit code. The
 resolver at 10.0.2.3 is not used, because it forwards to the host's, which an offline machine
@@ -1418,6 +1424,16 @@ there is no excuse for either.) Every buffer must be back afterwards, as before.
 `sockets`, on x86_64 and aarch64, runs `user/tcp-client` over the socket calls on the scheduler
 ([userspace-abi.md](userspace-abi.md)); i686 has no userspace, and gates on the TCP part of
 `net` alone.
+
+**What the congestion control costs, measured.** A 60-second stress run at four CPUs on
+`x86_64-qemu-smp` made **204 TCP round trips with 205 data retransmits and no retried round**,
+with 6,181 socket waits woken by the card and none polled. The same run shape recorded before
+this work made 162 round trips with 163 retransmits (and 154/154 on `aarch64-virt-smp`). Two
+caveats, and they matter more than the numbers: the guest is emulated, so TCG's cost dominates a
+loopback path with no real latency or loss to control for; and the relay drops one data segment
+of every connection on purpose, so retransmits track round trips by construction rather than
+telling you anything about loss recovery. What the figures support is that a window, an estimate
+and a queue did not cost throughput — not that TCP got faster on a network.
 
 **Waits woken by the card.** From `sockets` on, the card's interrupt handler runs the stack and
 wakes the socket calls' queue, and a waiter otherwise looks again only at the stack's next TCP

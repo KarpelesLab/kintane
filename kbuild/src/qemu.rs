@@ -916,7 +916,6 @@ fn downstream(
         };
         let mut state = Disturbance {
             tcp_port,
-            held: None,
             reordered: false,
         };
         let mut len = [0u8; 4];
@@ -941,35 +940,89 @@ fn downstream(
     })
 }
 
-/// What [`downstream`] has done so far, and the frame it is holding back.
+/// What [`downstream`] has done so far.
 struct Disturbance {
     tcp_port: u16,
-    /// The segment held back, to be sent after the one behind it.
-    held: Option<Vec<u8>>,
-    /// Whether a pair has been swapped already: one per run.
+    /// Whether a segment has been split and reversed already: one per run.
     reordered: bool,
 }
 
-/// The frames to send the guest in place of `frame`: none while one is held back, one for an
-/// ordinary frame, and two for a fragmented datagram or a released pair.
+/// The frames to send the guest in place of `frame`: two for a datagram that is fragmented,
+/// three for the data segment that is split and sent backwards, and otherwise the frame itself.
+///
+/// Nothing is ever held back waiting for another frame. An earlier version held the service's
+/// first data segment until the next frame went by and sent the two in the other order, which
+/// reordered a pair only when the next frame happened to be the rest of the reply: on
+/// `x86_64-qemu-smp` it was an acknowledgement instead, nothing arrived out of order, and the
+/// boot failed a check that was really about frame timing. Splitting one segment needs no
+/// second frame and cannot be timed out of happening.
 fn disturb(frame: &[u8], state: &mut Disturbance) -> Vec<Vec<u8>> {
     if udp_payload(frame).is_some_and(|p| p.starts_with(NET_UDP_FRAGMENTED))
         && let Some(fragments) = fragment_datagram(frame)
     {
         return fragments;
     }
-    let from_service = tcp_data_from(frame, state.tcp_port);
-    match state.held.take() {
-        // The frame behind the one held goes first, then the held one, then the held one
-        // again: reordered, and duplicated.
-        Some(held) => vec![frame.to_vec(), held.clone(), held],
-        None if from_service && !state.reordered => {
-            state.reordered = true;
-            state.held = Some(frame.to_vec());
-            Vec::new()
-        }
-        None => vec![frame.to_vec()],
+    if !state.reordered
+        && tcp_data_from(frame, state.tcp_port)
+        && let Some(pieces) = split_reversed(frame)
+    {
+        state.reordered = true;
+        return pieces;
     }
+    vec![frame.to_vec()]
+}
+
+/// One data segment as two, the second half first and the first half twice: what a guest sees
+/// when the network reorders and duplicates. Each half carries its own sequence number, length
+/// and checksums, so the guest's stack sees two ordinary segments with a hole between them
+/// until the second arrives.
+fn split_reversed(frame: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let (ihl, total) = ipv4_header(frame)?;
+    let tcp = 14 + ihl;
+    let offset = usize::from(*frame.get(tcp + 12)? >> 4) * 4;
+    if offset < 20 || total < ihl + offset {
+        return None;
+    }
+    let payload = frame.get(tcp + offset..14 + total)?;
+    if payload.len() < 2 {
+        return None;
+    }
+    let seq = u32::from_be_bytes(frame.get(tcp + 4..tcp + 8)?.try_into().ok()?);
+    let cut = payload.len() / 2;
+    let mut halves = Vec::new();
+    for (at, part) in [(0, &payload[..cut]), (cut, &payload[cut..])] {
+        let mut f = Vec::with_capacity(tcp + offset + part.len());
+        f.extend_from_slice(&frame[..tcp + offset]);
+        f.extend_from_slice(part);
+        let length = (ihl + offset + part.len()) as u16;
+        f[16..18].copy_from_slice(&length.to_be_bytes());
+        f[24..26].copy_from_slice(&[0, 0]);
+        let sum = ipv4_checksum(&f[14..14 + ihl]);
+        f[24..26].copy_from_slice(&sum.to_be_bytes());
+        f[tcp + 4..tcp + 8].copy_from_slice(&seq.wrapping_add(at as u32).to_be_bytes());
+        let sum = tcp_checksum(&f, ihl);
+        f[tcp + 16..tcp + 18].copy_from_slice(&sum.to_be_bytes());
+        halves.push(f);
+    }
+    let (first, second) = (halves.remove(0), halves.remove(0));
+    // The half behind arrives first, and the one in front arrives twice.
+    Some(vec![second, first.clone(), first])
+}
+
+/// A segment's checksum over the IPv4 pseudo-header, with the field itself taken as zero.
+fn tcp_checksum(frame: &[u8], ihl: usize) -> u16 {
+    let tcp = 14 + ihl;
+    let len = frame.len() - tcp;
+    let mut pseudo = [0u8; 12];
+    pseudo[..4].copy_from_slice(&frame[26..30]);
+    pseudo[4..8].copy_from_slice(&frame[30..34]);
+    pseudo[9] = 6;
+    pseudo[10..12].copy_from_slice(&(len as u16).to_be_bytes());
+    let mut segment = frame[tcp..].to_vec();
+    segment[16..18].copy_from_slice(&[0, 0]);
+    let mut all = pseudo.to_vec();
+    all.extend_from_slice(&segment);
+    ipv4_checksum(&all)
 }
 
 /// The UDP payload of an IPv4 datagram in `frame`, if it is one and is not itself a fragment.
@@ -1511,9 +1564,33 @@ mod tests {
     fn quiet(tcp_port: u16) -> super::Disturbance {
         super::Disturbance {
             tcp_port,
-            held: None,
             reordered: false,
         }
+    }
+
+    /// An Ethernet frame holding an IPv4 TCP segment carrying `payload` bytes of data, with
+    /// addresses and a checksum, as the service's replies have.
+    fn reply(src_port: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let total = 20 + 20 + payload.len();
+        let mut f = vec![0u8; 14 + total];
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&(total as u16).to_be_bytes());
+        f[22] = 64;
+        f[23] = 6;
+        f[26..30].copy_from_slice(&[10, 0, 2, 2]);
+        f[30..34].copy_from_slice(&[10, 0, 2, 15]);
+        let sum = super::ipv4_checksum(&f[14..34]);
+        f[24..26].copy_from_slice(&sum.to_be_bytes());
+        f[34..36].copy_from_slice(&src_port.to_be_bytes());
+        f[36..38].copy_from_slice(&50000u16.to_be_bytes());
+        f[38..42].copy_from_slice(&seq.to_be_bytes());
+        f[46] = 0x50;
+        f[47] = 0x18;
+        f[54..].copy_from_slice(payload);
+        let sum = super::tcp_checksum(&f, 20);
+        f[50..52].copy_from_slice(&sum.to_be_bytes());
+        f
     }
 
     #[test]
@@ -1537,17 +1614,29 @@ mod tests {
     }
 
     #[test]
-    fn the_services_first_pair_of_segments_is_swapped_and_the_held_one_duplicated() {
+    fn the_services_first_data_segment_is_split_and_its_halves_sent_backwards() {
         let port = 4000;
         let mut state = quiet(port);
-        let first = segment(port, 50000, 100, 0x18, 5);
-        let second = segment(port, 50000, 105, 0x18, 5);
-        assert!(super::disturb(&first, &mut state).is_empty(), "the first is held back");
-        let out = super::disturb(&second, &mut state);
-        assert_eq!(out, vec![second, first.clone(), first], "behind it, then it, then it again");
-        // One pair per run: everything after it passes straight through.
-        let third = segment(port, 50000, 110, 0x18, 5);
-        assert_eq!(super::disturb(&third, &mut state), vec![third.clone()]);
+        let whole = reply(port, 100, b"abcdefgh");
+        let out = super::disturb(&whole, &mut state);
+        assert_eq!(out.len(), 3, "the half behind, then the half in front, twice");
+        let piece = |f: &Vec<u8>| {
+            let total = usize::from(u16::from_be_bytes([f[16], f[17]]));
+            let seq = u32::from_be_bytes([f[38], f[39], f[40], f[41]]);
+            // The IPv4 header carries its own checksum, so summed as it stands it is zero.
+            assert_eq!(super::ipv4_checksum(&f[14..34]), 0, "the IPv4 header");
+            // `tcp_checksum` sums with the field taken as zero, so it yields the value the
+            // segment must carry rather than zero.
+            let carried = u16::from_be_bytes([f[50], f[51]]);
+            assert_eq!(super::tcp_checksum(f, 20), carried, "the segment");
+            (seq, f[54..14 + total].to_vec())
+        };
+        assert_eq!(piece(&out[0]), (104, b"efgh".to_vec()), "the second half first");
+        assert_eq!(piece(&out[1]), (100, b"abcd".to_vec()), "then the first");
+        assert_eq!(out[2], out[1], "and the first again, duplicated");
+        // One segment per run: everything after it passes straight through.
+        let next = reply(port, 108, b"ijkl");
+        assert_eq!(super::disturb(&next, &mut state), vec![next.clone()]);
     }
 
     #[test]
