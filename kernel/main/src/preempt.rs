@@ -180,9 +180,10 @@ pub const MAX_STACKS: usize = kconfig::KERNEL_THREAD_SLOTS;
 /// A build whose checks need more stacks than it configured would fail at run time, in the
 /// middle of a check, with "no guarded thread stack left". The threads are known here, so
 /// it fails to compile instead. `stress::WORKLOADS` reuses the four `THREAD_STACKS` slots
-/// the scheduler's check leaves behind and claims `stress::EXTRA_STACKS` more.
+/// the scheduler's check leaves behind and claims `stress::EXTRA_STACKS` more, and the
+/// driver-isolation check claims `isolation::STACKS` for its domains on every boot.
 const _: () = assert!(
-    MAX_STACKS >= THREAD_STACKS + crate::stress::EXTRA_STACKS,
+    MAX_STACKS >= THREAD_STACKS + crate::stress::EXTRA_STACKS + crate::isolation::STACKS,
     "KERNEL_THREAD_SLOTS is below what this build's kernel threads need"
 );
 

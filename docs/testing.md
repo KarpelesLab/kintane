@@ -352,6 +352,49 @@ In a stress run the `block` workload writes random runs of the scratch area and 
 back, reads the untouched part against the pattern, and flushes. At every audit the driver
 must report nothing in flight and every descriptor on the ring.
 
+### 2c. Driver isolation
+
+On aarch64, with `DRIVER_ISOLATION` (on by default there), every boot runs Phase 5's
+prototype and gates on its `isolation` line; [isolation.md](isolation.md) covers the design
+and the costs. One driver body, `drivers/virtio-probe`, reads an unoccupied `virtio,mmio`
+slot's identification registers twice: once in the kernel, and once inside an unprivileged
+domain whose address space holds its program, its stack, a report page and that one window.
+
+```
+  isolation  kernel read device 0, vendor 1431127377; the domain read the same; past its grant: killed; an identification 732 ns in the kernel, 673 ns in the domain; a domain's start, run and teardown 6370 us; 0 frames left
+```
+
+The boot fails if any of these happens:
+
+- the domain's registers differ from the kernel's;
+- a domain that should succeed does not, including each timed run;
+- a domain's window translates, in its own page tables, to any page but the one the platform
+  recorded;
+- a domain whose window is not a virtio device reports instead of refusing;
+- a domain that reads the page after its grant is not killed;
+- a frame is left behind.
+
+Each was falsified: the mutation was asserted to apply, the boot observed, and the file
+restored byte for byte.
+
+| Mutation | Result |
+|---|---|
+| Grant the neighbouring empty slot | before the grant audit existed, **the check passed**; see below. With it: `the domain's window maps a page other than the one the platform recorded` |
+| Grant the PL011's page instead of a slot | `the domain's probe refused its window: it holds no virtio device` |
+| Do not give the report page back on teardown | `7 FRAMES LEAKED`, one per domain run |
+| Grant a second page, so the read past the window lands inside the grant | `PAST ITS GRANT: NOT STOPPED` |
+
+**The first mutation is why the grant audit exists.** Every unoccupied slot answers
+byte-identical identification registers, so a domain granted the wrong empty slot read what
+the kernel read, and matching registers passed it. Register values prove the domain did not
+invent an answer, not which window it read; only walking its page tables says that.
+
+The proxy layer and the driver body are also host-tested. `lib/hwproxy` checks bounds,
+alignment and silent refusal across all four widths. `drivers/virtio-probe` checks register
+offsets, an empty slot, non-virtio memory, a window too small to read, and the report's
+wire format round trip. The falsifications above were run by hand; nothing in CI mutates
+the code.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

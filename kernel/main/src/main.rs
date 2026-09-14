@@ -44,6 +44,13 @@ mod stress;
 #[cfg(CONFIG_MM_FLAT)]
 #[path = "stress_off.rs"]
 mod stress;
+// The driver-isolation prototype where a domain can exist; elsewhere the same call doing
+// nothing. See `docs/isolation.md`.
+#[cfg(CONFIG_DRIVER_ISOLATION)]
+mod isolation;
+#[cfg(not(CONFIG_DRIVER_ISOLATION))]
+#[path = "isolation_off.rs"]
+mod isolation;
 // The block check on a paged kernel; on a flat one, the same call doing nothing.
 #[cfg(CONFIG_MM_PAGED)]
 mod block;

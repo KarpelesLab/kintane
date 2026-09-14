@@ -44,6 +44,11 @@ pub fn device_windows() -> Option<&'static [DeviceWindow]> {
     Some(arch::kspace::device_windows())
 }
 
+/// No window is granted to a driver domain on this port; see `kernel/platform/fdt`.
+pub fn isolation_window() -> Option<(u64, u64)> {
+    None
+}
+
 /// No console on these ports receives on interrupt yet, so there is no line to report.
 pub fn console_line() -> Option<u32> {
     None

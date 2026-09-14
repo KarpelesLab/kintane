@@ -1,0 +1,20 @@
+# The driver body the isolation prototype runs on both sides of the boundary: it reads a
+# virtio-mmio slot's identification registers and reports what is plugged in.
+#
+# Layer `user`, with `hwproxy`, because this is the crate that has to compile into the
+# kernel image *and* into an unprivileged domain program. That is the whole claim Phase 5
+# makes — the same driver source, either way — and layering is what makes it checkable
+# rather than asserted: a `device`-layer crate could not be linked by a domain at all.
+#
+# It drives no device: reading MAGIC, VERSION, DEVICE_ID and VENDOR_ID changes nothing and
+# is safe against a slot another driver owns. The virtqueue and DMA of a real virtio driver
+# live in `drivers/block/virtio-blk`, which this does not touch.
+[unit]
+name = "virtio-probe"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "user"
+
+[deps]
+units = ["hwproxy"]
