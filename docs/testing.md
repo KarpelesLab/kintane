@@ -1674,14 +1674,16 @@ The heartbeat reports the most slices of each kind any passing wait needed. Unlo
 
 With only other agents' work loading the host, the old window also failed 2 runs in 20.
 
-**Other wall-clock bounds**, and why each stays:
+**Other bounds that are still durations**, and why each stays:
 
-- the stress audit's *progress since the last audit* (1 s): a workload that blocks on every
-  iteration needs one slice a second, and a real starvation must still fail it;
 - `sleep`'s 500 ms lateness and the boot `sleep` check's three slices: lateness *is* wall
-  time, and what they check;
-- `waits`' 10 s and 5 s patience, `procs::wait_exit`'s 1 s drain in the boot check, and
-  `PARK_WITHIN`'s 3 s: generous bounds on something that normally takes milliseconds;
+  time, and what they check. Beside a second soak on the same host, a two-hour run on
+  `x86_64-qemu-smp` at eight CPUs reached 284 ms of it, and one on `aarch64-virt-smp` 89 ms;
+- `waits`' 10 s and 5 s patience and `procs::wait_exit`'s 1 s drain in the boot check:
+  generous bounds on something that normally takes milliseconds;
+- `PARK_WITHIN`'s 3 s and the audit's `STALL_WAIT`: these now judge only a workload the
+  scheduler has barely run, which is the one case no count of its own slices can judge. See
+  [the workloads' bounds](#the-workloads-are-judged-by-their-slices-too) below;
 - none in the boot `preempt` check any more; see below.
 
 **The boot `preempt` check is judged in interrupts and slices too.** It used to require 12
@@ -1919,6 +1921,75 @@ timer and the console, and fault injection outside the kernel heap. The heap inj
 also leaves out the buddy-page site, because a refused page block falls back to an arena
 that reclaims only in last-in-first-out order. Injecting there would exhaust the arena by
 design (`kernel/main/src/stress/heap.rs`).
+
+#### The workloads are judged by their slices too
+
+The auditor's two per-workload bounds were durations of guest time: three seconds to reach a
+checkpoint once asked, and an iteration in every one-second audit interval. Under an emulator
+that measures the host, for the reason above, and it is the same fault the process cycle was
+cured of — left in the workloads.
+
+Each workload's thread is remembered when it is spawned, and both bounds are now read from the
+slices the timer interrupt charges it:
+
+- **`PARK_SLICES`, 512:** a workload that runs this long without reaching a checkpoint fails,
+  however long the host took over it. The bound has to clear the longest honest iteration:
+  the network workload waits up to a second for a round trip and the TCP one up to two,
+  polling with millisecond naps, which the scheduler charges as running. A first try at 128
+  failed a healthy run at four seconds with the network workload 89 slices into an iteration.
+  Five hundred is over five seconds of CPU, more than twice the longest wait any workload
+  makes.
+- **`PROGRESS_SLICES`, 512:** the same, for slices run without completing an iteration.
+- **`PARK_WITHIN`, 3 s, and `STALL_WAIT`, 5 s:** a workload that is *not* running earns no
+  slices, and only a duration tells a sleeper mid-nap, or a thread behind more urgent ones,
+  from one that will never answer. These two apply only where the scheduler has charged the
+  workload fewer than `RUNNING_SLICES` since the request; a workload that is running keeps its
+  whole slice allowance.
+
+The heartbeat carries how close a passing run came to each slice bound — `slices to park max`
+and `without progress max` — so the margin is a number somebody can read rather than a guess.
+Unloaded, a 45-second run on `x86_64-qemu-smp` at eight CPUs needed 176 slices to park; beside
+a second soak, a two-hour run on the same preset needed 304 of the 512 allowed, and never
+missed an iteration in an audit interval at all.
+
+| Mutation | Result |
+|---|---|
+| No workload is ever asked to park | `a workload ran its slices without reaching a checkpoint: block B`, at 1 s |
+| heap A runs but never records an iteration, with `STALL_WAIT` raised so only the slice bound can fire | `a workload ran its slices without progress: heap A`, at 6 s |
+| The sleeper blocks for ten seconds, so it cannot answer a park request | `a workload did not reach a checkpoint: sleep`, at 1 s |
+| The sleeper parks and sleeps as usual but never records an iteration | `a workload made no progress: sleep`, at 4 s |
+
+#### A slow shootdown is not a broken one
+
+The audit failed on `mismatches + stalls` together. They are not the same kind of fact. A
+mismatch is the kernel's: the answers were not the online CPUs, or the books did not balance.
+A stall is a wait that spun `STALL_SPINS` before its answers arrived — and that count is the
+*waiting* CPU's own spins, which a host that stops running the CPU being waited for runs up
+without anything here going wrong.
+
+A two-hour soak on `aarch64-virt-smp` at eight CPUs, running beside a second soak, failed this
+way at 65 seconds, with the mean answer holding at 236 µs and the worst at 92 ms; a 90-second
+rerun passed with a worse worst-case wait of 219 ms. So the audit fails on mismatches alone,
+and every heartbeat carries the stalled-wait count beside the mean and worst answer, where a
+kernel that grows slower at this shows it. A shootdown that is never answered still fails the
+run: the wait never returns, the heartbeat stops, and kbuild kills the guest.
+
+### 3a-bis. The soak
+
+`kbuild soak --duration <len>` is a stress run nobody watches. It builds and runs the stress
+image exactly as `stress` does — the verdict is still the guest's exit status — and adds the
+two things a long run needs.
+
+**The trail.** Every heartbeat, the verdict, and the failed audit when there is one are written
+to `build/<target>/soak-<len>.trail`, whatever the outcome, because a run that failed at the
+ninth hour is exactly the one whose trail is worth reading after the scrollback is gone.
+
+**The drift.** The trail is compared with itself: every counter's rate over the first window
+against the same counter's rate over the last, where the window is a sixth of the run between
+ten seconds and ten minutes. A run can pass every audit and still be leaking, and a rate that
+climbs or falls away is what a long run is for. Counters whose rate moved by more than a
+quarter are marked. The comparison is arithmetic on the guest's own numbers; nothing in it
+decides whether the run passed.
 
 ### 4. Hardware — deferred
 
