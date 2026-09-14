@@ -74,6 +74,11 @@ pub fn route_interrupt(_line: u32, _cpu: usize) -> Result<(), &'static str> {
     Err("no message-signalled interrupts on this platform")
 }
 
+/// These ports deliver no message-signalled interrupts.
+pub fn delivers_msi() -> bool {
+    false
+}
+
 /// Nothing received: `(interrupts, bytes)`.
 pub fn console_received() -> (u32, u32) {
     (0, 0)

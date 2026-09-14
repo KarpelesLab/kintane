@@ -641,8 +641,8 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
       (`NO_VECTOR`): the driver reads its configuration once. With MSI-X on, the device does
       not set the interrupt status register for a queue interrupt (virtio 1.1 §4.1.4.5), so
       the handler stops reading it. The vector is written after the reset and read back, and
-      a refusal fails bring-up. On a PC with messages, a test run whose disk comes up on
-      anything else fails discovery, so a silent fallback cannot turn the interrupt checks
+      a refusal fails bring-up. On a PC with messages, `block irq` fails a test run whose
+      disk came up on anything else, so a silent fallback cannot turn the interrupt checks
       into skips.
     - **INTx is the fallback.** A function with neither capability, or one on a platform
       without messages, keeps the line in its interrupt-line register. Firmware routed that

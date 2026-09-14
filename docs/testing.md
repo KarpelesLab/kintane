@@ -372,7 +372,7 @@ The interrupt differs by port:
 
 - **x86_64** (`x86_64-qemu`, `x86_64-efi`, `x86_64-efistub`, `x86_64-qemu-smp`): MSI-X entry 0
   of QEMU's virtio-blk-pci function, delivered to the boot CPU's local APIC. Discovery reports
-  `virtio-blk receives MSI-X entry 0 on line 16, vector 48`. It fails the boot if a test run's
+  `virtio-blk receives MSI-X entry 0 on line 16, vector 48`. `block irq` fails if a test run's
   disk came up on anything else, so a fallback cannot quietly turn these checks into skips
   ([architecture.md](architecture.md#device--the-device-framework), "PCI interrupts").
 - **i686**: the line firmware programmed into the PCI function, 11 under QEMU's `pc`, wired
@@ -462,6 +462,30 @@ purpose: the virtio BAR lands at `0xc020000000`, 768 GiB, inside the user half's
 and every boot requires `user half clear` on the live tables with the BAR mapped in the device
 window above it. aarch64's enforcement probe also checks that the UART is writable in the
 window and faults with a translation fault at its physical address.
+
+The MSI-X path on the PCs was falsified the same way, each mutation confirmed applied, then
+restored. Every mutation fails a check, and every boot still completes:
+
+| Mutation | Caught by |
+| --- | --- |
+| The MSI-X entry's data names the next line's vector, 49 | x86_64-qemu: discovery reports `vector 49`, and `block irq` fails on its first request, which timed out because its interrupt never arrived. The delivery is counted as unhandled |
+| The MSI-X entry is left masked | x86_64-qemu: `block irq` fails, a request timed out |
+| A secondary CPU's message names an APIC ID no CPU has | x86_64-qemu-smp: `block irq` passes on CPU 0, then `block cpu` fails: a request timed out and CPU 1 took 0 interrupts |
+| The interrupt is routed to CPU 2 while the check counts CPU 1 | x86_64-qemu-smp: `block cpu` fails with `taken on CPU 1: 0`, although all 32 completions arrived by interrupt |
+| No EOI for a message-signalled line | x86_64-qemu: `clock` fails first, with 0 timer interrupts. The local APIC's in-service bit for vector 48, left set by an MSI raised during bring-up's polled requests, holds off every lower-priority vector, the ISA timer's among them. Then `block irq` fails with a request timed out |
+| The queue is given no vector | x86_64-qemu: `block irq` fails, a request timed out |
+| MSI-X left disabled, as QEMU leaves it | x86_64-qemu: `block irq` fails, a request timed out |
+| QEMU's function has no MSI-X table (`vectors=0`) | x86_64-qemu: discovery falls back to the line and leaves the disk polled, and `block irq` fails with `THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT` |
+| A stress run leaves the driver polling | x86_64-qemu-smp stress fails an audit: `a completion was collected by polling in a run driven by interrupts` |
+| `on_interrupt` reads the ISR register under MSI-X | the host test `an_msix_interrupt_collects_completions_without_asking_the_status_register` |
+
+**Not observable on QEMU:** the last mutation passes every boot. QEMU sets the ISR bit even
+when it delivers a queue interrupt by MSI-X, which virtio 1.1 allows a device not to do. Only
+the host test's device, which leaves the bit clear, shows the handler dropping completions.
+
+The `vectors=0` row also shows the INTx fallback working as designed. Before the guard moved
+into `block irq`, the same mutation failed discovery itself, and the boot halted until kbuild's
+timeout instead of reporting a check.
 
 ### 2c. Driver isolation
 

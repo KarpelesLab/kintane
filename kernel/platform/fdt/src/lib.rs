@@ -460,6 +460,12 @@ pub fn route_interrupt(_line: u32, _cpu: usize) -> Result<(), &'static str> {
     Err("no message-signalled interrupts on this platform")
 }
 
+/// Whether a PCI function's message-signalled interrupts are delivered here. No: these
+/// machines' devices interrupt on their controller's inputs.
+pub fn delivers_msi() -> bool {
+    false
+}
+
 /// Receive interrupts the console driver has taken, and the bytes they carried.
 pub fn console_received() -> (u32, u32) {
     pl011::received()

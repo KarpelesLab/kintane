@@ -300,6 +300,13 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no block device");
         return Check::Skipped;
     };
+    // QEMU's virtio-blk-pci has an MSI-X table. On a platform that delivers messages, a test
+    // disk that came up on anything else fell back somewhere, and this check and the next
+    // would skip where they should have measured.
+    if kconfig::QEMU_BLOCK_TEST && platform::delivers_msi() && !blk.uses_msix() {
+        c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
+        return Check::Failed;
+    }
     let Some(line) = platform::block_line() else {
         c.write_str("skipped: the disk is polled, no interrupt route on this port");
         return Check::Skipped;

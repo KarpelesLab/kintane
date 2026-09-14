@@ -969,18 +969,6 @@ unsafe fn wire_all(
             }
         }
     }
-    // QEMU's virtio-blk-pci has an MSI-X table. On a controller that delivers messages, a
-    // disk that came up on anything else fell back without saying why, and the interrupt
-    // checks would skip rather than fail.
-    let block_on_msi = BLOCK_LINE.get().is_some_and(|n| is_msi_line(n.0));
-    if controller::MSI
-        && kconfig::QEMU_BLOCK_TEST
-        && virtio_blk::window().is_some()
-        && !block_on_msi
-    {
-        c.write_str("; VIRTIO-BLK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
-        ok = false;
-    }
     (ok, console)
 }
 
@@ -1244,6 +1232,12 @@ pub fn interrupt_is_msi(line: u32) -> bool {
 /// only, which are the ones whose CPU can be chosen; zero for any other.
 pub fn interrupts_on_cpu(line: u32, cpu: usize) -> u64 {
     msi_taken(line, cpu).map_or(0, |t| t.load(Ordering::Relaxed))
+}
+
+/// Whether this platform delivers a PCI function's message-signalled interrupts, so that a
+/// function with MSI-X is expected to be wired on it.
+pub fn delivers_msi() -> bool {
+    controller::MSI
 }
 
 /// Deliver message-signalled `line` to CPU `cpu` from its next interrupt on.
