@@ -72,7 +72,7 @@ fn now() -> u64 {
     crate::timekeeping::now().as_nanos()
 }
 
-fn nap() {
+fn nap(_: crate::net::Seen) {
     sleep_until(after_ms(POLL_MS));
 }
 
