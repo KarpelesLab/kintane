@@ -380,6 +380,8 @@ pub fn image_sections() -> hal::ImageSections {
         static __data_end: u8;
         static __stack_guard_start: u8;
         static __stack_guard_end: u8;
+        static __stack_bottom: u8;
+        static __stack_top: u8;
         static __thread_stacks_start: u8;
         static __thread_stacks_end: u8;
     }
@@ -393,6 +395,7 @@ pub fn image_sections() -> hal::ImageSections {
         rodata: (addr(&raw const __rodata_start), addr(&raw const __rodata_end)),
         data: (addr(&raw const __data_start), addr(&raw const __data_end)),
         stack_guard: (addr(&raw const __stack_guard_start), addr(&raw const __stack_guard_end)),
+        boot_stack: (addr(&raw const __stack_bottom), addr(&raw const __stack_top)),
         thread_stacks: hal::StackArray {
             start: addr(&raw const __thread_stacks_start),
             end: addr(&raw const __thread_stacks_end),

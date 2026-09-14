@@ -250,6 +250,7 @@ fn stacks_exclude_a_guard_inside_the_data() {
         rodata: (0x2000, 0x3000),
         data: (0x3000, 0x9000),
         stack_guard: (0x5000, 0x6000),
+        boot_stack: (0x6000, 0x7000),
         thread_stacks: StackArray::NONE,
     };
     assert_eq!(image_stacks(&s), [(0x3000, 0x5000), (0x6000, 0x9000)]);
@@ -263,6 +264,7 @@ fn stacks_keep_all_data_when_the_guard_is_outside_it() {
         rodata: (0x2000, 0x3000),
         data: (0x4000, 0x9000),
         stack_guard: (0x3000, 0x4000),
+        boot_stack: (0x4000, 0x5000),
         thread_stacks: StackArray::NONE,
     };
     assert_eq!(image_stacks(&s)[0], (0x4000, 0x9000));
@@ -277,6 +279,7 @@ fn with_thread_stacks() -> ImageSections {
         rodata: (0x2000, 0x3000),
         data: (0x3000, 0xb000),
         stack_guard: (0x5000, 0x6000),
+        boot_stack: (0x6000, 0x7000),
         thread_stacks: StackArray {
             start: 0x7000,
             end: 0xb000,

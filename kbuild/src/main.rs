@@ -5,6 +5,7 @@
 
 mod bios;
 mod bootcfg;
+mod bootstack;
 mod build;
 mod buildid;
 mod cache;
@@ -644,8 +645,12 @@ impl UserFlavor {
 }
 
 /// The names of `unit`'s transitive dependencies, walked over `ordered`.
-fn transitive_deps(unit: &graph::Unit, ordered: &[graph::Unit]) -> std::collections::BTreeSet<String> {
-    let by_name: BTreeMap<&str, &graph::Unit> = ordered.iter().map(|u| (u.name.as_str(), u)).collect();
+fn transitive_deps(
+    unit: &graph::Unit,
+    ordered: &[graph::Unit],
+) -> std::collections::BTreeSet<String> {
+    let by_name: BTreeMap<&str, &graph::Unit> =
+        ordered.iter().map(|u| (u.name.as_str(), u)).collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<String> = unit.deps.clone();
     while let Some(name) = stack.pop() {
@@ -1021,6 +1026,9 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     }
 
     let linked = image.ok_or("no unit of kind `bin` was built; nothing to boot")?;
+    // Before anything is packaged: a kernel whose port ignored BOOT_STACK_KIB is refused
+    // here rather than booted with a stack of some other size.
+    bootstack::verify(&b.tc.tool("llvm-nm")?, &linked, res.int("BOOT_STACK_KIB"))?;
     let symbols = b.split_symbols(&linked)?;
     let build_id = buildid::stamp(&b.tc.tool("llvm-objcopy")?, &linked, &symbols)?;
     let entries = bootcfg::entry_list(&res, bootcfg::Chain::File(build::ESP_CHAIN_TEST_ENTRY_PATH));

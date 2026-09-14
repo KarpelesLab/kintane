@@ -64,9 +64,12 @@ config BOOT_STACK_KIB
         A driver domain's boot check hands the disk back to the kernel from the
         boot stack, under kmain's own frame: on x86_64 that path measured about
         15.7 KiB of frames, past a 16 KiB stack once the object-layer checks grew
-        kmain, so a build with BLOCK_DOMAIN doubles it. x86_64 and ARMv7-M
-        reserve this much; aarch64, i686 and riscv32 still reserve a fixed
-        16 KiB in their boot assembly.
+        kmain, so a build with BLOCK_DOMAIN doubles it.
+
+        Every port's linker script reserves this much, rounded up to a page
+        where the port has pages, and asserts it; kbuild refuses a linked
+        kernel whose __stack_bottom..__stack_top is any other size. Every boot
+        reports how deep it used the stack, and fails past 75% of it.
 
 config HANDLER_STACK_KIB
     int "Size of the exception stack (KiB)"

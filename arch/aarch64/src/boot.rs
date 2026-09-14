@@ -143,21 +143,8 @@ _start:
     wfi
     b       .Lhang
 
-// The boot stack, in a section of its own so that link.ld can put a guard page
-// directly beneath it. Were it left in .bss it would sit wherever the linker chose,
-// with the translation tables — also .bss — as likely as not immediately below, and an
-// overflow would rewrite the page tables instead of faulting. `nobits`, so the 16 KiB
-// costs nothing in the image; `.balign 4096` so the bottom of the stack is the page
-// boundary the guard ends on.
-.section .stack, "aw", @nobits
-.balign 4096
-// Global, not because anything links against them, but because link.ld's ASSERTs do:
-// a linker-script expression can only name a global symbol, and those assertions are
-// what stops the guard page and the stack drifting into each other unnoticed.
-.globl __stack_bottom
-.globl __stack_top
-__stack_bottom:
-    .skip 16384
-__stack_top:
+// The boot stack is not reserved here. link.ld reserves CONFIG_BOOT_STACK_KIB of it, in a
+// section of its own directly above the guard page, and defines `__stack_bottom` and
+// `__stack_top`: a size written here would be one the configuration cannot change.
 "#
 );

@@ -158,3 +158,5 @@ ASSERT((THREAD_STACK_SLOT & (THREAD_STACK_SLOT - 1)) == 0, "THREAD_STACK_KIB is 
 ASSERT(THREAD_STACK_SLOT >= 8K, "THREAD_STACK_KIB leaves no stack above the guard page")
 ASSERT(__thread_stacks_start % 4K == 0, "__thread_stacks_start is not page-aligned")
 ASSERT((__thread_stacks_end - __thread_stacks_start) % THREAD_STACK_SLOT == 0, "thread stacks are not whole slots")
+ASSERT(__stack_guard_end == __stack_bottom, "the boot stack does not start on its guard page")
+ASSERT(__stack_top - __stack_bottom == ALIGN(CONFIG_BOOT_STACK_KIB * 1K, 4K), "the boot stack is not BOOT_STACK_KIB, rounded up to a page")
