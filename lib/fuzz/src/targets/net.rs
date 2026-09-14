@@ -55,7 +55,7 @@ fn build(rng: &mut Rng) -> Vec<u8> {
     let id = rng.next_u32() as u16;
     let seq = rng.next_u32() as u16;
     let data: Vec<u8> = (0..rng.below(96)).map(|i| i as u8).collect();
-    let len = match rng.below(4) {
+    let len = match rng.below(5) {
         0 => {
             let arp = Arp {
                 operation: *rng.pick(&[wire::ARP_REQUEST, wire::ARP_REPLY, 3]),
@@ -81,6 +81,24 @@ fn build(rng: &mut Rng) -> Vec<u8> {
             ip_frame(&mut buf, dst_mac, src, dst, wire::PROTO_UDP, |p| {
                 wire::write_udp(p, src, dst, id, port, &data)
             })
+        }
+        3 => {
+            // One fragment of a larger datagram, which the stack holds until the rest of it
+            // arrives: an offset and a "more fragments" flag over a well-formed datagram, with
+            // the header checksum made right again so only the fragment fields differ.
+            let n = ip_frame(&mut buf, dst_mac, src, dst, wire::PROTO_UDP, |p| {
+                wire::write_udp(p, src, dst, id, *rng.pick(&[5555, seq]), &data)
+            });
+            if n > 0 {
+                let at = wire::ETH_HEADER;
+                let more = if rng.one_in(2) { 0x2000u16 } else { 0 };
+                let offset = u16::from(rng.next_u32() as u8) & 0x1fff;
+                buf[at + 6..at + 8].copy_from_slice(&(more | offset).to_be_bytes());
+                buf[at + 10..at + 12].copy_from_slice(&[0, 0]);
+                let sum = wire::checksum(&[&buf[at..at + wire::IPV4_HEADER]]);
+                buf[at + 10..at + 12].copy_from_slice(&sum.to_be_bytes());
+            }
+            n
         }
         _ => {
             let wild = rng.next_u32() as u8;
@@ -141,6 +159,15 @@ pub fn run(input: &[u8]) {
 /// Whatever the parsers accept is consistent with the bytes it came from.
 fn parsers(input: &[u8]) {
     let Ok((eth, frame)) = wire::parse_frame(input) else {
+        // A fragment is refused by the whole-datagram parser and taken by the one that says
+        // where its bytes belong; what that hands back must lie inside the input too.
+        if let Ok(eth) = wire::parse_ethernet(input)
+            && eth.ethertype == wire::ETHERTYPE_IPV4
+            && let Ok((ip, Some(part))) = wire::parse_ipv4_part(eth.payload)
+        {
+            assert!(inside(input, ip.payload), "a fragment's payload is outside the frame");
+            assert!(part.offset % 8 == 0, "a fragment offset counts eight-byte units");
+        }
         return;
     };
     assert!(inside(input, eth.payload), "the Ethernet payload is outside the frame");
@@ -242,9 +269,18 @@ fn stack(input: &[u8]) {
     }
 }
 
-/// A frame whose layers parse down to a protocol this stack speaks.
+/// A frame whose layers parse down to a protocol this stack speaks, or one fragment of a
+/// datagram, which the stack holds for reassembly rather than parsing whole.
 pub fn accepts(input: &[u8]) -> bool {
-    !matches!(wire::parse_frame(input), Err(_) | Ok((_, Frame::OtherEthernet(_))))
+    match wire::parse_frame(input) {
+        Ok((_, Frame::OtherEthernet(_))) => false,
+        Ok(_) => true,
+        Err(_) => wire::parse_ethernet(input)
+            .ok()
+            .filter(|eth| eth.ethertype == wire::ETHERTYPE_IPV4)
+            .and_then(|eth| wire::parse_ipv4_part(eth.payload).ok())
+            .is_some_and(|(_, fragment)| fragment.is_some()),
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +298,15 @@ mod tests {
                 if t.flags == wire::TCP_SYN && t.dst_port == super::LISTENING && t.mss == Some(1460)
         ));
         super::run(syn);
+    }
+
+    #[test]
+    fn the_committed_fragment_seed_is_one_fragment_of_a_datagram() {
+        let fragment = include_bytes!("../../corpus/net/seed-ipv4-fragment.bin");
+        // The whole-datagram parser refuses it; the corpus keeps it because the stack takes it.
+        assert_eq!(wire::parse_frame(fragment), Err(wire::WireError::Fragmented));
+        assert!(super::accepts(fragment), "a fragment is input the stack has a path for");
+        super::run(fragment);
     }
 
     #[test]
@@ -295,6 +340,11 @@ mod tests {
                 Ok(_) => {}
                 // The one frame built to be refused: an ARP message with no such operation.
                 Err(wire::WireError::ArpOperation(3)) => {}
+                // A fragment: refused by the whole-datagram parser, and taken by the stack,
+                // which holds it until the rest of its datagram arrives.
+                Err(wire::WireError::Fragmented) => {
+                    assert!(super::accepts(&frame), "a fragment is input with a path")
+                }
                 Err(e) => panic!("a frame built with the stack's writers did not parse: {e:?}"),
             }
         }

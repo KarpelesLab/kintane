@@ -441,6 +441,11 @@ const NET_GUEST_TCP_PORT: u16 = 7777;
 const NET_PROBE: &[u8] = b"kintane-udp-probe";
 const NET_ECHO: &[u8] = b"kintane-udp-echo ";
 const NET_ACK: &[u8] = b"kintane-udp-ack ";
+/// The datagram [`downstream`] always splits into two IPv4 fragments on its way to the guest,
+/// and the pattern after its marker, which the guest checks byte for byte once it has put the
+/// datagram back together: `kernel/main/src/net.rs`'s `FRAGMENTED` and `pattern`.
+const NET_UDP_FRAGMENTED: &[u8] = b"kintane-udp-fragmented ";
+const NET_FRAGMENT_PATTERN: usize = 64;
 
 /// How often [`udp_peer`] sends its probe.
 const NET_PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -462,14 +467,16 @@ const NET_TCP_INBOUND_WRONG: &[u8] = b"kintane-tcp-inbound-wrong ";
 
 /// The loopback ports a run with a network card is served on: the UDP port QEMU forwards to
 /// the guest, the TCP port of [`tcp_service`], which the guest reaches at the gateway's
-/// address, the two ports of [`relay`], which QEMU connects to, and the TCP port QEMU forwards
-/// to the guest's listener, which [`tcp_inbound`] connects to.
+/// address, the two ports of [`relay`] and the two of [`downstream`], which QEMU connects to,
+/// and the TCP port QEMU forwards to the guest's listener, which [`tcp_inbound`] connects to.
 #[derive(Clone, Copy, Debug)]
 pub struct NetPorts {
     pub udp: u16,
     pub tcp: u16,
     pub relay_out: u16,
     pub relay_in: u16,
+    pub down_out: u16,
+    pub down_in: u16,
     pub inbound: u16,
 }
 
@@ -497,11 +504,14 @@ fn net_port(res: &Resolution) -> Result<Option<NetPorts>, String> {
             .map_err(|e| format!("no loopback TCP port for the network check: {e}"))
     };
     let (service, out, inject, inbound) = (tcp()?, tcp()?, tcp()?, tcp()?);
+    let (down_out, down_in) = (tcp()?, tcp()?);
     Ok(Some(NetPorts {
         udp,
         tcp: port(&service)?,
         relay_out: port(&out)?,
         relay_in: port(&inject)?,
+        down_out: port(&down_out)?,
+        down_in: port(&down_in)?,
         inbound: port(&inbound)?,
     }))
 }
@@ -541,6 +551,22 @@ fn net_card(res: &Resolution, device: &str, ports: Option<NetPorts>) -> Vec<Stri
         "filter-redirector,id=kt_net_in,netdev=kt_net,queue=rx,indev=kt_relay_in".to_string(),
         "-object".to_string(),
         "filter-redirector,id=kt_net_out,netdev=kt_net,queue=rx,outdev=kt_relay_out".to_string(),
+        // And the same pair the other way, on the queue that carries frames to the guest, for
+        // [`downstream`]: what the network sends the guest passes through kbuild before the
+        // card sees it.
+        "-chardev".to_string(),
+        format!("socket,id=kt_down_out,host=127.0.0.1,port={}", ports.down_out),
+        "-chardev".to_string(),
+        format!("socket,id=kt_down_in,host=127.0.0.1,port={}", ports.down_in),
+        // Declared the other way round from the pair above, because a frame on its way to the
+        // guest passes the filters in declaration order rather than last to first: the
+        // redirector must come first, so that what the injector puts back goes on to the card
+        // instead of round to the redirector again.
+        "-object".to_string(),
+        "filter-redirector,id=kt_net_down_out,netdev=kt_net,queue=tx,outdev=kt_down_out"
+            .to_string(),
+        "-object".to_string(),
+        "filter-redirector,id=kt_net_down_in,netdev=kt_net,queue=tx,indev=kt_down_in".to_string(),
         "-device".to_string(),
         format!("{device},netdev=kt_net"),
     ];
@@ -591,11 +617,16 @@ fn udp_peer(
         let mut last: Option<Instant> = None;
         let mut buf = [0u8; 512];
         let announce = [NET_TCP_ANNOUNCE, tcp_port.to_string().as_bytes()].concat();
+        // The datagram the downstream relay fragments, with a pattern the guest checks after
+        // it has put the two fragments back together.
+        let pattern: Vec<u8> = (0..NET_FRAGMENT_PATTERN).map(|i| (i as u8) ^ 0x5a).collect();
+        let fragmented = [NET_UDP_FRAGMENTED, b"1 ", &pattern].concat();
         let mut listeners = std::collections::HashSet::new();
         while !stop.load(Ordering::Relaxed) {
             if last.is_none_or(|t| t.elapsed() >= NET_PROBE_EVERY) {
                 let _ = socket.send(NET_PROBE);
                 let _ = socket.send(&announce);
+                let _ = socket.send(&fragmented);
                 last = Some(Instant::now());
             }
             match socket.recv(&mut buf) {
@@ -718,7 +749,17 @@ fn serve_tcp(mut stream: std::net::TcpStream) {
     let Some(rest) = request.strip_prefix(NET_TCP_REQUEST) else {
         return;
     };
-    if stream.write_all(&[NET_TCP_REPLY, rest].concat()).is_err() {
+    // The reply goes out in two segments, not one: [`downstream`] swaps the first pair of a
+    // connection's data segments, and a reply in one segment is a pair of nothing. Nagle off,
+    // so the second write is a segment of its own rather than a tail on the first.
+    let reply = [NET_TCP_REPLY, rest].concat();
+    let split = reply.len() / 2;
+    let _ = stream.set_nodelay(true);
+    if stream.write_all(&reply[..split]).is_err() {
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    if stream.write_all(&reply[split..]).is_err() {
         return;
     }
     if rest.starts_with(b"peer-closes ") {
@@ -840,6 +881,180 @@ fn first_data_segment(
         }
         _ => false,
     }
+}
+
+/// kbuild's relay on the other queue: every frame the network sends the guest passes through
+/// here before the card sees it, so a run can require the kernel to cope with a network that
+/// is not orderly.
+///
+/// Three disturbances, each of which the guest's `net` check gates on:
+///
+/// - **fragmentation.** Every datagram carrying [`NET_UDP_FRAGMENTED`] is split into two IPv4
+///   fragments. Reassembled, the datagram is the bytes that were sent, so the guest can check
+///   the pattern it carries and not merely that something arrived.
+/// - **reordering.** The first pair of data segments of the first connection to
+///   [`tcp_service`] is swapped: the first is held until the second has gone by. The guest
+///   must hold the second until the first arrives and hand the stream to its reader in order.
+/// - **duplication.** The segment that was held is sent twice, so the guest must take it once.
+///
+/// Each happens once per run except fragmentation, which is every time, because the guest may
+/// not be listening when the first one goes past. Everything else is passed on unchanged.
+fn downstream(
+    from_network: std::net::TcpListener,
+    to_guest: std::net::TcpListener,
+    tcp_port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(mut from_network) = accept_until(&from_network, &stop) else {
+            return;
+        };
+        let Some(mut to_guest) = accept_until(&to_guest, &stop) else {
+            return;
+        };
+        let mut state = Disturbance {
+            tcp_port,
+            held: None,
+            reordered: false,
+        };
+        let mut len = [0u8; 4];
+        let mut frame = vec![0u8; 1 << 16];
+        while from_network.read_exact(&mut len).is_ok() {
+            let n = u32::from_be_bytes(len) as usize;
+            if n > frame.len() || from_network.read_exact(&mut frame[..n]).is_err() {
+                break;
+            }
+            let mut failed = false;
+            for out in disturb(&frame[..n], &mut state) {
+                let length = (out.len() as u32).to_be_bytes();
+                failed |= to_guest
+                    .write_all(&length)
+                    .and_then(|()| to_guest.write_all(&out))
+                    .is_err();
+            }
+            if failed {
+                break;
+            }
+        }
+    })
+}
+
+/// What [`downstream`] has done so far, and the frame it is holding back.
+struct Disturbance {
+    tcp_port: u16,
+    /// The segment held back, to be sent after the one behind it.
+    held: Option<Vec<u8>>,
+    /// Whether a pair has been swapped already: one per run.
+    reordered: bool,
+}
+
+/// The frames to send the guest in place of `frame`: none while one is held back, one for an
+/// ordinary frame, and two for a fragmented datagram or a released pair.
+fn disturb(frame: &[u8], state: &mut Disturbance) -> Vec<Vec<u8>> {
+    if udp_payload(frame).is_some_and(|p| p.starts_with(NET_UDP_FRAGMENTED))
+        && let Some(fragments) = fragment_datagram(frame)
+    {
+        return fragments;
+    }
+    let from_service = tcp_data_from(frame, state.tcp_port);
+    match state.held.take() {
+        // The frame behind the one held goes first, then the held one, then the held one
+        // again: reordered, and duplicated.
+        Some(held) => vec![frame.to_vec(), held.clone(), held],
+        None if from_service && !state.reordered => {
+            state.reordered = true;
+            state.held = Some(frame.to_vec());
+            Vec::new()
+        }
+        None => vec![frame.to_vec()],
+    }
+}
+
+/// The UDP payload of an IPv4 datagram in `frame`, if it is one and is not itself a fragment.
+fn udp_payload(frame: &[u8]) -> Option<&[u8]> {
+    let (ihl, total) = ipv4_header(frame)?;
+    if frame.get(23) != Some(&17) {
+        return None;
+    }
+    let udp = 14 + ihl;
+    frame.get(udp + 8..14 + total)
+}
+
+/// Whether `frame` is a TCP segment carrying data from `port`.
+fn tcp_data_from(frame: &[u8], port: u16) -> bool {
+    let Some((ihl, total)) = ipv4_header(frame) else {
+        return false;
+    };
+    if frame.get(23) != Some(&6) {
+        return false;
+    }
+    let tcp = 14 + ihl;
+    let src = frame
+        .get(tcp..tcp + 2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let offset = frame.get(tcp + 12).map(|o| usize::from(o >> 4) * 4);
+    match (src, offset) {
+        (Some(src), Some(offset)) => src == port && total > ihl + offset,
+        _ => false,
+    }
+}
+
+/// An IPv4 packet's header length and total length, for a frame that carries one whole.
+fn ipv4_header(frame: &[u8]) -> Option<(usize, usize)> {
+    if frame.get(12..14) != Some(&[0x08, 0x00]) {
+        return None;
+    }
+    let ihl = usize::from(*frame.get(14)? & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([*frame.get(16)?, *frame.get(17)?]));
+    // Not already a fragment, and wholly inside the frame.
+    let flags = u16::from_be_bytes([*frame.get(20)?, *frame.get(21)?]);
+    (ihl >= 20 && total > ihl && frame.len() >= 14 + total && flags & 0x3fff == 0)
+        .then_some((ihl, total))
+}
+
+/// `frame`'s datagram as two IPv4 fragments, split at an eight-byte boundary, each with its
+/// own header checksum. The payload of the two, concatenated, is the payload of the one.
+fn fragment_datagram(frame: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let (ihl, total) = ipv4_header(frame)?;
+    let payload = frame.get(14 + ihl..14 + total)?;
+    if payload.len() < 16 {
+        return None;
+    }
+    // A fragment's offset counts eight-byte units, so every fragment but the last carries a
+    // multiple of eight.
+    let cut = (payload.len() / 2 / 8 * 8).clamp(8, payload.len() - 8);
+    let mut out = Vec::new();
+    for (offset, part, more) in [(0, &payload[..cut], true), (cut, &payload[cut..], false)] {
+        let mut f = Vec::with_capacity(14 + ihl + part.len());
+        f.extend_from_slice(&frame[..14 + ihl]);
+        f.extend_from_slice(part);
+        let length = (ihl + part.len()) as u16;
+        f[16..18].copy_from_slice(&length.to_be_bytes());
+        let flags = if more { 0x2000u16 } else { 0 } | (offset / 8) as u16;
+        f[20..22].copy_from_slice(&flags.to_be_bytes());
+        f[24..26].copy_from_slice(&[0, 0]);
+        let sum = ipv4_checksum(&f[14..14 + ihl]);
+        f[24..26].copy_from_slice(&sum.to_be_bytes());
+        out.push(f);
+    }
+    Some(out)
+}
+
+/// The Internet checksum of a header (RFC 1071), as `net::wire::checksum` computes it.
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for pair in header.chunks(2) {
+        let word = match pair {
+            [high, low] => u16::from_be_bytes([*high, *low]),
+            [high] => u16::from_be_bytes([*high, 0]),
+            _ => 0,
+        };
+        sum += u32::from(word);
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// How an x86 guest gets its kernel: straight from QEMU's multiboot loader, or from a
@@ -1069,8 +1284,10 @@ pub fn run_watched(
         };
         let service = listen(ports.tcp)?;
         let (from_guest, to_network) = (listen(ports.relay_out)?, listen(ports.relay_in)?);
+        let (from_network, to_guest) = (listen(ports.down_out)?, listen(ports.down_in)?);
         peers.push(tcp_service(service, stop_peer.clone()));
         peers.push(relay(from_guest, to_network, ports.tcp, stop_peer.clone()));
+        peers.push(downstream(from_network, to_guest, ports.tcp, stop_peer.clone()));
     }
 
     let mut child = Command::new(m.binary)
@@ -1272,6 +1489,80 @@ mod tests {
     fn an_empty_marker_never_matches() {
         let mut c = MarkerCounter::new(b"");
         assert_eq!(c.feed(b"anything"), 0);
+    }
+
+    /// An Ethernet frame holding an IPv4 UDP datagram carrying `payload`.
+    fn datagram(payload: &[u8]) -> Vec<u8> {
+        let total = 20 + 8 + payload.len();
+        let mut f = vec![0u8; 14 + total];
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&(total as u16).to_be_bytes());
+        f[23] = 17;
+        f[34..36].copy_from_slice(&1234u16.to_be_bytes());
+        f[36..38].copy_from_slice(&5555u16.to_be_bytes());
+        f[38..40].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        f[42..].copy_from_slice(payload);
+        f
+    }
+
+    fn quiet(tcp_port: u16) -> super::Disturbance {
+        super::Disturbance {
+            tcp_port,
+            held: None,
+            reordered: false,
+        }
+    }
+
+    #[test]
+    fn a_marked_datagram_becomes_two_fragments_whose_payloads_join_up() {
+        let payload = [super::NET_UDP_FRAGMENTED, &[7u8; 64][..]].concat();
+        let frame = datagram(&payload);
+        let out = super::disturb(&frame, &mut quiet(4000));
+        assert_eq!(out.len(), 2, "one datagram, two fragments");
+        let mut rebuilt = Vec::new();
+        for (i, f) in out.iter().enumerate() {
+            let total = usize::from(u16::from_be_bytes([f[16], f[17]]));
+            let flags = u16::from_be_bytes([f[20], f[21]]);
+            assert_eq!(usize::from(flags & 0x1fff) * 8, rebuilt.len(), "where it belongs");
+            assert_eq!(flags & 0x2000 != 0, i == 0, "only the last says none follow");
+            // A header carrying its own checksum sums to zero, which is what the guest checks.
+            assert_eq!(super::ipv4_checksum(&f[14..34]), 0);
+            assert_eq!(f.len(), 14 + total, "the frame is the packet it says it is");
+            rebuilt.extend_from_slice(&f[34..14 + total]);
+        }
+        assert_eq!(rebuilt, frame[34..], "the fragments carry the whole datagram");
+    }
+
+    #[test]
+    fn the_services_first_pair_of_segments_is_swapped_and_the_held_one_duplicated() {
+        let port = 4000;
+        let mut state = quiet(port);
+        let first = segment(port, 50000, 100, 0x18, 5);
+        let second = segment(port, 50000, 105, 0x18, 5);
+        assert!(super::disturb(&first, &mut state).is_empty(), "the first is held back");
+        let out = super::disturb(&second, &mut state);
+        assert_eq!(out, vec![second, first.clone(), first], "behind it, then it, then it again");
+        // One pair per run: everything after it passes straight through.
+        let third = segment(port, 50000, 110, 0x18, 5);
+        assert_eq!(super::disturb(&third, &mut state), vec![third.clone()]);
+    }
+
+    #[test]
+    fn frames_that_are_not_the_services_data_pass_through_untouched() {
+        let mut state = quiet(4000);
+        // An acknowledgement carries no data.
+        let ack = segment(4000, 50000, 100, 0x10, 0);
+        assert_eq!(super::disturb(&ack, &mut state), vec![ack.clone()]);
+        // Another service's data.
+        let other = segment(80, 50000, 100, 0x18, 5);
+        assert_eq!(super::disturb(&other, &mut state), vec![other.clone()]);
+        // A datagram without the marker.
+        let plain = datagram(b"kintane-udp-probe");
+        assert_eq!(super::disturb(&plain, &mut state), vec![plain.clone()]);
+        // A runt, read and passed on rather than read past its end.
+        assert_eq!(super::disturb(&[0u8; 20], &mut state), vec![vec![0u8; 20]]);
+        assert!(!state.reordered, "nothing was held back");
     }
 }
 

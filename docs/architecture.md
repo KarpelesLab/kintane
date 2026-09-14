@@ -1182,8 +1182,16 @@ ICMP echo, UDP and TCP, host-tested against a simulated gateway and a scripted T
 `drivers/net/virtio-net` is the card. The boot's `net` check drives both against QEMU's
 user-mode network, and sockets put TCP behind handles. What it is not:
 
-- **No fragment reassembly.** A fragment is refused and counted (`WireError::Fragmented`),
-  and a datagram that does not fit one 1500-byte frame is not sent.
+- **Fragment reassembly, bounded** (`kernel/net/src/reasm.rs`). Two datagrams are put back
+  together at once, each up to 2 KiB held as at most six runs of arrived bytes, in memory that
+  is part of the stack rather than allocated. A set that is not complete within two seconds is
+  given up; a datagram that arrives when both sets are taken displaces the set closest to being
+  given up, so a sender that opens sets and never finishes them loses its own first; and a
+  fragment that would reach past 2 KiB, or need a seventh run, gives up its whole set. Fragments
+  may overlap and may arrive in any order. TCP is not reassembled — a segment is delivered by
+  copying out of the pool buffer its frame arrived in, and a reassembled datagram is not in one
+  — so a fragmented segment is counted and dropped. Nothing this stack sends is ever fragmented:
+  it is all marked don't-fragment and fits one frame.
 - **No thread of its own.** TCP's timers run when someone runs the stack: the card's handler
   when a frame arrives, or a waiter whose wait ran to the stack's next timer. A connection
   nobody waits on — one a program closed and left — retransmits its FIN only when the next
@@ -1251,19 +1259,43 @@ Exactly what is implemented:
   answered and ignored. A segment overlapping what arrived is trimmed.
 - **Retransmission on a timer.** One timer per connection, armed while a SYN, data or a FIN is
   unacknowledged and restarted when new data is acknowledged. When it runs out, sending goes back
-  to the oldest unacknowledged byte (go-back-N) and the timeout doubles from 300 ms up to 4 s;
-  after seven in a row the connection is reset and reports `TimedOut`.
+  to the oldest unacknowledged byte (go-back-N) and the timeout doubles up to 4 s; after seven in
+  a row the connection is reset and reports `TimedOut`.
+- **The timeout is computed from the round trip** (RFC 6298): one segment is timed at a time and
+  never a retransmitted one (Karn's rule), giving a smoothed estimate and its variation, and
+  `srtt + max(G, 4 × rttvar)` clamped to 200 ms..4 s. A connection with no sample yet uses 300 ms.
+  A timeout doubles the timeout in use and leaves the estimate alone; the next acknowledgement of
+  a segment sent once restores it.
+- **Congestion control** (RFC 5681, with NewReno's fast recovery from RFC 6582). Slow start from
+  four segments, growing by a segment per acknowledgement; congestion avoidance above the
+  slow-start threshold, growing by about one segment per round trip; fast retransmit on three
+  duplicate acknowledgements, which resends the oldest unacknowledged segment without waiting for
+  the timer; fast recovery, where the threshold becomes half the flight, each further duplicate
+  inflates the window, a partial acknowledgement resends the next hole, and the window falls back
+  to the threshold once everything outstanding when the loss was found is acknowledged; and a
+  timeout that collapses the window to one segment. Nothing is sent past the smaller of the
+  peer's window and the congestion window. In recovery only the one segment NewReno asks for goes
+  out per acknowledgement — go-back-N is for a timeout, not a hole — so new data waits for
+  recovery to end.
+- **An out-of-order queue**: four runs of bytes per connection, held in the receive ring at the
+  place the stream will read them from, so filling the hole in front of them is arithmetic and
+  not a copy. A run that touches another is merged into it; with every run taken, a nearer run
+  displaces the one furthest ahead, and a run that is itself the furthest is dropped for the
+  peer to send again. A FIN that arrives ahead of a hole is not remembered.
 - **A fixed receive window**: the free space of a connection's 1514-byte receive ring, never
   scaled, announced again when a read reopens it past a segment. **The peer's window is
   respected**, and a shut one is probed a byte at a time on the timer. **The MSS option** is sent
   on a SYN (1460) and honoured; 536 when the peer sends none.
 
-Exactly what is not: **no congestion control** — no slow start, congestion window, fast
-retransmit, fast recovery or Nagle. The stated minimum is that nothing is sent beyond the
-peer's window or more than one segment at a time, a timeout resends one segment from the oldest
-unacknowledged byte, and consecutive timeouts back off exponentially. **No RTT estimation**; no
-out-of-order queue, so a reordered segment is dropped and the sender's retransmission fills the
-gap; no delayed acknowledgements, urgent data, SACK, timestamps or window scaling. TIME-WAIT is
+Exactly what is not: **no selective acknowledgement**, so a hole is filled by the sender
+resending from it and a second loss in one window costs another round trip, which is what
+NewReno's partial acknowledgements handle one hole at a time; **no appropriate byte counting,
+proportional rate reduction or pacing**, so the window is counted in bytes but grown per
+acknowledgement, which over-counts when the peer acknowledges less than a segment; no Nagle, no
+delayed acknowledgements, no explicit congestion notification, no urgent data, timestamps or
+window scaling. The send ring holds one frame's worth of data, so fewer segments are ever
+outstanding than a peer needs to send three duplicate acknowledgements: the sender's fast
+retransmit is proven by host tests rather than by a boot. TIME-WAIT is
 1 s rather than four minutes, and a released connection in TIME-WAIT is given up early when
 every slot is needed. Initial sequence numbers are the clock mixed with the ports, not RFC 6528's
 keyed hash, so they are predictable. Ephemeral ports start from the clock at the first connection

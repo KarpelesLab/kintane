@@ -39,6 +39,7 @@
 
 pub mod arp;
 pub mod pool;
+pub mod reasm;
 pub mod stack;
 pub mod tcp;
 pub mod wire;

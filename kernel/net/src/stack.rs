@@ -2,6 +2,7 @@
 
 use crate::arp::Cache;
 use crate::pool::Pool;
+use crate::reasm::{Reassembler, Took};
 use crate::tcp::{self, Conn, Deliver, Segment, Tcp, TcpError};
 use crate::wire::{
     self, ARP_REPLY, ARP_REQUEST, Arp, BROADCAST, ETH_HEADER, ETHERTYPE_ARP, ETHERTYPE_IPV4, Frame,
@@ -72,6 +73,15 @@ pub struct Counters {
     pub inbox_full: u64,
     /// A frame that could not be received or answered for want of a pool buffer.
     pub no_buffer: u64,
+    /// Fragments of larger datagrams that arrived for this address.
+    pub fragments_received: u64,
+    /// Datagrams put back together from them and handled.
+    pub datagrams_reassembled: u64,
+    /// Fragments refused: a protocol that is not reassembled, more holes or bytes than a set
+    /// can hold, or every set taken by a datagram closer to being whole.
+    pub fragments_dropped: u64,
+    /// Sets given up because the fragments they were missing never came.
+    pub reassembly_timeouts: u64,
 }
 
 /// Echo replies remembered for a caller to collect.
@@ -115,6 +125,8 @@ struct State {
 
 pub struct Stack {
     pool: Pool,
+    /// Datagrams being put back together from their fragments; see [`crate::reasm`].
+    reasm: Reassembler,
     st: State,
 }
 
@@ -130,6 +142,7 @@ impl Stack {
     pub const fn with_arp(config: Config, arp: Cache) -> Stack {
         Stack {
             pool: Pool::new(),
+            reasm: Reassembler::new(),
             st: State {
                 config,
                 mac: [0; 6],
@@ -157,6 +170,10 @@ impl Stack {
                     not_for_us: 0,
                     inbox_full: 0,
                     no_buffer: 0,
+                    fragments_received: 0,
+                    datagrams_reassembled: 0,
+                    fragments_dropped: 0,
+                    reassembly_timeouts: 0,
                 },
                 ip_id: 1,
                 tcp: Tcp::new(),
@@ -175,6 +192,11 @@ impl Stack {
     /// Pool buffers held right now.
     pub fn buffers_in_use(&self) -> usize {
         self.pool.in_use()
+    }
+
+    /// Datagrams being put back together from fragments right now.
+    pub fn fragments_in_progress(&self) -> usize {
+        self.reasm.in_use()
     }
 
     /// Pool buffers taken and returned since the stack was made.
@@ -207,6 +229,9 @@ impl Stack {
     pub fn poll<N: Nic>(&mut self, nic: &N, now: u64) -> usize {
         self.st.mac = nic.mac();
         self.st.tcp.timers(now);
+        // A datagram whose missing fragments never came holds a set until its time is up.
+        let given_up = self.reasm.expire(now);
+        self.st.counters.reassembly_timeouts += given_up as u64;
         let mut handled = 0;
         while handled < FRAMES_PER_POLL {
             let Some(rx) = self.pool.take() else {
@@ -218,13 +243,23 @@ impl Stack {
             let tx = self.pool.take();
             let got = match tx.and_then(|tx| self.pool.pair(rx, tx)) {
                 Some((rx_buf, tx_buf)) => nic.recv(rx_buf).map(|len| {
-                    self.st
-                        .handle(nic, &rx_buf[..len.min(rx_buf.len())], Some(tx_buf), now)
+                    self.st.handle(
+                        nic,
+                        &rx_buf[..len.min(rx_buf.len())],
+                        Some(tx_buf),
+                        &mut self.reasm,
+                        now,
+                    )
                 }),
                 None => match self.pool.buffer(rx) {
                     Some(rx_buf) => nic.recv(rx_buf).map(|len| {
-                        self.st
-                            .handle(nic, &rx_buf[..len.min(rx_buf.len())], None, now)
+                        self.st.handle(
+                            nic,
+                            &rx_buf[..len.min(rx_buf.len())],
+                            None,
+                            &mut self.reasm,
+                            now,
+                        )
                     }),
                     None => None,
                 },
@@ -565,11 +600,17 @@ impl State {
         nic: &N,
         frame: &[u8],
         tx: Option<&mut [u8; wire::FRAME_MAX]>,
+        reasm: &mut Reassembler,
         now: u64,
     ) -> Option<Deliver> {
         self.counters.rx_frames += 1;
         let (eth, inner) = match wire::parse_frame(frame) {
             Ok(parsed) => parsed,
+            // One fragment of a larger datagram: held until the rest of it arrives.
+            Err(WireError::Fragmented) => {
+                self.fragment(nic, frame, tx, reasm, now);
+                return None;
+            }
             Err(e) => {
                 self.count_drop(frame, e);
                 return None;
@@ -627,26 +668,121 @@ impl State {
                     self.counters.not_for_us += 1;
                     return;
                 }
-                let free = self.inbox.iter_mut().find(|d| d.is_none());
-                match free {
-                    Some(slot) if udp.payload.len() <= UDP_MAX => {
-                        let mut data = [0u8; UDP_MAX];
-                        data[..udp.payload.len()].copy_from_slice(udp.payload);
-                        *slot = Some(Datagram {
-                            src_ip: ip.src,
-                            src_port: udp.src_port,
-                            dst_port: udp.dst_port,
-                            len: udp.payload.len(),
-                            data,
-                        });
-                        self.counters.udp_received += 1;
-                    }
-                    _ => self.counters.inbox_full += 1,
-                }
+                self.take_datagram(ip.src, &udp);
             }
             // Taken by `handle` before it gets here.
             Frame::Tcp(..) => {}
             Frame::OtherIpv4(_) | Frame::OtherEthernet(_) => self.counters.not_for_us += 1,
+        }
+    }
+
+    /// Keep a datagram for whoever asks for its port, or count an inbox that cannot hold it.
+    fn take_datagram(&mut self, src: Ipv4Addr, udp: &wire::Udp<'_>) {
+        let free = self.inbox.iter_mut().find(|d| d.is_none());
+        match free {
+            Some(slot) if udp.payload.len() <= UDP_MAX => {
+                let mut data = [0u8; UDP_MAX];
+                data[..udp.payload.len()].copy_from_slice(udp.payload);
+                *slot = Some(Datagram {
+                    src_ip: src,
+                    src_port: udp.src_port,
+                    dst_port: udp.dst_port,
+                    len: udp.payload.len(),
+                    data,
+                });
+                self.counters.udp_received += 1;
+            }
+            _ => self.counters.inbox_full += 1,
+        }
+    }
+
+    /// Take one fragment of a larger datagram, and handle the datagram once it is whole.
+    ///
+    /// TCP is not reassembled: a segment's payload is delivered by copying out of the pool
+    /// buffer its frame arrived in, and a reassembled datagram is not in one. Nothing this
+    /// stack talks to fragments TCP — the segment size sees to that — so a fragmented segment
+    /// is counted and dropped rather than quietly half-handled.
+    fn fragment<N: Nic>(
+        &mut self,
+        nic: &N,
+        frame: &[u8],
+        tx: Option<&mut [u8; wire::FRAME_MAX]>,
+        reasm: &mut Reassembler,
+        now: u64,
+    ) {
+        let Ok(eth) = wire::parse_ethernet(frame) else {
+            self.counters.dropped_ethernet += 1;
+            return;
+        };
+        if eth.dst != self.mac && eth.dst != BROADCAST {
+            self.counters.not_for_us += 1;
+            return;
+        }
+        let Ok((ip, Some(part))) = wire::parse_ipv4_part(eth.payload) else {
+            self.counters.dropped_ipv4 += 1;
+            return;
+        };
+        if ip.dst != self.config.ip {
+            self.counters.not_for_us += 1;
+            return;
+        }
+        self.counters.fragments_received += 1;
+        if ip.protocol == PROTO_TCP {
+            self.counters.fragments_dropped += 1;
+            self.counters.dropped_tcp += 1;
+            return;
+        }
+        match reasm.take(ip.src, ip.dst, ip.protocol, &part, ip.payload, now) {
+            Took::Held => {}
+            Took::Dropped => self.counters.fragments_dropped += 1,
+            Took::Complete(i) => {
+                if let Some(done) = reasm.datagram(i) {
+                    self.counters.datagrams_reassembled += 1;
+                    self.reassembled(nic, eth.src, done.src, done.protocol, done.payload, tx);
+                }
+                reasm.release(i);
+            }
+        }
+    }
+
+    /// A datagram that arrived in fragments, now whole: handled as one that arrived in a
+    /// single frame is.
+    fn reassembled<N: Nic>(
+        &mut self,
+        nic: &N,
+        from_mac: Mac,
+        src: Ipv4Addr,
+        protocol: u8,
+        payload: &[u8],
+        tx: Option<&mut [u8; wire::FRAME_MAX]>,
+    ) {
+        match protocol {
+            PROTO_UDP => match wire::parse_udp(payload, src, self.config.ip) {
+                Ok(udp) => self.take_datagram(src, &udp),
+                Err(_) => self.counters.dropped_udp += 1,
+            },
+            PROTO_ICMP => match wire::parse_icmp_echo(payload) {
+                Ok(echo) if echo.kind == ICMP_ECHO_REQUEST => {
+                    let Some(buf) = tx else {
+                        self.counters.no_buffer += 1;
+                        return;
+                    };
+                    let (id, seq) = (echo.id, echo.seq);
+                    let sent = self.send_ip(nic, buf, from_mac, src, PROTO_ICMP, |p| {
+                        wire::write_icmp_echo(p, ICMP_ECHO_REPLY, id, seq, echo.data)
+                    });
+                    if sent.is_ok() {
+                        self.counters.echo_replies_sent += 1;
+                    }
+                }
+                Ok(echo) => {
+                    self.counters.echo_replies_received += 1;
+                    self.replies[self.next_reply] = Some((echo.id, echo.seq, src));
+                    self.next_reply = (self.next_reply + 1) % REPLIES;
+                }
+                Err(_) => self.counters.dropped_icmp += 1,
+            },
+            _ => self.counters.not_for_us += 1,
         }
     }
 
