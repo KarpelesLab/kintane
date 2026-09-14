@@ -370,11 +370,25 @@ each return the pattern with every completion collected in the handler and none 
 
 The interrupt differs by port:
 
-- **x86_64** (`x86_64-qemu`, `x86_64-efi`, `x86_64-efistub`, `x86_64-qemu-smp`): MSI-X entry 0
-  of QEMU's virtio-blk-pci function, delivered to the boot CPU's local APIC. Discovery reports
-  `virtio-blk receives MSI-X entry 0 on line 16, vector 48`. `block irq` fails if a test run's
-  disk came up on anything else, so a fallback cannot quietly turn these checks into skips
-  ([architecture.md](architecture.md#device--the-device-framework), "PCI interrupts").
+- **x86_64** (`x86_64-qemu`, `x86_64-efi`, `x86_64-efistub`, `x86_64-qemu-smp`, `x86_64-iommu`):
+  MSI-X entry 0 of QEMU's virtio-blk-pci function, delivered to the boot CPU's local APIC.
+  Discovery reports `virtio-blk receives MSI-X entry 0 on line 16, vector 48`. On `x86_64-iommu`
+  that entry is remapped through the IOMMU, and the `remap` line below proves it.
+- **x86_64-bios**: the disk's interrupt pin. That run starts QEMU's function with `vectors=0`, so
+  it has no MSI-X table, and discovery routes INTA# through the ACPI namespace's `_PRT`
+  ([architecture.md](architecture.md#device--the-device-framework), "PCI interrupts"):
+  `AML 276 nodes, _PIC(1), 5 pins routed; ... virtio-blk receives its pin through _PRT on GSI 22,
+  level, active high, line 16`. The check reads the I/O APIC entry back and requires what the
+  route asked for: the line's vector, the boot CPU, unmasked, the trigger and the polarity. It
+  also requires the route QEMU's q35 gives a PCI pin: GSI 16 to 23, level-triggered, active high.
+
+  ```
+    block irq  line 16, INTx on GSI 22 level active high; 32 requests, 32 completions in 32 interrupts, 0 polled ok
+  ```
+
+  On x86_64, `block irq` fails if a test run's disk came up on anything else. A function with an
+  MSI-X table must be on it, and one without must be on its routed pin. So falling back to
+  polling cannot quietly turn these checks into skips.
 - **i686**: the line firmware programmed into the PCI function, 11 under QEMU's `pc`, wired
   through the 8259A.
 - **aarch64**: the slot's SPI.
@@ -484,9 +498,23 @@ restored. Every mutation fails a check, and every boot still completes:
 when it delivers a queue interrupt by MSI-X, which virtio 1.1 allows a device not to do. Only
 the host test's device, which leaves the bit clear, shows the handler dropping completions.
 
-The `vectors=0` row also shows the INTx fallback working as designed. Before the guard moved
-into `block irq`, the same mutation failed discovery itself, and the boot halted until kbuild's
-timeout instead of reporting a check.
+The `vectors=0` row predates INTx routing. Back then, a function without MSI-X fell back to its
+line and was left polled. Before the guard moved into `block irq`, the same mutation failed
+discovery itself, and the boot halted until kbuild's timeout instead of reporting a check. A
+function without an MSI-X table is now expected on its pin through `_PRT`, and that is what
+`x86_64-bios` runs. Its falsifications, each confirmed applied and then restored:
+
+| Mutation | Caught by |
+| --- | --- |
+| The route's GSI is one past the one `_PRT` gave | x86_64-bios: `block irq  line 16, INTx on GSI 23 level active high`, then the first read waits for an interrupt nothing raises, and kbuild's 60 s timeout fails the run |
+| The I/O APIC entry is programmed with the opposite polarity | `THE I/O APIC ENTRY HAS THE WRONG POLARITY` |
+| The link device's `_CRS` is decoded with the opposite polarity | `INTx on GSI 22 level active low: NOT THE ROUTE QEMU'S Q35 GIVES A PCI PIN`. The AML host tests fail too |
+| No route is kept, so the disk polls | discovery reports `0 pins routed`, and `block irq` fails with `THE DISK HAS NO MSI-X AND IS NOT ON ITS PIN THROUGH _PRT` |
+
+**Polarity is not observable in delivery on QEMU.** Its I/O APIC ignores the polarity bit, so
+an entry with the wrong one still delivers. That is why the check compares the entry with the
+route, and the route with q35's known wiring. It is also why host tests pin the AML decode
+against the captured DSDTs.
 
 ### 2c. Driver isolation
 
@@ -560,6 +588,43 @@ that is the in-grant DMA working. Then the `iommu` line requires all of:
 (`q35-iommu.bin`) and the register programming, page tables, attach and fault decode against
 models of the hardware. The live falsifications above were run by hand.
 
+**Interrupt remapping.** On the same preset the disk's MSI-X goes through the unit's interrupt
+remapping table. QEMU runs with `intel-iommu,intremap=on,eim=on`; `eim=on` because `auto`
+turns extended interrupt mode on only with an in-kernel irqchip. The `block` line reports
+`interrupts remapped, 32-bit destinations`, and `block irq` runs with the disk's message naming
+entry 0. The `remap` line gates the boot, and every other preset reports it skipped:
+
+```
+  remap      remappable MSI-X through entry 0; 32 requests, 32 completions in 32 interrupts, 0 polled; entry absent: blocked, fault 0x22 from 0x10; entry for another function: blocked, fault 0x26 from 0x10; entry to x2APIC ID 256: not taken by the boot CPU; restored; 32 requests, 32 completions in 32 interrupts, 0 polled ok
+```
+
+(The two fault fields are printed at 64-bit width.) The check requires the disk's MSI-X entry to
+hold a remappable-format message naming entry 0, remapping to be on, and the entry to be the
+disk's, for its line's vector on the boot CPU. Then, with interrupts enabled:
+
+- every read by interrupt completes;
+- with the entry absent, a read that completes by polling takes no interrupt, and the fault log
+  holds an interrupt-remapping fault from the disk for entry 0. QEMU records reason 0x22, entry
+  not present;
+- the same with the entry present but validating another function (the disk's function 1).
+  QEMU records 0x26, invalid source id;
+- with the entry delivering to x2APIC ID 256, the boot CPU takes nothing. Cut to the eight bits
+  a compatibility-format message holds, that ID is the boot CPU's 0;
+- restored, every read by interrupt completes again.
+
+| Mutation | Result |
+|---|---|
+| The disk's message names entry 1, which is absent | `block irq  line 16, MSI-X` and its first read waits for an interrupt that is blocked, so kbuild's 60 s timeout fails the run |
+| "Absent" leaves the entry present | `entry absent: THE INTERRUPT WAS DELIVERED` |
+| "Another function" writes the disk's own source id | `entry for another function: THE INTERRUPT WAS DELIVERED` |
+| Extended destinations are cut to eight bits when encoded | `entry to x2APIC ID 256: DELIVERED TO THE BOOT CPU: THE DESTINATION WAS CUT TO EIGHT BITS`, and the `vtd` host tests fail |
+
+**Not shown in a guest:** delivery to a CPU whose x2APIC ID is above 255. No preset has such a
+CPU. It would need an x2APIC topology with an IOMMU on an SMP build, and `x86_64-iommu` is
+uniprocessor. The check shows the 32-bit destination is carried whole, not truncated onto CPU 0,
+and the `vtd` host tests show it encoded. Changing an entry in use without flushing the
+interrupt entry cache works only because QEMU keeps none; see architecture.md, "PCI interrupts".
+
 ### 2d. Fuzzing
 
 Every parser that reads bytes the kernel did not write is fuzzed on the host, and so is
@@ -570,6 +635,7 @@ lists, the nightly job iterates, and the smoke run replays:
 |---|---|---|
 | `fdt` | device tree blobs | seeded: QEMU `virt` and the device model's tree, mutated |
 | `acpi` | ACPI tables | seeded: QEMU `q35` and `pc` captures, mutated, checksums repaired half the time |
+| `aml` | DSDT and SSDT bytecode, loaded and run as the kernel routes pins | seeded: QEMU `q35` and `pc` DSDTs, body mutated, checksum always repaired; `\_PIC(1)`, pin routes, and every method under a 5000-step budget |
 | `elf` | static executables | built valid, then one deliberate mistake a third of the time |
 | `module` | relocatable modules and their bundle | seeded: a module kbuild built, sometimes bundled |
 | `bootproto` | the boot protocol's tag stream | built with the crate's own `Builder`, then corrupted |
