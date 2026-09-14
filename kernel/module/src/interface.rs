@@ -168,6 +168,22 @@ macro_rules! declare_interface {
             $( pub type $name = unsafe extern "C" fn($($ty),*) $(-> $ret)?; )*
         }
 
+        $crate::interface_signatures! {
+            $( $(#[$attr])* fn $name($($arg: $ty),*) $(-> $ret)?; )*
+        }
+    };
+}
+
+/// Only the `SIGNATURES` half of [`declare_interface!`]: each function's name and interface
+/// hash, with no `extern` declaration and no function-pointer type.
+///
+/// For what records an interface without calling it: a module's import table as another
+/// build declared it. `declare_interface!` declares its functions `extern "C"`, and two
+/// declarations of one symbol with different signatures in one crate are a clash the
+/// compiler rightly warns about, since calling either would be undefined behaviour.
+#[macro_export]
+macro_rules! interface_signatures {
+    ($( $(#[$attr:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
         /// Each function's name and interface hash, in declaration order.
         pub const SIGNATURES: &[(&str, u64)] = &[
             $((
