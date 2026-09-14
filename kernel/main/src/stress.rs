@@ -888,7 +888,12 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         // And the most slices any of its waits was charged before it succeeded, against the
         // bounds that fail one: the margin the progress check really has.
         let (ran, passed) = crate::model::process_stress_slices_worst();
-        c.write_str(" us, slices ran max ");
+        // Waits that ran out with the thread charged nothing at all: no interrupt on its CPU
+        // saw it, which is the host not running that CPU rather than the scheduler starving
+        // it. Counted, not failed.
+        c.write_str(" us, none charged ");
+        write_usize(c, crate::model::process_stress_starved_elsewhere() as usize);
+        c.write_str(", slices ran max ");
         write_usize(c, ran as usize);
         c.write_str(", passed over max ");
         write_usize(c, passed as usize);

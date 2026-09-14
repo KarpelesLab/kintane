@@ -390,6 +390,18 @@ pub fn process_stress_slices_worst() -> (u64, u64) {
     (0, 0)
 }
 
+/// Waits of the process cycles that ran out with their thread charged nothing at all: no
+/// interrupt on its CPU saw it, so nothing ran there.
+#[cfg(CONFIG_USERSPACE)]
+pub fn process_stress_starved_elsewhere() -> u64 {
+    crate::procs::stress_starved_elsewhere()
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn process_stress_starved_elsewhere() -> u64 {
+    0
+}
+
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn process_stress_cycles() -> u64 {
     0
