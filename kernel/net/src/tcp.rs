@@ -1119,6 +1119,32 @@ impl Tcp {
         }
     }
 
+    /// [`recv`](Self::recv), leaving what it copies in the ring: what Linux's `MSG_PEEK`
+    /// answers with.
+    ///
+    /// Nothing is acknowledged and no window is reopened, because nothing was taken: a peek
+    /// owes the peer nothing, and the receive after it reads the same bytes again.
+    pub fn peek(&mut self, pool: &mut Pool, c: Conn, into: &mut [u8]) -> Result<usize, TcpError> {
+        let t = self.get_mut(c)?;
+        let n = into.len().min(t.rx.len);
+        if n > 0 {
+            let ring = pool.buffer(t.rx.buf).ok_or(TcpError::BadConnection)?;
+            ring_read(ring, t.rx.head, &mut into[..n]);
+            return Ok(n);
+        }
+        if into.is_empty() || t.peer_fin {
+            return Ok(0);
+        }
+        if let Some(e) = t.error {
+            return Err(e);
+        }
+        match t.state {
+            State::Listen => Err(TcpError::WrongState),
+            State::Closed | State::TimeWait => Ok(0),
+            _ => Err(TcpError::WouldBlock),
+        }
+    }
+
     /// Close this end for sending: a FIN follows whatever is still in the send ring. Reading
     /// goes on until the peer closes too.
     pub fn shutdown(&mut self, c: Conn) -> Result<(), TcpError> {

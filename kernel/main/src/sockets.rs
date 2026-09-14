@@ -379,6 +379,16 @@ pub fn recv(conn: Conn, into: &mut [u8]) -> Result<Option<usize>, Error> {
     }
 }
 
+/// Read what has arrived into `into` without taking it: `Some(0)` at the end of the stream,
+/// `None` while nothing has arrived. The receive after a peek reads the same bytes.
+pub fn peek(conn: Conn, into: &mut [u8]) -> Result<Option<usize>, Error> {
+    match stack(|s, _, _| s.tcp_peek(conn, into))? {
+        Ok(n) => Ok(Some(n)),
+        Err(TcpError::WouldBlock) => Ok(None),
+        Err(e) => Err(error(e)),
+    }
+}
+
 /// Queue a FIN after what is queued.
 pub fn shutdown(conn: Conn) -> Result<(), Error> {
     let done = stack(|s, card, t| s.tcp_shutdown(card, conn, t))?.map_err(error);
@@ -670,6 +680,23 @@ pub fn datagram_recv(id: ObjectId, into: &mut [u8]) -> Result<Option<(u64, usize
                 _ => return Some((from, copied, whole)),
             }
         }
+    })
+}
+
+/// [`datagram_recv`], leaving the datagram in the inbox: what `MSG_PEEK` answers with.
+///
+/// A connected socket peeks only at datagrams from the address it connected to, which is the
+/// one its next receive would take; an unconnected one peeks at the oldest for its port.
+pub fn datagram_peek(id: ObjectId, into: &mut [u8]) -> Result<Option<(u64, usize, usize)>, Error> {
+    let (port, peer) = datagram_state(id)?;
+    if port == 0 {
+        return Ok(None);
+    }
+    crate::net::drain_probes();
+    let from = peer.map(|p| (abi::socket::ip(p), abi::socket::port(p)));
+    stack(|s, _, _| {
+        let (ip, src, copied, whole) = s.udp_peek_from(port, from, into)?;
+        Some((abi::socket::address(ip, src), copied, whole))
     })
 }
 
