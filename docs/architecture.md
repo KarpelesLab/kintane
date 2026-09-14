@@ -157,9 +157,30 @@ guard of a quarter of each slot rather than a page, because a microcontroller ca
 256 KiB on stacks. Threads take their stacks from `arch::kspace::claim_thread_stack`,
 which records who each slot is for, so an overflow report names the thread. Without this, a
 thread that overflowed wrote into the stack of the thread whose slot was below, which
-corrupts a suspended thread and fails later, somewhere else. The slot size is a power of
+corrupts a suspended thread and fails later, somewhere else. The scheduler's `spawn` refuses a
+slot whose last thread is still in the thread table, exited or not, until it has been reaped:
+two live threads on one stack overwrite each other's frames, and before that refusal a boot
+check that went on after a thread failed to exit did exactly that, faulting at rip 0x5. The slot size is a power of
 two for a reason: aarch64's exception entry has to decide whether a frame would land in
 *some* guard page with two scratch registers and no stack, and a mask is the test that fits.
+
+**The boot stack.** Every port's `link.ld` reserves `BOOT_STACK_KIB` for the stack the first
+thread of execution runs on, rounded up to a page where the port has pages, directly above its
+guard page, and asserts the size; `hal::ImageSections::boot_stack` describes it. Until the ninth
+round only ARMv7-M did: x86_64, aarch64, i686 and riscv32 reserved a fixed 16 KiB in their boot
+assembly, so a configuration asking for more got a stack of the old size. A script that forgot
+the option would forget its assertion too, so kbuild also checks every linked kernel from
+outside (`kbuild/src/bootstack.rs`): `__stack_bottom` and `__stack_top` must be the configured
+size apart, or the build is refused.
+
+A guard page catches a boot that runs out of stack, not one that nearly does. So `kmain` paints
+the stack below its own frame with a known byte before anything else runs, and after the
+banner's checks and the in-kernel suite the `bootstack` line reports the lowest byte that no
+longer holds it (`kernel/main/src/bootstack.rs`). More than 75% of the stack fails the boot.
+First measured: x86_64-qemu 65% of 16 KiB, x86_64-isolated 55% of 32 KiB, i686-qemu 55%,
+aarch64-virt 48%, riscv32 and ARMv7-M 37%, and armv7m-tiny 77% of its 12 KiB, which is why that
+preset now has 14. It is a high-water mark, so a lower bound: a path the boot did not take, or a
+frame reserved and never written, is not seen.
 
 **What a stack overflow does now.** On every port, an overflow of the boot stack or of a
 thread stack faults on that stack's guard page and is reported by name:

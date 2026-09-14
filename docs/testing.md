@@ -86,6 +86,33 @@ memory the loader described can be read and written. Anything that does not need
 hardware belongs in level 1, which is faster and far easier to debug. Page table
 manipulation and context switching join this level when they exist.
 
+### The boot stack: its size and how deep the boot goes
+
+Every boot prints a `bootstack` line and gates on it:
+
+```
+  bootstack  deepest 10688 of 16384 bytes (65%, limit 75%) ok
+```
+
+`kmain` paints the boot stack below its own frame before anything else runs, and after the
+banner's checks and the in-kernel suite the line reports the lowest byte that no longer holds
+the paint. More than 75% fails the boot while there is still room to act. The first boots
+measured x86_64-qemu at 65% of 16 KiB, x86_64-isolated at 55% of 32 KiB, i686-qemu 55%,
+aarch64-virt 48%, riscv32-virt, riscv32i-virt and armv7m-mps2 37%, and armv7m-tiny at 77% of its
+12 KiB, which failed and now has 14 (66%).
+
+The size is checked twice. Each port's linker script asserts that `__stack_bottom` to
+`__stack_top` is `BOOT_STACK_KIB` rounded up to a page, and kbuild refuses any linked kernel
+where it is not, whatever its script says (`kbuild/src/bootstack.rs`, with host tests). The
+default of 16 KiB cannot tell a port that honours the option from one that hard-codes 16 KiB,
+so CI also builds every preset with `BOOT_STACK_KIB=20`.
+
+| Mutation | What happened |
+|---|---|
+| aarch64's boot assembly and script back to the fixed 16 KiB, built with `BOOT_STACK_KIB=32` | kbuild refuses the image: `the kernel image reserves a 16384-byte boot stack (0x40323000..0x40327000), but BOOT_STACK_KIB asks for 32768 bytes` |
+| aarch64's script reserves a fixed `16K` but keeps its assertion, built with 32 | the link fails: `the boot stack is not BOOT_STACK_KIB, rounded up to a page` |
+| A 12 KiB array written on the boot stack just before the line, on `x86_64-qemu` | `deepest 14272 of 16384 bytes (87%, limit 75%) TOO DEEP`, and the boot fails |
+
 ### Expected faults: the stack guard test
 
 Some properties are only visible as a fault: "the guard page is unmapped" is a fact about
@@ -1376,10 +1403,85 @@ With only other agents' work loading the host, the old window also failed 2 runs
   time, and what they check;
 - `waits`' 10 s and 5 s patience, `procs::wait_exit`'s 1 s drain in the boot check, and
   `PARK_WITHIN`'s 3 s: generous bounds on something that normally takes milliseconds;
-- the boot `preempt` check, which requires 12 interrupts in 300 ms and a 20 ms wake-up.
-  Under the same load it failed bring-up in 4 of 15 runs, with 7 to 11 interrupts and wakes
-  45.7 to 56.2 ms late. It checks interrupt delivery and latency, which are wall-clock
-  properties, so it was not changed. It is now the check a loaded host breaks first.
+- none in the boot `preempt` check any more; see below.
+
+**The boot `preempt` check is judged in interrupts and slices too.** It used to require 12
+interrupts in its 300 ms window and `high` awake within 20 ms of its deadline, and under the
+load above it failed bring-up in 4 of 15 runs with 7 to 11 interrupts and wakes 45.7 to 56.2 ms
+late. Neither number is the kernel's to answer for: a host that stalls the emulator moves the
+guest's clock on without delivering the interrupts that time would have held. What the kernel
+does with each interrupt is its own, so the check now requires:
+
+- **slices:** every boot-CPU interrupt that found the workers contending armed the next no more
+  than a slice away, as `timekeeping::program` reports it, with at least two such interrupts.
+  That is what the interrupt count stood for: on x86 the PIT's 55 ms reach hides a missing slice
+  from the tickless bound;
+- **the wake-up:** the interrupt before the one that woke `high` came before its deadline, so no
+  interrupt after the deadline passed `high` over, and `high` ran inside the interrupt that
+  woke it, before the next. Its lateness is still printed in microseconds.
+
+And boot no longer trusts a window. It stops the workers once their 250 ms have passed *and*
+`high` has woken, and waits for every thread to finish a slice at a time, both bounded by 5 s of
+guest time. The loaded runs below showed the fixed window failing a boot outright, too:
+a stall at the start carried the guest clock past 250 ms before the workers had run at all, so
+boot stopped them unrun (`NOT INTERLEAVED`, 0 spins) and idle waited more often than the window
+counted interrupts (`DID NOT HALT`). Calibration keeps the fastest of four single slices, since
+a stall only ever removes spins from one.
+
+Old and new boots alternated beside six busy QEMU guests (the stress kernel on four vCPUs each,
+restarted before every boot when one had stopped, since that kernel ends on a failed audit under
+this load), booted directly under QEMU and stopped once the `preempt` block was out. The host has
+16 cores; its load average, with other work on it too, was 22 to 33 throughout:
+
+| Check | x86_64-qemu failed | aarch64-virt failed |
+|---|---|---|
+| old | 1 of 10: 11 interrupts, `NOT INTERLEAVED`, `DID NOT HALT` (the window) | 3 of 10: woken 37.2, 37.2 and 82.3 ms late |
+| new | 0 of 10 | 0 of 10 |
+
+Three of the new boots measured what the old check would have failed: x86_64 woken 25.8 ms late,
+and once 6 interrupts in 302 ms with a 78.1 ms wake; aarch64 woken 21.9 ms late. Each ran `high`
+inside the interrupt that woke it, with no interrupt after its deadline passing it over, and
+armed a slice on every contended interrupt. A first attempt at this load was discarded: its
+guests stopped on their own audits one by one, so the load it reported was not the load it had.
+
+What the reworked check still catches, each mutation confirmed applied and booted on
+`x86_64-qemu`:
+
+| Mutation | Result |
+|---|---|
+| Preemption disabled: the tick never reschedules | `NOT INTERLEAVED`, `DID NOT HALT`, `high` `NOT IN THE INTERRUPT THAT WOKE IT`, `AFTER THE WORKERS FINISHED` |
+| The tick wakes every sleeper but `high` | `NEVER WOKE`, after the 5 s bound rather than a hang |
+| Idle enables interrupts and loops instead of halting | `idle waited 17543 times BUT DID NOT HALT UNTIL AN INTERRUPT` |
+| A contended interrupt arms no slice | `0 of 3 contended interrupts armed a slice`; the tickless bound fails too (19 slices' worth) on this LAPIC-timed preset |
+| Timers popped a slice late | `AN INTERRUPT AFTER ITS DEADLINE PASSED IT OVER` |
+| `high` no more urgent than the workers | `HIGH DID NOT RUN FIRST`, `NOT IN THE INTERRUPT THAT WOKE IT` |
+| The local APIC timer's EOI sent after the hook | `A THREAD STOPPED RECEIVING INTERRUPTS` (50 slices' worth), `AFTER THE WORKERS FINISHED` |
+
+**A real bug the window hid: two threads on one stack.** Under load the old check sometimes
+went on to fault. Another branch saw `thread table INCONSISTENT` and then a fault at rip 0x5,
+and 3 of the 60 loaded boots of the old check above did the same (none of the 60 of the new
+one, before or after the fix). The sequence:
+
+1. The fixed window ended before a worker or `high` had exited.
+2. `reap` refused that thread, which the report called an inconsistent table.
+3. `shared::run` went on anyway. Its sleep phase spawns on stack slots 1 to 3, which belonged
+   to the workers and `high`, and nothing checked that a slot's previous thread was gone.
+4. The worker resumed on frames the sleeper had written, and returned to whatever address
+   was there.
+
+Base 8bfa611 reproduces it without any load when boot wakes the moment it stops the workers
+(`BOOT_WAKES_AFTER` = `WORKERS_STOP_AFTER`): `thread table INCONSISTENT`, then `#PF` with rip
+equal to cr2. The check now waits until its threads have exited, not for a flag each sets on
+the way out, which a thread preempted between the two has set without being reapable. A thread
+not given back fails the check as `A THREAD HAD NOT EXITED`, and the shared checks do not run
+on its stack. Under all of that, `spawn` and `spawn_prepared` refuse a stack slot whose last
+thread is still in the table, so no other caller can repeat it.
+
+| Mutation, with boot reaping before its threads can exit | Result |
+|---|---|
+| Nothing else | `A THREAD HAD NOT EXITED`, `shared not run: a scheduler thread's stack is still in use`; no fault |
+| The shared checks run anyway | `kheap mt spawn refused`, `processes could not start the workers`, and the rest fail; no fault |
+| The shared checks run, and `spawn` no longer refuses a slot in use | `#PF` at rip `0x0000000000000005`: the fault the other branch saw |
 
 **What the slice check was shown to catch**, each mutation in a 20-second run on
 `x86_64-qemu` unless named:
