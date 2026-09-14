@@ -24,6 +24,14 @@ use crate::preempt::{begin, sleep_until};
 const TIMEOUT_NS: u64 = 1_000_000_000;
 const TRIES: u32 = 3;
 
+/// The pause between polls while a reply is awaited, and between one round of exchanges and
+/// the next. Paced, because this thread wakes several times for every exchange where the
+/// disk workloads wake once an iteration: at one millisecond each, on a single CPU it took
+/// enough of the CPU from the user process below it that the process made no progress in
+/// its 80 ms window, on x86_64-qemu and aarch64-virt both.
+const POLL_MS: u64 = 2;
+const ROUND_MS: u64 = 10;
+
 static PINGS: AtomicU64 = AtomicU64::new(0);
 static ROUNDS: AtomicU64 = AtomicU64::new(0);
 static RETRIES: AtomicU64 = AtomicU64::new(0);
@@ -64,7 +72,7 @@ fn now() -> u64 {
 }
 
 fn nap() {
-    sleep_until(after_ms(1));
+    sleep_until(after_ms(POLL_MS));
 }
 
 pub extern "C" fn worker(_: usize) -> ! {
@@ -101,7 +109,7 @@ pub extern "C" fn worker(_: usize) -> ! {
         }
 
         progress(w);
-        sleep_until(after_ms(1));
+        sleep_until(after_ms(ROUND_MS));
     }
 }
 
