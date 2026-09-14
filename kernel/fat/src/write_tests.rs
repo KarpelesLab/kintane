@@ -316,25 +316,26 @@ fn a_rename_keeps_the_bytes_and_replacing_frees_the_old_file() {
 }
 
 #[test]
-fn names_that_are_not_eight_three_are_refused() {
+fn a_name_is_stored_long_or_short_and_an_unwritable_one_is_refused() {
     let disk = Disk::new(format());
     with_volume(&disk, 8, |fat| {
         let root = fat.root();
-        for bad in [
-            &b"toolongname.txt"[..],
-            b"a.long",
-            b".hidden",
-            b"a b",
-            b"a.b.c",
-            b"x.",
-            b".",
-        ] {
+        // Names a short entry cannot hold are kept in long entries, whatever it is about them
+        // that does not fit: length, a second dot, a space, a leading dot.
+        for long in [&b"toolongname.txt"[..], b"a.long", b".hidden", b"a b", b"a.b.c"] {
+            let node = fat.create(root, long, Kind::File).unwrap();
+            assert_eq!(fat.lookup(root, long).unwrap(), node, "{long:?} is found by its name");
+        }
+        // What no name may be: the directory's own entries, and a name ending in a dot or a
+        // space, which every reader strips and would bring back as a different name.
+        for bad in [&b"x."[..], b".", b"..", b"trailing space "] {
             assert_eq!(fat.create(root, bad, Kind::File), Err(Error::BadPath), "{bad:?}");
         }
+        // A short name is still a short name, with the case it was written in recorded.
         let node = fat.create(root, b"lower.txt", Kind::File).unwrap();
-        assert_eq!(fat.lookup(root, b"LOWER.TXT").unwrap(), node);
-        let entry = fat.readdir(root, 0).unwrap().unwrap();
-        assert_eq!(entry.name(), b"LOWER.TXT", "stored as FAT stores a short name");
+        assert_eq!(fat.lookup(root, b"LOWER.TXT").unwrap(), node, "matched without case");
+        let entry = fat.readdir(root, 5).unwrap().unwrap();
+        assert_eq!(entry.name(), b"lower.txt", "the case it was written in comes back");
         assert_eq!(fat.create(root, b"LOWER.txt", Kind::File), Err(Error::Exists));
     });
 }
