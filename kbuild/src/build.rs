@@ -443,6 +443,7 @@ fn dep_order(unit: &Unit, deps: &BTreeMap<String, Built>) -> Vec<String> {
 /// Where each image built for the ESP goes, by unit name.
 const ESP_IMAGES: &[(&str, &str)] = &[
     ("kinboot_efi", "EFI/BOOT/BOOTX64.EFI"),
+    ("kinboot_stub", "EFI/BOOT/BOOTX64.EFI"),
     ("kinboot_efi_chaintest", "EFI/KINTANE/CHAIN.EFI"),
 ];
 
@@ -471,8 +472,10 @@ impl Build {
         linked: &Path,
         images: &[(String, PathBuf)],
         entries: &str,
+        command_line: &str,
+        reset_on_failure: bool,
     ) -> Result<PathBuf, String> {
-        if format != "efi-esp"
+        if !matches!(format, "efi-esp" | "efi-stub")
             && let Some((name, _)) = images.first()
         {
             return Err(format!(
@@ -481,6 +484,9 @@ impl Build {
         }
         let (flags, dest): (&[&str], PathBuf) = match format {
             "efi-esp" => return self.package_esp(linked, images, entries),
+            "efi-stub" => {
+                return self.package_efi_stub(linked, images, command_line, reset_on_failure);
+            }
             "" | "elf" => (&["--strip-all"], linked.with_extension("img.elf")),
             "multiboot-elf32" => {
                 (&["--strip-all", "-O", "elf32-i386"], linked.with_extension("mb32.elf"))
@@ -499,6 +505,72 @@ impl Build {
     ///
     /// The ELF64 rather than the ELF32 the multiboot path needs: kinboot-efi reads 64-bit
     /// program headers and enters in long mode.
+    /// The EFI stub: one application on the partition, with the kernel inside it.
+    ///
+    /// The stub is linked knowing nothing about the kernel, which does not exist yet when
+    /// it is built and is stamped with its build ID after it does. So the kernel and the
+    /// command line are added here, as sections of the stub's own PE, and where they
+    /// landed is written into the descriptor the stub declares. The firmware loads every
+    /// section it is told about, so both arrive in memory with the stub and it needs no
+    /// filesystem to find them.
+    fn package_efi_stub(
+        &self,
+        linked: &Path,
+        images: &[(String, PathBuf)],
+        command_line: &str,
+        reset_on_failure: bool,
+    ) -> Result<PathBuf, String> {
+        let (_, stub) = images
+            .iter()
+            .find(|(name, _)| name == "kinboot_stub")
+            .ok_or("the efi-stub image format needs kinboot_stub, and it is not enabled")?;
+        if let Some((name, _)) = images.iter().find(|(name, _)| name != "kinboot_stub") {
+            return Err(format!("`{name}` was built, but an EFI stub image carries only the stub"));
+        }
+        // The stripped ELF64, as kinboot-efi would have read from the partition: the
+        // handover is the same code, so it wants the same bytes.
+        let kernel = linked.with_extension("img.elf");
+        self.objcopy(&["--strip-all"], linked, &kernel)
+            .map_err(|e| format!("stripping the kernel failed:\n{e}"))?;
+        let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+        let kernel_bytes = read(&kernel)?;
+
+        let stub_bytes = read(stub)?;
+        let (image, kernel_at) =
+            crate::pe::add_section(&stub_bytes, ".kernel", &kernel_bytes, crate::pe::DATA_SECTION)?;
+        // `.cmdline` is where a unified kernel image carries its arguments, and this is
+        // one: a single PE holding the kernel and the line it is booted with.
+        let (mut image, cmdline_at) = crate::pe::add_section(
+            &image,
+            ".cmdline",
+            command_line.as_bytes(),
+            crate::pe::DATA_SECTION,
+        )?;
+        crate::pe::stamp(
+            &mut image,
+            crate::pe::KERNEL_BLOB_MARKER,
+            &[
+                u64::from(kernel_at),
+                kernel_bytes.len() as u64,
+                u64::from(cmdline_at),
+                command_line.len() as u64,
+                u64::from(reset_on_failure),
+            ],
+        )?;
+
+        // The application on its own, beside the disk, for firmware that is given a file
+        // rather than a disk and for `kbuild image`.
+        let efi = linked.with_extension("efi");
+        std::fs::write(&efi, &image).map_err(|e| format!("{}: {e}", efi.display()))?;
+        let disk = crate::esp::disk_image(&[crate::esp::File {
+            path: "EFI/BOOT/BOOTX64.EFI",
+            data: &image,
+        }])?;
+        let dest = linked.with_extension("esp.img");
+        std::fs::write(&dest, disk).map_err(|e| format!("{}: {e}", dest.display()))?;
+        Ok(dest)
+    }
+
     fn package_esp(
         &self,
         linked: &Path,

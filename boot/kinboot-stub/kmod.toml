@@ -1,0 +1,18 @@
+# The EFI stub: the kernel as its own UEFI application.
+#
+# Built like `kinboot-efi`, for a target built into rustc, and then finished by kbuild:
+# `kbuild/src/pe.rs` adds the kernel and the command line to this image as sections and
+# stamps where they landed into the descriptor `src/main.rs` declares. So the file the
+# firmware starts is the kernel, with no loader beside it on the partition.
+[unit]
+name = "kinboot_stub"
+kind = "bin"
+root = "src/main.rs"
+layer = "loader"
+target = "x86_64-unknown-uefi"
+
+[deps]
+units = ["boot_protocol", "uefi"]
+
+[config]
+requires = "KINBOOT_STUB"

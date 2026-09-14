@@ -35,7 +35,7 @@ use crate::toolchain::Toolchain;
 
 #[allow(dead_code)] // the loader uses parts of the layout the writer does not
 #[path = "../../boot/kinboot-bios/src/disk.rs"]
-mod disk;
+pub(crate) mod disk;
 
 /// The configuration symbol that selects this boot path.
 pub const SYMBOL: &str = "KINBOOT_BIOS";

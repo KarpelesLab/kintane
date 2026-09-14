@@ -13,7 +13,7 @@ layer = "loader"
 target = "x86_64-unknown-uefi"
 
 [deps]
-units = ["boot_protocol", "cmdline", "kinboot-menu"]
+units = ["boot_protocol", "cmdline", "kinboot-menu", "uefi"]
 
 [config]
 requires = "KINBOOT_EFI"

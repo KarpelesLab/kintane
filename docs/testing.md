@@ -551,6 +551,7 @@ hand:
 | Target | Emulator | Machine | Firmware | Result channel |
 |---|---|---|---|---|
 | x86_64 (UEFI) | `qemu-system-x86_64` | `q35` | OVMF, booting `kinboot-efi` from the image's ESP | `isa-debug-exit` |
+| x86_64 (`x86_64-efistub`) | `qemu-system-x86_64` | `q35` | OVMF, booting the kernel itself: the EFI stub | `isa-debug-exit` |
 | x86_64 (`x86_64-qemu`) | `qemu-system-x86_64` | `q35` | `-kernel` | `isa-debug-exit` |
 | x86_64 (`x86_64-bios`) | `qemu-system-x86_64` | `q35`, raw disk | SeaBIOS, `kinboot-bios` | `isa-debug-exit` |
 | i686 (`i686-qemu`) | `qemu-system-i386` | `pc` (i440FX) | `-kernel` | `isa-debug-exit` |

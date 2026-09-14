@@ -268,10 +268,26 @@ config KINBOOT_EFI
         loader, its boot entries and the kernel, and QEMU boots it under
         OVMF rather than with -kernel. See docs/bootloader.md.
 
+config KINBOOT_STUB
+    bool "Boot the kernel as its own UEFI application (the EFI stub)"
+    depends on ARCH_X86_64 && !KINBOOT_EFI
+    select BOOT_KINBOOT
+    default n
+    help
+        Emit the kernel as a PE/COFF EFI application with the handover in
+        front of it, so firmware starts one file and there is no loader
+        beside it on the partition. kbuild adds the kernel and the command
+        line to that image as sections after both are linked; see
+        docs/bootloader.md.
+
+        Not with KINBOOT_EFI: a build produces one bootable arrangement, and
+        the two answer the same question differently.
+
 config IMAGE_FORMAT
     string
     readonly
     default "efi-esp" if KINBOOT_EFI
+    default "efi-stub" if KINBOOT_STUB
     default "multiboot-elf32" if ARCH_X86_64
     default "elf"
     # i686 links as ELF32 already, so the multiboot container needs no rewrite.
@@ -280,7 +296,9 @@ config IMAGE_FORMAT
         QEMU's multiboot loader refuses an ELF64 container, so on x86_64 the
         image is rewritten to ELF32 after linking. The 64-bit code is untouched
         and the ELF64 is kept as the debug artifact. `efi-esp` is a disk image
-        whose EFI system partition holds kinboot-efi and the stripped ELF64.
+        whose EFI system partition holds kinboot-efi and the stripped ELF64;
+        `efi-stub` is one whose partition holds a single application, the
+        kernel carried inside the stub.
 
 config KINBOOT_BIOS
     bool "Boot from a BIOS disk through kinboot-bios"

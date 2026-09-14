@@ -321,7 +321,8 @@ kbuild randconfig-build --count K --seed S  build sampled configurations, report
 kbuild randconfig-build --allyes|--allno  build every preset's boundary configuration
 kbuild build [--target T]                 build the kernel image
 kbuild modules [--preset P]               build the kernel, its modules, and the bundle
-kbuild image [--format elf|bin|uki|uimage]  package a bootable artifact
+kbuild image --format elf|bin|uki|uimage  build, then write the image in that format
+kbuild release --preset P                build, then gather one configuration's deliverables
 kbuild symbols                            extract the separate debug-symbol bundle
 kbuild symbolize [--preset P] [log]       decode a guest backtrace against the symbol bundle
 kbuild run [--machine M]                  boot the image under QEMU
@@ -477,6 +478,10 @@ The release packaging above is ahead of the code. What `kbuild build` writes to
   `build/x86_64-kintane/x86_64-unknown-uefi/kinboot_efi.efi` — `KINTANE/BOOT.CFG`, the boot
   entries, and `KINTANE/KERNEL.ELF`, the stripped ELF64. The ELF64 rather than the ELF32:
   the loader enters in long mode. With `CHAIN_TEST` it also holds `EFI/KINTANE/CHAIN.EFI`.
+- With `KINBOOT_STUB` (the `x86_64-efistub` preset): `kintane.efi`, the EFI stub, whose
+  `.kernel` and `.cmdline` sections carry the stripped ELF64 and the command line, and
+  `kintane.esp.img`, a disk whose partition holds nothing but that file as
+  `EFI/BOOT/BOOTX64.EFI`. See [bootloader.md](bootloader.md#as-built-the-efi-stub).
 
 - With `MODULES` and at least one module unit at `m`: `modules/<name>.kmod`, one
   relocatable object per module, and `modules.kmb`, the bundle that carries them. A
@@ -490,6 +495,47 @@ default entry's command line through `-append` instead. The entry format belongs
 `boot/kinboot-menu`. kbuild cannot link that crate, so the writer and the parser are held
 together by two files in `boot/kinboot-menu/testdata`: kbuild's tests require it to write
 exactly those bytes, and the crate's tests require its parser to read them as meant.
+
+### Image formats and releases
+
+`kbuild build` packages the image the configuration's own boot path needs. `kbuild image
+--format` writes the same linked kernel in another shape, without changing the
+configuration (`kbuild/src/image.rs`):
+
+| Format | What it is | Booted |
+|---|---|---|
+| `elf` | the stripped ELF, for anything that loads ELF | yes: it is the file aarch64's boot step starts with `-kernel` |
+| `bin` | a flat binary from the lowest load address, for execute-in-place | yes: ARMv7-M starts it with nothing but QEMU's raw loader |
+| `uki` | the EFI stub's PE, which already carries `.kernel` and `.cmdline`; needs `KINBOOT_STUB` | yes: byte for byte the image the `x86_64-efistub` preset boots |
+| `uimage` | a U-Boot legacy header in front of `bin` | no: nothing here runs U-Boot |
+
+A uImage's header is checked, not proven. Its tests show the layout is the documented one
+and that both CRCs recompute, which is self-consistency. They cannot show that U-Boot
+accepts it: neither `mkimage` nor U-Boot is part of the pinned toolchain. The header marks
+the image a standalone application (`IH_TYPE_STANDALONE`, `IH_OS_U_BOOT`), which U-Boot
+copies to the load address and jumps to, handing over nothing. That is what a KinTane image
+on a board with no KinTane loader expects, since its boot information is built into it. It
+is also the first thing to check against a real board.
+
+`bin` refuses an image whose segments are more than 256 MiB apart, because `objcopy -O
+binary` fills the gap between them with zeros.
+
+`kbuild release --preset P` gathers one configuration's deliverables into
+`build/release/<preset>/` (`kbuild/src/release.rs`):
+
+```text
+image/<file>          the bootable image, as the configuration packages it
+symbols/kintane.debug the symbol bundle `kbuild symbolize` reads
+config                the resolved configuration
+modules/              the loadable modules and their bundle, when there are any
+sdk/                  the module SDK, when there are modules
+MANIFEST              the build ID, the toolchain, and a SHA-256 of every file above
+```
+
+The manifest holds nothing that varies between two builds of one commit: no clock and no
+host path, with files listed by their path inside the release, in sorted order, in the
+layout `shasum -c` reads. CI builds a release twice from scratch and requires identical
+manifests, and a difference is reported by `diff`, which names the file.
 
 ### The build ID
 

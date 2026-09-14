@@ -228,6 +228,26 @@ jobs:
           done
           exit $fail
 
+      # Every format `kbuild image` writes comes from the same linked kernel, and the ones a
+      # machine here can start are started: the flat binary runs on ARMv7-M with nothing but
+      # QEMU's raw loader, and a UKI is byte for byte the EFI stub image the boot step above
+      # already booted. A uImage is written and its size checked; no U-Boot runs here, and
+      # nothing claims one started it.
+      - name: Image formats are packaged, and booted where a machine can boot them
+        run: |
+          set -euo pipefail
+          ./kbuild/target/release/kbuild image --preset aarch64-virt --format elf
+          ./kbuild/target/release/kbuild image --preset armv7m-mps2 --format bin
+          timeout 120 qemu-system-arm -machine mps2-an385 \
+            -kernel build/armv7m-kintane/out/kintane.bin \
+            -semihosting-config enable=on,target=native \
+            -serial stdio -display none -no-reboot | tee "$RUNNER_TEMP/bin-boot.log"
+          grep -q "reached kmain" "$RUNNER_TEMP/bin-boot.log"
+          ./kbuild/target/release/kbuild image --preset armv7m-mps2 --format uimage
+          bin=$(stat -c %s build/armv7m-kintane/out/kintane.bin)
+          test "$(stat -c %s build/armv7m-kintane/out/kintane.uimage)" -eq "$((bin + 64))"
+          ./kbuild/target/release/kbuild image --preset x86_64-efistub --format uki
+          cmp build/x86_64-kintane/out/kintane.uki.efi build/x86_64-kintane/out/kintane.efi
       - name: In-kernel tests on every preset
         run: |
           set -euo pipefail
@@ -538,6 +558,37 @@ jobs:
           echo "second: $b"
           if [ "$a" != "$b" ]; then
             echo "::error title=not reproducible::the same source produced a different ESP image"
+            exit 1
+          fi
+      # The EFI stub edits a linked PE after the fact: sections appended, a descriptor
+      # stamped. Anything of that taken from state that varies between builds shows here.
+      - name: Build the EFI stub image twice from scratch and compare
+        run: |
+          set -euo pipefail
+          rm -rf build
+          ./kbuild/target/release/kbuild build --preset x86_64-efistub
+          a=$(sha256sum build/x86_64-kintane/out/kintane.esp.img | cut -d' ' -f1)
+          rm -rf build
+          ./kbuild/target/release/kbuild build --preset x86_64-efistub
+          b=$(sha256sum build/x86_64-kintane/out/kintane.esp.img | cut -d' ' -f1)
+          echo "first:  $a"
+          echo "second: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error title=not reproducible::the same source produced a different EFI stub image"
+            exit 1
+          fi
+      # A release is only worth its manifest if two builds of one commit write the same
+      # one. The diff names every file that differs, not only that something did.
+      - name: Build a release twice from scratch and compare manifests
+        run: |
+          set -euo pipefail
+          rm -rf build
+          ./kbuild/target/release/kbuild release --preset x86_64-efistub
+          cp build/release/x86_64-efistub/MANIFEST "$RUNNER_TEMP/MANIFEST.first"
+          rm -rf build
+          ./kbuild/target/release/kbuild release --preset x86_64-efistub
+          if ! diff -u "$RUNNER_TEMP/MANIFEST.first" build/release/x86_64-efistub/MANIFEST; then
+            echo "::error title=not reproducible::two builds of this commit produced different release manifests"
             exit 1
           fi
       - name: Build the BIOS disk image twice from scratch and compare

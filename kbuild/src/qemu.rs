@@ -50,10 +50,11 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
         }
     };
 
-    if res.is_on("ARCH_X86_64") && res.is_on("KINBOOT_EFI") {
-        // The firmware path: OVMF boots the disk image's EFI system partition, which
-        // starts kinboot-efi, which starts the kernel. No -kernel: QEMU's own loader is
-        // exactly what this configuration exists to not use.
+    if res.is_on("ARCH_X86_64") && (res.is_on("KINBOOT_EFI") || res.is_on("KINBOOT_STUB")) {
+        // The firmware path: OVMF boots the disk image's EFI system partition. With
+        // KINBOOT_EFI that starts kinboot-efi, which starts the kernel; with KINBOOT_STUB
+        // the application it starts is the kernel. No -kernel either way: QEMU's own
+        // loader is exactly what these configurations exist to not use.
         let fw = uefi_firmware(log.parent().unwrap_or(Path::new(".")))?;
         let mut args = vec![
             s("-machine"),
