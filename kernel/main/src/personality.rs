@@ -202,7 +202,7 @@ fn locked<R>(
 // ---- the namespace ----------------------------------------------------------------------
 
 /// The namespace Linux processes open files in.
-type Namespace = Vfs<'static, 1, 4>;
+type Namespace = Vfs<'static, 2, 4>;
 
 /// The namespace, while a check runs Linux processes in it; null otherwise.
 ///
@@ -1811,7 +1811,12 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
         unsafe { core::slice::from_raw_parts_mut(virt.raw() as *mut u8, len) };
 
     let mut ns: Namespace = Vfs::new();
-    let (ok, kept) = match ns.mount("/", volume) {
+    let mounted = ns.mount("/", volume);
+    // SAFETY: as for `volume`: the boot path, before any other thread holds the volumes.
+    if let Some(second) = unsafe { crate::fs::volume32() } {
+        let _ = ns.mount(crate::fileserver::FAT32_AT, second);
+    }
+    let (ok, kept) = match mounted {
         Ok(()) => run_hello(c, frames, &mut ns, buf),
         Err(_) => {
             c.write_str("MOUNTING THE VOLUME FAILED");
@@ -2011,6 +2016,12 @@ fn run_mode(argv: &'static [&'static [u8]]) -> Result<Run, (Check, &'static str)
     let mut ns: Namespace = Vfs::new();
     if ns.mount("/", volume).is_err() {
         return Err((Check::Failed, "MOUNTING THE VOLUME FAILED"));
+    }
+    // The second volume below the first, so a Linux program can read it and can meet the
+    // refusal a rename across two filesystems gets.
+    // SAFETY: as for `volume`.
+    if let Some(second) = unsafe { crate::fs::volume32() } {
+        let _ = ns.mount(crate::fileserver::FAT32_AT, second);
     }
     spawn::use_stacks(&STACKS);
     let frames_before = free_frames();

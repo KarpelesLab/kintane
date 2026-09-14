@@ -39,8 +39,13 @@ pub const SCRATCH_SECTORS: u64 = 256;
 pub const FS_START: u64 = SCRATCH_START + SCRATCH_SECTORS;
 /// Sectors in the volume: 4 MiB with one sector per cluster.
 pub const FS_SECTORS: u64 = 8192;
+/// The second volume's first sector, right after the first volume. It is FAT32, which a
+/// volume is by its cluster count and nothing else: the specification's boundary is 65 525
+/// clusters, so the smallest honest one is about 34 MiB.
+pub const FS32_START: u64 = FS_START + FS_SECTORS;
+pub const FS32_SECTORS: u64 = 66_600;
 /// Sectors in the image.
-pub const SECTORS: u64 = FS_START + FS_SECTORS;
+pub const SECTORS: u64 = FS32_START + FS32_SECTORS;
 
 /// `/HELLO.TXT`'s content.
 pub const HELLO: &[u8] = b"hello from the KinTane test disk\n";
@@ -50,6 +55,13 @@ pub const NESTED: &[u8] = b"a file in a directory\n";
 pub const BIG_LEN: usize = 100_000;
 /// Where the user program is, when the image carries one.
 pub const PROGRAM_PATH: &str = "/KINTANE/INIT.ELF";
+/// What the FAT32 volume holds; mirrors `kbuild/src/testdisk.rs`.
+pub const HELLO32: &[u8] = b"hello from the KinTane FAT32 volume\n";
+pub const NESTED32: &[u8] = b"a file in a directory on FAT32\n";
+/// `/BIG32.BIN`'s length, whose bytes are [`big_byte`]'s: eighty clusters, so reading it
+/// walks a chain of 32-bit entries.
+pub const BIG32_LEN: usize = 40_000;
+
 /// Where the static Linux program is, when the image carries one. In the program's own
 /// directory, so the root lists exactly what it did before the Linux personality.
 pub const LINUX_PROGRAM_PATH: &str = "/KINTANE/LINUX.ELF";
@@ -179,7 +191,9 @@ mod tests {
     #[test]
     fn the_regions_are_contiguous_and_the_pinned_sectors_are_the_pattern() {
         assert_eq!(FS_START, SCRATCH_START + SCRATCH_SECTORS, "the volume follows scratch");
-        assert_eq!(SECTORS, FS_START + FS_SECTORS, "and runs to the end");
+        assert_eq!(FS32_START, FS_START + FS_SECTORS, "the second volume follows the first");
+        assert_eq!(SECTORS, FS32_START + FS32_SECTORS, "and it runs to the end");
+        assert!(FS32_SECTORS > 65_525, "a volume this small could not be FAT32");
         for (sector, _, _) in PINNED {
             assert!(sector < FS_START, "sector {sector} is pattern, not volume");
         }

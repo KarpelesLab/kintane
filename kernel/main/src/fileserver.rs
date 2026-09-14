@@ -74,6 +74,10 @@ use crate::preempt::{self, sleep_until};
 use crate::wait::WaitQueue;
 use crate::{Check, objects, spawn, timekeeping, userproc, write_hex, write_usize};
 
+/// Where the disk's second volume is mounted, in every namespace a program reaches through
+/// this server. Mirrored by `user/init`'s write mode and by `linux-hello`.
+pub const FAT32_AT: &str = "/FAT32";
+
 /// Connections the server holds at once.
 const CONNECTIONS: usize = 4;
 /// Files one connection holds open at once.
@@ -477,12 +481,19 @@ fn done(result: Result<(), vfs::Error>) -> vfsproto::Message {
 
 /// Lease the volume, mount it in a namespace of its own, run `f` on it, and give it back.
 fn with_ns<R>(
-    f: impl FnOnce(&mut Vfs<'_, 1, 1>) -> Result<R, vfs::Error>,
+    f: impl FnOnce(&mut Vfs<'_, 2, 1>) -> Result<R, vfs::Error>,
 ) -> Result<R, vfs::Error> {
     let mut volume = crate::fs::lease(None).ok_or(vfs::Error::NoSuchMount)?;
-    let mut ns = Vfs::<1, 1>::new();
-    ns.mount("/", &mut *volume)?;
+    let (first, second) = volume.both();
+    let mut ns = Vfs::<2, 1>::new();
+    ns.mount("/", first)?;
+    // The disk's second volume, below the first. A client that renames across the two meets
+    // the refusal its own filesystem cannot avoid.
+    if let Some(second) = second {
+        ns.mount(FAT32_AT, second)?;
+    }
     let result = f(&mut ns);
+    let _ = ns.unmount(FAT32_AT);
     let _ = ns.unmount("/");
     result
 }
@@ -490,7 +501,7 @@ fn with_ns<R>(
 /// [`with_ns`], for a path a program sent.
 fn with_path<R>(
     path: &[u8],
-    f: impl FnOnce(&mut Vfs<'_, 1, 1>, &str) -> Result<R, vfs::Error>,
+    f: impl FnOnce(&mut Vfs<'_, 2, 1>, &str) -> Result<R, vfs::Error>,
 ) -> Result<R, vfs::Error> {
     let path = core::str::from_utf8(path).map_err(|_| vfs::Error::BadPath)?;
     with_ns(|ns| f(ns, path))
@@ -501,7 +512,7 @@ fn with_path<R>(
 fn with_file<R>(
     open: &OpenFile,
     flags: OpenFlags,
-    f: impl FnOnce(&mut Vfs<'_, 1, 1>, vfs::Fd) -> Result<R, vfs::Error>,
+    f: impl FnOnce(&mut Vfs<'_, 2, 1>, vfs::Fd) -> Result<R, vfs::Error>,
 ) -> Result<R, vfs::Error> {
     let path = open.path.get(..open.len).ok_or(vfs::Error::BadPath)?;
     with_path(path, |ns, path| {

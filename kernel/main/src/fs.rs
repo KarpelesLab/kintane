@@ -55,6 +55,12 @@ const PROBE_LBA: u64 = testdisk::SCRATCH_START + testdisk::SCRATCH_SECTORS - 1;
 /// mounts; nothing reaches the storage except through that volume afterwards.
 static CACHE: SyncUnsafeCell<Storage<CACHE_SLOTS, SECTOR>> = SyncUnsafeCell::new(Storage::new());
 
+/// The second volume's cache. Its table is 513 sectors to the first volume's 32, so a walk of
+/// it reads far more; the slots are the same, and the walk is what pays.
+///
+/// SAFETY INVARIANT: borrowed once, by [`check`], which hands it to the volume it mounts.
+static CACHE32: SyncUnsafeCell<Storage<CACHE_SLOTS, SECTOR>> = SyncUnsafeCell::new(Storage::new());
+
 /// A small cache of its own for the write-through check, so that check can prove what it
 /// claims without touching the volume's.
 ///
@@ -81,6 +87,12 @@ unsafe impl Sync for Volume {}
 
 static VOLUME: Volume = Volume(UnsafeCell::new(None));
 static MOUNTED: AtomicBool = AtomicBool::new(false);
+
+/// The second volume, FAT32, mounted from the same device at [`testdisk::FS32_START`]. Held
+/// under the same lease as the first: every user takes both or neither, so the two are never
+/// half-held and no order between them can deadlock.
+static VOLUME32: Volume = Volume(UnsafeCell::new(None));
+static MOUNTED32: AtomicBool = AtomicBool::new(false);
 
 /// Whether the check mounted the volume. Reads nothing but a flag, so any thread may ask
 /// without borrowing the volume.
@@ -109,14 +121,35 @@ pub unsafe fn volume() -> Option<&'static mut Fat<'static, 'static>> {
     unsafe { (*VOLUME.0.get()).as_mut() }
 }
 
+/// The second volume, once [`check`] has mounted it.
+///
+/// # Safety
+/// As [`volume`]: the caller is on the boot path, before the file server or the stress run
+/// has started.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(
+        dead_code,
+        reason = "the Linux personality's check is the one boot-path user left"
+    )
+)]
+pub unsafe fn volume32() -> Option<&'static mut Fat<'static, 'static>> {
+    if !MOUNTED32.load(Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: `MOUNTED32` is set only after the one write; the caller upholds exclusivity.
+    unsafe { (*VOLUME32.0.get()).as_mut() }
+}
+
 /// Whether a [`Lease`] on the volume is held.
 static LEASED: AtomicBool = AtomicBool::new(false);
 
 /// How often a thread waiting for the volume looks again.
 const LEASE_POLL: Duration = Duration::from_nanos(1_000_000);
 
-/// Bits for [`consistency`]: one per cluster of the test disk's volume, with room to spare.
-const BITMAP_BYTES: usize = 2048;
+/// Bits for [`consistency`]: one per cluster of the larger volume, with room to spare. The
+/// FAT32 volume has 66 534 of them, which is what sets this.
+const BITMAP_BYTES: usize = 8704;
 
 /// SAFETY INVARIANT: borrowed only by [`consistency`], while [`BITMAP_BUSY`] is held.
 static BITMAP: SyncUnsafeCell<[u8; BITMAP_BYTES]> = SyncUnsafeCell::new([0; BITMAP_BYTES]);
@@ -146,6 +179,23 @@ pub fn consistency(volume: &mut Fat<'_, '_>) -> Result<fat::Consistency, Error> 
 /// waits for anything else.
 pub struct Lease {
     volume: &'static mut Fat<'static, 'static>,
+    volume32: Option<&'static mut Fat<'static, 'static>>,
+}
+
+impl Lease {
+    /// Both volumes at once: the first, and the second when the disk carries one.
+    ///
+    /// One call rather than two accessors, because a caller mounting both in one namespace
+    /// needs both borrows live at the same time, which two methods could not give it. A
+    /// caller that mounts the second puts it below the first, so a rename across the two —
+    /// and its refusal — is something a program can meet.
+    pub fn both(&mut self) -> (&mut Fat<'static, 'static>, Option<&mut Fat<'static, 'static>>) {
+        let second = match &mut self.volume32 {
+            Some(v) => Some(&mut **v),
+            None => None,
+        };
+        (&mut *self.volume, second)
+    }
 }
 
 impl Deref for Lease {
@@ -181,8 +231,10 @@ pub fn lease(deadline: Option<Instant>) -> Option<Lease> {
             .is_ok()
         {
             // SAFETY: see `Volume`: the lease is this thread's, so this is the only borrow.
+            // SAFETY: as below, for the second volume, which the same lease covers.
+            let volume32 = unsafe { (*VOLUME32.0.get()).as_mut() };
             return match unsafe { (*VOLUME.0.get()).as_mut() } {
-                Some(volume) => Some(Lease { volume }),
+                Some(volume) => Some(Lease { volume, volume32 }),
                 None => {
                     LEASED.store(false, Ordering::Release);
                     None
@@ -275,6 +327,8 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
     if kconfig::FS_CRASH_TEST {
         crash_writes(c, fat);
     }
+
+    ok &= second_volume(c, disk);
 
     // SAFETY: the one write to `VOLUME`, before `MOUNTED` makes it reachable.
     unsafe { *VOLUME.0.get() = Some(fat) };
@@ -537,6 +591,120 @@ fn cache_books(c: &dyn EarlyConsole, fat: &Fat<'_, '_>) -> bool {
     c.write_str(" hits, ");
     write_usize(c, s.misses as usize);
     c.write_str(" misses");
+    true
+}
+
+/// Mount the disk's second volume and check it is FAT32 and whole.
+///
+/// The first volume is FAT16 and the second FAT32, on one device, so both of the driver's
+/// formats are exercised on every boot with a disk: the root that is a chain, the 28-bit
+/// entries and the FSInfo count, against a volume kbuild wrote rather than one a test built.
+fn second_volume(c: &dyn EarlyConsole, disk: &'static dyn BlockDevice) -> bool {
+    // SAFETY: the one borrow of `CACHE32`; see its invariant.
+    let storage = unsafe { &mut *CACHE32.get() };
+    let Some(cache) = storage.cache() else {
+        c.write_str("; the second cache's storage is not whole blocks");
+        return false;
+    };
+    let mut fat = match Fat::mount(disk, cache, testdisk::FS32_START) {
+        Ok(f) => f,
+        Err(e) => return failed(c, "mounting the second volume", e),
+    };
+    if fat.format() != fat::Format::Fat32 {
+        c.write_str("; THE SECOND VOLUME IS NOT FAT32");
+        return false;
+    }
+    let mut ok = true;
+    {
+        let mut ns = Vfs::<1, 2>::new();
+        if ns.mount("/", &mut fat).is_err() {
+            c.write_str("; the second volume did not mount at /");
+            return false;
+        }
+        let mut small = [0u8; 64];
+        match ns.read_all("/HELLO32.TXT", &mut small) {
+            Ok(n) if &small[..n] == testdisk::HELLO32 => {}
+            _ => {
+                c.write_str("; /HELLO32.TXT IS NOT WHAT KBUILD WROTE");
+                ok = false;
+            }
+        }
+        match ns.read_all("/sub32/nested.txt", &mut small) {
+            Ok(n) if &small[..n] == testdisk::NESTED32 => {}
+            _ => {
+                c.write_str("; /SUB32/NESTED.TXT IS NOT WHAT KBUILD WROTE");
+                ok = false;
+            }
+        }
+        ok &= chain32(c, &mut ns);
+        let _ = ns.unmount("/");
+    }
+    // The walk, and the free count FAT32 keeps in a sector of its own.
+    match consistency(&mut fat) {
+        Ok(k) if k.lost == 0 && k.fats_differ == 0 && k.fsinfo_free == Some(k.free) => {
+            c.write_str("; FAT32 at sector ");
+            write_usize(c, testdisk::FS32_START as usize);
+            c.write_str(": ");
+            write_usize(c, k.files as usize);
+            c.write_str(" files, ");
+            write_usize(c, k.free as usize);
+            c.write_str(" clusters free, FSInfo agreeing");
+        }
+        Ok(k) => {
+            c.write_str("; THE SECOND VOLUME IS NOT WHOLE: lost ");
+            write_usize(c, k.lost as usize);
+            c.write_str(", tables differ in ");
+            write_usize(c, k.fats_differ as usize);
+            if k.fsinfo_free != Some(k.free) {
+                c.write_str(", FSInfo DISAGREES WITH THE TABLE");
+            }
+            ok = false;
+        }
+        Err(e) => {
+            ok = failed(c, "walking the second volume", e);
+        }
+    }
+    // SAFETY: the one write to `VOLUME32`, before `MOUNTED32` makes it reachable.
+    unsafe { *VOLUME32.0.get() = Some(fat) };
+    MOUNTED32.store(true, Ordering::Release);
+    ok
+}
+
+/// `/BIG32.BIN` reads back, which walks a chain of 32-bit entries.
+fn chain32(c: &dyn EarlyConsole, ns: &mut Vfs<'_, 1, 2>) -> bool {
+    let Ok(fd) = ns.open("/BIG32.BIN") else {
+        c.write_str("; /BIG32.BIN DID NOT OPEN");
+        return false;
+    };
+    // SAFETY: the one borrow of `CHUNK` on this path; `contents` has finished with it.
+    let chunk = unsafe { &mut *CHUNK.get() };
+    let mut offset = 0usize;
+    loop {
+        let n = match ns.read(fd, chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => {
+                let _ = ns.close(fd);
+                c.write_str("; /BIG32.BIN DID NOT READ");
+                return false;
+            }
+        };
+        if chunk[..n]
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b != testdisk::big_byte(offset + i))
+        {
+            let _ = ns.close(fd);
+            c.write_str("; /BIG32.BIN DIFFERS FROM WHAT KBUILD WROTE");
+            return false;
+        }
+        offset += n;
+    }
+    let _ = ns.close(fd);
+    if offset != testdisk::BIG32_LEN {
+        c.write_str("; /BIG32.BIN IS THE WRONG LENGTH");
+        return false;
+    }
     true
 }
 

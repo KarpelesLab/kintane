@@ -40,16 +40,78 @@ pub fn fresh(run: &Path) -> Result<(), String> {
 }
 
 fn volume_bytes(image: &[u8]) -> Result<&[u8], String> {
+    let start = testdisk::FS_START as usize * testdisk::SECTOR;
+    let end = testdisk::FS32_START as usize * testdisk::SECTOR;
     image
-        .get(testdisk::FS_START as usize * testdisk::SECTOR..)
-        .ok_or_else(|| "the disk image is shorter than its volume's start".into())
+        .get(start..end)
+        .ok_or_else(|| "the disk image is shorter than its first volume".into())
+}
+
+/// The second volume's bytes: FAT32, from where the first ends to the end of the image.
+fn volume32_bytes(image: &[u8]) -> Result<&[u8], String> {
+    image
+        .get(testdisk::FS32_START as usize * testdisk::SECTOR..)
+        .ok_or_else(|| "the disk image is shorter than its second volume".into())
+}
+
+/// The second volume after a run, read with kbuild's own FAT32 reader, which shares no code
+/// with the kernel's driver or with the writer that made it. The kernel only reads this one,
+/// so nothing it wrote is expected here — but it must still be whole, and the free count in
+/// its FSInfo sector must agree with its table.
+fn verify_fat32(bytes: &[u8]) -> Result<String, String> {
+    let v = crate::fat32::Volume::open(bytes)
+        .map_err(|e| format!("the FAT32 volume after the run: {e}"))?;
+    let r = v
+        .check()
+        .map_err(|e| format!("the FAT32 volume after the run is inconsistent: {e}"))?;
+    if r.lost != 0 || r.fats_differ != 0 {
+        return Err(format!(
+            "the FAT32 volume lost {} clusters, and its tables differ in {} entries",
+            r.lost, r.fats_differ
+        ));
+    }
+    if r.fsinfo_free != Some(r.free) {
+        return Err(format!(
+            "the FAT32 volume's FSInfo says {:?} clusters are free where its table says {}",
+            r.fsinfo_free, r.free
+        ));
+    }
+    for (path, want) in [
+        ("/HELLO32.TXT", testdisk::HELLO32),
+        ("/SUB32/NESTED.TXT", testdisk::NESTED32),
+    ] {
+        match v.read(path)? {
+            Some(data) if data == want => {}
+            _ => return Err(format!("{path} on the FAT32 volume is not what kbuild wrote")),
+        }
+    }
+    let big = v.read("/BIG32.BIN")?.unwrap_or_default();
+    if big.len() != testdisk::BIG32_LEN
+        || big
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b != testdisk::big_byte(i))
+    {
+        return Err("/BIG32.BIN on the FAT32 volume is not what kbuild wrote".into());
+    }
+    // The two volumes are not each other. A volume written or mounted at the wrong offset
+    // would still walk clean; what tells them apart is which names are on them.
+    if v.exists("/KINTANE")? || !v.exists("/SUB32")? {
+        return Err("the FAT32 volume does not hold the names kbuild put there".into());
+    }
+    Ok(format!(
+        "FAT32 consistent, {} files, {} directories, {} clusters free, FSInfo agreeing",
+        r.files, r.dirs, r.free
+    ))
 }
 
 /// The volume on the run's copy after a clean exit, checked; `console` is what the guest
 /// printed, which says which checks claim to have written their files. A line for the report.
 pub fn after_run(run: &Path, console: &[u8]) -> Result<String, String> {
     let image = std::fs::read(run).map_err(|e| format!("{}: {e}", run.display()))?;
-    verify_clean(volume_bytes(&image)?, &String::from_utf8_lossy(console))
+    let first = verify_clean(volume_bytes(&image)?, &String::from_utf8_lossy(console))?;
+    let second = verify_fat32(volume32_bytes(&image)?)?;
+    Ok(format!("{first}; {second}"))
 }
 
 fn verify_clean(bytes: &[u8], console: &str) -> Result<String, String> {

@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::fat16::{self, File, Params};
+use crate::fat32;
 
 const MAGIC: &[u8; 8] = b"KTBLKDSK";
 const VERSION: u32 = 2;
@@ -32,7 +33,14 @@ pub const FS_START: u64 = SCRATCH_START + SCRATCH_SECTORS;
 /// 4 MiB of FAT16 with one sector per cluster, which is 8 095 clusters: FAT16 by the
 /// specification's count, and small enough to write on every build.
 const FS_SECTORS: u64 = 8192;
-pub const SECTORS: u64 = FS_START + FS_SECTORS;
+/// The second volume's first sector, right after the first volume.
+pub const FS32_START: u64 = FS_START + FS_SECTORS;
+/// The second volume, FAT32. A volume is FAT32 by its cluster count and nothing else, and
+/// the specification's boundary is 65 525, so the smallest honest FAT32 volume is about
+/// 34 MiB. That is what the format costs, and what a volume pretending to be FAT32 would
+/// not test.
+const FS32_SECTORS: u64 = 66_600;
+pub const SECTORS: u64 = FS32_START + FS32_SECTORS;
 
 /// The config symbol that attaches the disk.
 pub const SYMBOL: &str = "QEMU_BLOCK_TEST";
@@ -46,6 +54,12 @@ const HELLO: &[u8] = b"hello from the KinTane test disk\n";
 const NESTED: &[u8] = b"a file in a directory\n";
 /// `/BIG.BIN`'s length: two hundred clusters, so reading it walks a chain.
 const BIG_LEN: usize = 100_000;
+/// What the FAT32 volume holds; mirrors the kernel's copy.
+pub const HELLO32: &[u8] = b"hello from the KinTane FAT32 volume\n";
+pub const NESTED32: &[u8] = b"a file in a directory on FAT32\n";
+/// `/BIG32.BIN`'s length: eighty clusters, so reading it walks a chain of 32-bit entries.
+pub const BIG32_LEN: usize = 40_000;
+
 /// Where the user program goes.
 const PROGRAM: &str = "KINTANE/INIT.ELF";
 /// Where the static Linux program goes; mirrors `LINUX_PROGRAM_PATH` in the kernel's copy.
@@ -77,7 +91,7 @@ const fn pattern(sector: u64, offset: usize) -> u8 {
 
 /// The byte at offset `i` of `/BIG.BIN`. Unlike the sector pattern in shape, so a read of
 /// the file that lands in the pattern region matches nothing.
-const fn big_byte(i: usize) -> u8 {
+pub const fn big_byte(i: usize) -> u8 {
     let x = (i as u32)
         .wrapping_mul(2_246_822_519)
         .wrapping_add(i as u32 >> 7);
@@ -95,6 +109,19 @@ const VOLUME: Params = Params {
     label: *b"KTTESTDISK ",
     volume_id: 0x4B54_4453,
     what: "the test disk's volume",
+};
+
+/// The second volume's shape: one sector per cluster, and a reserved region with room for
+/// the FSInfo sector and a backup boot sector, as FAT32 has.
+const VOLUME32: fat32::Params = fat32::Params {
+    sectors: FS32_SECTORS as u32,
+    sectors_per_cluster: 1,
+    reserved_sectors: 32,
+    fats: 2,
+    hidden_sectors: FS32_START as u32,
+    label: *b"KTFAT32    ",
+    volume_id: 0x4654_3332,
+    what: "the test disk's FAT32 volume",
 };
 
 /// The whole image. `program` is the user program to place on the volume, if there is one,
@@ -139,7 +166,26 @@ pub fn image(program: Option<&[u8]>, linux: Option<&[u8]>) -> Result<Vec<u8>, St
         });
     }
     let volume = fat16::volume(&files, &VOLUME)?;
-    disk[pattern_bytes..].copy_from_slice(&volume);
+    let fs32_at = FS32_START as usize * SECTOR;
+    disk[pattern_bytes..fs32_at].copy_from_slice(&volume);
+
+    let big32: Vec<u8> = (0..BIG32_LEN).map(big_byte).collect();
+    let files32 = [
+        File {
+            path: "HELLO32.TXT",
+            data: HELLO32,
+        },
+        File {
+            path: "BIG32.BIN",
+            data: &big32,
+        },
+        File {
+            path: "SUB32/NESTED.TXT",
+            data: NESTED32,
+        },
+    ];
+    let volume32 = fat32::volume(&files32, &VOLUME32)?;
+    disk[fs32_at..].copy_from_slice(&volume32);
     Ok(disk)
 }
 
