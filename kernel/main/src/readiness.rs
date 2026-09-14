@@ -119,6 +119,12 @@ pub fn queue() -> &'static WaitQueue {
 /// Something that could have made a member of some set ready has happened. Called after the
 /// change, beside the wake of whatever queue already had one.
 pub fn wake() {
+    // This is called from every hot path that changes anything a set could be watching — a
+    // channel's send, a completion posted, a pipe written — and most of the time no thread is
+    // waiting on a set at all. One relaxed load is what that case costs.
+    if !POLL.has_waiters() {
+        return;
+    }
     let woke = POLL.wake_all();
     WOKEN.fetch_add(woke as u64, Ordering::Relaxed);
 }

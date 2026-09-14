@@ -81,6 +81,9 @@ pub struct WaitQueue {
     /// Serialises registration against waking. Held only for those, never while blocked.
     lock: SpinLock<(), Cpu>,
     waiters: [Waiter; WAITERS],
+    /// Slots in use. Read without the lock by [`WaitQueue::has_waiters`], so a waker on a hot
+    /// path can skip a queue nobody is waiting in.
+    registered: AtomicUsize,
 }
 
 /// Every wait queue shares this class: taking two queues' locks at once is a lock-order
@@ -139,7 +142,19 @@ impl WaitQueue {
                     cpu: AtomicUsize::new(0),
                 }
             }; WAITERS],
+            registered: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether any thread is registered here. A waker that changes something many times a
+    /// second — a channel's send, a completion posted, a pipe written — asks this before doing
+    /// the work of a wake, and an empty queue costs it one relaxed load.
+    ///
+    /// Racy by nature, and safe for it: a thread registering after this is read has not yet
+    /// made its second check of the condition, which is the check that sees a change made
+    /// before it. See the module documentation.
+    pub fn has_waiters(&self) -> bool {
+        self.registered.load(Ordering::Relaxed) != 0
     }
 
     /// Register `me`, returning its slot, or `None` if the queue is full.
@@ -153,6 +168,7 @@ impl WaitQueue {
         w.woken.store(false, Ordering::Release);
         w.cpu.store(Cpu::cpu_index(), Ordering::Relaxed);
         w.thread.store(me.raw(), Ordering::Release);
+        self.registered.fetch_add(1, Ordering::Release);
         Some(slot)
     }
 
@@ -160,6 +176,7 @@ impl WaitQueue {
     fn release(&self, slot: usize) {
         let _guard = self.lock.lock_irqsave();
         self.waiters[slot].thread.store(FREE, Ordering::Release);
+        self.registered.fetch_sub(1, Ordering::Release);
     }
 
     /// Check `ready`, and if it has nothing yet, block once — until a wake or `deadline` —
