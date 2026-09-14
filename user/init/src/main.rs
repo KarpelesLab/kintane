@@ -437,7 +437,14 @@ fn recv_promptly(channel: Handle, buf: &mut [u8]) -> Received {
     let start = rt::now_ns();
     let got = match rt::recv_timeout(channel, buf, WAKE_NS) {
         Ok(got) => got,
-        Err(Error::TimedOut) => return Received::Lost,
+        // Nothing inside the timeout. From here a wake that was lost and a sender the host
+        // never ran look identical, so ask once more without waiting: a message already
+        // queued was sent and simply not collected in time, which is slowness rather than
+        // loss. An empty channel is a wake that never came.
+        Err(Error::TimedOut) => match rt::recv_timeout(channel, buf, rt::NO_WAIT) {
+            Ok(_) => return Received::Slow,
+            Err(_) => return Received::Lost,
+        },
         Err(_) => return Received::Failed,
     };
     if rt::now_ns().wrapping_sub(start) >= LOST_NS {
