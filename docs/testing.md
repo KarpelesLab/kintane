@@ -448,12 +448,20 @@ Falsified, each mutation confirmed applied, then restored:
 | `drain` marks the first request in flight, not the one the device named | the host test `a_completion_marks_the_request_it_names_not_the_first_one_in_flight` |
 | The ring returns a chain's descriptors only when no other chain is outstanding | aarch64-virt-smp stress fails at 1 s: the ring fills and a block workload's read fails |
 | A waiter drains the ring even in interrupt-driven mode | aarch64: `block irq` fails, 30 of 32 completions polled |
-| x86_64-efi without `phys-bits=36`, so OVMF places the virtio BAR at 768 GiB | `userspace` fails: `REFUSED: the kernel maps something in the user half`. Before the guard the same run passed `userspace` and failed `processes` with a worker reading another's memory |
+| Every device window mapped at its physical address as well as in the device window, on x86_64-efi with the virtio BAR at 768 GiB | the `live` line: `the kernel maps something in the USER HALF`, and the boot fails; `userspace` also refuses, as the backstop |
+| The device window undone (base zero), the post-install check forced to pass and the `userproc` backstop disabled, BAR at 768 GiB | the boot fails: no `userspace` program exits, `processes` cannot build its workers and `spawn`'s init never exits. The shared table breaks process construction outright rather than reproducing the old cross-read |
 
-**Not observable on i686:** the last mutation passes there. On QEMU's `pc` the device
+**Not observable on i686:** the block-irq mutation passes there. On QEMU's `pc` the device
 completes and interrupts before the waiter first looks, so the handler always wins. The
 check is sound, and aarch64 proves it catches polling, but on i686 it cannot distinguish
 the two.
+
+**The machine that broke runs as it broke.** x86_64-efi used to run with `-cpu max,phys-bits=36`
+so OVMF would place its 64-bit PCI window below 64 GiB. It now runs at TCG's full 40 bits on
+purpose: the virtio BAR lands at `0xc020000000`, 768 GiB, inside the user half's physical range,
+and every boot requires `user half clear` on the live tables with the BAR mapped in the device
+window above it. aarch64's enforcement probe also checks that the UART is writable in the
+window and faults with a translation fault at its physical address.
 
 ### 2c. Driver isolation
 

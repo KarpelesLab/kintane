@@ -19,6 +19,11 @@ use hal::EarlyConsole;
 /// PL011 #0 on QEMU `virt`. Fixed by the machine model, not discovered.
 pub(crate) const UART0: usize = 0x0900_0000;
 
+/// Where [`UART0`] is reached: in the device window, like every register this kernel
+/// touches. The physical address stays [`UART0`], which is what the device tree is
+/// compared against.
+const UART0_VIRT: usize = hal::paging::DEVICE_WINDOW_BASE as usize + UART0;
+
 /// Where the early console writes.
 ///
 /// The device tree is read after this console has already printed, so the two can
@@ -46,12 +51,13 @@ const FR_TXFF: u32 = 1 << 5;
 /// `off` must be a register offset of a PL011 that is actually mapped at [`UART0`],
 /// and the write must be one the device tolerates in its current state.
 unsafe fn write_reg(off: usize, value: u32) {
-    // SAFETY: the boot identity map in `paging` maps 0x09000000 to itself as
-    // Device-nGnRnE, so this address is the device and the memory type is one that
+    // SAFETY: the boot tables in `paging` map the device window, `DEVICE_WINDOW_BASE` above
+    // 0x09000000, as Device-nGnRnE, and so does the kernel's own space, so this address is
+    // the device and the memory type is one that
     // neither caches nor reorders the access. It is naturally aligned, which Device
     // memory requires regardless of `SCTLR_EL1.A`. `write_volatile` is what keeps the
     // compiler from merging or reordering stores that the device distinguishes.
-    unsafe { write_volatile((UART0 + off) as *mut u32, value) };
+    unsafe { write_volatile((UART0_VIRT + off) as *mut u32, value) };
 }
 
 /// # Safety
@@ -59,7 +65,7 @@ unsafe fn write_reg(off: usize, value: u32) {
 /// PL011 registers has side effects; the ones used here do not.
 unsafe fn read_reg(off: usize) -> u32 {
     // SAFETY: as above — a mapped, naturally aligned device register.
-    unsafe { read_volatile((UART0 + off) as *const u32) }
+    unsafe { read_volatile((UART0_VIRT + off) as *const u32) }
 }
 
 pub struct Serial;

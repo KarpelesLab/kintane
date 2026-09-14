@@ -223,11 +223,7 @@ pub fn program_msi(
         return false;
     }
     let control = cfg.read(at, cap.offset);
-    cfg.write(
-        at,
-        cap.offset,
-        control & !(msi_ctl::ENABLE | msi_ctl::MULTIPLE_ENABLE),
-    );
+    cfg.write(at, cap.offset, control & !(msi_ctl::ENABLE | msi_ctl::MULTIPLE_ENABLE));
     cfg.write(at, cap.offset + 4, address as u32);
     if cap.address_64 {
         cfg.write(at, cap.offset + 8, (address >> 32) as u32);

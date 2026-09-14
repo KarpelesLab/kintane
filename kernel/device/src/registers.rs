@@ -28,15 +28,18 @@ impl Registers {
     /// `None` when the window does not fit this machine's address space — a region above
     /// 4 GiB on a 32-bit kernel, which the tree can describe and the CPU cannot reach.
     ///
+    /// The registers are reached at [`hal::paging::device_virt`] of the window's physical
+    /// address, never at the physical address itself.
+    ///
     /// # Safety
-    /// `[mmio.phys(), mmio.phys() + mmio.len())` must be mapped at the same virtual
-    /// address, as device memory that neither caches nor reorders accesses, for as long
-    /// as the returned value is used. On aarch64 that is both the boot identity map and
-    /// the kernel's own space, which maps every claimed window; it is the caller who knows
-    /// which of those is live.
+    /// `[mmio.phys(), mmio.phys() + mmio.len())` must be mapped at
+    /// [`hal::paging::DEVICE_WINDOW_BASE`] above that address, as device memory that neither
+    /// caches nor reorders accesses, for as long as the returned value is used. That is
+    /// both the boot tables' device alias and the kernel's own space, which maps every
+    /// claimed window there; it is the caller who knows which of those is live.
     pub unsafe fn new(mmio: &Mmio) -> Option<Registers> {
         Some(Registers {
-            base: usize::try_from(mmio.phys()).ok()?,
+            base: hal::paging::device_virt(mmio.phys())?,
             len: usize::try_from(mmio.len()).ok()?,
         })
     }
@@ -45,8 +48,9 @@ impl Registers {
     /// holding its handle: the platform programming an MSI-X table in a window the driver
     /// claimed.
     ///
-    /// The same translation as [`Self::new`], kept beside it so that where a claimed window
-    /// is mapped is decided in one place. `None` on the same terms.
+    /// The same translation as [`Self::new`] — [`hal::paging::device_virt`] of the window's
+    /// physical address — kept beside it so that where a claimed window is reached is decided
+    /// in one place. `None` on the same terms.
     ///
     /// # Safety
     /// As [`Self::new`], for `[claim.phys, claim.phys + claim.len)`; and the caller must be
@@ -54,7 +58,7 @@ impl Registers {
     /// claimed it has agreed to by leaving them to the platform.
     pub unsafe fn for_claim(claim: &MmioClaim) -> Option<Registers> {
         Some(Registers {
-            base: usize::try_from(claim.phys).ok()?,
+            base: hal::paging::device_virt(claim.phys)?,
             len: usize::try_from(claim.len).ok()?,
         })
     }

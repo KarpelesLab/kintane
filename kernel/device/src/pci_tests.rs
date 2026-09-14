@@ -866,9 +866,7 @@ fn a_vector_is_claimed_only_where_the_platform_delivers_messages() {
     let mut res = Resources::new(&mut mmio, &mut irqs);
     assert_eq!(
         driver::probe(&Vectors(0), &tree, id, &mut res).err(),
-        Some(ProbeError::Declined(
-            "this platform delivers no message-signalled interrupts"
-        ))
+        Some(ProbeError::Declined("this platform delivers no message-signalled interrupts"))
     );
     assert_eq!(res.irq_claims().count(), 0);
 }

@@ -765,24 +765,21 @@ pub fn msix_entry() -> Option<u16> {
 /// The window claimed for the MSI-X table, as a physical `(address, length)`, when it is
 /// not the registers' window.
 pub fn msix_table_window() -> Option<(u64, u64)> {
-    CLAIMS
-        .get()?
-        .table
-        .as_ref()
-        .map(|t| (t.phys(), t.len()))
+    CLAIMS.get()?.table.as_ref().map(|t| (t.phys(), t.len()))
 }
 
 /// The transport for the bound device, of whichever kind its bus is.
 ///
 /// # Safety
-/// The claimed window must be mapped, as device memory, at its physical address — the
-/// kernel's address space maps every claimed window — and this must be called once,
+/// The claimed window must be mapped, as device memory, at
+/// [`hal::paging::DEVICE_WINDOW_BASE`] above its physical address — the kernel's address
+/// space maps every claimed window there — and this must be called once,
 /// because two transports for one device would be two drivers for one device.
 #[allow(unsafe_code)]
 pub unsafe fn transport() -> Option<AnyTransport> {
     let claims = CLAIMS.get()?;
     let (phys, len) = window()?;
-    let base = usize::try_from(phys).ok()?;
+    let base = hal::paging::device_virt(phys)?;
     let len = usize::try_from(len).ok()?;
     match &claims.bus {
         Bus::Mmio => {
@@ -898,8 +895,8 @@ impl Driver for VirtioBlkDriver {
                 bus,
             })
         }
-            .map(|_| ())
-            .map_err(|_| ProbeError::Declined("one virtio-blk device is supported"))
+        .map(|_| ())
+        .map_err(|_| ProbeError::Declined("one virtio-blk device is supported"))
     }
 
     fn start(&self, _bound: &Bound) -> Result<(), &'static str> {

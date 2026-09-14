@@ -287,7 +287,9 @@ impl PhysMemory for BootMemory {
     }
 }
 
-/// Memory-mapped configuration space for one segment, through the boot identity map.
+/// Memory-mapped configuration space for one segment, through the device window: the boot
+/// tables alias the low 4 GiB at `DEVICE_WINDOW_BASE`, and the kernel's own space maps the
+/// claimed ECAM window there.
 ///
 /// Constructed only inside [`discover`], for a segment it checked lies below
 /// `BOOT_IDENTITY_END`.
@@ -299,7 +301,7 @@ impl Ecam {
             return None;
         }
         let base = self.0.function_address(at.bus, at.device, at.function)?;
-        let address = usize::try_from(base.checked_add(u64::from(offset))?).ok()?;
+        let address = hal::paging::device_virt(base.checked_add(u64::from(offset))?)?;
         Some(core::ptr::with_exposed_provenance_mut(address))
     }
 }
@@ -308,7 +310,8 @@ impl ConfigSpace for Ecam {
     fn read(&self, at: Address, offset: u16) -> u32 {
         match self.register(at, offset) {
             // SAFETY: an aligned register inside the segment's window, which `discover`
-            // checked is identity-mapped while an `Ecam` exists. Reading configuration
+            // checked lies below `BOOT_IDENTITY_END` and so inside the boot tables' device
+            // alias, and which the kernel's space maps at the same address. Reading configuration
             // space has no side effects on the standard header fields enumeration reads.
             Some(p) => unsafe { core::ptr::read_volatile(p) },
             None => u32::MAX,
@@ -970,7 +973,10 @@ unsafe fn wire_all(
     // disk that came up on anything else fell back without saying why, and the interrupt
     // checks would skip rather than fail.
     let block_on_msi = BLOCK_LINE.get().is_some_and(|n| is_msi_line(n.0));
-    if controller::MSI && kconfig::QEMU_BLOCK_TEST && virtio_blk::window().is_some() && !block_on_msi
+    if controller::MSI
+        && kconfig::QEMU_BLOCK_TEST
+        && virtio_blk::window().is_some()
+        && !block_on_msi
     {
         c.write_str("; VIRTIO-BLK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
         ok = false;
@@ -1040,7 +1046,9 @@ fn wire_msi(
     let mut routes = MSI_ROUTES.lock_irqsave();
     let free = routes.iter().position(Option::is_none);
     let Some((slot, number)) = free.and_then(|s| {
-        let line = controller::MSI_LINES.start.checked_add(u32::try_from(s).ok()?)?;
+        let line = controller::MSI_LINES
+            .start
+            .checked_add(u32::try_from(s).ok()?)?;
         controller::MSI_LINES
             .contains(&line)
             .then_some((s, IrqNumber(line)))
@@ -1105,9 +1113,9 @@ fn wire_msi(
 /// The MSI-X table `cap` describes, through a window `node` claimed that holds it whole.
 ///
 /// `None` when no such window is claimed, or when it is past what discovery can reach. The
-/// one place a table's address comes from, and it comes from the ledger: a platform that
-/// maps claimed windows somewhere other than their physical address changes
-/// `Registers::for_claim`, and nothing here.
+/// one place a table's address comes from, and it comes from the ledger: where a claimed
+/// window is reached is `Registers::for_claim`'s to decide, through the device window, and
+/// nothing here names an address to dereference.
 fn msix_table(
     f: &Function,
     cap: &MsixCapability,
@@ -1123,14 +1131,16 @@ fn msix_table(
     let claim = resources.mmio_claims().find(|w| {
         w.node == node && w.phys <= phys && phys + bytes <= w.phys.saturating_add(w.len)
     })?;
-    // Discovery runs on the boot identity map, and the table is written during it.
+    // The table is written during discovery, on the boot tables, whose device alias covers
+    // what they identity-map and no more.
     if claim.phys.checked_add(claim.len)? > arch::pc::BOOT_IDENTITY_END {
         return None;
     }
-    // SAFETY: a window the function's driver claimed, which is mapped at its physical
-    // address on the boot identity map discovery runs on (checked above) and in the kernel's
-    // own space, which maps every claimed window. The driver leaves the table to the
-    // platform: it claimed the window for it and never touches the table's registers.
+    // SAFETY: a window the function's driver claimed, which is mapped at the device window
+    // above its physical address both by the boot tables' alias discovery runs on (the window
+    // lies below `BOOT_IDENTITY_END`, checked above) and by the kernel's own space, which maps
+    // every claimed window there. The driver leaves the table to the platform: it claimed
+    // the window for it and never touches the table's registers.
     let regs = unsafe { Registers::for_claim(claim) }?;
     MsixTable::new(regs, usize::try_from(phys - claim.phys).ok()?, cap.table_size)
 }
