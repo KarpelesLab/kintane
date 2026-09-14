@@ -13,9 +13,86 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | not started |
-| 6 — Userspace and the Linux personality | processes on the scheduler with their own address spaces, on x86_64 and aarch64 |
-| 7 — Real hardware and real work | started early: a block layer and a virtio-blk driver |
+| 5 — Driver isolation | a first prototype: one driver body in the kernel and in a domain, a rogue domain killed; no IOMMU, so no DMA confinement |
+| 6 — Userspace and the Linux personality | a program creates a program through handles and construction calls; a VFS; `init` loaded from disk. The Linux personality is not started |
+| 7 — Real hardware and real work | started early: disks on every tier-1 port, a read-only FAT16 filesystem, an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The sixth round of landings
+
+Fifteen presets now build and boot, with `x86_64-efistub` new. Six branches landed. As
+before, most of the work of merging was in the seams between them, not in the conflicts.
+
+- **A program creates a program** (Phase 6a). Images, processes, threads, memory regions
+  and completion queues are kernel objects behind handles, and eight construction calls
+  build a process piece by piece from handles its builder holds — still no fork. `init`,
+  given only a console and an image, builds a child, hands it a channel endpoint, waits
+  for it on a completion queue, and checks its exit code; the child's forged handles are
+  refused, and every object and frame comes back.
+- **Storage end to end.** `vfs` (a mount namespace, handles, an in-memory filesystem), a
+  write-through block cache and a read-only FAT16 reader, all host-tested. The test disk
+  carries a FAT16 volume, and on every port with a disk the kernel loads
+  `/KINTANE/INIT.ELF` from it and runs it — userspace from storage, not from the image.
+- **Disks on the PCs.** virtio over PCI on x86_64 and i686, completion by interrupt with
+  several requests in flight (32 of 32 by interrupt on aarch64 and i686; x86_64 still
+  polls until MSI-X or `_PRT` routing exists), and roughly double the throughput.
+- **Driver isolation, a first prototype** (Phase 5). One driver body runs in the kernel
+  and in an unprivileged domain over the same device window; the reports must agree, the
+  domain's page tables must map only its grant, a rogue domain is killed, and every frame
+  returns. A register access costs the same in both modes under emulation; starting and
+  tearing down a domain costs about 6 ms, which argues for long-lived domains. No DMA
+  confinement yet: that needs an IOMMU.
+- **Fuzzing.** `kbuild fuzz` runs seeded, reproducible, structure-aware campaigns over nine
+  targets — the device tree, ACPI, ELF, modules, boot tags, the boot menu, PCI
+  configuration, virtio rings and the syscall table — with a committed corpus replayed on
+  every change and a million inputs per target nightly. No kernel parser has panicked or
+  hung.
+- **Boot integration** (Phase 7). The kernel boots as its own UEFI application; images come
+  in `elf`, `bin`, `uki` and `uimage`; `kbuild release` produces a manifest two cold builds
+  reproduce; and a last-known-good counter falls back to safe mode after three failed
+  boots and is cleared by a good one, proven end to end in one QEMU machine.
+
+**A security bug the storage work exposed, guarded rather than fixed.** On x86_64 UEFI
+boots, firmware placed the disk's BAR at 768 GiB, inside the user half of the address
+space. The kernel maps device memory at its physical address, and every process copies
+the kernel's top-level entries, so all processes built their pages into one shared table
+and one read another's memory. The kernel now refuses to build a process while anything
+is mapped in the user range. The real fix — mapping device memory outside the user range —
+changes an assumption every driver makes, and is named here as open work.
+
+**What integration found that no branch could:**
+
+- **The scheduler's table lived on the boot stack.** `Threads::new` returned the table by
+  value, so it existed once on the 16 KiB boot stack before moving into place, and it grows
+  with stack slots and CPUs. Isolation's extra slot at eight CPUs overflowed the boot stack
+  into its guard page — which caught it cleanly. The table is now built in place.
+- **A fuzz mock that predated eight syscalls.** The fuzzing branch's mock handler was
+  written against the syscall table before the object layer grew it, so after both merged
+  the fuzz unit no longer compiled. That break was exactly the compile error the target's
+  documentation promised. It also reached master: the merge was pushed before its checks
+  had finished, and every push since is gated on the full suite passing.
+- **Two branches wrote the same helper.** The object layer and the filesystem both added
+  an identical `parse` to `userproc.rs`.
+- **Three disk workloads, one stack budget.** The filesystem and storage branches each
+  added a stress workload that needs the disk; together with isolation's slot, a stress
+  build now needs thirteen guarded stacks, and the build-time assertion counts every one.
+
+**Findings worth keeping from the branches themselves:**
+
+- **Three fuzz generators were testing nothing.** A first campaign of 45,000 inputs found no
+  failures, and was worth almost nothing: the ELF, ACPI and menu generators produced inputs
+  every parser rejected at its first check (0–5% accepted). Measuring acceptance exposed
+  it; they now reach 40–80%.
+- **A falsification only a host test could see.** A FAT reader that starts the root
+  directory one entry late passes the boot check, because kbuild's volume — like almost
+  every real one — has its label first, and skipping the label hides the offset.
+- **A grant check that passed on the wrong window.** Every empty virtio slot answers
+  identical identification registers, so a domain granted the neighbouring slot matched the
+  kernel's read. Only walking the domain's page tables says which window it read.
+
+**Build speed, measured.** A no-op rebuild takes 0.18 s and a one-line change to the kernel
+crate about a second; a one-line change in `hal` recompiles 37 of 42 crates in 4.9 s,
+against 22 s cold. The cache is content-addressed and per crate, dependents are keyed on
+their dependencies' keys, crates compile one at a time, and nothing is incremental.
 
 ### The fifth round of landings
 
