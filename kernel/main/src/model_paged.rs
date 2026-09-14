@@ -314,7 +314,33 @@ pub fn kernel_space(
     }
     c.write_str(", ");
     let walked = space::check_live::<Cpu>(c, direct, sections);
+    c.write_str(", ");
+    let user_half = user_half_check(c, direct);
     c.write_str("\n             ");
     let enforced = arch::kspace::enforcement_selftest(c);
-    (Check::from_ok(walked && enforced), live)
+    (Check::from_ok(walked && enforced && user_half), live)
+}
+
+/// Whether the live kernel tables leave the user half empty, on a configuration with one.
+///
+/// A process root mirrors every top-level entry of the kernel's, so anything the kernel maps
+/// in the user half is shared by every process: a page table all of them build into. Device
+/// windows once landed there, mapped at a physical address firmware had put at 768 GiB.
+/// They are mapped in the device window now, and this is what says so on every boot.
+#[cfg(CONFIG_USERSPACE)]
+fn user_half_check(c: &dyn EarlyConsole, direct: mm::DirectMap) -> bool {
+    let clear = crate::userproc::user_half_clear(direct, <Cpu as HasPageTables>::root());
+    c.write_str(if clear {
+        "user half clear"
+    } else {
+        "the kernel maps something in the USER HALF"
+    });
+    clear
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+fn user_half_check(c: &dyn EarlyConsole, direct: mm::DirectMap) -> bool {
+    let _ = direct;
+    c.write_str("no user half on this configuration");
+    true
 }
