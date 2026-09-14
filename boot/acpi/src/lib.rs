@@ -35,10 +35,12 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod dmar;
 pub mod fadt;
 pub mod madt;
 pub mod mcfg;
 
+pub use dmar::{Dmar, Drhd, Remapping};
 pub use fadt::{AddressSpace, Fadt, GenericAddress};
 pub use madt::{Madt, MadtEntry, ProcessorFlags};
 pub use mcfg::{EcamSegment, Mcfg};
