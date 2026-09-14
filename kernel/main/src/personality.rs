@@ -2156,6 +2156,17 @@ pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
 /// Pairs of Linux processes the stress run has run to completion.
 static PAIRS: AtomicU64 = AtomicU64::new(0);
 const PAIR_PATIENCE: Duration = Duration::from_nanos(10_000_000_000);
+
+/// Slices the pair's threads may be given, between them, without both ending. Each process
+/// maps, faults in and unmaps sixteen hundred pages, which is a second or two of emulated CPU;
+/// four thousand slices is over forty seconds of it. Like the auditor's own bounds, this is
+/// what the scheduler gave the threads rather than how long the wait took, because two
+/// processes faulting pages take as long as the host lets them.
+const PAIR_SLICES: u64 = 4096;
+
+/// Slices that say the threads are being run at all, rather than waiting for a host that is
+/// running something else.
+const PAIR_RUNNING_SLICES: u64 = 2;
 /// Audit intervals per pair.
 const PAIR_EVERY: u64 = 4;
 
@@ -2195,10 +2206,7 @@ fn pair_cycle(round: u64) -> Result<(), &'static str> {
     for id in [a, b].into_iter().flatten() {
         preempt::set_affinity(id, 1 << cpu);
     }
-    let give_up = timekeeping::now().saturating_add(PAIR_PATIENCE);
-    while [a, b].into_iter().flatten().any(preempt::alive) && timekeeping::now() < give_up {
-        preempt::sleep_until(timekeeping::now().saturating_add(POLL));
-    }
+    await_pair([a, b]);
     if !spawn::end_threads() {
         // Its tables cannot be freed while a thread may still run on them.
         return Err("a Linux process's thread did not end");
@@ -2242,6 +2250,35 @@ pub fn churn_cycles() -> u64 {
     CHURNS.load(Ordering::Relaxed)
 }
 
+/// Wait for both of a pair's threads to end.
+///
+/// A pair that is running finishes within the slices it is given; one that is not running is
+/// waiting on a host busy elsewhere, and only a duration tells that from a pair that will
+/// never finish. So the wait ends when the threads have been given [`PAIR_SLICES`] between
+/// them without both ending, or when [`PAIR_PATIENCE`] has passed and they have been given
+/// almost nothing. Either way the caller reports the thread that did not end.
+///
+/// A thread that has ended is reaped and reports no slices, so each is counted against what it
+/// had when the wait began and never against what another thread has.
+fn await_pair(ids: [Option<ThreadId>; 2]) {
+    let slices = |id: Option<ThreadId>| id.and_then(preempt::slices).map_or(0, |s| s.ran);
+    let start = ids.map(slices);
+    let give_up = timekeeping::now().saturating_add(PAIR_PATIENCE);
+    while ids.into_iter().flatten().any(preempt::alive) {
+        let mut given = 0u64;
+        for (i, id) in ids.iter().enumerate() {
+            given = given.saturating_add(slices(*id).saturating_sub(start[i]));
+        }
+        if given >= PAIR_SLICES {
+            return;
+        }
+        if timekeeping::now() >= give_up && given < PAIR_RUNNING_SLICES {
+            return;
+        }
+        preempt::sleep_until(timekeeping::now().saturating_add(POLL));
+    }
+}
+
 /// Run one churning pair; see the section comment.
 fn churn_cycle(round: u64) -> Result<(), &'static str> {
     let cpus = preempt::stats().cpus;
@@ -2269,10 +2306,7 @@ fn churn_cycle(round: u64) -> Result<(), &'static str> {
     let a = start_on(0, cpu);
     preempt::sleep_until(timekeeping::now().saturating_add(CHURN_HEAD_START));
     let b = start_on(1, (cpu + 1) % cpus);
-    let give_up = timekeeping::now().saturating_add(PAIR_PATIENCE);
-    while [a, b].into_iter().flatten().any(preempt::alive) && timekeeping::now() < give_up {
-        preempt::sleep_until(timekeeping::now().saturating_add(POLL));
-    }
+    await_pair([a, b]);
     if !spawn::end_threads() {
         return Err("a churning process's thread did not end");
     }
