@@ -22,7 +22,8 @@ static IO_APIC: Reserve = Reserve {
 };
 
 /// Every driver this image carries.
-pub(crate) const DRIVERS: &[&dyn Driver] = &[&LOCAL_APIC, &IO_APIC, &ECAM, &uart16550::DRIVER];
+pub(crate) const DRIVERS: &[&dyn Driver] =
+    &[&LOCAL_APIC, &IO_APIC, &ECAM, &uart16550::DRIVER, &virtio_blk::DRIVER];
 
 /// Nothing to install: the 8259A stays.
 ///

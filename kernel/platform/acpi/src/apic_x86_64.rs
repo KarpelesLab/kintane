@@ -17,6 +17,7 @@ pub(crate) const DRIVERS: &[&dyn Driver] = &[
     &apic::IO_DRIVER,
     &ECAM,
     &uart16550::DRIVER,
+    &virtio_blk::DRIVER,
 ];
 
 /// Build the controller from what bound and install it and its timer. Returns whether that
