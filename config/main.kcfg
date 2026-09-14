@@ -58,13 +58,17 @@ config BOOT_STACK_KIB
     int "Size of the boot stack (KiB)"
     range 1 256
     default 32 if BLOCK_DOMAIN
+    default 32 if IOMMU
+    default 32 if SMP
     default 16
     help
         The stack the first thread of execution runs on, with a guard below it.
         A driver domain's boot check hands the disk back to the kernel from the
         boot stack, under kmain's own frame: on x86_64 that path measured about
         15.7 KiB of frames, past a 16 KiB stack once the object-layer checks grew
-        kmain, so a build with BLOCK_DOMAIN doubles it.
+        kmain, so a build with BLOCK_DOMAIN doubles it. So does one with an
+        IOMMU, whose in-kernel test image reached 93% of 16 KiB, and one with
+        SMP, whose reached 72%.
 
         Every port's linker script reserves this much, rounded up to a page
         where the port has pages, and asserts it; kbuild refuses a linked

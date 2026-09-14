@@ -179,7 +179,9 @@ banner's checks and the in-kernel suite the `bootstack` line reports the lowest 
 longer holds it (`kernel/main/src/bootstack.rs`). More than 75% of the stack fails the boot.
 First measured: x86_64-qemu 65% of 16 KiB, x86_64-isolated 55% of 32 KiB, i686-qemu 55%,
 aarch64-virt 48%, riscv32 and ARMv7-M 37%, and armv7m-tiny 77% of its 12 KiB, which is why that
-preset now has 14. It is a high-water mark, so a lower bound: a path the boot did not take, or a
+preset now has 14. An in-kernel test image is deeper still, since the suite runs on the same
+stack: `x86_64-iommu`'s reached 93% and `x86_64-qemu-smp`'s 72%, so an IOMMU and SMP default to
+32 KiB as a driver domain already did. It is a high-water mark, so a lower bound: a path the boot did not take, or a
 frame reserved and never written, is not seen.
 
 **What a stack overflow does now.** On every port, an overflow of the boot stack or of a

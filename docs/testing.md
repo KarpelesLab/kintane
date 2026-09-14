@@ -101,6 +101,13 @@ measured x86_64-qemu at 65% of 16 KiB, x86_64-isolated at 55% of 32 KiB, i686-qe
 aarch64-virt 48%, riscv32-virt, riscv32i-virt and armv7m-mps2 37%, and armv7m-tiny at 77% of its
 12 KiB, which failed and now has 14 (66%).
 
+An in-kernel test image goes deeper than the boot of the same preset, because the suite runs on
+the boot stack too. `x86_64-iommu`'s reached 15,280 bytes, 93% of 16 KiB, and failed; the VT-d
+and remapping checks are what take it there. `x86_64-qemu-smp`'s reached 72%. Both an IOMMU and
+SMP now default the boot stack to 32 KiB, as `BLOCK_DOMAIN` already did, which puts those images
+at 46% and 36%. The next deepest are `armv7m-tiny`'s at 70% of its 14 KiB — a 56 KiB board, so it
+keeps what it has — and `x86_64-efistub`'s at 65%.
+
 The size is checked twice. Each port's linker script asserts that `__stack_bottom` to
 `__stack_top` is `BOOT_STACK_KIB` rounded up to a page, and kbuild refuses any linked kernel
 where it is not, whatever its script says (`kbuild/src/bootstack.rs`, with host tests). The
