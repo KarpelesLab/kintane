@@ -73,6 +73,12 @@ pub struct Unit {
     /// such as `x86_64-unknown-uefi`. Such a unit is a separate image — a bootloader —
     /// built with its own `core` and its own copies of its dependencies.
     pub target: Option<String>,
+    /// Built for the architecture's hard-float target rather than the kernel's soft-float
+    /// one, with its own `core`. Only a `user` unit may ask: the kernel and its modules
+    /// stay soft-float, and the assertion in `arch/aarch64/src/context.rs` says why. A
+    /// program that asks must be single-threaded, because nothing saves floating-point
+    /// registers across a context switch yet; see docs/targets.md.
+    pub hard_float: bool,
     pub manifest: PathBuf,
 }
 
@@ -177,6 +183,18 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
         return Err(at("`unit.target` is for images; a library is built for whoever links it"));
     }
 
+    let hard_float = match v.get_path("unit.float").and_then(|x| x.as_str()) {
+        None | Some("soft") => false,
+        Some("hard") => true,
+        Some(other) => {
+            return Err(at(&format!("unknown `unit.float` `{other}`; expected `soft` or `hard`")));
+        }
+    };
+    if hard_float && kind != Kind::User {
+        return Err(at("`float = \"hard\"` is for user programs: the kernel and its modules are \
+             soft-float, and a context switch saves no floating-point state"));
+    }
+
     Ok(Unit {
         name,
         kind,
@@ -190,6 +208,7 @@ fn parse_unit(manifest: &Path) -> Result<Unit, String> {
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
         target,
+        hard_float,
         dir,
         manifest: manifest.to_path_buf(),
     })
@@ -420,6 +439,7 @@ mod tests {
             rustflags: vec![],
             host_tests: false,
             target: None,
+            hard_float: false,
             manifest: PathBuf::from("kmod.toml"),
         }
     }

@@ -139,7 +139,14 @@ _start:
     movl %eax, %cr3
 
     movl %cr4, %eax
-    orl $(1 << 5), %eax
+    orl $(1 << 5), %eax         /* CR4.PAE */
+    /* SSE made legal to execute. The kernel's own target disables SSE and it emits none,
+     * so this changes nothing about kernel code; it is here for user programs built for
+     * the hard-float target, whose XMM instructions would otherwise raise #UD. Secondaries
+     * need no copy of this: `smp.rs` publishes the boot CPU's CR4 and each one loads it
+     * wholesale. See docs/targets.md. */
+    orl $(1 << 9), %eax         /* CR4.OSFXSR: SSE state is the kernel's to save */
+    orl $(1 << 10), %eax        /* CR4.OSXMMEXCPT: SIMD exceptions as #XF, not #UD */
     movl %eax, %cr4
 
     movl $0xC0000080, %ecx
@@ -148,8 +155,10 @@ _start:
     wrmsr
 
     movl %cr0, %eax
-    orl $(1 << 31), %eax
-    orl $(1 << 0), %eax
+    andl $0xFFFFFFFB, %eax      /* clear CR0.EM: no x87 emulation trap on an SSE instruction */
+    orl $(1 << 1), %eax         /* CR0.MP */
+    orl $(1 << 31), %eax        /* CR0.PG */
+    orl $(1 << 0), %eax         /* CR0.PE */
     movl %eax, %cr0
 
     lgdt gdt64_pointer
