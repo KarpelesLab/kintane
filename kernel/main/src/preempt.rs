@@ -177,6 +177,20 @@ static STACKS: [(AtomicUsize, AtomicUsize); MAX_STACKS] =
 static STARTS: [(AtomicUsize, AtomicUsize); MAX_STACKS] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; MAX_STACKS];
 
+/// The raw id of the thread last spawned on each stack slot, `u32::MAX` for none.
+///
+/// A slot may be spawned on again only once that thread has left the table, which is to say
+/// exited and been reaped: two live threads on one stack overwrite each other's frames, and
+/// the one that resumes second jumps to whatever the other left there. Ids are never reused,
+/// so a reaped thread's id is simply unknown to the table.
+static STACK_OWNERS: [AtomicU32; MAX_STACKS] = [const { AtomicU32::new(u32::MAX) }; MAX_STACKS];
+
+/// Whether stack slot `stack` may be spawned on: its last thread, if any, has left `t`.
+fn stack_free(t: &Threads<Cpu, SLOTS, { mp::CPUS }>, stack: usize) -> bool {
+    let owner = STACK_OWNERS[stack].load(Ordering::Relaxed);
+    owner == u32::MAX || t.state(ThreadId::new(owner)).is_none()
+}
+
 /// Slots of `STACKS` claimed so far.
 static CLAIMED: AtomicUsize = AtomicUsize::new(0);
 
@@ -269,8 +283,6 @@ static HIGH_RESUMED_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
 /// When the boot CPU's interrupt before the one that woke `high` found the clock, in
 /// nanoseconds. `u64::MAX` until an interrupt wakes `high`.
 static HIGH_WAKE_PREVIOUS: AtomicU64 = AtomicU64::new(u64::MAX);
-/// Set by `high` as it exits.
-static HIGH_DONE: AtomicBool = AtomicBool::new(false);
 /// When the boot CPU's latest scheduler interrupt found the clock, in nanoseconds.
 static LAST_TICK: AtomicU64 = AtomicU64::new(0);
 /// Set while the workers race, for [`on_tick`] to count what it did then.
@@ -693,6 +705,9 @@ fn spawn_with(
         return None;
     }
     with_table(|t| {
+        if !stack_free(t, stack) {
+            return None;
+        }
         STARTS[stack].0.store(entry as usize, Ordering::Release);
         STARTS[stack].1.store(arg, Ordering::Release);
         let here = Cpu::cpu_index();
@@ -701,9 +716,9 @@ fn spawn_with(
             None => (CpuSet::all(mp::CPUS), here, false),
         };
         // SAFETY: `top` and `size` describe a guarded slot claimed for the scheduler alone,
-        // mapped read-write. The caller guarantees no live thread uses it: either it was
+        // mapped read-write, and `stack_free` has just shown no live thread uses it: it was
         // never handed out, or its thread exited and was reaped.
-        unsafe {
+        let id = unsafe {
             t.spawn_on(
                 thread_start,
                 stack,
@@ -715,7 +730,9 @@ fn spawn_with(
                 idle,
             )
         }
-        .ok()
+        .ok()?;
+        STACK_OWNERS[stack].store(id.raw(), Ordering::Relaxed);
+        Some(id)
     })
 }
 
@@ -750,11 +767,14 @@ pub fn spawn_prepared(
         return None;
     }
     with_table(|t| {
+        if !stack_free(t, stack) {
+            return None;
+        }
         STARTS[stack].0.store(entry as usize, Ordering::Release);
         STARTS[stack].1.store(arg, Ordering::Release);
         let here = Cpu::cpu_index();
-        // SAFETY: as in `spawn_with`: a guarded slot claimed for the scheduler alone,
-        // whose previous thread the caller guarantees has been reaped.
+        // SAFETY: as in `spawn_with`: a guarded slot claimed for the scheduler alone, whose
+        // previous thread `stack_free` has just shown to be gone.
         let id = unsafe {
             t.spawn_on(
                 thread_start,
@@ -768,6 +788,7 @@ pub fn spawn_prepared(
             )
         }
         .ok()?;
+        STACK_OWNERS[stack].store(id.raw(), Ordering::Relaxed);
         // The thread is queued but not running, so its saved context is the one a switch
         // into it will load, and `context_mut` refuses anything else.
         prepare(t.context_mut(id).ok()?, KernAddr::new(top));
@@ -809,13 +830,6 @@ pub fn set_affinity(id: ThreadId, mask: u64) -> bool {
 }
 
 /// Whether `id` still exists in the table and has not exited.
-#[cfg_attr(
-    not(CONFIG_USERSPACE),
-    expect(
-        dead_code,
-        reason = "used only by the process checks, which need USERSPACE"
-    )
-)]
 pub fn alive(id: ThreadId) -> bool {
     with_table(|t| !matches!(t.state(id), None | Some(thread::State::Exited)))
 }
@@ -1154,7 +1168,6 @@ extern "C" fn high(_: usize) -> ! {
     HIGH_WOKE_AT.store(timekeeping::now().as_nanos(), Ordering::Relaxed);
     let busy = !DONE[0].load(Ordering::Relaxed) && !DONE[1].load(Ordering::Relaxed);
     HIGH_PREEMPTED_WORKERS.store(busy, Ordering::Relaxed);
-    HIGH_DONE.store(true, Ordering::Relaxed);
     exit_thread()
 }
 
@@ -1273,22 +1286,30 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     RACING.store(false, Ordering::Relaxed);
     STOP_WORKERS.store(true, Ordering::Relaxed);
     sleep_until(start.saturating_add(BOOT_WAKES_AFTER));
-    wait_in_slices(give_up, || {
-        DONE.iter().all(|d| d.load(Ordering::Relaxed)) && HIGH_DONE.load(Ordering::Relaxed)
-    });
+    // Until they have exited, not until they have set a flag on the way: a thread preempted
+    // between the two is not reapable yet.
+    wait_in_slices(give_up, || ids[1..].iter().all(|&id| !alive(id)));
     let interrupts = arch::tick::ticks() - interrupts;
     let elapsed = timekeeping::now().saturating_duration_since(start);
 
-    // Every thread but idle has exited by now; give their slots back and let the table
-    // check itself in its final state.
+    // Every thread but idle has exited by now, unless the kernel is broken or `PATIENCE` ran
+    // out; give their slots back and let the table check itself in its final state.
     let reaped = ids[1..].iter().all(|&id| reap(id));
-    let consistent = reaped && table_ok();
+    let consistent = table_ok();
 
-    let preempted = report(c, interrupts, elapsed, consistent);
+    let preempted = report(c, interrupts, elapsed, reaped, consistent);
 
-    // The shared-state checks run on the same scheduler, with idle still in place and
-    // the stacks the threads above gave back.
-    let shared = shared::run(c);
+    // The shared-state checks run on the same scheduler, with idle still in place and on
+    // the stacks the threads above gave back. Not if one was not given back: its thread is
+    // still in the table and may yet resume on that stack. `spawn` would refuse the slot
+    // anyway; before it did, a boot on a loaded host started the sleep phase on a worker's
+    // stack and faulted, at a garbage address, when the worker resumed.
+    let shared = if reaped {
+        shared::run(c)
+    } else {
+        c.write_str("\n  shared     not run: a scheduler thread's stack is still in use");
+        Check::Failed
+    };
 
     arch::tick::stop();
     arch::tick::set_hook(None);
@@ -1298,7 +1319,13 @@ pub fn demonstrate(c: &dyn EarlyConsole) -> Check {
     preempted.and(shared)
 }
 
-fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bool) -> Check {
+fn report(
+    c: &dyn EarlyConsole,
+    interrupts: u64,
+    elapsed: Duration,
+    reaped: bool,
+    table_ok: bool,
+) -> Check {
     let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let counts = [load(&COUNT[0]), load(&COUNT[1])];
     let saw = [load(&SAW_OTHER[0]), load(&SAW_OTHER[1])];
@@ -1402,6 +1429,11 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
         c.write_str(" A THREAD STOPPED RECEIVING INTERRUPTS");
     }
 
+    if !reaped {
+        c.write_str(
+            "\n             A THREAD HAD NOT EXITED, so its slot and stack were not given back",
+        );
+    }
     if !table_ok {
         c.write_str("\n             thread table INCONSISTENT after the run");
     }
@@ -1414,6 +1446,7 @@ fn report(c: &dyn EarlyConsole, interrupts: u64, elapsed: Duration, table_ok: bo
             && ticks_kept_coming
             && sliced
             && idled
+            && reaped
             && table_ok
             && broken == 0,
     )
