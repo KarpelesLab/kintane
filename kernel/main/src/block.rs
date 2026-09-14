@@ -28,7 +28,7 @@ use mm::phys::FrameAllocator;
 use virtio_blk::VirtioBlk;
 use virtio_blk::mem::Dma;
 
-use crate::{Check, Live, Locks, write_usize};
+use crate::{Check, Live, Locks, iommu, write_usize};
 
 /// Frames for the rings and for every request that may be in flight: each has its own
 /// header, status byte and bounce buffer, so the driver can have several outstanding.
@@ -111,6 +111,19 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
     // freed: the device keeps using it for as long as the kernel runs.
     let dma = unsafe { Dma::new(virt.raw(), phys, len) };
 
+    // With an IOMMU, put the disk behind it *before* it does any DMA: a translation domain
+    // that maps exactly this grant and nothing else. `iommu` does nothing on a build without
+    // one, and there the disk's DMA reaches memory directly as before.
+    let confined = if kconfig::IOMMU {
+        if !iommu::confine_disk(c, frames, direct, phys, len as u64) {
+            return Check::Failed;
+        }
+        c.write_str("; ");
+        true
+    } else {
+        false
+    };
+
     // SAFETY: the claimed window is mapped by the kernel's address space, which maps
     // every window a bound driver claimed, and this is the one transport made for it.
     let Some(transport) = (unsafe { virtio_blk::transport() }) else {
@@ -155,13 +168,158 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
 
     // SAFETY: the one borrow of `BUF`; see its invariant.
     let buf = unsafe { &mut *BUF.get() };
-    let ok = run_checks(c, blk, buf);
+    let mut ok = run_checks(c, blk, buf);
+    // With the IOMMU on, prove the confinement: an out-of-grant DMA is stopped and logged,
+    // and the device restarts and serves again. `blk` is re-fetched inside, because a
+    // restart replaces the stored device.
+    if ok && confined {
+        ok = iommu_checks(c, frames, direct, virt.raw(), phys, len, buf);
+    }
     if ok {
         c.write_str(" ok");
         Check::Passed
     } else {
         Check::Failed
     }
+}
+
+/// Polls the deliberate out-of-grant DMA waits before it is called blocked. A blocked request
+/// never completes, so this only bounds the wait; it is far above what a served request takes.
+const ROGUE_POLLS: u32 = 2_000_000;
+
+/// The IOMMU confinement checks, run after the functional ones with the device behind the
+/// IOMMU: the in-grant DMA that `run_checks` already served, then a deliberate out-of-grant
+/// DMA the hardware must stop and log, then a restart that serves again.
+fn iommu_checks(
+    c: &dyn EarlyConsole,
+    frames: &mut FrameAllocator<'_, Cpu>,
+    direct: mm::DirectMap,
+    virt: usize,
+    phys: u64,
+    len: usize,
+    buf: &mut [u8],
+) -> bool {
+    let Some(blk) = disk() else {
+        return false;
+    };
+    // A canary frame outside the grant, filled with a sentinel the device will try to
+    // overwrite. It is never freed, so nothing reuses the address the fault will name.
+    let Ok(canary) = frames.alloc_frame() else {
+        c.write_str("\n  iommu      NO CANARY FRAME");
+        return false;
+    };
+    let cphys = canary.start().raw();
+    let Ok(cvirt) = direct.to_virt(PhysAddr::new(cphys)) else {
+        c.write_str("\n  iommu      CANARY OUTSIDE THE DIRECT MAP");
+        return false;
+    };
+    let cp = cvirt.raw() as *mut u8;
+    const SENTINEL: u8 = 0x5a;
+    for i in 0..testdisk::SECTOR {
+        // SAFETY: `cp` is the canary frame through the direct map, a whole page; writing a
+        // sector of it is in bounds. Volatile, because the device may write it behind us.
+        unsafe { cp.add(i).write_volatile(SENTINEL) };
+    }
+
+    // The grant must translate and the canary must not: the domain maps exactly the grant.
+    if !iommu::domain_maps(phys) || iommu::domain_maps(cphys) {
+        c.write_str("\n  iommu      THE DOMAIN DOES NOT MAP EXACTLY THE GRANT");
+        return false;
+    }
+
+    // The rogue DMA: point the device at a read into the canary, outside its grant.
+    let completed = blk.dma_probe(0, cphys, testdisk::SECTOR as u32, ROGUE_POLLS);
+    let fault = iommu::take_fault();
+    let mut untouched = true;
+    for i in 0..testdisk::SECTOR {
+        // SAFETY: as the fill above.
+        if unsafe { cp.add(i).read_volatile() } != SENTINEL {
+            untouched = false;
+            break;
+        }
+    }
+
+    c.write_str("\n  iommu      in-grant DMA served behind VT-d");
+    let stopped = match fault {
+        Some((f, source)) if f.address == cphys && f.write => {
+            c.write_str("; out-of-grant DMA stopped at ");
+            write_hex(c, f.address);
+            c.write_str(" from ");
+            write_hex(c, u64::from(source));
+            true
+        }
+        Some((f, _)) => {
+            c.write_str("; A FAULT AT ");
+            write_hex(c, f.address);
+            c.write_str(" BUT NOT THE ROGUE ONE");
+            false
+        }
+        None => {
+            let _ = completed;
+            c.write_str("; THE ROGUE DMA WAS NOT STOPPED");
+            false
+        }
+    };
+    if !untouched {
+        c.write_str("; THE CANARY WAS OVERWRITTEN");
+    }
+
+    // Restart: the faulted device is reset and a fresh one brought up over the same grant,
+    // which the IOMMU domain still maps, so it serves again — and the stress run can use it.
+    let served = restart(c, virt, phys, len, buf);
+    stopped && untouched && served
+}
+
+/// Reset the device after the fault and bring a fresh one up over the same DMA grant and
+/// window, then prove it serves a read. Replaces the stored device.
+fn restart(c: &dyn EarlyConsole, virt: usize, phys: u64, len: usize, buf: &mut [u8]) -> bool {
+    // SAFETY: the single-threaded boot path. The old device is dropped before the new one is
+    // built, so the DMA region and the register window have exactly one owner at a time; the
+    // new bring-up resets the device (status 0) and re-lays the queue, discarding the faulted
+    // request. `virt`/`phys`/`len` are the same region `check` mapped, still direct-mapped.
+    unsafe { *DISK.get() = None };
+    STARTED.store(false, Ordering::Release);
+    let dma = unsafe { Dma::new(virt, phys, len) };
+    let Some(transport) = (unsafe { virtio_blk::transport() }) else {
+        c.write_str("; NO TRANSPORT ON RESTART");
+        return false;
+    };
+    let blk = match VirtioBlk::<Locks>::bring_up(transport, dma) {
+        Ok(b) => b,
+        Err(e) => {
+            c.write_str("; RESTART BRING-UP FAILED: ");
+            c.write_str(bring_up_error(e));
+            return false;
+        }
+    };
+    // SAFETY: the one write to `DISK` after the old one was cleared, before `STARTED`.
+    unsafe { *DISK.get() = Some(blk) };
+    STARTED.store(true, Ordering::Release);
+    let Some(blk) = disk() else {
+        return false;
+    };
+    let sector0 = &mut buf[..testdisk::SECTOR];
+    if let Err(e) = blk.read_blocks(0, sector0) {
+        return failed(c, "reading after the restart", e);
+    }
+    if testdisk::header(sector0) != Some(testdisk::SECTORS) {
+        c.write_str("; THE RESTARTED DEVICE READ WRONG DATA");
+        return false;
+    }
+    c.write_str("; restarted and served a read");
+    true
+}
+
+/// A 64-bit value in hex, `0x`-prefixed, for the IOMMU report.
+fn write_hex(c: &dyn EarlyConsole, value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[2 + i] = HEX[((value >> (60 - 4 * i)) & 0xf) as usize];
+    }
+    c.write_bytes(&buf);
 }
 
 fn run_checks(c: &dyn EarlyConsole, blk: &VirtioBlk<Locks>, buf: &mut [u8]) -> bool {

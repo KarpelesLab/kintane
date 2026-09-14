@@ -60,7 +60,7 @@ impl MockRegs {
         let high = (1u64 << 63)
             | (u64::from(source_id))
             | (u64::from(reason) << 32)
-            | (u64::from(!write) << 40);
+            | (u64::from(!write) << 62);
         w.insert(FRCD_LOW, address & !0xfff);
         w.insert(FRCD_HIGH, high);
         let fsts = w.get(&reg::FSTS).copied().unwrap_or(0);

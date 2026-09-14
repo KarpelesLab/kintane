@@ -685,6 +685,25 @@ config QEMU_BLOCK_TEST
         way. Needs MM_PAGED, because the check maps the driver's DMA region
         through the kernel's direct map.
 
+config IOMMU
+    bool "Confine device DMA with an Intel VT-d IOMMU"
+    depends on QEMU_BLOCK_TEST && ARCH_X86_64
+    help
+        Discover the machine's DMA remapping hardware from the ACPI DMAR
+        (`boot/acpi::dmar`), program it (`drivers/iommu/vtd`), and put the
+        virtio-blk device behind it: a translation domain that maps exactly the
+        device's granted DMA buffer, and nothing else.
+
+        The block check then runs with the device's DMA translated by the
+        IOMMU, which proves an in-grant DMA still works. A deliberate DMA to a
+        canary frame outside the grant is stopped by the hardware, and the boot
+        reads the fault back from the unit's log -- the faulting address and the
+        device's own source id -- and confirms the canary is untouched.
+
+        x86_64 only, and off by default: QEMU must be started with
+        `-device intel-iommu` and the disk with `iommu_platform=on`, which the
+        `x86_64-iommu` preset does. See docs/isolation.md.
+
 config SERIAL_IRQ_TEST
     bool "Prove the console UART receives on interrupt under QEMU"
     # The harness answers each prompt once per run, and a BOOT_COUNTER_TEST run is four

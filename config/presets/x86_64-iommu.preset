@@ -1,0 +1,16 @@
+# x86_64 under QEMU q35 with an Intel VT-d IOMMU in front of the disk.
+#
+# The same kernel as x86_64-qemu, with IOMMU on. QEMU is started with
+# `-device intel-iommu,intremap=on` behind a split irqchip, and the test disk with
+# `iommu_platform=on`, so the virtio-blk device sends its DMA through the IOMMU. The kernel
+# discovers the remapping hardware from the DMAR, builds a translation domain that maps
+# exactly the device's DMA grant, and puts the device behind it: the block check runs with
+# every DMA translated, and a deliberate out-of-grant DMA is stopped by the hardware and
+# read back from its fault log. See docs/isolation.md.
+ARCH_X86_64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+IOMMU=y
+SIZE_BUDGET_KIB=1280

@@ -432,6 +432,45 @@ impl<L: LockFamily, T: Transport> VirtioBlk<L, T> {
     pub fn peak_in_flight(&self) -> usize {
         L::with(&self.inner, |i| i.peak_in_flight)
     }
+
+    /// Point the device at a read of `len` bytes into device address `addr`, and wait a
+    /// bounded while for it. Returns whether the device *completed* the read.
+    ///
+    /// For one purpose: proving an IOMMU stops a device reaching memory outside its grant. A
+    /// driver never does this — every buffer it uses is one of its own slots — so it is a
+    /// deliberate out-of-grant DMA, exactly what isolation must contain. Behind an IOMMU with
+    /// no mapping for `addr`, the device's write faults and never completes, and this returns
+    /// `false`; the fault log and the untouched target are the evidence the host checks.
+    /// `false` is the expected, safe outcome; `true` means the DMA was *not* blocked.
+    pub fn dma_probe(&self, lba: u64, addr: u64, len: u32, poll_limit: u32) -> bool {
+        let slot = match L::with(&self.inner, |i| {
+            i.engine.submit_raw_read(&self.transport, lba, addr, len)
+        }) {
+            Ok(slot) => slot,
+            Err(_) => return false,
+        };
+        let mut polls = 0u32;
+        loop {
+            let done = L::with(&self.inner, |i| {
+                if !i.engine.is_done(slot) {
+                    i.engine.drain();
+                }
+                i.engine.is_done(slot)
+            });
+            if done {
+                L::with(&self.inner, |i| i.engine.finish(slot, None, false));
+                return true;
+            }
+            polls += 1;
+            if polls >= poll_limit {
+                // Leave the slot: its chain is still the device's, and a completion that
+                // arrives late must not write into a reused slot.
+                L::with(&self.inner, |i| i.engine.finish(slot, None, true));
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
 }
 
 impl<L: LockFamily, T: Transport> BlockDevice for VirtioBlk<L, T> {

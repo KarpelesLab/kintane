@@ -51,6 +51,12 @@ mod isolation;
 #[cfg(not(CONFIG_DRIVER_ISOLATION))]
 #[path = "isolation_off.rs"]
 mod isolation;
+// Confining the disk's DMA with a VT-d IOMMU; without one, the same calls doing nothing.
+#[cfg(CONFIG_IOMMU)]
+mod iommu;
+#[cfg(not(CONFIG_IOMMU))]
+#[path = "iommu_off.rs"]
+mod iommu;
 // The block check on a paged kernel; on a flat one, the same call doing nothing.
 #[cfg(CONFIG_MM_PAGED)]
 mod block;

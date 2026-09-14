@@ -52,8 +52,9 @@ pub fn take(regs: &impl Regs) -> Option<Fault> {
         address: low & !0xfff,
         source_id: (high & 0xffff) as u16,
         reason: ((high >> 32) & 0xff) as u8,
-        // Bit 40 (T): 0 is a write request, 1 is a read (VT-d §10.4.14).
-        write: (high >> 40) & 1 == 0,
+        // The Type bit is bit 126 of the record, i.e. bit 62 of the high qword: 0 is a write
+        // request, 1 is a read (VT-d §10.4.14).
+        write: (high >> 62) & 1 == 0,
     };
     // Clear the record by writing 1 to its F bit, then clear the pending-fault status.
     regs.write64(base + 8, 1 << 63);

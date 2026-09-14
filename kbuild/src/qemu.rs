@@ -113,13 +113,20 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
 
     if res.is_on("ARCH_X86_64") {
+        // With an IOMMU, interrupt remapping needs the split irqchip: the I/O APIC is
+        // emulated in userspace so remapped interrupts pass through the IOMMU.
+        let machine = if res.is_on("IOMMU") {
+            "q35,kernel-irqchip=split"
+        } else {
+            "q35"
+        };
         // isa-debug-exit reports (value << 1) | 1, so the guest can never produce 0
         // and "QEMU exited for its own reasons" is never mistaken for a pass.
         return Ok(Machine {
             binary: "qemu-system-x86_64",
             args: vec![
                 s("-machine"),
-                s("q35"),
+                s(machine),
                 s("-cpu"),
                 cpu,
                 s("-m"),
@@ -312,6 +319,15 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
         return Vec::new();
     }
     let disk = crate::testdisk::beside(image);
+    // With an IOMMU in front of it, the device's DMA goes through the platform IOMMU: it
+    // negotiates VIRTIO_F_ACCESS_PLATFORM and treats descriptor addresses as device
+    // addresses the IOMMU translates. QEMU refuses the handshake unless `iommu_platform=on`
+    // is set on a PCI virtio device here.
+    let device = if res.is_on("IOMMU") && device.starts_with("virtio-blk-pci") {
+        format!("{device},iommu_platform=on")
+    } else {
+        device.to_string()
+    };
     let mut args = vec![
         "-drive".to_string(),
         format!("file={},if=none,id=kt_disk,format=raw,snapshot=on", disk.display()),
@@ -342,6 +358,11 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
 /// failure — the same trap the memory-mapped transport hit with `force-legacy`.
 fn x86_platform(res: &Resolution, chipset: &str, image: &Path) -> Vec<String> {
     let mut args = vec!["-smp".to_string(), res.int("QEMU_CPUS").max(1).to_string()];
+    // The IOMMU device must be created before the PCI devices it governs, so it goes first.
+    // `intremap=on` needs the split irqchip the machine line asks for.
+    if res.is_on("IOMMU") {
+        args.extend(["-device".to_string(), "intel-iommu,intremap=on".to_string()]);
+    }
     args.extend(block_disk(res, image, "virtio-blk-pci,disable-legacy=on"));
     if res.is_on("QEMU_PCI_TEST_DEVICE") {
         let (bridge, device) = if chipset == "q35" {
