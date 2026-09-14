@@ -322,7 +322,13 @@ fn a_name_is_stored_long_or_short_and_an_unwritable_one_is_refused() {
         let root = fat.root();
         // Names a short entry cannot hold are kept in long entries, whatever it is about them
         // that does not fit: length, a second dot, a space, a leading dot.
-        for long in [&b"toolongname.txt"[..], b"a.long", b".hidden", b"a b", b"a.b.c"] {
+        for long in [
+            &b"toolongname.txt"[..],
+            b"a.long",
+            b".hidden",
+            b"a b",
+            b"a.b.c",
+        ] {
             let node = fat.create(root, long, Kind::File).unwrap();
             assert_eq!(fat.lookup(root, long).unwrap(), node, "{long:?} is found by its name");
         }

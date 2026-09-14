@@ -15,13 +15,13 @@
 //!   its table were 12 bits wide. The two formats differ in three places and nowhere else: a table
 //!   entry is 16 or 28 bits, the root is a fixed region or a cluster chain, and FAT32 keeps a free
 //!   count in an FSInfo sector ([`Format`]).
-//! * **Long names, read and written.** A name that is already eight-and-three is stored as a
-//!   short name, with the two bits that record whether each half was written in lower case, so
+//! * **Long names, read and written.** A name that is already eight-and-three is stored as a short
+//!   name, with the two bits that record whether each half was written in lower case, so
 //!   `readme.txt` comes back as it went in. Anything longer, or mixed in case, gets a set of
-//!   long-name entries and a short alias of its own (`lfn`). Only printable ASCII is written:
-//!   the format reserves `"*/:<>?\|`, and a name outside that is [`vfs::Error::BadPath`] rather
-//!   than one silently shortened. A name already on the disk whose characters this cannot
-//!   represent is reported by its short name rather than guessed at.
+//!   long-name entries and a short alias of its own (`lfn`). Only printable ASCII is written: the
+//!   format reserves `"*/:<>?\|`, and a name outside that is [`vfs::Error::BadPath`] rather than
+//!   one silently shortened. A name already on the disk whose characters this cannot represent is
+//!   reported by its short name rather than guessed at.
 //! * **Every field is checked before it is used.** A cluster number outside the table, a chain
 //!   longer than the volume has clusters, a directory entry past the end of its region: each is
 //!   [`vfs::Error::Corrupt`] with the field named. The bytes come from a disk, and a disk is not

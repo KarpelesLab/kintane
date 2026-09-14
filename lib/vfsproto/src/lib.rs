@@ -31,8 +31,8 @@
 //! * `rename`: the payload is the old path, a zero byte, and the new path, which may name another
 //!   directory of the same filesystem.
 //! * `statfs`: the payload is a path; the reply's payload is the filesystem covering it — its
-//!   allocation unit, how many units it has, how many are free and the longest name it holds,
-//!   as [`statfs_answer`] encodes them. A read-side request, so a read-only connection may ask.
+//!   allocation unit, how many units it has, how many are free and the longest name it holds, as
+//!   [`statfs_answer`] encodes them. A read-side request, so a read-only connection may ask.
 //! * `sync`: nothing; every write so far reaches the disk before the reply.
 //! * `close`: `a` is the file number.
 //!

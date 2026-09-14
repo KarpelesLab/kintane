@@ -34,8 +34,8 @@
 //!   and asks the kernel, over that channel, to make one of them ready after a delay it chooses;
 //!   see [`poll_wait`].
 //! * [`MODE_STATFS`] asks the file server what each of the disk's two volumes is, checks the
-//!   answers stand on their own, and leaves them for the kernel to hold against its own walk of
-//!   the same volumes; see [`statfs_mode`].
+//!   answers stand on their own, and leaves them for the kernel to hold against its own walk of the
+//!   same volumes; see [`statfs_mode`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -815,14 +815,7 @@ fn ask_what_the_volumes_are(rw: Handle) -> Result<(), u64> {
     let mut buf = [0u8; vfsproto::MESSAGE];
     let mut answers = [0u8; 2 * vfsproto::STATFS_BYTES];
     let root = one_statfs(rw, b"/", 0xb01, &mut buf, &mut answers, 0)?;
-    let second = one_statfs(
-        rw,
-        b"/FAT32",
-        0xb02,
-        &mut buf,
-        &mut answers,
-        vfsproto::STATFS_BYTES,
-    )?;
+    let second = one_statfs(rw, b"/FAT32", 0xb02, &mut buf, &mut answers, vfsproto::STATFS_BYTES)?;
     // Each answer stands on its own: a unit of some size, units to hold, no more free than
     // there are, and room for a name longer than a short one.
     for (answer, step) in [(root, 0xb03u64), (second, 0xb04)] {

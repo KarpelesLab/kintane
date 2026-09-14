@@ -375,7 +375,8 @@ fn removing_a_long_name_frees_every_entry_of_its_set() {
         create(&mut ns, "/a name long enough to need three entries.bin", b"z");
         assert_eq!(listing(&mut ns).len(), 1);
         assert!(ns.stat("/ANAMEL~1.BIN").is_ok(), "the first alias was free again");
-        ns.unlink("/a name long enough to need three entries.bin").unwrap();
+        ns.unlink("/a name long enough to need three entries.bin")
+            .unwrap();
 
         // The slots come back: the same name written again fits where the first one was.
         create(&mut ns, long, b"y");
@@ -396,10 +397,7 @@ fn a_long_name_survives_a_rename_and_a_directory() {
         ns.mkdir("/a directory with a long name").unwrap();
         create(&mut ns, "/a directory with a long name/inside it.txt", b"deep");
 
-        assert_eq!(
-            ns.stat("/a directory with a long name").unwrap().kind,
-            Kind::Dir
-        );
+        assert_eq!(ns.stat("/a directory with a long name").unwrap().kind, Kind::Dir);
         let mut buf = [0u8; 16];
         let n = ns
             .read_all("/a directory with a long name/inside it.txt", &mut buf)
@@ -412,10 +410,7 @@ fn a_long_name_survives_a_rename_and_a_directory() {
             "/a directory with a long name/renamed to something longer.txt",
         )
         .unwrap();
-        assert_eq!(
-            ns.stat("/a directory with a long name/inside it.txt"),
-            Err(Error::NotFound)
-        );
+        assert_eq!(ns.stat("/a directory with a long name/inside it.txt"), Err(Error::NotFound));
         ns.rename(
             "/a directory with a long name/renamed to something longer.txt",
             "/moved out.txt",
@@ -444,11 +439,7 @@ fn a_name_the_driver_will_not_write_is_refused_rather_than_shortened() {
                 create: true,
                 ..OpenFlags::READ
             };
-            assert_eq!(
-                ns.open_with(bad, flags).err(),
-                Some(Error::BadPath),
-                "{bad} is refused"
-            );
+            assert_eq!(ns.open_with(bad, flags).err(), Some(Error::BadPath), "{bad} is refused");
         }
         assert_eq!(listing(&mut ns), Vec::<String>::new(), "and nothing was made");
         ns.unmount("/").unwrap();
