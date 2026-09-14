@@ -1617,14 +1617,14 @@ before programming a function's message.
 
 Host tests, without QEMU:
 
-- `kernel/net`: 45 tests. 21 are against a simulated gateway, and cover RFC 1071 checksums, IPv4
+- `kernel/net`: 47 tests. 21 are against a simulated gateway, and cover RFC 1071 checksums, IPv4
   lengths, fragments and bad checksums refused and counted, and the UDP pseudo-header. For
   ARP: resolution through the gateway and its retry limit, a reply with the wrong operation
   ignored, and expiry followed by a new request. Then echo replies matched by sequence
   number, a UDP round trip, the stack answering ARP and pings addressed to it and ignoring
   frames for other hosts, a refused send holding no buffer, a full inbox counted, a flood
   handled in bounded polls, and the pool refusing a second give.
-- `kernel/net`'s TCP: the other 24, against a scripted peer that spells out every segment it
+- `kernel/net`'s TCP: the other 26, against a scripted peer that spells out every segment it
   sends, so loss is a segment it never answers, duplication one it delivers twice, and
   reordering two it delivers out of turn. They cover the wire format (the checksum over the
   pseudo-header, and a bad data offset or option length refused) and a round trip closed by
@@ -1638,6 +1638,19 @@ Host tests, without QEMU:
   Memory: the receive window shrinking to zero and announced again, the peer's window and
   segment size respected with a shut window probed, two pool buffers per connection with the
   pool's bound, a stale connection name refused, and unread data turning a close into a reset.
+  Selective acknowledgement: the options written and parsed back, the blocks naming the runs
+  held past a hole nearest first, none sent to a peer that never asked, and — the sending half —
+  a peer's blocks used to resend the hole and step over what it already holds, with a block
+  naming data never sent discarded. The last two are what tell selective recovery from
+  go-back-N, which is why they are worth spelling out: with the blocks ignored the stack resends
+  every byte from the hole onwards (`bbbbccccdddd` where the fix sends `bbbb`), and with a
+  block naming unsent data believed it steps over bytes the peer never had. Both mutations were
+  applied, each failed its own test while leaving the other passing, and `tcp.rs` was restored
+  byte for byte afterwards.
+
+  **No boot exercises either half**, and that is a property of the peer rather than of the
+  stack: QEMU's user-mode network offers no SACK-permitted, as the capture in this document's
+  network section shows, so nothing in a guest can send a block to act on.
 - `kbuild`: the relay drops each connection's first data segment once and passes everything
   else.
 - `drivers/net/virtio-net`: 16 tests against the shared fake device on both queues, three of

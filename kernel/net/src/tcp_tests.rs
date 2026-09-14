@@ -191,6 +191,36 @@ impl Wire {
     }
 }
 
+impl Wire {
+    /// A bare acknowledgement from a peer that offered selective acknowledgement, naming the
+    /// runs past the hole it already holds.
+    fn peer_blocks(
+        &self,
+        to_port: u16,
+        seq: u32,
+        ack: u32,
+        blocks: [Option<(u32, u32)>; wire::SACK_BLOCKS],
+    ) {
+        let h = TcpHeader {
+            src_port: PORT,
+            dst_port: to_port,
+            seq,
+            ack,
+            flags: TCP_ACK,
+            window: 8192,
+            mss: None,
+            sack_permitted: false,
+            sack: blocks,
+        };
+        let mut buf = vec![0u8; wire::FRAME_MAX];
+        let n = wire::write_tcp(&mut buf[34..], PEER, US, &h, &[]).unwrap();
+        wire::write_ipv4(&mut buf[ETH_HEADER..], PEER, US, PROTO_TCP, 1, n).unwrap();
+        wire::write_ethernet(&mut buf, OUR_MAC, PEER_MAC, ETHERTYPE_IPV4).unwrap();
+        buf.truncate(34 + n);
+        self.to_stack.borrow_mut().push_back(buf);
+    }
+}
+
 /// An established connection whose peer offered selective acknowledgement.
 fn open_sack(s: &mut Stack, w: &Wire) -> (Conn, u16, u32) {
     let c = s.tcp_connect(w, PEER, PORT, 0).unwrap();
@@ -260,6 +290,88 @@ fn a_peer_that_offered_no_selective_acknowledgement_is_sent_no_blocks() {
     let ack = w.one();
     assert_eq!(ack.ack, base);
     assert_eq!(ack.sack, [None; wire::SACK_BLOCKS], "it never asked for them");
+}
+
+/// Four segments out, the second lost. The peer says it holds the third and fourth, so the
+/// hole is sent again and *only* the hole: what it already has is stepped over.
+///
+/// The discriminator is the partial acknowledgement. Whether or not the blocks are read, the
+/// first retransmission starts at the same byte — go-back-N and selective recovery agree on
+/// where the hole begins. They part company afterwards: with the blocks, the bytes the peer
+/// reported are never sent again.
+#[test]
+fn only_the_holes_are_resent_when_the_peer_acknowledges_selectively() {
+    let (mut s, w) = ready();
+    let (c, me, iss) = open_sack(&mut s, &w);
+    for chunk in [&b"aaaa"[..], b"bbbb", b"cccc", b"dddd"] {
+        s.tcp_send(&w, c, chunk, 2 * MS).unwrap();
+    }
+    assert_eq!(w.take().len(), 4, "one segment per write");
+    // Segment one arrives and is acknowledged; two is lost; three and four arrive, and each
+    // of their acknowledgements repeats what the stream still waits for, naming what is held.
+    let (two, three, end) = (iss + 5, iss + 9, iss + 17);
+    w.peer_blocks(me, PEER_ISS + 1, two, [None; wire::SACK_BLOCKS]);
+    s.poll(&w, 3 * MS);
+    w.take();
+    for _ in 0..DUP_ACK_THRESHOLD {
+        w.peer_blocks(me, PEER_ISS + 1, two, [Some((three, end)), None, None]);
+    }
+    s.poll(&w, 5 * MS);
+    let resent = w.take();
+    assert_eq!(resent.len(), 1, "one segment, not the whole window");
+    // Four bytes, not twelve: go-back-N would send everything from the hole onwards, since
+    // the segment size is far larger than these writes.
+    assert_eq!(
+        (resent[0].seq, &resent[0].payload[..]),
+        (two, &b"bbbb"[..]),
+        "the hole the peer is missing, and nothing past it"
+    );
+    assert_eq!(s.tcp_counters().fast_retransmits, 1);
+    // The hole is filled. What the peer said it held must not be sent again, which is what
+    // go-back-N would do from here.
+    w.peer_blocks(me, PEER_ISS + 1, three, [Some((three, end)), None, None]);
+    s.poll(&w, 6 * MS);
+    for seg in w.take() {
+        assert!(
+            seg.payload.is_empty(),
+            "bytes the peer already holds were sent again: {:?}",
+            seg.payload
+        );
+    }
+    assert_eq!(
+        s.tcp_counters().sack_retransmits,
+        1,
+        "the retransmission stepped over the run the peer holds"
+    );
+}
+
+/// A block naming bytes this end never sent is discarded: a peer cannot use one to talk the
+/// stack out of resending what it owes.
+#[test]
+fn a_block_naming_data_never_sent_is_discarded() {
+    let (mut s, w) = ready();
+    let (c, me, iss) = open_sack(&mut s, &w);
+    for chunk in [&b"aaaa"[..], b"bbbb"] {
+        s.tcp_send(&w, c, chunk, 2 * MS).unwrap();
+    }
+    assert_eq!(w.take().len(), 2);
+    w.peer_blocks(me, PEER_ISS + 1, iss + 5, [None; wire::SACK_BLOCKS]);
+    s.poll(&w, 3 * MS);
+    w.take();
+    // Everything from the second segment to far beyond anything sent.
+    let beyond = (iss + 5, iss + 5000);
+    for _ in 0..DUP_ACK_THRESHOLD {
+        w.peer_blocks(me, PEER_ISS + 1, iss + 5, [Some(beyond), None, None]);
+    }
+    s.poll(&w, 5 * MS);
+    let resent = w.take();
+    assert_eq!(resent.len(), 1);
+    assert_eq!(
+        (resent[0].seq, &resent[0].payload[..]),
+        (iss + 5, &b"bbbb"[..]),
+        "still owed, whatever the peer claims"
+    );
+    assert_eq!(s.tcp_counters().sack_retransmits, 0, "nothing was stepped over");
 }
 
 fn stack() -> Box<Stack> {
