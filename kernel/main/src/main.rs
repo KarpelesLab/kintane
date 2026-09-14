@@ -81,6 +81,8 @@ mod objects;
 #[cfg(CONFIG_USERSPACE)]
 mod procs;
 #[cfg(CONFIG_USERSPACE)]
+mod sockets;
+#[cfg(CONFIG_USERSPACE)]
 mod spawn;
 #[cfg(CONFIG_USERSPACE)]
 mod userproc;

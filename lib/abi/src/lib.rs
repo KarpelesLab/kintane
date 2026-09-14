@@ -177,6 +177,32 @@ pub mod rights {
     pub const ALL: u32 = (1 << 10) - 1;
 }
 
+/// What the socket calls take.
+pub mod socket {
+    /// A TCP byte stream: the one kind of socket there is.
+    pub const STREAM: u64 = 1;
+
+    /// The one-word address the socket calls take: `ip` in bits 47..16, `port` in 15..0.
+    pub const fn address(ip: [u8; 4], port: u16) -> u64 {
+        (u32::from_be_bytes(ip) as u64) << 16 | port as u64
+    }
+
+    /// The IPv4 address in an address word.
+    pub const fn ip(address: u64) -> [u8; 4] {
+        ((address >> 16) as u32).to_be_bytes()
+    }
+
+    /// The port in an address word.
+    pub const fn port(address: u64) -> u16 {
+        address as u16
+    }
+
+    /// Whether bits above the address are clear.
+    pub const fn well_formed(address: u64) -> bool {
+        address >> 48 == 0
+    }
+}
+
 /// A handle value as a program holds it: an opaque number the kernel issued. Only the
 /// kernel's table knows what, if anything, it names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

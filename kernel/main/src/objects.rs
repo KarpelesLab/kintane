@@ -95,6 +95,14 @@ pub enum Object {
         /// Expirations delivered so far.
         fires: u64,
     },
+    /// A TCP socket. `port` is the local port `socket_bind` gave it, zero until then; `conn`
+    /// is the network stack's name for its connection or listener, once it has one (a
+    /// `net::Conn`'s raw word). See [`crate::sockets`].
+    Socket {
+        port: u16,
+        conn: Option<u64>,
+        listening: bool,
+    },
 }
 
 impl Object {
@@ -118,6 +126,7 @@ impl Object {
             Object::Completion { .. } => ObjectType::Completion,
             Object::Event { .. } => ObjectType::Event,
             Object::Timer { .. } => ObjectType::Timer,
+            Object::Socket { .. } => ObjectType::Socket,
         })
     }
 }
@@ -168,7 +177,19 @@ static IDS: ObjectIds = ObjectIds::new();
 /// Give a destroyed object's cell back. Called by the store when the last reference to an
 /// object is gone, with no store lock held.
 fn destroy(_id: ObjectId, cell: &'static Cell) {
-    cell.with(|o| *o = Object::Free);
+    let connection = cell.with(|o| {
+        let conn = match o {
+            Object::Socket { conn, .. } => conn.take(),
+            _ => None,
+        };
+        *o = Object::Free;
+        conn
+    });
+    // A socket's connection is closed in order once nothing names it, after the cell's lock
+    // is released: the network stack's lock is never taken inside a cell's.
+    if let Some(conn) = connection {
+        crate::sockets::release(conn);
+    }
     // A thread waiting on the object checks again and finds it gone, rather than waiting
     // for a wake the object can no longer send.
     if let Some(waiters) = WAITS.get(cell.index()) {

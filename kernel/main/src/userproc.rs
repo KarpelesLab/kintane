@@ -73,7 +73,7 @@ use time::Instant;
 use crate::demand::KernelFrames;
 use crate::objects::{self, Object};
 use crate::wait::{self, WaitQueue};
-use crate::{Check, Live, Locks, mp, preempt, timekeeping, write_hex, write_usize};
+use crate::{Check, Live, Locks, mp, preempt, sockets, timekeeping, write_hex, write_usize};
 
 /// The embedded program. `kbuild` links `user/init` for this target and sets the variable
 /// to its path; see the `user` unit kind in `kbuild/src/build.rs`.
@@ -1356,6 +1356,139 @@ impl abi::Handler for Syscalls {
 
     fn clock_now(&mut self) -> Result<u64, Error> {
         Ok(timekeeping::now().as_nanos())
+    }
+
+    // ---- sockets: see `crate::sockets` -------------------------------------------------------
+
+    fn socket_create(&mut self, kind: u64) -> Result<u64, Error> {
+        if kind != abi::socket::STREAM {
+            return Err(Error::InvalidArgument);
+        }
+        if !sockets::available() {
+            return Err(Error::Unsupported);
+        }
+        let socket = Object::Socket {
+            port: 0,
+            conn: None,
+            listening: false,
+        };
+        let id = objects::create(socket).ok_or(Error::Full)?;
+        self.insert_new(id, ObjectType::Socket)
+    }
+
+    fn socket_bind(&mut self, socket: AbiHandle, address: u64) -> Result<u64, Error> {
+        let id = self.socket(socket, Rights::WRITE)?;
+        sockets::bind(id, address)
+    }
+
+    fn socket_connect(
+        &mut self,
+        socket: AbiHandle,
+        address: u64,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let id = self.socket(socket, Rights::WRITE)?;
+        let conn = sockets::connect(id, address)?;
+        self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
+            sockets::connected(conn)
+        })
+    }
+
+    fn socket_listen(&mut self, socket: AbiHandle, backlog: u64) -> Result<u64, Error> {
+        // Advisory, as the table says: the stack's own backlog applies.
+        let _ = backlog;
+        let id = self.socket(socket, Rights::WRITE)?;
+        sockets::listen(id)
+    }
+
+    fn socket_accept(&mut self, socket: AbiHandle, timeout_ns: u64) -> Result<u64, Error> {
+        let id = self.socket(socket, Rights::READ)?;
+        let (listener, port) = sockets::listener(id)?;
+        self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |p| {
+            let Some(accepted) = sockets::accept(listener, port)? else {
+                return Ok(None);
+            };
+            match p.table.insert(accepted, ObjectType::Socket, Rights::ALL) {
+                Ok(h) => Ok(Some(u64::from(h.raw()))),
+                Err(e) => {
+                    // Nothing names it, so nothing could ever close it.
+                    objects::retire(accepted);
+                    Err(handle_error(e))
+                }
+            }
+        })
+    }
+
+    fn socket_send(
+        &mut self,
+        socket: AbiHandle,
+        bytes: UserPtr,
+        len: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let conn = self.connection(socket, Rights::WRITE)?;
+        let len = len.min(sockets::CHUNK);
+        let mut buf = [0u8; sockets::CHUNK];
+        // SAFETY: as `channel_write`: the process's space is loaded, and the copy checks the
+        // range and faults pages in.
+        unsafe { Cpu::copy_from_user(&mut buf[..len], user(bytes)) }.map_err(|_| Error::Fault)?;
+        self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
+            sockets::send(conn, &buf[..len])
+        })
+    }
+
+    fn socket_recv(
+        &mut self,
+        socket: AbiHandle,
+        buf: UserPtr,
+        cap: usize,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
+        let conn = self.connection(socket, Rights::READ)?;
+        let cap = cap.min(sockets::CHUNK);
+        if cap == 0 {
+            return Ok(0);
+        }
+        // Written before anything is received, so its pages are present: bytes taken from the
+        // connection and then refused their copy would be lost, as `channel_recv` says.
+        // SAFETY: as `channel_recv`.
+        unsafe { Cpu::copy_to_user(user(buf), &[0u8; sockets::CHUNK][..cap]) }
+            .map_err(|_| Error::Fault)?;
+        self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
+            let mut bytes = [0u8; sockets::CHUNK];
+            let Some(n) = sockets::recv(conn, &mut bytes[..cap])? else {
+                return Ok(None);
+            };
+            // SAFETY: as `channel_recv`; the range was written above.
+            unsafe { Cpu::copy_to_user(user(buf), &bytes[..n]) }.map_err(|_| Error::Fault)?;
+            Ok(Some(n as u64))
+        })
+    }
+
+    fn socket_shutdown(&mut self, socket: AbiHandle, timeout_ns: u64) -> Result<u64, Error> {
+        let conn = self.connection(socket, Rights::WRITE)?;
+        sockets::shutdown(conn)?;
+        self.wait_for(sockets::waits(), timeout_ns, sockets::next_look, move |_| {
+            sockets::shut(conn)
+        })
+    }
+}
+
+impl Syscalls {
+    /// The socket `socket` names, checked for `rights`.
+    fn socket(&mut self, socket: AbiHandle, rights: Rights) -> Result<ObjectId, Error> {
+        Ok(self
+            .p()
+            .table
+            .get_checked(handle(socket), ObjectType::Socket, rights)
+            .map_err(handle_error)?
+            .object)
+    }
+
+    /// The connection of the connected socket `socket` names, checked for `rights`.
+    fn connection(&mut self, socket: AbiHandle, rights: Rights) -> Result<net::Conn, Error> {
+        let id = self.socket(socket, rights)?;
+        sockets::connection(id)
     }
 }
 

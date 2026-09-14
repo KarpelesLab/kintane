@@ -113,6 +113,18 @@ pub fn waits_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// A native program talking TCP through the socket calls. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
+    crate::sockets::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// The stress run's waiting-process cycle: claim the second stack its threads run on.
 /// Nothing to do, and `Ok`, without USERSPACE.
 #[cfg(CONFIG_USERSPACE)]

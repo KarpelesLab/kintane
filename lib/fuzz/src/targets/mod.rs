@@ -110,7 +110,7 @@ pub const TARGETS: &[Target] = &[
     },
     Target {
         name: "net",
-        what: "Ethernet frames carrying ARP, IPv4, ICMP and UDP, as anything on a network sends them",
+        what: "Ethernet frames carrying ARP, IPv4, ICMP, UDP and TCP, as anything on a network sends them",
         needs_seeds: true,
         generate: net::generate,
         run: net::run,

@@ -2,10 +2,11 @@
 
 use crate::arp::Cache;
 use crate::pool::Pool;
+use crate::tcp::{self, Conn, Deliver, Segment, Tcp, TcpError};
 use crate::wire::{
     self, ARP_REPLY, ARP_REQUEST, Arp, BROADCAST, ETH_HEADER, ETHERTYPE_ARP, ETHERTYPE_IPV4, Frame,
-    ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HEADER, Ipv4Addr, Mac, PROTO_ICMP, PROTO_UDP,
-    UDP_HEADER, WireError,
+    ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HEADER, Ipv4Addr, Mac, PROTO_ICMP, PROTO_TCP,
+    PROTO_UDP, UDP_HEADER, WireError,
 };
 
 /// What the stack needs from a network device.
@@ -64,6 +65,7 @@ pub struct Counters {
     pub dropped_ipv4: u64,
     pub dropped_icmp: u64,
     pub dropped_udp: u64,
+    pub dropped_tcp: u64,
     /// Addressed to another host, or a protocol this stack does not speak.
     pub not_for_us: u64,
     /// A datagram larger than the inbox holds, or with the inbox full.
@@ -80,6 +82,8 @@ const INBOX: usize = 4;
 pub const UDP_MAX: usize = 256;
 /// Frames one poll handles at most, so a flood cannot hold the caller's lock for ever.
 const FRAMES_PER_POLL: usize = 16;
+/// Segments one connection sends in one flush at most.
+const SEGMENTS_PER_FLUSH: usize = 8;
 /// How often an unanswered ARP request is repeated.
 const ARP_RETRY_NS: u64 = 200_000_000;
 
@@ -106,6 +110,7 @@ struct State {
     inbox: [Option<Datagram>; INBOX],
     counters: Counters,
     ip_id: u16,
+    tcp: Tcp,
 }
 
 pub struct Stack {
@@ -148,11 +153,13 @@ impl Stack {
                     dropped_ipv4: 0,
                     dropped_icmp: 0,
                     dropped_udp: 0,
+                    dropped_tcp: 0,
                     not_for_us: 0,
                     inbox_full: 0,
                     no_buffer: 0,
                 },
                 ip_id: 1,
+                tcp: Tcp::new(),
             },
         }
     }
@@ -193,10 +200,13 @@ impl Stack {
         self.st.arp.forget(ip);
     }
 
-    /// Receive and handle what the device has, answering what needs an answer. Returns how
-    /// many frames were handled. Every buffer taken is given back before this returns.
+    /// Receive and handle what the device has, answering what needs an answer, then run the
+    /// TCP timers and send what every connection has to send. Returns how many frames were
+    /// handled. Every buffer taken for a frame is given back before this returns; the only
+    /// buffers still held are connections' rings.
     pub fn poll<N: Nic>(&mut self, nic: &N, now: u64) -> usize {
         self.st.mac = nic.mac();
+        self.st.tcp.timers(now);
         let mut handled = 0;
         while handled < FRAMES_PER_POLL {
             let Some(rx) = self.pool.take() else {
@@ -219,6 +229,9 @@ impl Stack {
                     None => None,
                 },
             };
+            if let Some(Some(d)) = got {
+                self.deliver(rx, d);
+            }
             if let Some(tx) = tx {
                 self.pool.give(tx);
             }
@@ -228,7 +241,187 @@ impl Stack {
             }
             handled += 1;
         }
+        self.tcp_flush(nic, now);
         handled
+    }
+
+    /// Copy a segment's accepted payload from the frame in pool buffer `rx` into its ring.
+    fn deliver(&mut self, rx: usize, d: Deliver) {
+        if let Some((frame, ring)) = self.pool.pair(rx, d.ring)
+            && let Some(payload) = frame.get(d.from..d.from + d.len)
+        {
+            tcp::ring_write(ring, d.at, payload);
+        }
+    }
+
+    /// Make connections for waiting SYNs, send what every connection has to send, send the
+    /// resets owed, and give back the buffers of connections that are over.
+    fn tcp_flush<N: Nic>(&mut self, nic: &N, now: u64) {
+        while let Some(syn) = self.st.tcp.take_syn() {
+            self.st.tcp.open_passive(&mut self.pool, syn, now);
+        }
+        for i in 0..tcp::CONNECTIONS {
+            for _ in 0..SEGMENTS_PER_FLUSH {
+                let Some(seg) = self.st.tcp.next_segment(i, now) else {
+                    break;
+                };
+                self.send_segment(nic, &seg, now);
+            }
+        }
+        while let Some(seg) = self.st.tcp.take_reset() {
+            self.send_segment(nic, &seg, now);
+        }
+        self.st.tcp.reap(&mut self.pool);
+    }
+
+    /// Send one segment. A segment that cannot be sent — its next hop unresolved, no buffer,
+    /// the device full — is lost, and retransmission sends it again.
+    fn send_segment<N: Nic>(&mut self, nic: &N, seg: &Segment, now: u64) -> bool {
+        let Some(mac) = self.resolve(nic, seg.remote_ip, now) else {
+            return false;
+        };
+        let Some(tx) = self.pool.take() else {
+            self.st.counters.no_buffer += 1;
+            return false;
+        };
+        let (src, dst, h) = (self.st.config.ip, seg.remote_ip, seg.header);
+        let result = match seg.data {
+            Some((ring, at, len)) => match self.pool.pair(tx, ring) {
+                Some((buf, ring)) => self.st.send_ip(nic, buf, mac, dst, PROTO_TCP, |p| {
+                    let start = wire::tcp_header_len(&h);
+                    let payload = p.get_mut(start..start + len).ok_or(WireError::TooLarge)?;
+                    tcp::ring_read(ring, at, payload);
+                    wire::write_tcp_header(p, src, dst, &h, len)
+                }),
+                None => Err(NetError::NoBuffer),
+            },
+            None => match self.pool.buffer(tx) {
+                Some(buf) => self.st.send_ip(nic, buf, mac, dst, PROTO_TCP, |p| {
+                    wire::write_tcp(p, src, dst, &h, &[])
+                }),
+                None => Err(NetError::NoBuffer),
+            },
+        };
+        self.pool.give(tx);
+        if result.is_ok() {
+            self.st.tcp.sent();
+        }
+        result.is_ok()
+    }
+
+    // ---- TCP -------------------------------------------------------------------------------
+    //
+    // Each call changes the connection and then flushes, so what it queued is on the wire when
+    // it returns, as far as the peer's window and the next hop allow.
+
+    /// Open a connection to `dst`:`port`. It is usable once [`Stack::tcp_status`] shows it
+    /// established.
+    pub fn tcp_connect<N: Nic>(
+        &mut self,
+        nic: &N,
+        dst: Ipv4Addr,
+        port: u16,
+        now: u64,
+    ) -> Result<Conn, TcpError> {
+        self.st.mac = nic.mac();
+        let c = self.st.tcp.connect(&mut self.pool, dst, port, now)?;
+        self.tcp_flush(nic, now);
+        Ok(c)
+    }
+
+    /// Listen for connections on `port`.
+    pub fn tcp_listen(&mut self, port: u16) -> Result<Conn, TcpError> {
+        self.st.tcp.listen(port)
+    }
+
+    /// A connection that arrived on `listener`, or [`TcpError::WouldBlock`].
+    pub fn tcp_accept(&mut self, listener: Conn) -> Result<Conn, TcpError> {
+        self.st.tcp.accept(listener)
+    }
+
+    /// Queue as much of `data` as fits and send what the peer's window allows.
+    pub fn tcp_send<N: Nic>(
+        &mut self,
+        nic: &N,
+        c: Conn,
+        data: &[u8],
+        now: u64,
+    ) -> Result<usize, TcpError> {
+        self.st.mac = nic.mac();
+        let n = self.st.tcp.send(&mut self.pool, c, data)?;
+        self.tcp_flush(nic, now);
+        Ok(n)
+    }
+
+    /// Read what has arrived; zero at the end of the stream. A read that opens a shut window
+    /// announces it.
+    pub fn tcp_recv<N: Nic>(
+        &mut self,
+        nic: &N,
+        c: Conn,
+        into: &mut [u8],
+        now: u64,
+    ) -> Result<usize, TcpError> {
+        self.st.mac = nic.mac();
+        let n = self.st.tcp.recv(&mut self.pool, c, into)?;
+        self.tcp_flush(nic, now);
+        Ok(n)
+    }
+
+    /// Send a FIN after what is queued; keep reading.
+    pub fn tcp_shutdown<N: Nic>(&mut self, nic: &N, c: Conn, now: u64) -> Result<(), TcpError> {
+        self.st.mac = nic.mac();
+        self.st.tcp.shutdown(c)?;
+        self.tcp_flush(nic, now);
+        Ok(())
+    }
+
+    /// Let go of `c`, closing it in order; see [`tcp::Tcp::close`].
+    pub fn tcp_close<N: Nic>(&mut self, nic: &N, c: Conn, now: u64) -> Result<(), TcpError> {
+        self.st.mac = nic.mac();
+        self.st.tcp.close(c)?;
+        self.tcp_flush(nic, now);
+        Ok(())
+    }
+
+    /// Reset `c` and let go of it.
+    pub fn tcp_abort<N: Nic>(&mut self, nic: &N, c: Conn, now: u64) -> Result<(), TcpError> {
+        self.st.mac = nic.mac();
+        self.st.tcp.abort(c)?;
+        self.tcp_flush(nic, now);
+        Ok(())
+    }
+
+    pub fn tcp_status(&self, c: Conn) -> Option<tcp::Status> {
+        self.st.tcp.status(c)
+    }
+
+    pub fn tcp_counters(&self) -> tcp::Counters {
+        self.st.tcp.counters()
+    }
+
+    /// Pool buffers held as connections' rings. With nothing else using the stack, this is
+    /// exactly [`Stack::buffers_in_use`].
+    pub fn tcp_rings_held(&self) -> usize {
+        self.st.tcp.rings_held()
+    }
+
+    /// Connection slots in use, listeners and TIME-WAIT included.
+    pub fn tcp_slots_in_use(&self) -> usize {
+        self.st.tcp.slots_in_use()
+    }
+
+    /// When the next TCP timer runs out, for a caller deciding how long it may sleep.
+    pub fn tcp_next_deadline(&self) -> Option<u64> {
+        self.st.tcp.next_deadline()
+    }
+
+    /// Every buffer that is held is a connection's ring, and the books agree with what is
+    /// held: what an owner checks while connections are open.
+    pub fn books_consistent(&self) -> bool {
+        let (taken, returned) = self.pool.books();
+        self.pool.in_use() == self.st.tcp.rings_held()
+            && taken.checked_sub(returned) == Some(self.pool.in_use() as u64)
     }
 
     /// The next hop's hardware address for `ip`, sending a request (at most every
@@ -355,25 +548,47 @@ impl State {
         if on_link { ip } else { self.config.gateway }
     }
 
+    /// Handle one received frame. Returns the payload copy a TCP segment needs, which the
+    /// caller makes, since the frame and the connection's ring are both pool buffers.
     fn handle<N: Nic>(
         &mut self,
         nic: &N,
         frame: &[u8],
         tx: Option<&mut [u8; wire::FRAME_MAX]>,
         now: u64,
-    ) {
+    ) -> Option<Deliver> {
         self.counters.rx_frames += 1;
         let (eth, inner) = match wire::parse_frame(frame) {
             Ok(parsed) => parsed,
             Err(e) => {
                 self.count_drop(frame, e);
-                return;
+                return None;
             }
         };
         if eth.dst != self.mac && eth.dst != BROADCAST {
             self.counters.not_for_us += 1;
-            return;
+            return None;
         }
+        if let Frame::Tcp(ip, seg) = inner {
+            if ip.dst != self.config.ip {
+                self.counters.not_for_us += 1;
+                return None;
+            }
+            let from = (seg.payload.as_ptr() as usize).wrapping_sub(frame.as_ptr() as usize);
+            return self.tcp.input(ip.src, &seg, from, now);
+        }
+        self.handle_other(nic, eth, inner, tx, now);
+        None
+    }
+
+    fn handle_other<N: Nic>(
+        &mut self,
+        nic: &N,
+        eth: wire::Ethernet<'_>,
+        inner: Frame<'_>,
+        tx: Option<&mut [u8; wire::FRAME_MAX]>,
+        now: u64,
+    ) {
         match inner {
             Frame::Arp(arp) => self.handle_arp(nic, &arp, tx, now),
             Frame::Echo(ip, echo) => {
@@ -419,6 +634,8 @@ impl State {
                     _ => self.counters.inbox_full += 1,
                 }
             }
+            // Taken by `handle` before it gets here.
+            Frame::Tcp(..) => {}
             Frame::OtherIpv4(_) | Frame::OtherEthernet(_) => self.counters.not_for_us += 1,
         }
     }
@@ -466,6 +683,7 @@ impl State {
                 (ETHERTYPE_IPV4, _) => match wire::parse_ipv4(eth.payload) {
                     Err(_) => c.dropped_ipv4 += 1,
                     Ok(ip) if ip.protocol == PROTO_ICMP => c.dropped_icmp += 1,
+                    Ok(ip) if ip.protocol == PROTO_TCP => c.dropped_tcp += 1,
                     Ok(_) => c.dropped_udp += 1,
                 },
                 _ => c.dropped_ethernet += 1,

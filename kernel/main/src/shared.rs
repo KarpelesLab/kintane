@@ -518,7 +518,10 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `spawn`, whose process slot and stack slots it reuses once that phase has
     // reaped its threads.
     let waits = crate::model::waits_check(c);
-    // After `waits`, which has torn its process down by now: this borrows the process
+    // After `waits`, whose process slot and stack slots it reuses once that phase has torn its
+    // process down, and long after the net check, which learned kbuild's TCP port.
+    let sockets = crate::model::sockets_check(c);
+    // After `sockets`, which has torn its process down by now: this borrows the process
     // check's frame pool and reuses its process slot and stack. Before tickless, which
     // wants everything but idle gone.
     c.write_str("\n  isolation  ");
@@ -535,6 +538,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(processes)
         .and(spawn)
         .and(waits)
+        .and(sockets)
         .and(isolation)
         .and(tickless)
         .and(abba)

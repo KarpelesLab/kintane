@@ -1,0 +1,29 @@
+# A native program that talks TCP: the test of the socket calls.
+#
+# Embedded in the image like `user/child`, and run by the kernel's sockets check once the
+# scheduler is up (`kernel/main/src/sockets.rs`). It connects through QEMU's user network to
+# kbuild's TCP service, sends a request, reads the reply until kbuild closes, closes its socket,
+# and exits with a code the kernel grades. It carries the KinTane ABI note, from the shared
+# linker script, so the loader tags it native.
+#
+# `usertcp` is a provider name: with USERSPACE off, `user/tcp-client-none` provides it as an
+# empty library, so the kernel image depends on the name in every configuration.
+[unit]
+name = "usertcp"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+# As `user/child`: position-independent code at a static link address, the same linker script,
+# and no debug info, because it is embedded with `include_bytes!`.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-T$ROOT/user/init/link.ld",
+    "-C", "link-arg=--no-warnings",
+    "-C", "strip=debuginfo",
+]
+
+[deps]
+units = ["abi", "rt"]
+
+[config]
+requires = "USERSPACE"

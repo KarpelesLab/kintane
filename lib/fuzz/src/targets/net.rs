@@ -1,4 +1,4 @@
-//! Ethernet, ARP, IPv4, ICMP and UDP: what anything on a network can send the kernel.
+//! Ethernet, ARP, IPv4, ICMP, UDP and TCP: what anything on a network can send the kernel.
 //!
 //! Two levels. The parsers in `net::wire` run on the input directly, and whatever they
 //! accept is checked for consistency: every payload they hand back lies inside the bytes it
@@ -29,6 +29,8 @@ const OURS: Config = Config {
 };
 const OUR_MAC: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const PEER_MAC: Mac = [0x52, 0x55, 10, 0, 2, 2];
+/// The port the fuzzed stack listens on, so a SYN can open a connection.
+const LISTENING: u16 = 5555;
 
 /// A seed or a frame built from scratch, then usually corrupted.
 pub fn generate(rng: &mut Rng, seeds: &[Vec<u8>]) -> Vec<u8> {
@@ -53,7 +55,7 @@ fn build(rng: &mut Rng) -> Vec<u8> {
     let id = rng.next_u32() as u16;
     let seq = rng.next_u32() as u16;
     let data: Vec<u8> = (0..rng.below(96)).map(|i| i as u8).collect();
-    let len = match rng.below(3) {
+    let len = match rng.below(4) {
         0 => {
             let arp = Arp {
                 operation: *rng.pick(&[wire::ARP_REQUEST, wire::ARP_REPLY, 3]),
@@ -74,10 +76,33 @@ fn build(rng: &mut Rng) -> Vec<u8> {
                 wire::write_icmp_echo(p, kind, id, seq, &data)
             })
         }
-        _ => {
+        2 => {
             let port = *rng.pick(&[5555, 7, seq]);
             ip_frame(&mut buf, dst_mac, src, dst, wire::PROTO_UDP, |p| {
                 wire::write_udp(p, src, dst, id, port, &data)
+            })
+        }
+        _ => {
+            let wild = rng.next_u32() as u8;
+            let h = wire::TcpHeader {
+                src_port: *rng.pick(&[40000, id]),
+                dst_port: *rng.pick(&[LISTENING, 80, seq]),
+                seq: rng.next_u32(),
+                ack: rng.next_u32(),
+                flags: *rng.pick(&[
+                    wire::TCP_SYN,
+                    wire::TCP_SYN | wire::TCP_ACK,
+                    wire::TCP_ACK,
+                    wire::TCP_ACK | wire::TCP_PSH,
+                    wire::TCP_FIN | wire::TCP_ACK,
+                    wire::TCP_RST,
+                    wild,
+                ]),
+                window: rng.next_u32() as u16,
+                mss: *rng.pick(&[None, Some(1460), Some(1)]),
+            };
+            ip_frame(&mut buf, dst_mac, src, dst, wire::PROTO_TCP, |p| {
+                wire::write_tcp(p, src, dst, &h, &data)
             })
         }
     };
@@ -137,6 +162,16 @@ fn parsers(input: &[u8]) {
             assert!(inside(eth.payload, ip.payload), "the IPv4 payload is outside the packet");
             assert!(inside(ip.payload, udp.payload), "the UDP payload is outside the datagram");
         }
+        Frame::Tcp(ip, tcp) => {
+            assert!(inside(eth.payload, ip.payload), "the IPv4 payload is outside the packet");
+            assert!(inside(ip.payload, tcp.payload), "the TCP payload is outside the segment");
+            let offset = usize::from(ip.payload[12] >> 4) * 4;
+            assert_eq!(
+                tcp.payload.len(),
+                ip.payload.len() - offset,
+                "the TCP payload does not start at the data offset"
+            );
+        }
         Frame::OtherIpv4(ip) => {
             assert!(inside(eth.payload, ip.payload), "the IPv4 payload is outside the packet");
         }
@@ -182,8 +217,19 @@ fn stack(input: &[u8]) {
         sent: RefCell::new(Vec::new()),
     };
     let mut stack = Box::new(Stack::new(OURS));
+    stack
+        .tcp_listen(LISTENING)
+        .expect("a fresh stack has a slot to listen on");
     stack.poll(&card, 1);
-    assert!(stack.balanced(), "a buffer was not back in the pool after one frame");
+    // A SYN for the listener opens a connection, which holds its two rings: every other
+    // buffer must be back, and the books must say so.
+    assert!(
+        stack.books_consistent(),
+        "a buffer other than a connection's rings was not back in the pool after one frame"
+    );
+    // Long enough later for every timer to have run out and been acted on.
+    stack.poll(&card, 1 + 100_000_000_000);
+    assert!(stack.books_consistent(), "the books did not balance after the timers ran");
     for frame in card.sent.borrow().iter() {
         assert!(
             frame.len() <= wire::FRAME_MAX,
@@ -206,6 +252,17 @@ mod tests {
     use net::wire::{self, Frame};
 
     use crate::Rng;
+
+    #[test]
+    fn the_committed_tcp_seed_is_a_syn_for_the_listener() {
+        let syn = include_bytes!("../../corpus/net/seed-tcp-syn.bin");
+        assert!(matches!(
+            wire::parse_frame(syn),
+            Ok((_, Frame::Tcp(_, t)))
+                if t.flags == wire::TCP_SYN && t.dst_port == super::LISTENING && t.mss == Some(1460)
+        ));
+        super::run(syn);
+    }
 
     #[test]
     fn the_committed_seeds_are_what_their_names_say() {

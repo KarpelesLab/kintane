@@ -48,6 +48,7 @@ mod ipc;
 mod net;
 mod pages;
 mod sleep;
+mod tcp;
 mod vm;
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -91,24 +92,27 @@ pub enum Workload {
     Fs,
     /// Present only when the net check completed its round trips with kbuild.
     Net,
+    /// Present only when the net check heard kbuild announce its TCP port.
+    Tcp,
 }
 
-const WORKLOADS: usize = 11;
+const WORKLOADS: usize = 12;
 
 const NAMES: [&str; WORKLOADS] = [
     "heap A", "heap B", "ping", "pong", "sleep", "vm", "pages", "block", "block B", "fs", "net",
+    "tcp",
 ];
 
 /// Guarded stacks the run claims beyond the ones the scheduler's own check left behind.
 /// `preempt` asserts at compile time that `KERNEL_THREAD_SLOTS` covers both.
 pub const EXTRA_STACKS: usize = if kconfig::STRESS_TEST {
     // The four named workloads; the three disk workloads (two block, one filesystem) when the
-    // disk is attached; the network workload when a card is; and, when there is userspace,
-    // the user process the auditor drives and the second thread of the waiting process it
-    // drives after it.
+    // disk is attached; the two network workloads (datagrams and TCP) when a card is; and,
+    // when there is userspace, the user process the auditor drives and the second thread of
+    // the waiting process it drives after it.
     EXTRA_NAMES.len()
         + 3 * kconfig::QEMU_BLOCK_TEST as usize
-        + kconfig::QEMU_NET_TEST as usize
+        + 2 * kconfig::QEMU_NET_TEST as usize
         + 2 * kconfig::USERSPACE as usize
 } else {
     0
@@ -401,6 +405,7 @@ fn start() -> Result<(), &'static str> {
     block::setup()?;
     fs::setup()?;
     net::setup()?;
+    tcp::setup()?;
 
     // Idle keeps the first of the scheduler's stacks. The other three the boot checks
     // used are free again; four more come from the port's array.
@@ -409,9 +414,9 @@ fn start() -> Result<(), &'static str> {
     // user process the auditor drives runs on, in an image with userspace.
     crate::model::process_stress_setup()?;
     crate::model::wait_stress_setup()?;
-    // Every workload but the three that need the disk and the one that needs the network,
+    // Every workload but the three that need the disk and the two that need the network,
     // which are spawned below only if those exist.
-    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 4] = [
+    let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 5] = [
         (heap::worker, 0, 4, 1),
         (heap::worker, 1, 4, extra),
         (ipc::ping, 0, 4, 2),
@@ -457,6 +462,13 @@ fn start() -> Result<(), &'static str> {
     } else {
         PARKED[Workload::Net as usize].store(Parked::Empty as u8, Ordering::Release);
     }
+    // The TCP workload needs kbuild's TCP port, which the net check leaves only where kbuild
+    // announced it; the same again.
+    if tcp::present() {
+        spawn_disk_workload("tcp", tcp::worker, 0)?;
+    } else {
+        PARKED[Workload::Tcp as usize].store(Parked::Empty as u8, Ordering::Release);
+    }
     Ok(())
 }
 
@@ -491,7 +503,8 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
         let is_block = w == Workload::Block as usize || w == Workload::BlockB as usize;
         let absent = (is_block && !block::present())
             || (w == Workload::Fs as usize && !fs::present())
-            || (w == Workload::Net as usize && !net::present());
+            || (w == Workload::Net as usize && !net::present())
+            || (w == Workload::Tcp as usize && !tcp::present());
         if absent {
             continue;
         }
@@ -520,6 +533,9 @@ fn audit(c: &dyn EarlyConsole, seconds: u64, last: &mut [u64; WORKLOADS]) {
     }
     if let Err(what) = net::audit() {
         audit_failed(c, seconds, "network", what);
+    }
+    if let Err(what) = tcp::audit() {
+        audit_failed(c, seconds, "tcp", what);
     }
     if !preempt::table_ok() {
         audit_failed(c, seconds, "thread table", "an invariant does not hold");
@@ -626,6 +642,18 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         write_usize(c, pings as usize);
         c.write_str(", udp round trips ");
         write_usize(c, rounds as usize);
+        c.write_str(", retries ");
+        write_usize(c, retries as usize);
+        c.write_str(")");
+    }
+    if tcp::present() {
+        let (rounds, retransmits, retries) = tcp::counts();
+        c.write_str(", tcp ");
+        write_usize(c, p(Workload::Tcp));
+        c.write_str(" (round trips ");
+        write_usize(c, rounds as usize);
+        c.write_str(", data retransmits ");
+        write_usize(c, retransmits as usize);
         c.write_str(", retries ");
         write_usize(c, retries as usize);
         c.write_str(")");

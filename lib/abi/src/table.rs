@@ -111,4 +111,41 @@ crate::syscalls! {
     25 => fn timer_cancel(timer: Handle);
     /// The kernel's monotonic clock, in nanoseconds.
     26 => fn clock_now();
+
+    // ---- sockets ------------------------------------------------------------------------
+    //
+    // A socket is a handle to a TCP endpoint of the kernel's network stack. An address is one
+    // word: the IPv4 address in bits 47..16, most significant byte first, and the port in bits
+    // 15..0 (see `socket::address`). Timeouts are as above. Sending and receiving need the
+    // socket connected; every call that waits looks at the network at least every few
+    // milliseconds while it waits.
+
+    /// Create a socket of `kind`, which must be `socket::STREAM`. It is neither bound nor
+    /// connected. Returns a handle to it with every right.
+    27 => fn socket_create(kind: u64);
+    /// Give `socket` (`WRITE`) the local port in `address`, for `socket_listen`; the address
+    /// part must be zero or this machine's. A socket that connects without being bound is given
+    /// an ephemeral port.
+    28 => fn socket_bind(socket: Handle, address: u64);
+    /// Connect `socket` (`WRITE`) to `address`, waiting up to `timeout_ns` for the handshake.
+    /// `PeerClosed` if the peer refused, `TimedOut` if it never answered.
+    29 => fn socket_connect(socket: Handle, address: u64, timeout_ns: u64);
+    /// Listen on `socket`'s bound port (`WRITE`). `backlog` is advisory; the stack's own bound
+    /// applies.
+    30 => fn socket_listen(socket: Handle, backlog: u64);
+    /// Wait up to `timeout_ns` for a connection on the listening `socket` (`READ`). Returns a
+    /// handle to the connected socket with every right.
+    31 => fn socket_accept(socket: Handle, timeout_ns: u64);
+    /// Queue up to `len` bytes at `bytes` for sending on `socket` (`WRITE`), waiting up to
+    /// `timeout_ns` for room for at least one. At most 512 bytes a call. Returns how many were
+    /// queued; delivery is the stack's to complete. `PeerClosed` once the connection is reset.
+    32 => fn socket_send(socket: Handle, bytes: UserPtr, len: usize, timeout_ns: u64);
+    /// Receive up to `cap` bytes into `buf` from `socket` (`READ`), waiting up to `timeout_ns`
+    /// for at least one. At most 512 bytes a call. Returns how many; zero is the end of the
+    /// stream, after the peer's orderly close.
+    33 => fn socket_recv(socket: Handle, buf: UserPtr, cap: usize, timeout_ns: u64);
+    /// Close `socket`'s sending half (`WRITE`): a FIN follows what is queued. Waits up to
+    /// `timeout_ns` for the peer to acknowledge everything, FIN included. Receiving goes on.
+    /// Closing the handle closes the connection in order too, without waiting.
+    34 => fn socket_shutdown(socket: Handle, timeout_ns: u64);
 }
