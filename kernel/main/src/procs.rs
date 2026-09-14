@@ -461,9 +461,17 @@ static CYCLES: AtomicU64 = AtomicU64::new(0);
 
 /// Slices a cycle's process thread may run, as the timer interrupt counts them
 /// ([`preempt::slices`]), while making no progress. Its loop publishes a pass every few
-/// instructions, so one slice is plenty; sixteen leave room for slices charged across a
-/// host stall in which it barely ran.
-const RAN_SLICES: u64 = 16;
+/// instructions, so one slice is plenty in principle — but a slice is charged to whatever the
+/// interrupt finds running, and a thread re-pinned to another CPU is charged for the interval
+/// it spends being moved, queued and trapped there, without a pass to show for it.
+///
+/// Sixteen was below what a healthy run needs. A passing two-hour soak on `x86_64-qemu-smp`
+/// at eight CPUs reported twenty slices for a wait that succeeded, and another failed at
+/// 159 s with this bound on a host carrying two soaks. A 60-second run at eight CPUs on a
+/// host at load 14 needed thirteen. A hundred and twenty-eight is over six times the worst
+/// figure a healthy run has shown, and still a second and a third of CPU time without a pass
+/// from a loop that publishes one every few instructions.
+const RAN_SLICES: u64 = 128;
 
 /// Slices it may be passed over for — ready on its CPU while a thread no more urgent runs
 /// there — for each slice it ran, while making no progress. Round robin passes it over once
