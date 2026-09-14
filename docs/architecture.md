@@ -419,6 +419,28 @@ substrate the syscall layer exposes as capabilities; see
   - A slot's generation advances each time it is vacated, and a slot that would wrap is
     never reused, so a stale `Locator` cannot reach the next occupant.
   - Everything runs under one lock per store, with no allocation and no `unsafe`.
+- **The kernel's object namespace** (`kernel/main/src/objects.rs`), the first user of the
+  store: the objects a program can create and name.
+  - **Kinds.** A program image, a process, a thread, an anonymous memory region and a
+    completion queue, each an `Object` variant carrying only what the kernel must remember.
+    Images and regions are both `ObjectType::MemoryRegion`.
+  - **Storage.** One static arena of `Cell`s, each a spinlock around an `Object`, behind a
+    single `ObjectStore`. There is no allocator here yet. A cell is claimed on creation and
+    freed by the store's `destroy`, so it is reused only after its object is gone.
+  - **Objects are global, handles are per-process.** An object's identity can appear in
+    several tables. `process_transfer` moves that name into another process's table while
+    the object itself stays where it is.
+  - **Lifetime.** Closing a handle, or tearing down the process whose table held it, retires
+    the object. It is destroyed once no reference remains, and `objects::live()` is the
+    count a check compares against its baseline.
+  - **The locking rule.** A cell's lock is never held while another's is taken; every cell
+    shares one lock class, so `DEBUG_LOCKDEP` fails the boot if one ever is. Posting an exit
+    reads the waiter under the process's lock, drops it, then locks the queue. Collecting
+    thread ids for reaping copies them out under the cells' locks and reaps afterwards,
+    because `thread_create` takes the scheduler's lock before a cell's.
+  - **Channels** are kept in their own kernel table, keyed by their endpoints' identities, so
+    an endpoint moved into another process still names its channel there. They are not yet
+    store objects.
 
 ### `ipc` — channels
 

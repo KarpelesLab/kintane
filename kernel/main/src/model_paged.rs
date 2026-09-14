@@ -81,6 +81,19 @@ pub fn processes_check(c: &dyn EarlyConsole) -> Check {
     crate::procs::check(c)
 }
 
+/// A program creating a program: `init` builds a process out of an image and talks to it.
+/// Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn spawn_check(c: &dyn EarlyConsole) -> Check {
+    crate::spawn::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn spawn_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn processes_check(c: &dyn EarlyConsole) -> Check {
     let _ = c;

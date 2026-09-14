@@ -55,6 +55,7 @@ use mm::phys::FrameAllocator;
 use mm::vm::{Backing, Region, ShareSlot, Shares, Vm};
 
 use crate::demand::KernelFrames;
+use crate::objects::{self, Object};
 use crate::{Check, Live, Locks, write_hex, write_usize};
 
 /// The embedded program. `kbuild` links `user/init` for this target and sets the variable
@@ -77,8 +78,67 @@ const REGIONS: usize = 20;
 /// The user stack: below the top of the user half, its own guard of unmapped space above.
 const USER_STACK_PAGES: usize = 16;
 
-/// A process's channel, for `channel_create`. One per process is all `init` asks for.
+/// A channel, for `channel_create`.
 type Chan = ipc::Channel<Locks, 4, 64, 2>;
+
+/// Channels that exist, and who made each.
+///
+/// Not a field of [`Process`], which is where this began. An endpoint given to another
+/// process — `process_transfer` — leaves its handle in that process's table, and the
+/// channel it names has to be reachable from there too. A channel is therefore the
+/// kernel's, like every other object, and a handle in either table finds it by the
+/// identity `Chan::new` gave that endpoint.
+///
+/// SAFETY INVARIANT: a slot is written once by `channel_create`, by a process holding no
+/// reference into it, and cleared by [`free_channels_of`] when its owner is torn down and
+/// no process can name either endpoint. Readers take `&'static Chan` and change it only
+/// through `Chan`'s own locks.
+const MAX_CHANNELS: usize = MAX_PROCS;
+static CHANNELS: [SyncUnsafeCell<Option<ChannelSlot>>; MAX_CHANNELS] =
+    [const { SyncUnsafeCell::new(None) }; MAX_CHANNELS];
+
+struct ChannelSlot {
+    chan: Chan,
+    /// The identities of its two endpoints, as `Chan::new` issued them.
+    ends: [ObjectId; 2],
+    /// The process slot that created it; its teardown frees this.
+    owner: usize,
+}
+
+/// The channel the endpoint `object` belongs to, in whichever table holds a handle to it.
+fn channel_of(object: ObjectId) -> Option<&'static Chan> {
+    CHANNELS.iter().find_map(|c| {
+        // SAFETY: see `CHANNELS`: a written slot is not moved or dropped while a process
+        // can name it, and `Chan`'s own locks order its contents.
+        let slot = unsafe { (*c.get()).as_ref() }?;
+        slot.ends.contains(&object).then_some(&slot.chan)
+    })
+}
+
+/// Put `chan` in a free slot, owned by process `owner`.
+fn keep_channel(chan: Chan, ends: [ObjectId; 2], owner: usize) -> Option<()> {
+    for cell in CHANNELS.iter() {
+        // SAFETY: see `CHANNELS`; an empty slot is named by nothing.
+        let slot = unsafe { &mut *cell.get() };
+        if slot.is_none() {
+            *slot = Some(ChannelSlot { chan, ends, owner });
+            return Some(());
+        }
+    }
+    None
+}
+
+/// Drop every channel process `slot` created. Called from [`teardown`].
+fn free_channels_of(slot: usize) {
+    for cell in CHANNELS.iter() {
+        // SAFETY: see `CHANNELS`; the owner's thread has exited, and no handle to either
+        // endpoint can be used once its table is gone.
+        let held = unsafe { &mut *cell.get() };
+        if held.as_ref().is_some_and(|c| c.owner == slot) {
+            *held = None;
+        }
+    }
+}
 
 /// Everything one process is.
 pub(crate) struct Process {
@@ -87,7 +147,9 @@ pub(crate) struct Process {
     ids: ObjectIds,
     /// The next free user address `vm_map` hands out, bumped upward.
     next_map: usize,
-    channel: Option<Chan>,
+    /// The program this process was built from, for its own thread to install. `None` for
+    /// a process the kernel filled in itself.
+    pub(crate) image: Option<&'static [u8]>,
     /// The console object's identity, so a handle to it can be recognised.
     console: ObjectId,
     pub(crate) exit: Option<u64>,
@@ -181,6 +243,36 @@ fn slots() -> impl Iterator<Item = &'static mut Process> {
     PROCS.iter().filter_map(|p| unsafe { (*p.get()).as_mut() })
 }
 
+impl Process {
+    /// Give this process a handle to `object`, of type `kind`, carrying `rights`.
+    ///
+    /// The one way in from outside: the handle table stays private, because a table that
+    /// anything may insert into is a table whose contents prove nothing about who granted
+    /// what. Boot uses this to hand a process the authority it starts with.
+    pub(crate) fn grant(
+        &mut self,
+        object: ObjectId,
+        kind: ObjectType,
+        rights: Rights,
+    ) -> Option<Handle> {
+        self.table.insert(object, kind, rights).ok()
+    }
+
+    /// A handle to the debug console with `WRITE`, made on demand.
+    ///
+    /// The console is the one object a process cannot create for itself: it is authority
+    /// over the machine's output, and a program holds it only because something handed it
+    /// over. Boot does that for the processes it starts.
+    pub(crate) fn console_handle(&mut self) -> Option<Handle> {
+        if self.console == ObjectId::from_raw(0) {
+            self.console = self.ids.next();
+        }
+        self.table
+            .insert(self.console, ObjectType::DeviceResource, Rights::WRITE)
+            .ok()
+    }
+}
+
 /// The process in slot `i`, for boot to build, inspect and tear down.
 pub(crate) fn slot(i: usize) -> Option<&'static mut Process> {
     // SAFETY: see `PROCS`; the caller is boot, and the slot's thread is not running.
@@ -220,7 +312,7 @@ fn on_kill(trap: UserTrap) -> ! {
         // A fault before the program set an exit code is the process being killed. If it
         // had already exited, keep that.
         if p.exit.is_none() {
-            p.exit = Some(KILLED);
+            record_exit(p, KILLED);
         }
     }
     let _ = trap;
@@ -239,6 +331,15 @@ fn end_thread() -> ! {
     // `exit` switches away and never comes back to an ended thread. If it somehow returned,
     // there is nothing safe to do but stop.
     Cpu::halt()
+}
+
+/// Record a process's exit, and tell whoever asked to be told.
+///
+/// Every path that ends a process goes through here — the program's own exit, and the
+/// kernel killing it — so a waiter cannot miss an exit depending on how it happened.
+pub(crate) fn record_exit(p: &mut Process, code: u64) {
+    p.exit = Some(code);
+    crate::objects::on_process_exit(p.slot, code);
 }
 
 /// Recorded as the exit code when the kernel kills a process rather than the program
@@ -272,7 +373,7 @@ impl abi::Handler for Syscalls<'_> {
     }
 
     fn thread_exit(&mut self, code: u64) -> Result<u64, Error> {
-        self.p.exit = Some(code);
+        record_exit(self.p, code);
         end_thread()
     }
 
@@ -334,9 +435,6 @@ impl abi::Handler for Syscalls<'_> {
     }
 
     fn channel_create(&mut self, out: UserPtr) -> Result<u64, Error> {
-        if self.p.channel.is_some() {
-            return Err(Error::Full);
-        }
         let (ch, [a, b]) = Chan::new(&self.p.ids, ipc::ENDPOINT_RIGHTS);
         let ha = self
             .p
@@ -348,7 +446,7 @@ impl abi::Handler for Syscalls<'_> {
             .table
             .insert(b.object, b.kind, b.rights)
             .map_err(handle_error)?;
-        self.p.channel = Some(ch);
+        keep_channel(ch, [a.object, b.object], self.p.slot).ok_or(Error::Full)?;
         let mut pair = [0u8; 8];
         pair[0..4].copy_from_slice(&ha.raw().to_le_bytes());
         pair[4..8].copy_from_slice(&hb.raw().to_le_bytes());
@@ -369,14 +467,16 @@ impl abi::Handler for Syscalls<'_> {
         let mut buf = [0u8; 64];
         // SAFETY: as `debug_write`.
         unsafe { Cpu::copy_from_user(&mut buf[..len], user(bytes)) }.map_err(|_| Error::Fault)?;
-        let ch = self.p.channel.as_ref().ok_or(Error::BadHandle)?;
+        let entry = self.p.table.get(handle(channel)).map_err(handle_error)?;
+        let ch = channel_of(entry.object).ok_or(Error::BadHandle)?;
         ch.send(&mut self.p.table, handle(channel), &buf[..len], &[])
             .map_err(channel_error)?;
         Ok(0)
     }
 
     fn channel_read(&mut self, channel: AbiHandle, buf: UserPtr, cap: usize) -> Result<u64, Error> {
-        let ch = self.p.channel.as_ref().ok_or(Error::BadHandle)?;
+        let entry = self.p.table.get(handle(channel)).map_err(handle_error)?;
+        let ch = channel_of(entry.object).ok_or(Error::BadHandle)?;
         let mut bytes = [0u8; 64];
         let mut handles = [Handle::from_raw(0); 2];
         let cap = cap.min(bytes.len());
@@ -389,11 +489,221 @@ impl abi::Handler for Syscalls<'_> {
     }
 
     fn handle_close(&mut self, h: AbiHandle) -> Result<u64, Error> {
+        let entry = self.p.table.close(handle(h)).map_err(handle_error)?;
+        // The handle was this process's only name for the object. Retiring here is what
+        // brings the object count back to its baseline once a program has cleaned up.
+        objects::retire(entry.object);
+        Ok(0)
+    }
+
+    fn process_create(&mut self, image: AbiHandle) -> Result<u64, Error> {
+        let bytes = objects::with_handle(
+            &self.p.table,
+            handle(image),
+            ObjectType::MemoryRegion,
+            Rights::READ,
+            |o| match o {
+                Object::Image { bytes } => Some(*bytes),
+                _ => None,
+            },
+        )
+        .map_err(store_error)?
+        .ok_or(Error::WrongType)?;
+        let program = parse(bytes).ok_or(Error::InvalidArgument)?;
+        let slot = free_slot().ok_or(Error::Full)?;
+        build(slot, &program).ok_or(Error::NoMemory)?;
+        // The child's own thread installs the program; remember what from.
+        if let Some(child) = self::slot(slot) {
+            child.image = Some(bytes);
+        }
+        let id = objects::create(Object::Process {
+            slot,
+            exited: false,
+            code: 0,
+            waiter: None,
+        })
+        .ok_or(Error::Full)?;
+        match self.p.table.insert(id, ObjectType::Process, Rights::ALL) {
+            Ok(h) => Ok(u64::from(h.raw())),
+            Err(e) => {
+                // Nothing could name the process, so nothing could ever tear it down.
+                objects::retire(id);
+                teardown(slot);
+                Err(handle_error(e))
+            }
+        }
+    }
+
+    fn process_transfer(&mut self, process: AbiHandle, h: AbiHandle) -> Result<u64, Error> {
+        let slot = self.target_slot(process)?;
+        // Moving a handle into the table it is already in would put it there twice, under
+        // two values.
+        if slot == self.p.slot {
+            return Err(Error::InvalidArgument);
+        }
+        let entry = self.p.table.transfer_out(handle(h)).map_err(handle_error)?;
+        // A different slot than the caller's, checked above, so this borrow and the
+        // caller's are of two different processes; see `PROCS`.
+        let Some(child) = self::slot(slot) else {
+            let _ = self.p.table.insert(entry.object, entry.kind, entry.rights);
+            return Err(Error::BadHandle);
+        };
+        match child.table.insert(entry.object, entry.kind, entry.rights) {
+            Ok(new) => Ok(u64::from(new.raw())),
+            Err(e) => {
+                // Give it back rather than destroy authority the caller still owns.
+                let _ = self.p.table.insert(entry.object, entry.kind, entry.rights);
+                Err(handle_error(e))
+            }
+        }
+    }
+
+    fn thread_create(&mut self, process: AbiHandle, entry: u64, arg: u64) -> Result<u64, Error> {
+        let slot = self.target_slot(process)?;
+        let id = crate::spawn::start_thread(slot, entry as usize, arg as usize)
+            .ok_or(Error::NoMemory)?;
+        let object = objects::create(Object::Thread { id }).ok_or(Error::Full)?;
         self.p
             .table
-            .close(handle(h))
-            .map(|_| 0)
+            .insert(object, ObjectType::Thread, Rights::ALL)
+            .map(|h| u64::from(h.raw()))
             .map_err(handle_error)
+    }
+
+    fn process_wait(
+        &mut self,
+        process: AbiHandle,
+        completion: AbiHandle,
+        key: u64,
+    ) -> Result<u64, Error> {
+        let queue = self
+            .p
+            .table
+            .get_checked(handle(completion), ObjectType::Completion, Rights::WRITE)
+            .map_err(handle_error)?
+            .object;
+        // Arm, or answer now: a process that has already ended must not leave its waiter
+        // waiting for something that has been and gone.
+        let ended = objects::with_handle(
+            &self.p.table,
+            handle(process),
+            ObjectType::Process,
+            Rights::WAIT,
+            |o| match o {
+                Object::Process {
+                    exited,
+                    code,
+                    waiter,
+                    ..
+                } => {
+                    if *exited {
+                        Ok(Some(*code))
+                    } else if waiter.is_some() {
+                        Err(Error::Full)
+                    } else {
+                        *waiter = Some((queue, key));
+                        Ok(None)
+                    }
+                }
+                _ => Err(Error::WrongType),
+            },
+        )
+        .map_err(store_error)??;
+        if let Some(code) = ended {
+            objects::post(queue, key, code).map_err(|_| Error::Full)?;
+        }
+        Ok(0)
+    }
+
+    fn completion_create(&mut self) -> Result<u64, Error> {
+        let id = objects::create(Object::new_completion()).ok_or(Error::Full)?;
+        self.p
+            .table
+            .insert(id, ObjectType::Completion, Rights::ALL)
+            .map(|h| u64::from(h.raw()))
+            .map_err(handle_error)
+    }
+
+    fn completion_poll(&mut self, completion: AbiHandle, out: UserPtr) -> Result<u64, Error> {
+        let taken = objects::with_handle(
+            &self.p.table,
+            handle(completion),
+            ObjectType::Completion,
+            Rights::READ,
+            objects::take,
+        )
+        .map_err(store_error)?;
+        let (key, value) = taken.ok_or(Error::ShouldWait)?;
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&key.to_le_bytes());
+        bytes[8..].copy_from_slice(&value.to_le_bytes());
+        // SAFETY: the process address space is loaded; `copy_to_user` checks the range and
+        // faults the page in, and refuses an address it cannot map.
+        unsafe { Cpu::copy_to_user(user(out), &bytes) }.map_err(|_| Error::Fault)?;
+        Ok(1)
+    }
+
+    fn vm_region_create(&mut self, len: usize) -> Result<u64, Error> {
+        let page = Cpu::PAGE_SIZE;
+        let bytes = len.div_ceil(page).max(1) * page;
+        let id = objects::create(Object::Region { len: bytes }).ok_or(Error::Full)?;
+        self.p
+            .table
+            .insert(id, ObjectType::MemoryRegion, Rights::ALL)
+            .map(|h| u64::from(h.raw()))
+            .map_err(handle_error)
+    }
+
+    fn vm_map_in(&mut self, process: AbiHandle, region: AbiHandle) -> Result<u64, Error> {
+        let len = objects::with_handle(
+            &self.p.table,
+            handle(region),
+            ObjectType::MemoryRegion,
+            Rights::MAP,
+            |o| match o {
+                Object::Region { len } => Some(*len),
+                // An image is memory the kernel owns; mapping one into a process is not
+                // something this kernel offers.
+                _ => None,
+            },
+        )
+        .map_err(store_error)?
+        .ok_or(Error::WrongType)?;
+        let slot = self.target_slot(process)?;
+        let target = if slot == self.p.slot {
+            &mut *self.p
+        } else {
+            self::slot(slot).ok_or(Error::BadHandle)?
+        };
+        let start = target.next_map;
+        let end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
+        if end > <Cpu as HasUserMode>::USER_END {
+            return Err(Error::NoMemory);
+        }
+        target
+            .vm
+            .reserve(anon(start, len))
+            .map_err(|_| Error::NoMemory)?;
+        target.next_map = end + Cpu::PAGE_SIZE;
+        Ok(start as u64)
+    }
+}
+
+impl Syscalls<'_> {
+    /// The process slot `process` names: live, and writable by the caller.
+    fn target_slot(&self, process: AbiHandle) -> Result<usize, Error> {
+        objects::with_handle(
+            &self.p.table,
+            handle(process),
+            ObjectType::Process,
+            Rights::WRITE,
+            |o| match o {
+                Object::Process { slot, exited, .. } if !*exited => Some(*slot),
+                _ => None,
+            },
+        )
+        .map_err(store_error)?
+        .ok_or(Error::InvalidArgument)
     }
 }
 
@@ -548,7 +858,7 @@ pub(crate) fn build(slot: usize, program: &Program) -> Option<PhysAddr> {
             vm,
             ids: ObjectIds::new(),
             next_map: first_map_addr(program),
-            channel: None,
+            image: None,
             console: ObjectId::from_raw(0),
             exit: None,
             root,
@@ -729,6 +1039,12 @@ pub(crate) fn teardown(slot: usize) {
         // and the kernel-half tables are shared with every other space and never freed.
         f.free(p.vm.space().root());
     });
+    // Objects only this process's table named go with it: a table that is gone can close
+    // nothing, and an object nothing can name is a leak the accounting reports.
+    for entry in p.table.entries() {
+        crate::objects::retire(entry.object);
+    }
+    free_channels_of(slot);
     // SAFETY: see `PROCS`; the thread has exited and been reaped, so nothing else holds
     // this slot.
     unsafe { *PROCS[slot].get() = None };
@@ -807,6 +1123,37 @@ fn user_flags(a: &elf::Access) -> hal::PageFlags {
 
 pub(crate) fn user_rw() -> hal::PageFlags {
     hal::PageFlags::USER | hal::PageFlags::READ | hal::PageFlags::WRITE
+}
+
+/// A free process slot, or `None` when as many processes exist as this kernel allows.
+fn free_slot() -> Option<usize> {
+    (0..MAX_PROCS).find(|&i| self::slot(i).is_none())
+}
+
+/// Parse `bytes` as a program for this port's user half.
+pub(crate) fn parse(bytes: &'static [u8]) -> Option<Program<'static>> {
+    Program::parse(
+        bytes,
+        <Cpu as HasUserMode>::ELF_MACHINE,
+        (<Cpu as HasUserMode>::USER_START as u64, <Cpu as HasUserMode>::USER_END as u64),
+        Cpu::PAGE_SIZE as u64,
+    )
+    .ok()
+}
+
+/// The embedded `init` program's bytes, for a process built to run it.
+pub(crate) fn init_elf() -> &'static [u8] {
+    INIT_ELF
+}
+
+fn store_error(e: kobject::StoreError) -> Error {
+    use kobject::StoreError as S;
+    match e {
+        S::Handle(h) => handle_error(h),
+        S::WrongType { .. } => Error::WrongType,
+        S::NotFound | S::Retiring => Error::BadHandle,
+        S::Full | S::TooManyRefs | S::Duplicate => Error::Full,
+    }
 }
 
 fn handle_error(e: kobject::handle::Error) -> Error {

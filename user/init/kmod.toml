@@ -16,10 +16,15 @@ rustflags = [
     "-C", "relocation-model=pic",
     "-C", "link-arg=-T$ROOT/user/init/link.ld",
     "-C", "link-arg=--no-warnings",
+    # Embedded in the kernel image with `include_bytes!`, so every byte of the file lands
+    # in the kernel's .rodata. `core` and the runtime are built with debug info, and without
+    # this the program's DWARF — megabytes, against kilobytes of code — rode along into
+    # every userspace kernel and broke its size budget.
+    "-C", "strip=debuginfo",
 ]
 
 [deps]
-units = ["abi"]
+units = ["abi", "rt"]
 
 [config]
 requires = "USERSPACE"

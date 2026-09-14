@@ -36,6 +36,8 @@ const MODE_FORGE: usize = 1;
 const MODE_FAULT: usize = 2;
 /// Run alongside another process until told to stop; see [`worker`].
 const MODE_WORKER: usize = 3;
+/// Create a process and talk to it; see [`spawn`].
+const MODE_SPAWN: usize = 4;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -73,6 +75,7 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_FORGE => forge(a, b),
         MODE_FAULT => fault(a),
         MODE_WORKER => worker(a, b, c as u64),
+        MODE_SPAWN => spawn(handle(a), handle(b)),
         _ => 0xbad0,
     };
     exit(code)
@@ -246,6 +249,100 @@ fn worker(shared: usize, private: usize, signature: u64) -> u64 {
         }
     }
 }
+
+/// Build a process out of an image, give it an endpoint, and talk to it.
+///
+/// The kernel hands this mode two handles and nothing else: `image`, the bytes of another
+/// program, and `console`. Everything else — the child process, its memory, its thread, the
+/// queue its exit arrives on — this program creates. Returns [`SPAWN_SUCCESS`], or
+/// `0x400 + step` for the first step that did not behave.
+fn spawn(image: Handle, console: Handle) -> u64 {
+    let _ = rt::print(console, b"init: creating a process\n");
+    let Ok((mine, theirs)) = rt::channel() else {
+        return 0x400;
+    };
+    // Types and rights are checked, not assumed, and a refusal is an answer rather than a
+    // fault. A console is not an image and an image is not a process, so each is refused
+    // as the wrong kind of object: the table checks an object's kind before its rights.
+    if call::process_create(console) != Err(Error::WrongType) {
+        return 0x410;
+    }
+    if call::thread_create(image, 0, 0) != Err(Error::WrongType) {
+        return 0x411;
+    }
+    let Ok(child) = rt::Process::create(image) else {
+        return 0x401;
+    };
+    // The image is a memory region, the right kind to map, but this program holds it with
+    // READ only. Mapping needs MAP, so this is refused for lack of a right — the one
+    // refusal here that is about authority rather than type.
+    if call::vm_map_in(child.handle, image) != Err(Error::AccessDenied) {
+        return 0x412;
+    }
+    // The child's own value for the endpoint. A handle value means nothing outside the
+    // table it belongs to, so this is what the child must be told to use.
+    let Ok(endpoint) = child.give(theirs) else {
+        return 0x402;
+    };
+    let Ok(queue) = rt::completion_queue() else {
+        return 0x403;
+    };
+    if child.wait_on(queue, CHILD_KEY).is_err() {
+        return 0x404;
+    }
+    if child.start(u64::from(endpoint.0)).is_err() {
+        return 0x405;
+    }
+    // The child speaks first, and waits for the answer before it exits. A parent waiting
+    // for a child's message also watches for the child's death: a child that ends without
+    // speaking would otherwise leave this waiting forever on a channel whose other end it
+    // never closed. Its exit arrives on the queue, and is reported with its own code
+    // folded in, so a failure names the step in the child that caused it.
+    let mut buf = [0u8; 16];
+    loop {
+        // `rt::starts_with` rather than `&buf[..n]`: slicing by a range instantiates
+        // `core`'s panicking index path, which a program linked in the user half cannot
+        // reach. See the note in `lib/rt`.
+        match rt::try_recv(mine, &mut buf) {
+            Ok(n) if rt::starts_with(&buf, n, CHILD_HELLO) => break,
+            Ok(_) => return 0x406,
+            Err(Error::ShouldWait) => {}
+            Err(_) => return 0x40a,
+        }
+        match rt::try_completion(queue) {
+            Ok(c) if c.key == CHILD_KEY => return CHILD_DIED_SILENT | (c.value & 0xffff),
+            Ok(_) | Err(Error::ShouldWait) => {}
+            Err(_) => return 0x40b,
+        }
+        rt::yield_now();
+    }
+    if rt::send(mine, CHILD_REPLY).is_err() {
+        return 0x407;
+    }
+    let Ok(code) = child.join(queue, CHILD_KEY) else {
+        return 0x408;
+    };
+    if code != CHILD_SUCCESS {
+        return 0x409;
+    }
+    let _ = rt::print(console, b"init: the process it created exited as expected\n");
+    SPAWN_SUCCESS
+}
+
+/// What the child says, what it is told, and the code it exits with. One contract with
+/// `user/child/src/main.rs`.
+const CHILD_HELLO: &[u8; 5] = b"hello";
+const CHILD_REPLY: &[u8; 5] = b"there";
+const CHILD_SUCCESS: u64 = 0x3c;
+/// The key `init` files the child's exit under, so a completion queue that answered
+/// something else is not mistaken for the child.
+const CHILD_KEY: u64 = 0x9001;
+/// [`MODE_SPAWN`]'s exit code when the child ended before it said hello, with the low
+/// sixteen bits of the child's own exit code in the low bits — so a failure in the child
+/// is reported as *which* failure, not as a parent that waited in vain.
+const CHILD_DIED_SILENT: u64 = 0x4_0000;
+/// [`MODE_SPAWN`]'s exit code when every step behaved.
+const SPAWN_SUCCESS: u64 = 0x5a;
 
 /// Write to `target`, which is kernel memory. The kernel must end the process here.
 fn fault(target: usize) -> u64 {

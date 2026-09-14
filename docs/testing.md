@@ -293,6 +293,37 @@ Falsified (each mutation on x86_64, then restored):
 The ABI table and the ELF loader are also host-tested (`lib/abi`, `kernel/elf`), the
 loader against fuzzed and truncated files.
 
+**A program creating a program.** The `spawn` line (`kernel/main/src/spawn.rs`) runs on
+the same presets, after the scheduled-processes check. The kernel starts one process,
+`init` in its spawn mode, and hands it only a console handle and a handle to the bytes of
+`user/child`. `init` is then refused two calls as the wrong kind of object and one for lack
+of a right. It builds a process from the image, moves a channel endpoint into it, asks for
+the child's exit on a completion queue, and starts the child's thread. While it waits for
+the child's hello it also watches that queue, so a child that dies early is reported with
+its own exit code folded in rather than as a parent waiting forever. The child tries six
+handle values it was never given, each refused as a bad handle, then exchanges a message
+and exits. The check requires `init`'s success code, and every object and frame back once
+both processes are torn down:
+
+```
+  spawn      init created a process, gave it a channel, and waited for it; 0 objects left, 0 frames left ok
+```
+
+Falsified (each mutation on x86_64, applied, booted, then restored byte for byte by
+`build/falsify.py`):
+
+| Mutation | Result |
+|---|---|
+| `process_transfer` puts the handle back in the caller's table | the child's endpoint names nothing, its send fails, and `init` reports it: exit `0x43c02` |
+| a process's exit is never posted to its waiter | `init` waits in `join` and never exits — the only honest symptom, since nothing can tell it |
+| teardown retires none of the objects a process named | `4 OBJECTS LEAKED` |
+| `vm_map_in` accepts `READ` where it needs `MAP` | mapping the image is not refused for lack of a right: exit `0x412` |
+| the child's forged-handle step also tries its own real endpoint | a real handle is refused as the wrong type, not a bad handle, so the step is not vacuous: exit `0x43c05` |
+
+The first version of `init` waited for the child's hello on the channel alone, and three of
+these mutations showed only as a parent that never exited. Watching the completion queue
+while waiting is what turned two of them into codes naming the fault.
+
 ### 2b. Block storage
 
 With `QEMU_BLOCK_TEST`, on by default on aarch64 test builds, kbuild writes

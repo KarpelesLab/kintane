@@ -1,0 +1,11 @@
+# The native runtime: what a userspace program links instead of writing system calls by
+# hand. `user`, the layer a user program may link, like the ABI it is built on.
+[unit]
+name = "rt"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = false
+layer = "user"
+
+[deps]
+units = ["abi"]

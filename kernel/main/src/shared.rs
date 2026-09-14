@@ -512,6 +512,9 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // Before tickless, which needs everything but idle gone, and after the phases whose
     // stack slots its process threads reuse.
     let processes = crate::model::processes_check(c);
+    // After `processes`, whose process slots and stack slots it reuses once that phase has
+    // torn its own down.
+    let spawn = crate::model::spawn_check(c);
     let tickless = tickless_phase(c);
     let abba = if kconfig::LOCKDEP_ABBA_TEST {
         lockcheck::abba(c)
@@ -522,6 +525,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     sleep
         .and(heap)
         .and(processes)
+        .and(spawn)
         .and(tickless)
         .and(abba)
         .and(Check::from_ok(unbroken))

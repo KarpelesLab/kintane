@@ -48,6 +48,49 @@ impl Handler for Recorder {
         self.calls.push(("handle_close", vec![u64::from(handle.0)]));
         Ok(0)
     }
+    fn process_create(&mut self, image: Handle) -> Result<u64, Error> {
+        self.calls
+            .push(("process_create", vec![u64::from(image.0)]));
+        Ok(0)
+    }
+    fn process_transfer(&mut self, process: Handle, handle: Handle) -> Result<u64, Error> {
+        self.calls
+            .push(("process_transfer", vec![u64::from(process.0), u64::from(handle.0)]));
+        Ok(0)
+    }
+    fn thread_create(&mut self, process: Handle, entry: u64, arg: u64) -> Result<u64, Error> {
+        self.calls
+            .push(("thread_create", vec![u64::from(process.0), entry, arg]));
+        Ok(0)
+    }
+    fn process_wait(
+        &mut self,
+        process: Handle,
+        completion: Handle,
+        key: u64,
+    ) -> Result<u64, Error> {
+        self.calls
+            .push(("process_wait", vec![u64::from(process.0), u64::from(completion.0), key]));
+        Ok(0)
+    }
+    fn completion_create(&mut self) -> Result<u64, Error> {
+        self.calls.push(("completion_create", vec![]));
+        Ok(0)
+    }
+    fn completion_poll(&mut self, completion: Handle, out: UserPtr) -> Result<u64, Error> {
+        self.calls
+            .push(("completion_poll", vec![u64::from(completion.0), out.0]));
+        Err(Error::ShouldWait)
+    }
+    fn vm_region_create(&mut self, len: usize) -> Result<u64, Error> {
+        self.calls.push(("vm_region_create", vec![len as u64]));
+        Ok(0)
+    }
+    fn vm_map_in(&mut self, process: Handle, region: Handle) -> Result<u64, Error> {
+        self.calls
+            .push(("vm_map_in", vec![u64::from(process.0), u64::from(region.0)]));
+        Ok(0x2000)
+    }
 }
 
 #[test]
@@ -59,6 +102,25 @@ fn numbers_are_unique_and_the_table_agrees_with_them() {
     assert_eq!(number::debug_write, 3);
     assert!(TABLE.contains(&(number::channel_read, "channel_read", 3)));
     assert!(TABLE.contains(&(number::thread_yield, "thread_yield", 0)));
+}
+
+#[test]
+fn the_construction_calls_take_the_arguments_the_abi_documents() {
+    // A process is built piece by piece, and each piece is named by a handle the caller
+    // already holds; the argument counts are the shape of that contract.
+    assert!(TABLE.contains(&(number::process_create, "process_create", 1)));
+    assert!(TABLE.contains(&(number::process_transfer, "process_transfer", 2)));
+    assert!(TABLE.contains(&(number::thread_create, "thread_create", 3)));
+    assert!(TABLE.contains(&(number::process_wait, "process_wait", 3)));
+    assert!(TABLE.contains(&(number::completion_create, "completion_create", 0)));
+    assert!(TABLE.contains(&(number::completion_poll, "completion_poll", 2)));
+    assert!(TABLE.contains(&(number::vm_region_create, "vm_region_create", 1)));
+    assert!(TABLE.contains(&(number::vm_map_in, "vm_map_in", 2)));
+
+    let mut r = Recorder::default();
+    let out = dispatch(&mut r, number::process_wait, [4, 9, 0x9001, 0, 0, 0]);
+    assert_eq!(out, Ok(0));
+    assert_eq!(r.calls, vec![("process_wait", vec![4, 9, 0x9001])]);
 }
 
 #[test]

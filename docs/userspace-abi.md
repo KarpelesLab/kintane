@@ -73,11 +73,53 @@ fault belongs to by the address space loaded on the CPU that took it
   process is destroyed with every frame returned. Migration is checked here and not at boot
   because a secondary CPU joins the scheduler only after the boot verdict.
 
-**Not yet:** one thread per process — `userproc::current`'s safety rests on it; no
-`Process` object in the handle namespace and no process-construction system calls — the
-kernel builds processes, so a program cannot yet create one; no completion queues; no ELF
-loading from a filesystem; no ASIDs or PCIDs, so every change of address space flushes the
-TLB (see `docs/architecture.md`). i686 and riscv32 have no userspace port.
+**Programs creating programs.** Until this, every process was assembled by the kernel,
+which proved the machinery and proved nothing about whether a *program* could use it. Now
+the handle namespace holds objects a program can create, and a process is built by the
+program that has the handles to build it with — there is still no `fork`:
+
+- **Objects** (`kernel/main/src/objects.rs`): a program image, a process, a thread, an
+  anonymous memory region and a completion queue. They live in one static arena behind
+  `kobject::store::ObjectStore`, which owns their identity and lifetime: an object is found
+  by the identity its handles carry, retired when its last name is closed, and destroyed
+  once nothing holds a reference. **Objects are the kernel's; handles are a process's.** That
+  is what makes giving a handle to another process a move of a name rather than a copy of an
+  object.
+- **Construction calls** (numbers 9–16 in `lib/abi/src/table.rs`): `process_create` from an
+  image, `process_transfer` of a handle into it, `vm_region_create` and `vm_map_in`,
+  `thread_create`, and `process_wait` — which posts the exit code to a completion queue,
+  read with `completion_poll`. Every step names the objects it acts on by handle, and every
+  handle is checked for kind, then rights, before anything happens.
+- **Channels became the kernel's too.** A channel used to be a field of the process that made
+  it, which meant an endpoint handed to another process named nothing there. A channel now
+  lives in a kernel table keyed by its endpoints' identities, so a transferred endpoint works
+  in whichever table holds it.
+- **`lib/rt`**, the native runtime: typed wrappers (`Process::create`, `give`, `start`,
+  `join`), channel and completion helpers, and the *blocking* wrappers. No system call
+  blocks: `recv` and `completion_wait` loop over the call that answers `ShouldWait`,
+  yielding between tries. That is the honest shape of a kernel without wait queues, and the
+  one place that changes when it grows them.
+
+**What the check proves** (`kernel/main/src/spawn.rs`, the `spawn` banner line, on every
+x86_64 and aarch64 preset including both SMP ones). The kernel starts one process, `init`,
+and hands it two handles: the console, and a region holding the bytes of a second program,
+`user/child`. Everything after that is `init`'s doing. It is refused `process_create` on the
+console and `thread_create` on the image, both as the wrong kind of object; it builds a
+process from the image; it is refused mapping the image into that process, holding it
+without `MAP`; it creates a channel, moves one endpoint into the child, asks for the child's
+exit on a completion queue, and starts the child's thread with the endpoint's value *in the
+child's table*. The child holds nothing but that endpoint. It tries six handle values it was
+never given and every use is refused as a bad handle; then it says hello, waits for the
+reply, and exits with a code of its own. `init` checks that code and exits with one the
+kernel checks, so the kernel grades a sequence it did not perform. Both processes are then
+torn down and every object and every frame must be back.
+
+**Not yet:** one thread per process — `userproc::current`'s safety rests on it, and
+`thread_create` refuses a second; no `Event`, `Timer`, `Mapping` or `Job` objects; no
+blocking system call and no wait queues; handles are not yet moved by `channel_write`, only
+by `process_transfer`; no ELF loading from a filesystem; no ASIDs or PCIDs, so every change
+of address space flushes the TLB (see `docs/architecture.md`). i686 and riscv32 have no
+userspace port.
 
 ## Two ABIs, one kernel
 

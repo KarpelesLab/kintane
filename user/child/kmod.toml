@@ -1,0 +1,29 @@
+# The program `init` creates. Built for the kernel's target and embedded in the image like
+# `init`, but the kernel never loads it itself: it hands `init` a handle to these bytes and
+# `init` builds the process. That is the whole point of the unit — a program that only
+# exists because another program created it.
+#
+# `userchild` is a provider name: with USERSPACE off, `user/child-none` provides it as an
+# empty library, so the kernel image depends on the name in every configuration.
+[unit]
+name = "userchild"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+# As `user/init`: position-independent code at a static link address, and the same linker
+# script, because a child process's address space is laid out exactly like any other.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-T$ROOT/user/init/link.ld",
+    "-C", "link-arg=--no-warnings",
+    # As `user/init`: embedded with `include_bytes!`, so its DWARF would otherwise land in
+    # the kernel's .rodata. Unstripped, this program was 2.2 MB of debug info around 1.3 KB
+    # of code, and every userspace preset went over its size budget by that much.
+    "-C", "strip=debuginfo",
+]
+
+[deps]
+units = ["abi", "rt"]
+
+[config]
+requires = "USERSPACE"
