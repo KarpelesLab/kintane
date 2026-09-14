@@ -289,6 +289,19 @@ pub fn files_write_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// A program asks the file server what each volume is, and what it was told is what walking
+/// the volumes counts. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn files_statfs_check(c: &dyn EarlyConsole) -> Check {
+    crate::fileserver::statfs_check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn files_statfs_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// Run a process whose second thread spins in user mode on another CPU, end it, and require
 /// the spinner stopped. `Ok` without USERSPACE.
 #[cfg(CONFIG_USERSPACE)]

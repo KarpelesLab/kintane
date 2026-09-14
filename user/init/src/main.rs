@@ -33,6 +33,9 @@
 //! * [`MODE_POLL`] waits on several objects at once — a channel, an event and a completion queue —
 //!   and asks the kernel, over that channel, to make one of them ready after a delay it chooses;
 //!   see [`poll_wait`].
+//! * [`MODE_STATFS`] asks the file server what each of the disk's two volumes is, checks the
+//!   answers stand on their own, and leaves them for the kernel to hold against its own walk of
+//!   the same volumes; see [`statfs_mode`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -69,6 +72,8 @@ const MODE_FILES: usize = 10;
 const MODE_WRITE: usize = 11;
 /// Wait on several objects at once; see the module comment.
 const MODE_POLL: usize = 12;
+/// Ask the file service what the volumes are; see [`statfs_mode`].
+const MODE_STATFS: usize = 13;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -115,6 +120,7 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_FILES => files(handle(a), handle(b)),
         MODE_WRITE => write_files(handle(a), handle(b), handle(c)),
         MODE_POLL => poll_wait(handle(a), handle(b), handle(c)),
+        MODE_STATFS => statfs_mode(handle(a), handle(b)),
         _ => 0xbad0,
     };
     exit(code)
@@ -777,6 +783,92 @@ fn out_byte(seed: u8, i: usize) -> u8 {
 /// Write the test disk through the file server: `rw` is a connection that may write, `ro` one
 /// that may not. Returns [`WRITE_SUCCESS`], or `0x900 + step` for the first step that did not
 /// behave.
+/// [`MODE_STATFS`]'s exit code when every step behaved.
+const STATFS_SUCCESS: u64 = 0x71;
+/// Where [`MODE_STATFS`] leaves what the service told it, for the kernel to hold against its
+/// own walk of the same volumes. Mirrored in `kernel/main/src/fileserver.rs`.
+const STATFS_OUT: &[u8] = b"/KINTANE/STATFS.BIN";
+/// The shortest longest-name a volume this kernel writes may report: it writes long names, so
+/// a volume that says it holds nothing longer than eight-and-three is not answering for itself.
+const LONG_NAME_AT_LEAST: u32 = 64;
+
+/// Ask the file service what each volume is, check the answers stand on their own, and leave
+/// them where the kernel can hold them against its own walk.
+///
+/// A program cannot count a volume's free clusters itself — it sees files, not tables — so what
+/// it can prove is that the service answered, that the answer is self-consistent, and that the
+/// two volumes answer differently. The kernel does the rest: it reads these bytes back and
+/// requires them to be what walking the volumes counts.
+fn statfs_mode(console: Handle, rw: Handle) -> u64 {
+    match ask_what_the_volumes_are(rw) {
+        Ok(()) => {
+            // The kernel's check goes on with the same line.
+            let _ = rt::print(console, b"init: asked the file service what the volumes are; ");
+            STATFS_SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn ask_what_the_volumes_are(rw: Handle) -> Result<(), u64> {
+    use vfsproto::{Status, flags};
+    let mut buf = [0u8; vfsproto::MESSAGE];
+    let mut answers = [0u8; 2 * vfsproto::STATFS_BYTES];
+    let root = one_statfs(rw, b"/", 0xb01, &mut buf, &mut answers, 0)?;
+    let second = one_statfs(
+        rw,
+        b"/FAT32",
+        0xb02,
+        &mut buf,
+        &mut answers,
+        vfsproto::STATFS_BYTES,
+    )?;
+    // Each answer stands on its own: a unit of some size, units to hold, no more free than
+    // there are, and room for a name longer than a short one.
+    for (answer, step) in [(root, 0xb03u64), (second, 0xb04)] {
+        let (block_size, blocks, free, name_max) = answer;
+        if block_size == 0 || blocks == 0 || free > blocks || name_max < LONG_NAME_AT_LEAST {
+            return Err(step);
+        }
+    }
+    // And they are two volumes, not one answered twice: the answer follows the path.
+    if root.1 == second.1 {
+        return Err(0xb05);
+    }
+    let replace = flags::WRITE | flags::CREATE | flags::TRUNCATE;
+    let open = vfsproto::open_with(STATFS_OUT, replace);
+    let (out, _) = expect_status(rw, open, Status::Ok, 0xb06, &mut buf)?;
+    expect_status(rw, vfsproto::write(out, &answers), Status::Ok, 0xb07, &mut buf)?;
+    expect_status(rw, Some(vfsproto::sync()), Status::Ok, 0xb08, &mut buf)?;
+    expect_status(rw, Some(vfsproto::close(out)), Status::Ok, 0xb09, &mut buf)?;
+    Ok(())
+}
+
+/// Ask what the filesystem covering `path` is, keep the bytes of the answer at `at`, and
+/// return what they say.
+fn one_statfs(
+    rw: Handle,
+    path: &[u8],
+    step: u64,
+    buf: &mut [u8; vfsproto::MESSAGE],
+    answers: &mut [u8; 2 * vfsproto::STATFS_BYTES],
+    at: usize,
+) -> Result<(u64, u64, u64, u32), u64> {
+    let request = vfsproto::statfs(path).ok_or(step)?;
+    let reply = ask(rw, request.as_bytes(), buf).ok_or(step)?;
+    if reply.status != vfsproto::Status::Ok {
+        return Err(step);
+    }
+    let said = vfsproto::parse_statfs(reply.data).ok_or(step)?;
+    let into = answers
+        .get_mut(at..at + vfsproto::STATFS_BYTES)
+        .ok_or(step)?;
+    for (dst, src) in into.iter_mut().zip(reply.data) {
+        *dst = *src;
+    }
+    Ok(said)
+}
+
 fn write_files(console: Handle, rw: Handle, ro: Handle) -> u64 {
     match write_through_the_service(rw, ro) {
         Ok(()) => {
