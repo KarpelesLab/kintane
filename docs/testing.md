@@ -1728,6 +1728,71 @@ Timing is measured on the native side only. This personality has no `clock_getti
 program here cannot read a clock to say its timeout ran out on time; `readiness` is where that is
 checked.
 
+### 2i. Racing a wait, on purpose
+
+The section above ends with a confession: the window between a wait's first look and its
+registering is sub-microsecond, nothing outside the wait can aim at it, and deleting the second
+look — the check that closes it — left every existing test passing, 18 wakes of 18. A guarantee
+nothing can falsify is a guarantee on paper.
+
+`WAIT_RACE_TEST` compiles a stall point into `WaitQueue::wait_once`, between the look that
+precedes registering and the registration itself. A thread arms itself, enters a wait whose
+condition is false, and parks there; the boot thread makes the condition true and wakes the
+queue while it is parked; then it lets the waiter go on to register. Two cases run: a plain
+`WaitQueue` with a condition of its own, and the set path (`readiness`) with a real event
+object, where the racer signals the event and calls `readiness::wake` — the path a program's
+`poll` is woken by.
+
+```
+  waitrace   a wake in the window before registering was not lost; a queue ok in 476 us,
+             0 blocks; a set ok in 1677 us, 0 blocks; 2 stalls taken; 0 objects left ok
+```
+
+**What it reads is not "was it woken" but "did it block".** Both a fixed and a broken kernel end
+with the condition true, because the wait's deadline expires and it looks once more on the way
+out; a check that asked only "did the condition hold" would pass either. A kernel that looks
+again after registering sees what the waker did in the window and never blocks at all, so the
+count that separates them is the block count, and this check requires it to be zero. It also
+requires one stall per case, so a run whose hook never fired says so rather than passing.
+
+| Mutation | Result |
+|---|---|
+| The second look after registering is deleted from `WaitQueue::wait_once` | **the boot fails**: both cases report `IT BLOCKED, so the wake in the window was lost; 1 blocks`. This is the mutation section 2h records as uncatchable |
+| The handshake does not name its case (the check's own first version) | both cases reported `ok, 0 blocks` with only **1 stall taken**: the boot thread saw the previous case's arrival, made its thing ready and released before the waiter had entered the next wait, which then found it ready at its first look. Caught by the one-stall-per-case requirement, and the reason the handshake carries a case number |
+
+That second row was not a planned falsification — it was the first run of the check, and it is
+kept here because it is the same failure this whole section exists to prevent: a test that
+reports success while racing nothing.
+
+**What it costs a kernel that does not want it.** Nothing. Without the symbol, `waitrace_off.rs`
+takes the module's place: `stall` is an empty inline function, so the wait path carries neither a
+branch nor a symbol, and the check passes without printing a word. The default build of every
+preset is unchanged.
+
+**The last wall-clock bound in this area went with it.** `spawn::wait_exit`, which every check
+calls through `spawn::end_threads` to reap the threads it started, waited three seconds of wall
+clock for a thread to exit and then reported "a thread did not end". Under an emulator that
+measured the host: a soak lost a run at 141 s that way. It now judges the thread by the slices
+the scheduler charged it, sharing `procs::await_slices` with the nine bounds the tenth round
+converted, rather than keeping a second rule for the same question.
+
+What that changes, stated plainly: a thread that is *running* and not exiting fails after 128
+slices, which is prompt and load-proof. A thread that is not running at all — blocked, or on a
+CPU the host is not scheduling — is charged nothing, so the wait falls through to
+`await_slices`'s starvation floor, five seconds of guest time, where the old bound used three.
+The worst case is therefore slower than it was, deliberately: five seconds of a guest that is
+genuinely stuck is cheaper than a false failure on a busy host.
+
+| Mutation | Result |
+|---|---|
+| `wait_exit` never sees the thread exit | **the boot fails.** Every check that reaps threads pays the starvation floor, because a thread that has already exited is charged no slices, so the run took 123 s rather than failing at one bound |
+
+**What else the hook reaches.** The window belongs to the wait rather than to any one thing
+waited on, so anything whose readiness another CPU can change while a thread is in there can be
+raced from here. Two are covered. Left for later, reachable the same way: a channel closed
+against a lookup that holds it, a timer expiring against the arming of the queue it delivers to,
+and a socket whose peer closes while a wait is in the window.
+
 ### 3. Boot and integration tests
 
 Per-target, per-preset: boot the real kernel image under QEMU, reach userspace (once

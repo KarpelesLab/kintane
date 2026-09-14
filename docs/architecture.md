@@ -581,6 +581,15 @@ because its condition is one closure — "any member is ready" — run at both c
 moment is between them, and the `readiness` boot check aims wakes at it deliberately
 ([testing.md](testing.md#2h-waiting-on-many-things-at-once)).
 
+That check cannot reach the moment itself, though: it is sub-microsecond, and a wake asked for
+over a channel arrives milliseconds later. So the kernel can be built to open it. With
+`WAIT_RACE_TEST`, `wait_once` calls a stall point between the first check and registering, and
+`crate::waitrace` parks a thread there while another makes the condition true and wakes the
+queue — which is the only way the second check's necessity has been demonstrated rather than
+argued: deleting it now fails a boot. Without the symbol the stall is an empty inline function
+and the wait path carries neither a branch nor a symbol for it
+([testing.md](testing.md#2i-racing-a-wait-on-purpose)).
+
 **Readiness takes nothing.** `READ` means the next receive would not wait; `CLOSED` that the other
 end is gone and it would answer the end of the stream rather than wait. Computing it consumes
 nothing: a readable channel still holds its message, a socket keeps its bytes, an event stays
