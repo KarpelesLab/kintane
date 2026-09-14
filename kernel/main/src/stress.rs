@@ -307,6 +307,16 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
     let mut audits = 0u64;
     loop {
         next = next.saturating_add(AUDIT_EVERY);
+        // Between audits, while every workload runs: create a user process, move its
+        // thread across the CPUs, destroy it, and require every frame back. A failure ends
+        // the run like any other audit.
+        if let Err(what) = crate::model::process_stress_cycle(audits) {
+            let seconds = timekeeping::now()
+                .saturating_duration_since(start)
+                .as_nanos()
+                / 1_000_000_000;
+            audit_failed(c, seconds, "user process", what);
+        }
         sleep_until(next.min(end));
         let now = timekeeping::now();
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;
@@ -347,6 +357,9 @@ fn start() -> Result<(), &'static str> {
     // used are free again; four more come from the port's array.
     let extra = preempt::claim_stacks(&["heap B", "sleep", "vm", "pages"])
         .ok_or("not enough guarded thread stacks")?;
+    // After the workloads' own, so their slot numbers are what they were: the stack the
+    // user process the auditor drives runs on, in an image with userspace.
+    crate::model::process_stress_setup()?;
     // Every workload but the block one, which is spawned below only if the disk exists.
     let plan: [(extern "C" fn(usize) -> !, usize, u8, usize); WORKLOADS - 1] = [
         (heap::worker, 0, 4, 1),
@@ -513,6 +526,11 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         c.write_str(")");
         c.write_str(", shootdowns ");
         write_usize(c, shootdowns);
+    }
+    let processes = crate::model::process_stress_cycles();
+    if processes != 0 {
+        c.write_str(", processes ");
+        write_usize(c, processes as usize);
     }
     c.write_str(", audits ");
     write_usize(c, audits as usize);

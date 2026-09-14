@@ -1,6 +1,6 @@
 //! `init`: the first native userspace program, and the kernel's test of its own ABI.
 //!
-//! One program with three modes, chosen by the kernel in the first argument register,
+//! One program with four modes, chosen by the kernel in the first argument register,
 //! because each mode needs exactly the same loader, the same system call path and the
 //! same process setup, and what differs is only what the program then tries.
 //!
@@ -14,6 +14,10 @@
 //!   handle. It exits with the number of refusals.
 //! * [`MODE_FAULT`] writes to the address the kernel passes, which is kernel memory. It must be
 //!   killed there, so reaching the exit call is itself the failure.
+//! * [`MODE_WORKER`] runs alongside other processes on the scheduler until the kernel tells it to
+//!   stop, writing a signature to the private address every worker shares and reading it back on
+//!   every pass; see [`worker`]. It exits with [`SUCCESS`], or with a code saying it read memory
+//!   that was not its own.
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -30,9 +34,23 @@ const MODE_MAIN: usize = 0;
 const MODE_FORGE: usize = 1;
 /// Write to kernel memory.
 const MODE_FAULT: usize = 2;
+/// Run alongside another process until told to stop; see [`worker`].
+const MODE_WORKER: usize = 3;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
+
+/// A worker's exit code when its private page held another process's signature.
+const WORKER_STOLEN: u64 = 0x5701;
+/// Passes between a worker's system calls. Small enough that the kernel sees a worker
+/// within a slice of it starting, large enough that the calls are not the workload.
+const YIELD_EVERY: u64 = 64;
+
+/// Words of the page a worker shares with the kernel. The kernel writes [`W_STOP`]; the
+/// worker writes the rest.
+const W_PASSES: usize = 0;
+const W_STOP: usize = 1;
+const W_SEEN: usize = 2;
 
 /// The message the kernel's peer answers.
 const PING: &[u8; 4] = b"ping";
@@ -54,6 +72,7 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_MAIN => main(handle(a), handle(b), handle(c)),
         MODE_FORGE => forge(a, b),
         MODE_FAULT => fault(a),
+        MODE_WORKER => worker(a, b, c as u64),
         _ => 0xbad0,
     };
     exit(code)
@@ -189,6 +208,43 @@ fn forge(channel: usize, console: usize) -> u64 {
         }
     }
     attempts.len() as u64
+}
+
+/// Run until the kernel says stop, proving as it goes that its own memory is its own.
+///
+/// The kernel gives every worker the same private address and a signature of its own. The
+/// worker writes the signature there once, and from then on every pass reads it back and
+/// publishes what it saw, so a kernel that let two processes share one address space is
+/// caught by the process that finds the other's signature rather than by the kernel
+/// checking its own tables. `shared` is a page of the worker's own that the kernel can
+/// read while the worker runs; it is how progress is observed without stopping anything.
+fn worker(shared: usize, private: usize, signature: u64) -> u64 {
+    let mine = private as *mut u64;
+    let shared = shared as *mut u64;
+    // SAFETY: both addresses are mapped read-write for this process — the kernel reserved
+    // them before it entered the program — and nothing else in the process touches them.
+    unsafe {
+        mine.write_volatile(signature);
+        let mut passes: u64 = 0;
+        loop {
+            let seen = mine.read_volatile();
+            shared.add(W_SEEN).write_volatile(seen);
+            if seen != signature {
+                return WORKER_STOLEN;
+            }
+            passes = passes.wrapping_add(1);
+            shared.add(W_PASSES).write_volatile(passes);
+            if shared.add(W_STOP).read_volatile() != 0 {
+                return SUCCESS;
+            }
+            // Trap now and then: the kernel records which CPU serves the call, which is how
+            // a migration becomes visible, and a thread that never left user mode would
+            // give the scheduler nothing to preempt on a machine with one CPU.
+            if passes % YIELD_EVERY == 0 {
+                let _ = call::thread_yield();
+            }
+        }
+    }
 }
 
 /// Write to `target`, which is kernel memory. The kernel must end the process here.

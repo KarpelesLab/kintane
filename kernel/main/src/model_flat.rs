@@ -37,6 +37,20 @@ pub fn write_translation(c: &dyn EarlyConsole) {
     c.write_str("none (flat memory model)");
 }
 
+/// No processes on a flat kernel, for the same reason as [`userspace_check`]. Each always
+/// `Passed`, or empty.
+pub fn process_reserve<F, L>(_frames: F, _live: L) -> Check {
+    Check::Passed
+}
+
+pub fn process_region() -> (u64, u64) {
+    (0, 0)
+}
+
+pub fn processes_check(_c: &dyn EarlyConsole) -> Check {
+    Check::Passed
+}
+
 /// No userspace on a flat kernel: USERSPACE depends on MM_PAGED. Always `Passed`.
 pub fn userspace_check<F, L>(_c: &dyn EarlyConsole, _frames: F, _live: L) -> Check {
     Check::Passed

@@ -509,6 +509,9 @@ fn spawn_all(
 pub fn run(c: &dyn EarlyConsole) -> Check {
     let sleep = sleep_phase(c);
     let heap = heap_phase(c);
+    // Before tickless, which needs everything but idle gone, and after the phases whose
+    // stack slots its process threads reuse.
+    let processes = crate::model::processes_check(c);
     let tickless = tickless_phase(c);
     let abba = if kconfig::LOCKDEP_ABBA_TEST {
         lockcheck::abba(c)
@@ -518,6 +521,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     let unbroken = preempt::report_broken(c);
     sleep
         .and(heap)
+        .and(processes)
         .and(tickless)
         .and(abba)
         .and(Check::from_ok(unbroken))

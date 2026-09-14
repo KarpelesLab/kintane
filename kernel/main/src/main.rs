@@ -53,6 +53,8 @@ mod block;
 mod timekeeping;
 // The native userspace slice: only on a paged kernel with a userspace port.
 #[cfg(CONFIG_USERSPACE)]
+mod procs;
+#[cfg(CONFIG_USERSPACE)]
 mod userproc;
 
 // The memory model's part of bring-up: the kernel address space, demand paging and the
@@ -124,6 +126,8 @@ pub extern "C" fn kmain(boot_arg: u64) -> ! {
         kheap::region(),
         // So do the stress run's pools, in an image that has them.
         stress::region(),
+        // And the frames the scheduled processes are built from.
+        model::process_region(),
     ];
     let ok = selftest::run_all::<Cpu>(c, boot_arg, &reserved);
     if selftest::PRESENT {
@@ -513,7 +517,8 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(model::userspace_check(c, &mut frames, live))
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(block::check(c, &mut frames, live))
-        .and(stress::reserve(c, &mut frames, &regions[..n], live));
+        .and(stress::reserve(c, &mut frames, &regions[..n], live))
+        .and(model::process_reserve(&mut frames, live));
     (space, live)
 }
 
