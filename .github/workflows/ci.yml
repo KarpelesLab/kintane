@@ -448,6 +448,20 @@ jobs:
             fi
             echo "::endgroup::"
           done
+          # Phase 3's exit criterion is eight CPUs, not the presets' four. The presets stay
+          # at four so every other step boots quickly; this is where eight is proven, and
+          # where a thread-stack array or epoch bag sized for four would show up first.
+          for name in aarch64-virt-smp x86_64-qemu-smp; do
+            echo "::group::stress $name at 8 CPUs"
+            if ./kbuild/target/release/kbuild stress --preset "$name" --set QEMU_CPUS=8 \
+                --duration 20s; then
+              echo "stress ok: $name at 8 CPUs"
+            else
+              echo "::error title=stress failed::preset $name at 8 CPUs"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
           exit $fail
 
       # A failure that cannot be investigated from CI output alone is itself a

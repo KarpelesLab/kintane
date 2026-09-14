@@ -30,15 +30,17 @@ ENTRY(__reset)
 PAGE_SIZE = 4K;
 
 /* The configuration's numbers, which is how a board too small for the defaults shrinks
- * what the image reserves. `src/lib.rs` reads the same symbols through kconfig, and the
- * assertions at the end of this file check the two agree. */
+ * what the image reserves: CONFIG_BOOT_STACK_KIB and CONFIG_HANDLER_STACK_KIB below.
+ * `src/lib.rs` reads the same symbols through kconfig, and the assertions at the end of
+ * this file check the two agree. */
 INCLUDE sizes.ld
 
-/* See `.thread_stacks` below. A slot's guard is a quarter of it, because an MPU region
- * covers two slots and its subregions are eighths of the region. */
-THREAD_STACK_SLOT = CONFIG_THREAD_STACK_KIB * 1K;
+/* THREAD_STACK_SLOT and THREAD_STACK_SLOTS: the thread-stack array's geometry, derived by
+ * kbuild from THREAD_STACK_KIB, KERNEL_THREAD_SLOTS and NR_CPUS (`codegen::stacks`). A
+ * slot's guard is a quarter of it, because an MPU region covers two slots and its
+ * subregions are eighths of the region. See `.thread_stacks` below. */
+INCLUDE stacks.ld
 THREAD_STACK_GUARD = THREAD_STACK_SLOT / 4;
-THREAD_STACK_SLOTS = CONFIG_THREAD_STACK_SLOTS;
 
 SECTIONS {
     __kernel_start = ORIGIN(FLASH);

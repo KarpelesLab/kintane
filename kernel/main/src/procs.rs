@@ -44,7 +44,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use arch::Cpu;
 use boot_protocol::{MemoryKind, MemoryRegion};
 use elf::Program;
-use hal::{Arch, EarlyConsole, HasPageTables, HasUserMode, KernAddr, PhysAddr};
+use hal::{Arch, EarlyConsole, HasUserMode, KernAddr, PhysAddr};
 use mm::DirectMap;
 use mm::paged::FrameSource;
 use mm::phys::{FrameAllocator, bitmap_bytes};

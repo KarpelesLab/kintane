@@ -299,8 +299,9 @@ impl Build {
                 .ok_or("this configuration selects no linker script (LINKER_SCRIPT is empty)")?;
             args.push("-C".into());
             args.push(format!("link-arg=-T{}", script.display()));
-            // Where `INCLUDE sizes.ld` finds the configuration's numbers; see
-            // `codegen::sizes_ld`. A script that includes nothing is unaffected.
+            // Where a script finds `sizes.ld`, the configuration's numbers, and `stacks.ld`,
+            // the thread-stack geometry derived from them; see `codegen::sizes_ld` and
+            // `codegen::stacks`. A script that includes neither is unaffected.
             args.push("-C".into());
             args.push(format!("link-arg=-L{}", self.gen_dir.display()));
             // Without this the linker emits a warning and picks its own entry point,
@@ -341,6 +342,16 @@ impl Build {
                 let sizes = self.gen_dir.join("sizes.ld");
                 if sizes.is_file() {
                     kb.file(&sizes)?;
+                }
+                // A kernel script includes this, so a changed stack geometry must relink.
+                // Keyed only where it exists: a loader such as kinboot-bios is linked
+                // through a `Build` of its own, whose generated directory has no thread
+                // stacks and no fragment. That is not a way to link a kernel against a
+                // stale or missing geometry, because a script that includes an absent
+                // `stacks.ld` fails to link.
+                let stacks = self.gen_dir.join("stacks.ld");
+                if stacks.exists() {
+                    kb.file(&stacks)?;
                 }
             }
         }

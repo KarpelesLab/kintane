@@ -53,25 +53,6 @@ endchoice
 # ARMv7-M these four sections were 90% of the RAM the image claimed. kbuild writes every
 # int symbol into `sizes.ld` for a script to INCLUDE; see docs/build-system.md.
 
-config THREAD_STACK_SLOTS
-    int "Guarded kernel thread stacks"
-    range 2 64
-    default 8
-    help
-        How many kernel threads can exist at once, since a slot is never
-        returned when its thread exits. Each slot costs THREAD_STACK_KIB of RAM
-        whether or not a thread is using it, and carries a guard region below it
-        that faults on overflow.
-
-config THREAD_STACK_KIB
-    int "Size of each kernel thread stack (KiB)"
-    range 1 256
-    default 32
-    help
-        Deep enough for an interrupt frame, the handler's Rust frames and the
-        scheduler on top of the thread's own. 32 KiB is generous because the
-        machines that boot first have RAM to spare; a Cortex-M does not.
-
 config BOOT_STACK_KIB
     int "Size of the boot stack (KiB)"
     range 1 256
@@ -142,6 +123,33 @@ config NR_CPUS
     depends on SMP
     range 2 4096
     default 8
+
+config KERNEL_THREAD_SLOTS
+    int "Guarded stack slots for kernel threads"
+    range 2 256
+    default 10 if STRESS_TEST
+    default 8
+    help
+        How many kernel threads may hold a guarded stack at once, not
+        counting the one each secondary CPU takes to come up on. The
+        scheduler's own check holds four and the stress run four more, so
+        eight is the floor for a test build; a build that asks for fewer
+        than its threads need fails to compile, in kernel/main/src/preempt.rs.
+
+        The port's linker script reserves this many slots plus one per
+        secondary CPU, so the array grows with NR_CPUS without anyone
+        editing a linker script. See docs/architecture.md, "Thread stacks".
+
+config THREAD_STACK_KIB
+    int "Bytes in a kernel thread's stack slot (KiB)"
+    range 1 1024
+    default 32
+    help
+        One slot: the guard at its bottom and the stack above it. A power
+        of two, which hal::StackArray requires so a faulting address maps
+        to its slot with a shift. Every slot costs this much RAM whether a
+        thread uses it or not, which is what makes it worth turning down on
+        a machine with kilobytes rather than gigabytes.
 
 config USERSPACE
     bool "Native userspace"

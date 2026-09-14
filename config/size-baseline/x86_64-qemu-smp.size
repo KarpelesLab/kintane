@@ -1,11 +1,11 @@
 # kbuild size report for preset x86_64-qemu-smp. Rewrite with `kbuild size --preset x86_64-qemu-smp --update-baseline`.
 section .bss 253952
-section .data 119760
+section .data 120024
 section .note.kintane 36
 section .rodata 85976
 section .stack 16384
-section .text 307200
-section .thread_stacks 393216
+section .text 303104
+section .thread_stacks 491520
 crate (anonymous) text 0 rodata 3085 data 0 bss 0
 crate (unmangled) text 3566 rodata 0 data 1024 bss 32
 crate __rustc text 139 rodata 0 data 0 bss 0
@@ -22,7 +22,7 @@ crate elf text 2383 rodata 0 data 0 bss 0
 crate hal text 531 rodata 0 data 0 bss 0
 crate ipc text 1513 rodata 16 data 0 bss 0
 crate kalloc text 13946 rodata 0 data 0 bss 0
-crate kintane text 80658 rodata 80 data 22876 bss 62020
+crate kintane text 78499 rodata 80 data 23140 bss 63556
 crate kobject text 2603 rodata 0 data 0 bss 0
 crate mm text 36084 rodata 0 data 0 bss 0
 crate module text 18553 rodata 0 data 0 bss 0
@@ -34,4 +34,4 @@ crate sync text 9978 rodata 32 data 1088 bss 2176
 crate thread text 8769 rodata 0 data 0 bss 0
 crate time text 2782 rodata 0 data 0 bss 0
 crate unwind text 3206 rodata 0 data 0 bss 0
-total 1176524
+total 1270996

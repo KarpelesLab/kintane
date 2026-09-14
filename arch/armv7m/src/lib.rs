@@ -195,7 +195,8 @@ pub fn image_range() -> (u64, u64) {
 }
 
 /// Bytes per kernel thread stack slot, from `THREAD_STACK_KIB`. `link.ld` reserves whole
-/// slots from the same symbol, so the two cannot drift.
+/// slots of the same size through `stacks.ld`, which kbuild derives from the same symbol,
+/// so the two cannot drift.
 pub const THREAD_STACK_SLOT: u64 = kconfig::THREAD_STACK_KIB as u64 * 1024;
 
 /// Bytes of MPU guard at the bottom of each slot: an eighth of the two-slot region that

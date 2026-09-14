@@ -32,12 +32,24 @@ use sync::epoch::{Collector, EpochPtr, RetireError};
 
 use crate::{AtomicU64, Check, Locks, write_usize};
 
-/// Retirements a CPU's bag holds before it must reclaim. The writer collects after every
-/// replacement, so a few is plenty, and the whole collector stays small enough to build on
-/// the boot stack before it is moved into its static.
-const BAG: usize = 8;
-/// Nodes the writer cycles through.
-const POOL: usize = 16;
+/// Retirements a CPU's bag holds before it must reclaim.
+///
+/// Two per participant rather than a fixed eight, because an epoch turns only when every
+/// pinned CPU has observed it: the more readers, the longer each retirement waits. That is
+/// the sizing half of the eight-CPU fix, and the smaller half. A bag of any size fills when
+/// a host deschedules the readers for long enough, so what makes the check correct is
+/// [`publish`] waiting for room instead of failing on the first refusal.
+///
+/// Not larger, because the collector is built on the 16 KiB boot stack before it is moved
+/// into its static, and at opt-level 1 that is a copy, not a construction in place. Four
+/// per participant at eight CPUs made it 6.7 KiB, and aarch64's boot stack overflowed into
+/// its guard page. Never below the eight it always was, so a uniprocessor build and any
+/// with `NR_CPUS` up to four keep exactly the collector they had.
+const BAG: usize = if 2 * SLOTS > 8 { 2 * SLOTS } else { 8 };
+/// Nodes the writer cycles through: more than a bag's worth, so the writer is refused for
+/// want of room in the bag — the case [`publish`] waits out — rather than for want of a
+/// node, which would be the same shortage wearing a different message.
+const POOL: usize = 2 * BAG;
 /// Replacements the boot CPU makes while the readers run.
 const WRITES: usize = 4000;
 /// The most CPUs checked, including the boot CPU.
@@ -139,8 +151,28 @@ unsafe fn reclaim(p: *mut ()) {
     RECLAIMED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Give an unpublished node back to the pool, without poisoning or counting it: it was
+/// taken for a retirement that the bag had no room for, and was never linked.
+fn give_back(p: *mut Node) {
+    // SAFETY: pool nodes are statics, and `p` came from `take_node` on this CPU.
+    unsafe { &*p }.free.store(true, Ordering::Relaxed);
+}
+
+/// What one attempt to publish came to.
+enum Attempt {
+    Published,
+    /// The running CPU's bag had no room, and nothing was unlinked. `Some` names a CPU the
+    /// collector has watched hold the epoch back for `sync::epoch::STALL_ATTEMPTS` advances.
+    Wait(Option<usize>),
+}
+
 /// Replace the published node with a fresh one stamped `stamp`, retiring the old one.
-fn publish(c: &Epochs, head: &Head, stamp: u64) -> Result<(), &'static str> {
+///
+/// A full bag is not a fault: a writer that outruns reclamation has to wait. Under a loaded
+/// host, with eight emulated CPUs on fewer real ones, the readers this check runs are
+/// descheduled long enough for that to happen. So the node goes back to the pool and the
+/// caller decides whether to wait.
+fn publish_once(c: &Epochs, head: &Head, stamp: u64) -> Result<Attempt, &'static str> {
     let guard = c.pin().ok_or("the boot CPU has no participant")?;
     let mut new = take_node(stamp);
     for _ in 0..4 {
@@ -153,13 +185,81 @@ fn publish(c: &Epochs, head: &Head, stamp: u64) -> Result<(), &'static str> {
     let new = new.ok_or("THE NODE POOL RAN DRY: reclamation is not keeping up")?;
     // SAFETY: the boot CPU is the only writer. `new` is a pool node, valid for ever, and
     // `reclaim` returns a retired node to the pool, which is sound on any CPU.
-    match unsafe { head.replace(new, reclaim, &guard) } {
-        Ok(()) => {}
-        Err(RetireError::Stalled(_)) => return Err("A PARTICIPANT STALLED THE EPOCH"),
-        Err(_) => return Err("RETIREMENT REFUSED"),
+    let refused = match unsafe { head.replace(new, reclaim, &guard) } {
+        Ok(()) => None,
+        Err(RetireError::Stalled(s)) => Some(Some(s.cpu)),
+        Err(_) => Some(None),
+    };
+    if let Some(named) = refused {
+        give_back(new);
+        return Ok(Attempt::Wait(named));
     }
     c.collect(&guard);
-    Ok(())
+    Ok(Attempt::Published)
+}
+
+/// The CPU [`publish`] found stalled, for the report. `usize::MAX` until one is.
+static STALLED_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// How long a CPU the collector names may go without finishing a single read before it is
+/// called stalled. A reader descheduled by the host is back well within this; one that has
+/// stopped unpinning never is.
+const STALL_TIMEOUT: time::Duration = time::Duration::from_nanos(2_000_000_000);
+
+/// How long [`publish`] waits for room in all, whatever it is waiting on. A reader that
+/// keeps finishing reads while never actually releasing its pin looks alive to the
+/// progress test, and this is what still ends that wait.
+const WAIT_TIMEOUT: time::Duration = time::Duration::from_nanos(20_000_000_000);
+
+/// Attempts [`publish`] makes before giving up however it is judged. The clock reads zero
+/// if timekeeping never started, as when a failed bring-up skipped the preemption check, and
+/// a wait bounded only by the clock would then never end.
+const RETIRE_PATIENCE: usize = 1 << 20;
+
+/// Replace the published node, waiting for room if reclamation is behind.
+///
+/// Each attempt pins and unpins. The writer's own pin holds the epoch back as much as any
+/// reader's, so waiting while pinned would be waiting for something this CPU prevents.
+///
+/// The collector's stall report counts advances a CPU held back, not time, so a writer
+/// retrying this fast turns a reader the host has merely descheduled into a "stall" within
+/// a few milliseconds. That is still the right question, asked with the wrong unit. So a
+/// named CPU is judged by its own progress instead: every read a reader finishes unpins and
+/// counts in `READS`. A CPU that finishes no read for [`STALL_TIMEOUT`] has stopped
+/// unpinning, and fails the check by name. One that is merely slow keeps counting, and the
+/// writer keeps waiting.
+fn publish(c: &Epochs, head: &Head, stamp: u64) -> Result<(), &'static str> {
+    // The CPU last named, its read count, and when it was first seen at that count.
+    let mut suspect: Option<(usize, usize, time::Instant)> = None;
+    let started = crate::timekeeping::now();
+    for _ in 0..=RETIRE_PATIENCE {
+        match publish_once(c, head, stamp)? {
+            Attempt::Published => return Ok(()),
+            Attempt::Wait(None) => suspect = None,
+            Attempt::Wait(Some(cpu)) => {
+                let reads = READS.get(cpu).map_or(0, |r| r.load(Ordering::Acquire));
+                let now = crate::timekeeping::now();
+                match suspect {
+                    Some((named, before, since)) if named == cpu && reads == before => {
+                        if now.saturating_duration_since(since) >= STALL_TIMEOUT {
+                            STALLED_CPU.store(cpu, Ordering::Relaxed);
+                            return Err("A PARTICIPANT STALLED THE EPOCH");
+                        }
+                    }
+                    _ => suspect = Some((cpu, reads, now)),
+                }
+            }
+        }
+        if crate::timekeeping::now().saturating_duration_since(started) >= WAIT_TIMEOUT {
+            break;
+        }
+        // Unpinned, so the readers can reach the epoch this CPU is waiting on. A counted
+        // loop rather than `spin_loop`, for the reason `reader` gives.
+        for i in 0..READ_PAUSE {
+            core::hint::black_box(i);
+        }
+    }
+    Err("RECLAMATION NEVER CAUGHT UP: a limbo bag stayed full")
 }
 
 /// Run the check.
@@ -318,6 +418,11 @@ fn concurrent(c: &dyn EarlyConsole, collector: &Epochs, head: &Head) -> bool {
     let ok = if let Some(why) = failure {
         c.write_str(", ");
         c.write_str(why);
+        let stalled = STALLED_CPU.load(Ordering::Relaxed);
+        if stalled != usize::MAX {
+            c.write_str(" on CPU ");
+            write_usize(c, stalled);
+        }
         false
     } else if torn != 0 {
         c.write_str(", ");

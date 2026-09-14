@@ -90,6 +90,19 @@ const NAMES: [&str; WORKLOADS] = [
     "heap A", "heap B", "ping", "pong", "sleep", "vm", "pages", "block",
 ];
 
+/// Guarded stacks the run claims beyond the ones the scheduler's own check left behind.
+/// `preempt` asserts at compile time that `KERNEL_THREAD_SLOTS` covers both.
+pub const EXTRA_STACKS: usize = if kconfig::STRESS_TEST {
+    // The four named workloads, the block workload's when the disk is attached, and the
+    // user process the auditor drives when there is userspace.
+    EXTRA_NAMES.len() + kconfig::QEMU_BLOCK_TEST as usize + kconfig::USERSPACE as usize
+} else {
+    0
+};
+
+/// The workloads that need a stack of their own, in the order they claim them.
+const EXTRA_NAMES: [&str; 4] = ["heap B", "sleep", "vm", "pages"];
+
 /// Where a parked workload stopped.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -355,8 +368,7 @@ fn start() -> Result<(), &'static str> {
 
     // Idle keeps the first of the scheduler's stacks. The other three the boot checks
     // used are free again; four more come from the port's array.
-    let extra = preempt::claim_stacks(&["heap B", "sleep", "vm", "pages"])
-        .ok_or("not enough guarded thread stacks")?;
+    let extra = preempt::claim_stacks(&EXTRA_NAMES).ok_or("not enough guarded thread stacks")?;
     // After the workloads' own, so their slot numbers are what they were: the stack the
     // user process the auditor drives runs on, in an image with userspace.
     crate::model::process_stress_setup()?;

@@ -101,9 +101,20 @@ struct Segment {
 /// thread stack, and above-image. Guard pages are holes rather than entries.
 const MAX_SEGMENTS: usize = 8 + MAX_THREAD_STACKS;
 
-/// Thread stacks the planner will cut guard pages for. A port that lays out more is
-/// refused, not silently left with unguarded stacks.
-const MAX_THREAD_STACKS: usize = 16;
+/// Thread stacks the planner will cut guard pages for: exactly the array the port's
+/// `link.ld` reserves through `stacks.ld`, which kbuild derives from the same symbols
+/// (`codegen::stacks`) — the kernel threads' slots plus one per secondary CPU. A port that
+/// lays out more is refused, not silently left with unguarded stacks.
+///
+/// It was a literal 16, which the thread-stack array outgrew as soon as its size came from
+/// the configuration: a stress build's ten slots plus seven secondaries is seventeen, and
+/// every SMP stress run refused its own kernel address space.
+const MAX_THREAD_STACKS: usize = kconfig::KERNEL_THREAD_SLOTS
+    + if kconfig::SMP && kconfig::NR_CPUS > 1 {
+        kconfig::NR_CPUS - 1
+    } else {
+        0
+    };
 
 /// A kernel address space that passed verification and has not been installed yet.
 pub struct Verified<A: HasPageTables> {

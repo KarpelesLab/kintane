@@ -167,12 +167,21 @@ static CLAIMED: AtomicUsize = AtomicUsize::new(0);
 /// thread stack claim theirs after these.
 const THREAD_STACKS: usize = 4;
 
-/// The most slots any port's linker script reserves: twelve on aarch64 and x86_64, eight
-/// on i686. A claim past a port's own array is refused by the port, so sizing this to the
-/// largest costs a port with fewer only table slots that stay empty. It was eight, from
-/// before aarch64 and x86_64 grew to twelve, and a stress run with the block workload's
-/// ninth thread found the stale limit.
-pub const MAX_STACKS: usize = 12;
+/// Guarded slots the scheduler may hand to kernel threads.
+///
+/// The port's array holds this many plus one per secondary CPU, which that CPU comes up on
+/// and keeps as its idle thread (`codegen::stacks`). So this number is the one the
+/// scheduler's own callers share, and it does not shrink as CPUs are added.
+pub const MAX_STACKS: usize = kconfig::KERNEL_THREAD_SLOTS;
+
+/// A build whose checks need more stacks than it configured would fail at run time, in the
+/// middle of a check, with "no guarded thread stack left". The threads are known here, so
+/// it fails to compile instead. `stress::WORKLOADS` reuses the four `THREAD_STACKS` slots
+/// the scheduler's check leaves behind and claims `stress::EXTRA_STACKS` more.
+const _: () = assert!(
+    MAX_STACKS >= THREAD_STACKS + crate::stress::EXTRA_STACKS,
+    "KERNEL_THREAD_SLOTS is below what this build's kernel threads need"
+);
 
 /// The scheduler state: the thread table, with a run queue per CPU.
 struct Sched {
