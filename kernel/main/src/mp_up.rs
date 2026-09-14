@@ -51,10 +51,24 @@ pub fn shootdown_stats() -> (usize, usize, usize) {
 }
 
 /// No shootdowns, so neither a mismatch nor a stall is possible.
+#[cfg_attr(
+    not(CONFIG_MM_PAGED),
+    expect(
+        dead_code,
+        reason = "read only by the stress run, which needs MM_PAGED"
+    )
+)]
 pub fn shootdown_mismatches() -> usize {
     0
 }
 
+#[cfg_attr(
+    not(CONFIG_MM_PAGED),
+    expect(
+        dead_code,
+        reason = "read only by the stress run, which needs MM_PAGED"
+    )
+)]
 pub fn shootdown_stalls() -> usize {
     0
 }
