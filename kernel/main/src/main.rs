@@ -79,6 +79,12 @@ mod procs;
 mod spawn;
 #[cfg(CONFIG_USERSPACE)]
 mod userproc;
+// ABI_LINUX depends on USERSPACE, so the personality is only ever built on a process.
+#[cfg(CONFIG_ABI_LINUX)]
+mod personality;
+#[cfg(not(CONFIG_ABI_LINUX))]
+#[path = "personality_off.rs"]
+mod personality;
 
 // The memory model's part of bring-up: the kernel address space, demand paging and the
 // test modes that need a guard page on a paged kernel; the flat region allocator on one
@@ -583,6 +589,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(block::check(c, &mut frames, live))
         .and(fs::check(c, &mut frames, live))
+        .and(personality::check(c, &mut frames, live))
         .and(stress::reserve(c, &mut frames, &regions[..n], live))
         .and(model::process_reserve(&mut frames, live));
     (space, live)

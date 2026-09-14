@@ -1,0 +1,17 @@
+# The Linux personality's machine-independent half: the system call table, the errno
+# mapping, and the initial stack a Linux program starts on.
+#
+# At the `core` layer and depending on nothing, because every piece of it is data or a
+# pure function of data. That is what lets it be host-tested, and compiled for the machines
+# the personality does not run on, so a mistake in the table or the stack layout is found
+# on a laptop rather than by a program crashing at start-up. The half that needs a process,
+# an address space and a filesystem is `kernel/main/src/linux.rs`.
+[unit]
+name = "linux"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "core"
+
+[deps]
+units = []

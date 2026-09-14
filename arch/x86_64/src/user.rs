@@ -87,6 +87,10 @@ impl SyscallFrameTrait for SyscallFrame {
         self.nr = status;
         self.rdx = value;
     }
+    fn set_return(&mut self, value: u64) {
+        // Linux returns in `rax` alone and preserves `rdx`.
+        self.nr = value;
+    }
 }
 
 /// The installed hooks. `syscall` and `kill` are called through it; `fault` is used by the
@@ -205,6 +209,7 @@ const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
+const MSR_FS_BASE: u32 = 0xC000_0100;
 const EFER_SCE: u64 = 1 << 0;
 /// Clear the interrupt flag and the direction flag on entry.
 const SFMASK: u64 = (1 << 9) | (1 << 10);
@@ -254,6 +259,12 @@ impl hal::HasUserMode for X86_64 {
     fn bind(ctx: &mut Self::Context, kernel_stack_top: KernAddr, root: PhysAddr) {
         ctx.user_kernel_stack = kernel_stack_top.raw() as u64;
         ctx.user_root = root.raw();
+    }
+
+    unsafe fn set_tls(value: usize) {
+        // SAFETY: writing `IA32_FS_BASE` is defined at CPL 0. The kernel addresses its per-CPU
+        // data through `GS`, never `FS`, so this changes nothing the kernel reads.
+        unsafe { paging::write_msr(MSR_FS_BASE, value as u64) };
     }
 
     unsafe fn enter_user(

@@ -50,6 +50,9 @@ pub const NESTED: &[u8] = b"a file in a directory\n";
 pub const BIG_LEN: usize = 100_000;
 /// Where the user program is, when the image carries one.
 pub const PROGRAM_PATH: &str = "/KINTANE/INIT.ELF";
+/// Where the static Linux program is, when the image carries one. In the program's own
+/// directory, so the root lists exactly what it did before the Linux personality.
+pub const LINUX_PROGRAM_PATH: &str = "/KINTANE/LINUX.ELF";
 
 /// The byte at `offset` of sector `sector`, for a sector below [`FS_START`].
 ///
