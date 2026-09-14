@@ -328,6 +328,7 @@ fn status_of(e: vfs::Error) -> Status {
         E::Full | E::MountFull => Status::NoSpace,
         E::Exists => Status::Exists,
         E::NotEmpty => Status::NotEmpty,
+        E::CrossDevice => Status::CrossDevice,
         E::OutOfRange | E::Corrupt(_) | E::Device(_) => Status::Io,
     }
 }

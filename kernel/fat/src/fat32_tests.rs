@@ -218,11 +218,13 @@ fn the_cluster_count_makes_it_fat32_and_its_geometry_reads_back() {
     let disk = Disk::new(format32());
     with_volume(&disk, 8, |fat| {
         assert_eq!(fat.format(), Format::Fat32);
-        let s = fat.statfs();
-        assert_eq!(s.clusters, CLUSTERS as u32);
-        assert_eq!(s.cluster_bytes, (SPC * SECTOR) as u64);
+        assert_eq!(fat.clusters(), CLUSTERS as u32);
         // Every cluster but the root's is free on a volume with nothing on it.
-        assert_eq!(s.free, CLUSTERS as u32 - 1);
+        assert_eq!(fat.free_count(), CLUSTERS as u32 - 1);
+        // And the namespace hears the same numbers in its own unit.
+        let s = FileSystem::statfs(fat).unwrap();
+        assert_eq!(s.block_size, (SPC * SECTOR) as u64);
+        assert_eq!((s.blocks, s.free), (CLUSTERS as u64, CLUSTERS as u64 - 1));
         let c = consistency(fat).unwrap();
         assert_eq!((c.files, c.dirs, c.lost), (0, 0, 0));
         assert_eq!(c.claimed, 1, "the root's own cluster is claimed, not lost");
@@ -337,12 +339,12 @@ fn the_free_count_in_fsinfo_is_the_tables_after_a_sync() {
     let disk = Disk::new(image);
     let mut expected = 0;
     with_volume(&disk, 32, |fat| {
-        assert_eq!(fat.statfs().free, CLUSTERS as u32 - 1, "counted from the table, not read");
+        assert_eq!(fat.free_count(), CLUSTERS as u32 - 1, "counted from the table, not read");
         let root = fat.root();
         let node = fat.create(root, b"B.BIN", Kind::File).unwrap();
         fat.write_at(node, 0, &pattern(3, 4000)).unwrap();
         fat.sync().unwrap();
-        expected = fat.statfs().free;
+        expected = fat.free_count();
         let c = assert_clean(fat);
         assert_eq!(c.free, expected, "the walk counts what the driver counts");
         assert_eq!(c.fsinfo_free, Some(expected), "and FSInfo says the same");

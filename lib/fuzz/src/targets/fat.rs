@@ -334,7 +334,7 @@ fn apply(
         },
         4 => {
             let j = usize::from(b[2]) % NAMES.len();
-            match (model[k].is_some(), fat.rename(root, name, NAMES[j])) {
+            match (model[k].is_some(), fat.rename(root, name, root, NAMES[j])) {
                 (true, Ok(())) if j != k => model[j] = model[k].take(),
                 (true, Ok(())) => {}
                 (false, Err(Error::NotFound)) => {}

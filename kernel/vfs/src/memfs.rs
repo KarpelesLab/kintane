@@ -10,7 +10,7 @@
 //! filesystem resolves nothing, parses no path and shares no code with this, and both
 //! satisfy the same five operations.
 
-use crate::{Entry, Error, FileSystem, Kind, MAX_NAME, NodeId, Stat};
+use crate::{Entry, Error, FileSystem, Kind, MAX_NAME, NodeId, Stat, StatFs};
 
 /// The root, which [`MemFs::new`] creates and nothing can remove.
 pub const ROOT: NodeId = 0;
@@ -259,16 +259,23 @@ impl<const NODES: usize> FileSystem for MemFs<'_, NODES> {
         self.remove(victim)
     }
 
-    fn rename(&mut self, dir: NodeId, from: &[u8], to: &[u8]) -> Result<(), Error> {
-        let dir = self.slot(dir)?;
-        if self.nodes[dir].kind != Kind::Dir {
+    fn rename(
+        &mut self,
+        from_dir: NodeId,
+        from: &[u8],
+        to_dir: NodeId,
+        to: &[u8],
+    ) -> Result<(), Error> {
+        let from_dir = self.slot(from_dir)?;
+        let to_dir = self.slot(to_dir)?;
+        if self.nodes[from_dir].kind != Kind::Dir || self.nodes[to_dir].kind != Kind::Dir {
             return Err(Error::NotADirectory);
         }
         if to.is_empty() || to.len() > MAX_NAME || to.contains(&b'/') {
             return Err(Error::BadPath);
         }
-        let source = self.find(dir, from).ok_or(Error::NotFound)?;
-        if let Some(target) = self.find(dir, to) {
+        let source = self.find(from_dir, from).ok_or(Error::NotFound)?;
+        if let Some(target) = self.find(to_dir, to) {
             if target != source {
                 match (self.nodes[source].kind, self.nodes[target].kind) {
                     (Kind::File, Kind::Dir) => return Err(Error::IsADirectory),
@@ -278,11 +285,35 @@ impl<const NODES: usize> FileSystem for MemFs<'_, NODES> {
                 self.remove(target)?;
             }
         }
+        // A directory moved into itself, or into something below it, would leave a loop no
+        // walk could end.
+        let mut above = to_dir;
+        loop {
+            if above == source {
+                return Err(Error::BadPath);
+            }
+            let next = self.nodes[above].parent;
+            if next == above {
+                break;
+            }
+            above = next;
+        }
         let n = &mut self.nodes[source];
         n.name = [0; MAX_NAME];
         n.name[..to.len()].copy_from_slice(to);
         n.name_len = to.len();
+        n.parent = to_dir;
         Ok(())
+    }
+
+    /// Nodes are the unit here, so a "block" is one node and the count is the table's.
+    fn statfs(&mut self) -> Result<StatFs, Error> {
+        Ok(StatFs {
+            block_size: 1,
+            blocks: NODES as u64,
+            free: self.nodes.iter().filter(|n| !n.used).count() as u64,
+            name_max: MAX_NAME as u32,
+        })
     }
 
     fn readdir(&mut self, dir: NodeId, index: usize) -> Result<Option<Entry>, Error> {

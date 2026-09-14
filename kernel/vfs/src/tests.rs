@@ -282,6 +282,16 @@ fn read_all_fills_a_buffer_or_says_why_not() {
 fn read_all_refuses_a_file_shorter_than_its_own_length() {
     struct Liar;
     impl FileSystem for Liar {
+        /// A filesystem that lies about everything else tells the truth about being empty.
+        fn statfs(&mut self) -> Result<crate::StatFs, Error> {
+            Ok(crate::StatFs {
+                block_size: 1,
+                blocks: 0,
+                free: 0,
+                name_max: crate::MAX_NAME as u32,
+            })
+        }
+
         fn root(&self) -> crate::NodeId {
             0
         }

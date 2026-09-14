@@ -679,16 +679,8 @@ fn renameat(slot: usize, from_dir: u64, from: u64, to_dir: u64, to: u64) -> Resu
     let mut new = [0u8; PATH_MAX + 1];
     let n = absolute_path(slot, to_dir, to, &mut new)?;
     let new = path_str(&new, n)?;
-    // The namespace renames only within a directory. Across two, Linux's answer for a
-    // rename the filesystem cannot do is `EXDEV`, which a program handles by copying.
-    fn parent(p: &str) -> Option<&str> {
-        let p = p.trim_end_matches('/');
-        p.rfind('/').map(|cut| &p[..cut])
-    }
-    match (parent(old), parent(new)) {
-        (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => {}
-        _ => return Err(Failure::CrossDevice),
-    }
+    // The namespace moves a name between directories of one filesystem, and answers
+    // `CrossDevice` for two: Linux's `EXDEV`, which a program handles by copying.
     with_ns(|ns| ns.rename(old, new).map_err(failure))?;
     Ok(0)
 }
@@ -811,6 +803,7 @@ fn failure(e: vfs::Error) -> Failure {
         E::Full | E::MountFull => Failure::NoSpace,
         E::Exists => Failure::Exists,
         E::NotEmpty => Failure::NotEmpty,
+        E::CrossDevice => Failure::CrossDevice,
         E::Corrupt(_) | E::Device(_) => Failure::Io,
     }
 }

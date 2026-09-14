@@ -69,6 +69,10 @@ impl Disk {
             log: RefCell::new(Vec::new()),
         }
     }
+
+    fn image(&self) -> Vec<u8> {
+        self.data.borrow().clone()
+    }
 }
 
 impl BlockDevice for Disk {
@@ -298,7 +302,10 @@ fn a_rename_keeps_the_bytes_and_replacing_frees_the_old_file() {
         ns.mkdir("/e").unwrap();
         write_file(&mut ns, "/e/x", b"x");
         assert_eq!(ns.rename("/d", "/e"), Err(Error::NotEmpty));
-        assert_eq!(ns.rename("/b.txt", "/e/b.txt"), Err(Error::BadPath));
+        // Out of the root and into `/e`: the name moves, and the bytes move with it.
+        ns.rename("/b.txt", "/e/b.txt").unwrap();
+        assert_eq!(ns.stat("/b.txt"), Err(Error::NotFound));
+        assert_eq!(read_file(&mut ns, "/e/b.txt"), pattern(1, 900));
         ns.sync().unwrap();
         ns.unmount("/").unwrap();
         let c = assert_clean(fat);
@@ -469,5 +476,112 @@ fn the_walk_refuses_a_cross_link_and_a_chain_into_a_free_cluster() {
     }
     with_volume(&disk, 8, |fat| {
         assert_eq!(consistency(fat), Err(Error::Corrupt("a chain through a free cluster")));
+    });
+}
+
+/// Where the entry named `name` sits in `image`, found by its eleven stored bytes.
+fn entry_at(image: &[u8], name: &[u8; 11]) -> usize {
+    image
+        .windows(11)
+        .position(|w| w == name)
+        .unwrap_or_else(|| panic!("no entry named {:?} on the volume", core::str::from_utf8(name)))
+}
+
+/// The first cluster the entry at `at` names, on a FAT16 volume.
+fn first_cluster_at(image: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([image[at + 26], image[at + 27]])
+}
+
+/// A rename that crosses directories moves the name and follows it with `..`.
+#[test]
+fn a_name_moves_between_directories_and_a_directorys_dotdot_follows() {
+    let disk = Disk::new(format());
+    let data = pattern(11, 1500);
+    with_volume(&disk, 16, |fat| {
+        let mut ns = Vfs::<1, 4>::new();
+        ns.mount("/", fat).unwrap();
+        ns.mkdir("/A").unwrap();
+        ns.mkdir("/B").unwrap();
+        write_file(&mut ns, "/A/F.BIN", &data);
+        ns.rename("/A/F.BIN", "/B/G.BIN").unwrap();
+        assert_eq!(ns.stat("/A/F.BIN"), Err(Error::NotFound), "gone from where it was");
+        assert_eq!(read_file(&mut ns, "/B/G.BIN"), data, "and holds what it held");
+
+        ns.mkdir("/A/SUB").unwrap();
+        ns.rename("/A/SUB", "/B/SUB").unwrap();
+        assert_eq!(ns.stat("/B/SUB").unwrap().kind, Kind::Dir);
+        assert_eq!(ns.stat("/A/SUB"), Err(Error::NotFound));
+        // A directory moved into itself, or below itself, is a loop.
+        assert_eq!(ns.rename("/B", "/B/SUB/B"), Err(Error::BadPath));
+        ns.sync().unwrap();
+        ns.unmount("/").unwrap();
+    });
+
+    // `..` in the moved directory names its new parent, not the one it came from.
+    let image = disk.image();
+    let b = first_cluster_at(&image, entry_at(&image, b"B          "));
+    let sub = first_cluster_at(&image, entry_at(&image, b"SUB        "));
+    // The data region starts after the reserved sector, both tables and the root's own
+    // region, which a FAT16 volume has and which this forgot at first.
+    let data_start = RESERVED + FATS * fat_sectors() + ROOT_ENTRIES * 32 / SECTOR;
+    let sub_at = (data_start + (sub as usize - 2)) * SECTOR;
+    assert_eq!(&image[sub_at + 32..sub_at + 34], b"..", "the second entry is `..`");
+    assert_eq!(
+        first_cluster_at(&image, sub_at + 32),
+        b,
+        "`..` names the directory it was moved into"
+    );
+
+    with_volume(&disk, 8, |fat| {
+        let c = assert_clean(fat);
+        assert_eq!((c.files, c.dirs), (1, 3), "one file, /A, /B and /B/SUB: {c:?}");
+    });
+}
+
+/// Growing a file past a cluster boundary reads as zeros, whatever it held before.
+#[test]
+fn a_file_grown_past_a_cluster_boundary_reads_zeros() {
+    let disk = Disk::new(format());
+    with_volume(&disk, 16, |fat| {
+        let root = fat.root();
+        let node = fat.create(root, b"G.BIN", Kind::File).unwrap();
+        fat.write_at(node, 0, b"head").unwrap();
+        // Four sectors past the end: the file had one cluster and needs five.
+        fat.truncate(node, 5 * SECTOR as u64).unwrap();
+        assert_eq!(fat.stat(node).unwrap().len, 5 * SECTOR as u64);
+        let mut buf = vec![0xAAu8; 5 * SECTOR];
+        assert_eq!(fat.read_at(node, 0, &mut buf).unwrap(), 5 * SECTOR);
+        assert_eq!(&buf[..4], b"head");
+        assert!(buf[4..].iter().all(|&b| b == 0), "every grown byte reads as zero");
+        fat.sync().unwrap();
+        let c = assert_clean(fat);
+        assert_eq!(c.claimed, 5, "five clusters hold it: {c:?}");
+    });
+}
+
+/// What the volume is, and what is left of it.
+#[test]
+fn statfs_counts_the_volumes_clusters_and_what_is_free() {
+    let disk = Disk::new(format());
+    with_volume(&disk, 16, |fat| {
+        assert_eq!(fat.format(), crate::Format::Fat16);
+        let clusters = fat.clusters();
+        let free_before = fat.free_count();
+        assert_eq!(free_before, clusters, "nothing is on an empty volume");
+        let s = FileSystem::statfs(fat).unwrap();
+        assert_eq!(s.block_size, SECTOR as u64, "a cluster is the unit it allocates in");
+        assert_eq!((s.blocks, s.free), (u64::from(clusters), u64::from(free_before)));
+
+        let root = fat.root();
+        let node = fat.create(root, b"S.BIN", Kind::File).unwrap();
+        fat.write_at(node, 0, &pattern(4, 3 * SECTOR)).unwrap();
+        fat.sync().unwrap();
+        assert_eq!(fat.clusters(), clusters);
+        assert_eq!(fat.free_count(), free_before - 3, "three clusters hold the file");
+        assert_eq!(consistency(fat).unwrap().free, fat.free_count(), "the walk agrees");
+
+        fat.unlink(root, b"S.BIN").unwrap();
+        fat.sync().unwrap();
+        assert_eq!(fat.free_count(), free_before, "and they come back");
     });
 }

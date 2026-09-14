@@ -81,6 +81,8 @@ pub enum Error {
     Exists,
     /// A directory to be removed, or replaced by a rename, still names something.
     NotEmpty,
+    /// The two paths of a rename are on different filesystems, which no rename can cross.
+    CrossDevice,
     /// The volume does not hold what its format requires. The string names the field, so
     /// a console with no formatter can still say what was wrong.
     Corrupt(&'static str),
@@ -101,6 +103,22 @@ pub struct Stat {
     pub kind: Kind,
     /// Bytes in a file; zero for a directory, whose size is not a byte count.
     pub len: u64,
+}
+
+/// What a whole filesystem is, as [`FileSystem::statfs`] reports it.
+///
+/// Sizes are in the unit the filesystem allocates in — a cluster, a block — because that is
+/// what a caller asking how much room is left needs, and what `statfs` reports everywhere
+/// else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StatFs {
+    /// Bytes in one allocation unit.
+    pub block_size: u64,
+    /// Units the filesystem has, and how many of them nothing claims.
+    pub blocks: u64,
+    pub free: u64,
+    /// The longest name this filesystem can hold.
+    pub name_max: u32,
 }
 
 /// A filesystem's own name for a node, opaque to everything above it.
@@ -189,12 +207,26 @@ pub trait FileSystem {
         Err(Error::ReadOnly)
     }
 
-    /// Give `from`, in `dir`, the name `to`, replacing what `to` named: a file by a file, or
-    /// an empty directory by a directory.
-    fn rename(&mut self, dir: NodeId, from: &[u8], to: &[u8]) -> Result<(), Error> {
-        let _ = (dir, from, to);
+    /// Move `from`, in `from_dir`, to the name `to` in `to_dir`, replacing what `to` named:
+    /// a file by a file, or an empty directory by a directory.
+    ///
+    /// The two directories may differ: the namespace resolves both and refuses only a rename
+    /// that crosses filesystems ([`Error::CrossDevice`]), since a filesystem can move a name
+    /// within itself and none here can move one between two.
+    fn rename(
+        &mut self,
+        from_dir: NodeId,
+        from: &[u8],
+        to_dir: NodeId,
+        to: &[u8],
+    ) -> Result<(), Error> {
+        let _ = (from_dir, from, to_dir, to);
         Err(Error::ReadOnly)
     }
+
+    /// What the filesystem is: its allocation unit, how many it has and how many are free.
+    /// Read-side, like `stat`, so every filesystem answers it.
+    fn statfs(&mut self) -> Result<StatFs, Error>;
 
     /// Make everything written so far durable. A filesystem that holds nothing back has
     /// nothing to do.
@@ -622,16 +654,23 @@ impl<'fs, const MOUNTS: usize, const OPEN: usize> Vfs<'fs, MOUNTS, OPEN> {
         self.fs_of(mount)?.unlink(dir, name)
     }
 
-    /// Rename `from` to `to`, which must be in the same directory: a rename that moves
-    /// something between directories is [`Error::BadPath`], because no filesystem here can
-    /// do one atomically.
+    /// Rename `from` to `to`, which may be in another directory of the same filesystem.
+    ///
+    /// Across two filesystems it is [`Error::CrossDevice`]: the bytes would have to be copied,
+    /// and a caller that wants them copied can do that itself, knowing what it costs.
     pub fn rename(&mut self, from: &str, to: &str) -> Result<(), Error> {
         let (mount, dir, old) = self.resolve_parent(from)?;
         let (to_mount, to_dir, new) = self.resolve_parent(to)?;
-        if mount != to_mount || dir != to_dir {
-            return Err(Error::BadPath);
+        if mount != to_mount {
+            return Err(Error::CrossDevice);
         }
-        self.fs_of(mount)?.rename(dir, old, new)
+        self.fs_of(mount)?.rename(dir, old, to_dir, new)
+    }
+
+    /// What the filesystem covering `path` is: its allocation unit, and how much of it is free.
+    pub fn statfs(&mut self, path: &str) -> Result<StatFs, Error> {
+        let (mount, _, _) = self.resolve(path)?;
+        self.fs_of(mount)?.statfs()
     }
 
     /// Move the handle's position. Seeking past the end is allowed and reads there return

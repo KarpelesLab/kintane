@@ -197,17 +197,6 @@ pub struct Consistency {
     pub fsinfo_free: Option<u32>,
 }
 
-/// What a volume is, as [`Fat::statfs`] reports it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct StatFs {
-    pub format: Format,
-    /// Bytes in one cluster: the unit everything below a file's size is allocated in.
-    pub cluster_bytes: u64,
-    /// Clusters the volume has, and how many of them are free.
-    pub clusters: u32,
-    pub free: u32,
-}
-
 /// A mounted FAT volume.
 ///
 /// Owns its cache: the cache is only ever reached through the filesystem, and a filesystem
@@ -465,14 +454,10 @@ impl<'s, 'd> Fat<'s, 'd> {
         self.format
     }
 
-    /// What the volume is and how much of it is free.
-    pub fn statfs(&self) -> StatFs {
-        StatFs {
-            format: self.format,
-            cluster_bytes: self.bytes_per_cluster(),
-            clusters: self.clusters,
-            free: self.free_count,
-        }
+    /// Clusters the table calls free: counted at mount and kept as the table changes, so
+    /// asking costs nothing.
+    pub fn free_count(&self) -> u32 {
+        self.free_count
     }
 
     /// What the cache has done, for a caller proving the volume is being read through it.
@@ -1040,6 +1025,34 @@ impl<'s, 'd> Fat<'s, 'd> {
         Ok(())
     }
 
+    /// Whether `dir` is `cluster`'s directory, or anything below it: what a directory may not
+    /// be moved into. Bounded by the volume's depth, so a `..` chain that loops ends the walk.
+    fn below(&mut self, dir: Dir, cluster: u32) -> Result<bool, Error> {
+        let mut here = match dir {
+            Dir::Root => return Ok(false),
+            Dir::Cluster(c) => c,
+        };
+        for _ in 0..MAX_DEPTH {
+            if here == cluster {
+                return Ok(true);
+            }
+            // The second entry of a directory is `..`, which names its parent.
+            let mut bytes = [0u8; ENTRY];
+            self.read_at_device(self.cluster_offset(here) + ENTRY as u64, &mut bytes)?;
+            if &bytes[..2] != b".." {
+                return Err(Error::Corrupt("a directory whose second entry is not `..`"));
+            }
+            match self.first_cluster(&bytes) {
+                0 => return Ok(false),
+                up if !self.in_volume(up) => {
+                    return Err(Error::Corrupt("a parent outside the volume"));
+                }
+                up => here = up,
+            }
+        }
+        Err(Error::Corrupt("directories nested deeper than a walk will follow"))
+    }
+
     /// Whether a directory names nothing but `.` and `..`.
     fn is_empty_dir(&mut self, entry: &[u8; ENTRY]) -> Result<bool, Error> {
         let dir = self.dir_of_entry(entry)?;
@@ -1181,6 +1194,15 @@ enum Dir {
     Root,
     /// The first cluster of its chain.
     Cluster(u32),
+}
+
+/// Whether two directories are the same place on the volume.
+fn same_dir(a: Dir, b: Dir) -> bool {
+    match (a, b) {
+        (Dir::Root, Dir::Root) => true,
+        (Dir::Cluster(x), Dir::Cluster(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// Where a directory's entries are, once the root is resolved for this volume's format.
@@ -1456,12 +1478,28 @@ impl FileSystem for Fat<'_, '_> {
         }
     }
 
-    fn rename(&mut self, dir: NodeId, from: &[u8], to: &[u8]) -> Result<(), Error> {
+    /// Within one directory the name is overwritten in place, which one sector holds whole.
+    ///
+    /// Between two directories there is no such entry: the old one must go and a new one must
+    /// appear, and a crash between them leaves one of two states. Writing the new entry first
+    /// would leave two names on one chain — a cross-link, which the walk calls corrupt and
+    /// which no crash here is allowed to cause. So the old entry goes first, and a crash
+    /// leaves the file unreachable: lost clusters, the damage this driver already allows.
+    /// The moved directory's `..` is written last; a crash before it leaves `..` naming the
+    /// old parent, which nothing here resolves and which a walk does not read.
+    fn rename(
+        &mut self,
+        from_dir: NodeId,
+        from: &[u8],
+        to_dir: NodeId,
+        to: &[u8],
+    ) -> Result<(), Error> {
         let short = short_name(to)?;
-        let parent = self.dir_of(dir)?;
-        let (offset, source) = self.find_entry(parent, from)?.ok_or(Error::NotFound)?;
+        let source_dir = self.dir_of(from_dir)?;
+        let target_dir = self.dir_of(to_dir)?;
+        let (offset, source) = self.find_entry(source_dir, from)?.ok_or(Error::NotFound)?;
         let mut replaced = None;
-        if let Some((target_at, target)) = self.find_entry(parent, to)? {
+        if let Some((target_at, target)) = self.find_entry(target_dir, to)? {
             if target_at != offset {
                 match (entry_kind(&source), entry_kind(&target)) {
                     (Kind::File, Kind::Dir) => return Err(Error::IsADirectory),
@@ -1478,12 +1516,52 @@ impl FileSystem for Fat<'_, '_> {
                 replaced = Some(self.first_cluster(&target));
             }
         }
-        self.write_at_device(offset, &short)?;
-        self.step();
+        if same_dir(source_dir, target_dir) {
+            self.write_at_device(offset, &short)?;
+            self.step();
+        } else {
+            let moved = entry_kind(&source) == Kind::Dir;
+            let first = self.first_cluster(&source);
+            // A directory may not move into itself or into anything below it: the chain of
+            // parents from the new directory up must not run through the one being moved.
+            if moved && self.below(target_dir, first)? {
+                return Err(Error::BadPath);
+            }
+            // A slot in the new directory before the old entry goes, so a full directory is
+            // refused with the file still where it was.
+            let slot = self.free_entry(target_dir)?;
+            self.write_at_device(offset, &[ENTRY_DELETED])?;
+            self.step();
+            let mut entry = source;
+            entry[..11].copy_from_slice(&short);
+            self.write_at_device(slot, &entry)?;
+            self.step();
+            if moved {
+                // `..` follows the directory to its new parent. The root is cluster 0 there,
+                // whatever cluster a FAT32 root starts at.
+                let up = match target_dir {
+                    Dir::Root => 0,
+                    Dir::Cluster(c) => c,
+                };
+                let dotdot = self.new_entry(*b"..         ", ATTR_DIRECTORY, up, 0);
+                let at = self.cluster_offset(first) + ENTRY as u64;
+                self.write_at_device(at, &dotdot)?;
+                self.step();
+            }
+        }
         match replaced {
             Some(first) if first != 0 => self.free_chain(first, None),
             _ => Ok(()),
         }
+    }
+
+    fn statfs(&mut self) -> Result<vfs::StatFs, Error> {
+        Ok(vfs::StatFs {
+            block_size: self.bytes_per_cluster(),
+            blocks: u64::from(self.clusters),
+            free: u64::from(self.free_count),
+            name_max: NAME_BYTES as u32,
+        })
     }
 
     fn sync(&mut self) -> Result<(), Error> {

@@ -103,11 +103,35 @@ fn directories_are_made_removed_and_renamed_by_path() {
     assert_eq!(vfs.unlink("/a"), Err(Error::NotEmpty));
     vfs.rename("/a/b", "/a/c").unwrap();
     assert_eq!(vfs.stat("/a/c").unwrap().kind, Kind::Dir);
-    assert_eq!(vfs.rename("/a/c", "/c"), Err(Error::BadPath), "not across directories");
-    vfs.unlink("/a/c").unwrap();
+    // Out of `/a` and into the root: the name is at its new place and gone from its old one.
+    vfs.rename("/a/c", "/c").unwrap();
+    assert_eq!(vfs.stat("/c").unwrap().kind, Kind::Dir);
+    assert_eq!(vfs.stat("/a/c"), Err(Error::NotFound));
+    // A directory moved inside itself would be a loop no walk could end.
+    vfs.mkdir("/c/d").unwrap();
+    assert_eq!(vfs.rename("/c", "/c/d/c"), Err(Error::BadPath));
+    vfs.unlink("/c/d").unwrap();
+    vfs.unlink("/c").unwrap();
     vfs.unlink("/a").unwrap();
     assert_eq!(vfs.stat("/a"), Err(Error::NotFound));
     vfs.sync().unwrap();
+}
+
+/// One filesystem can move a name between its own directories; two cannot move one between
+/// themselves, and say so rather than copying bytes nobody asked them to copy.
+#[test]
+fn a_rename_between_two_filesystems_is_refused() {
+    let mut outer = MemFs::<4>::new();
+    let outer_root = outer.root();
+    outer.create_dir(outer_root, b"disk").unwrap();
+    let mut inner = MemFs::<4>::new();
+    let mut vfs = Vfs::<2, 4>::new();
+    vfs.mount("/", &mut outer).unwrap();
+    vfs.mount("/disk", &mut inner).unwrap();
+    vfs.mkdir("/disk/d").unwrap();
+    assert_eq!(vfs.rename("/disk/d", "/d"), Err(Error::CrossDevice));
+    assert_eq!(vfs.rename("/disk/d", "/disk/e"), Ok(()), "within one of them it moves");
+    assert_eq!(vfs.stat("/disk/e").unwrap().kind, Kind::Dir);
 }
 
 #[test]

@@ -213,6 +213,7 @@ pub(crate) fn describe(e: Error) -> &'static str {
         Error::Full => "full",
         Error::Exists => "it already exists",
         Error::NotEmpty => "a directory that is not empty",
+        Error::CrossDevice => "a rename between filesystems",
         Error::Corrupt(what) | Error::Device(what) => what,
     }
 }
