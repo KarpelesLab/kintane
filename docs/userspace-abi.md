@@ -92,9 +92,12 @@ program that has the handles to build it with — there is still no `fork`:
   read with `completion_poll`. Every step names the objects it acts on by handle, and every
   handle is checked for kind, then rights, before anything happens.
 - **Channels became the kernel's too.** A channel used to be a field of the process that made
-  it, which meant an endpoint handed to another process named nothing there. A channel now
-  lives in a kernel table keyed by its endpoints' identities, so a transferred endpoint works
-  in whichever table holds it.
+  it, which meant an endpoint handed to another process named nothing there. Each endpoint is
+  now an object in the store, so a transferred endpoint works in whichever table holds it. A
+  channel lives while any handle, queued message or system call in progress names either
+  end, and is destroyed when the last of them lets go — not when the process that made it is
+  torn down while another process still holds the far end. Nothing about the channel calls
+  changed.
 - **`lib/rt`**, the native runtime: typed wrappers (`Process::create`, `give`, `start`,
   `start_at`, `join`), channel, completion, event and timer helpers. Its waiting wrappers
   (`recv`, `completion_wait`, `Event::wait`, `Process::join`) block in the kernel; the

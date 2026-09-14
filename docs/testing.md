@@ -339,6 +339,35 @@ The first version of `init` waited for the child's hello on the channel alone, a
 these mutations showed only as a parent that never exited. Watching the completion queue
 while waiting is what turned two of them into codes naming the fault.
 
+**A channel outlives a lookup in flight.** The `channels` line
+(`kernel/main/src/channels.rs`) runs after `spawn` and gates the verdict on the same presets.
+It forces the race the seventh round's Phase 6a work named: two threads, one closing a channel
+while the other is between finding it and using it. The kernel builds a process with one
+channel. A second kernel thread looks the channel up by its first endpoint and holds what it
+found. The boot thread then tears the process down, which closes both endpoints, and makes as
+many new channels as there is room for, so that any storage the closed channel gave back now
+holds another. Only then does the lookup thread ask the channel it holds whether its endpoint
+is one of that channel's two. Every object must be gone once it lets go:
+
+```
+  channels   a lookup held across its channel's close still named it; 7 channels made in its place; 0 objects left ok
+```
+
+Seven, not eight: the closed channel still occupies its slot until the lookup lets go.
+
+Shown failing on the code before channels became store objects — a kernel-wide table whose
+slot the owner's teardown emptied — on `x86_64-qemu` and `aarch64-virt-smp`:
+
+```
+  channels   A CHANNEL WAS FREED UNDER A LOOKUP AND REUSED; 8 channels made in its place; 0 objects left ok
+```
+
+Falsified (applied, booted on `x86_64-qemu`, restored): a channel freed when its *first*
+endpoint object is destroyed rather than its last gives that same line and fails the boot.
+
+The interleaving is forced, not raced: at boot only the boot CPU schedules, so this proves
+that a held lookup keeps its channel, not that two CPUs happen to collide.
+
 ### 2b. Block storage
 
 With `QEMU_BLOCK_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild

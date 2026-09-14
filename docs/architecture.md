@@ -457,11 +457,21 @@ substrate the syscall layer exposes as capabilities; see
     an event, re-arming a timer and destroying the object all wake. A timer is delivered when its
     queue is looked at; a wait on the queue ends at the earliest armed deadline, so the delivery
     is on time without posting from the timer interrupt.
-  - **Channels** are kept in their own kernel table, keyed by their endpoints' identities, so
-    an endpoint moved into another process still names its channel there. Each has a wait queue,
-    woken by every send and by an endpoint closing. Endpoint identities come from the same
-    kernel-wide source as store objects, so two processes' channels never share one. Channels
-    are not yet store objects.
+  - **Channels are store objects.** Each endpoint is an `Object::Endpoint` in the store,
+    found by its identity from whichever table holds a handle to it, so an endpoint moved into
+    another process still names its channel there. The channel's inboxes live in a slot of a
+    static channel arena while either endpoint object exists. A lookup (`objects::channel`)
+    returns a `ChanRef` holding a counted reference to the endpoint it found, so a channel
+    whose last handle another thread closes while a call is still using it is freed when the
+    call lets go, not under it. An endpoint is retired when the channel says it has closed —
+    its last handle closed, or the last message carrying it discarded — and every path that
+    gives an endpoint reference back (`handle_close`, teardown, a kernel end dropped, a handle
+    in a message nobody will receive) goes through `objects::release` or
+    `objects::close_endpoint`, so the channel's count and the store's agree. Each channel has
+    one wait queue for both ends, woken by every send, by an end closing, and by the channel
+    being freed. The channel ABI is unchanged. The `channels` boot check forces the race this
+    closes: one thread holds a lookup while another tears down the channel's process and
+    makes new channels in its place, and the lookup must still name its own channel.
 
 ### Wait queues
 

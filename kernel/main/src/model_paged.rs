@@ -100,6 +100,19 @@ pub fn processes_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// A channel looked up by one thread and closed by another lives until the lookup lets go.
+/// Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn channels_check(c: &dyn EarlyConsole) -> Check {
+    crate::channels::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn channels_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// Blocking waits, events, timers, two threads in one process, and a file read through a
 /// service over a channel. Passed when USERSPACE is off.
 #[cfg(CONFIG_USERSPACE)]

@@ -515,6 +515,9 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `processes`, whose process slots and stack slots it reuses once that phase has
     // torn its own down.
     let spawn = crate::model::spawn_check(c);
+    // After `spawn`, whose threads have been reaped from the stack slot this one's lookup
+    // thread runs on.
+    let channels = crate::model::channels_check(c);
     // After `spawn`, whose process slot and stack slots it reuses once that phase has
     // reaped its threads.
     let waits = crate::model::waits_check(c);
@@ -534,6 +537,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(heap)
         .and(processes)
         .and(spawn)
+        .and(channels)
         .and(waits)
         .and(isolation)
         .and(tickless)
