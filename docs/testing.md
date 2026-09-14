@@ -672,7 +672,14 @@ over and over, interrupt-driven where the card's line is wired. A lost reply is 
 twice, a third loss fails the run, and the heartbeat counts retries. At every audit the
 stack's pool must be full and every receive buffer with the card or holding a frame, while
 kbuild's probes keep arriving. 60 s on `aarch64-virt-smp`, four CPUs, passed all 60 audits
-with 8,547 echo replies, 8,547 round trips and 3 retries.
+with 3,318 echo replies, 3,318 round trips and 4 retries. The 20-second runs pass on
+`x86_64-qemu`, `i686-qemu`, `aarch64-virt`, both SMP presets at four CPUs and both at eight.
+
+The workload is paced: it sleeps 2 ms between polls for a reply and 10 ms between rounds.
+Unpaced, at one millisecond each, it passed 60 s at four CPUs with 8,547 round trips. On a
+single CPU, though, it took enough time from the user process below it that `x86_64-qemu` and
+`aarch64-virt` both failed at 15–16 s with `user process: a process made no progress`. The
+same runs without the card passed.
 
 The first two such runs hung at about 40 s: in one a workload missed its checkpoint, and the
 watchdog killed the other. The network workload took the stack's spinlock without masking
