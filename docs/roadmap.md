@@ -10,12 +10,110 @@ demonstrable — something boots, something passes, something fits in a budget �
 |---|---|
 | 0 — Build system and first boot | **done**, including `kinboot-efi` |
 | 1 — The portability spine | **done**, including `kinboot-bios` |
-| 2 — Core kernel | **every item landed**; stress runs of 10 minutes pass on all three; the 24-hour run is not yet done |
+| 2 — Core kernel | **every item landed**; the stress audit is judged in slices rather than wall-clock windows, and `kbuild soak` runs it unattended; 30-minute soaks pass on both SMP presets, the 2-hour and 24-hour runs are not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
 | 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
-| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals with their own frames, TCP sockets, and file writes. Stopping signals, `poll`/`epoll` and datagram sockets are not built |
-| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, a FAT16 filesystem written as well as read and checked after every run, virtio-net with IPv4 and TCP, sockets over handles and through Linux calls, an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Stopping signals, queued real-time signals, floating-point state in a signal frame, `MSG_PEEK` and scatter/gather are not built |
+| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, FAT16 written as well as read and a FAT32 second volume, both checked after every run; virtio-net with IPv4 reassembly, TCP with congestion control and out-of-order delivery, datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The tenth round of landings
+
+Eighteen presets build and boot. Six branches ran in parallel.
+
+- **A program can wait on several things at once.** One kernel queue carries every wait over a
+  set of objects, woken by each change that already woke something, and readiness takes nothing:
+  a channel reported readable still holds its message. The native ABI gains `object_wait_any`,
+  and the Linux personality answers `poll`, `ppoll`, `select`, `pselect6` and the `epoll` family
+  on both architectures, refusing edge-triggered and one-shot rather than pretending to offer
+  them. A native check waits on a channel, an event and a timer at once; a Linux check serves two
+  connections kbuild makes into one listener, in the order they arrive. The branch reports that
+  its checks do **not** cover the window between a wait's first look and its registering:
+  removing that look left them passing, because a millisecond-paced test cannot hit a
+  sub-microsecond race. The code closes it; the documentation says the checks do not prove it.
+- **Datagram sockets**, from the stack's inbox to Linux's calls. A datagram socket holds a port
+  rather than a connection, answers `MSG_TRUNC` with the length the datagram had, refuses
+  datagrams from anywhere but the address it connected to, and bounds its waits with
+  `SO_RCVTIMEO`/`SO_SNDTIMEO`. kbuild answers a request on a port it announces and leaves another
+  unbound, which is how a boot proves that a datagram nobody answers earns a timeout: this stack
+  turns no ICMP message into a socket error, and says so.
+- **The IP stack has the parts Phase 7 said it lacked.** TCP grows a congestion window in slow
+  start and congestion avoidance, fast-retransmits on three duplicate acknowledgements and
+  recovers the NewReno way, and computes its timeout from a round-trip estimate under Karn's
+  rule. A segment that arrives early is held in the receive ring where the stream will read it,
+  so a hole costs one retransmission rather than a window; IPv4 datagrams are reassembled in two
+  bounded sets that a hostile sender can only starve of its own. kbuild's relay now disturbs the
+  frames going *to* the guest — fragmenting, splitting, reordering and duplicating — so every
+  network boot must reassemble a datagram with its pattern intact and hold a segment out of order
+  before joining it to the stream. What is deliberately absent (SACK, ABC, PRR, pacing, ECN,
+  Nagle, delayed ACKs, reassembly of fragmented TCP) is named in the source rather than left to
+  be discovered, and the sender's fast retransmit is unreachable in a boot because the send ring
+  is one frame: host tests prove that half.
+- **Signals reach a thread the kernel is not already returning to.** The scheduler's interrupts
+  deliver on their way back to user mode, so a thread that only spins runs its handler, and a
+  fault raises its own signal — `SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL` — with the faulting
+  address in `si_addr`, which cannot be masked away because the instruction runs again the moment
+  the thread does. Getting there cost x86_64 assembly entries for seven vectors, since a signal
+  frame holds every register and the `x86-interrupt` ABI hides them. A handler that fixes nothing
+  is stopped after 16 re-faults rather than looping as Linux does. Floating-point state in the
+  frame is a stated gap: the kernel never clobbers those registers, but a handler is the
+  program's own code and does.
+- **FAT32, and a second volume in the guest.** The cluster count decides the format at mount:
+  FAT32's root is a chain that grows like any directory's, its entries are 28 bits wide with the
+  volume's own flag bits preserved, and its FSInfo free count is the driver's own — counted at
+  mount, kept as the table changes, and checked against the consistency walk on every disk boot.
+  The test disk carries a second, FAT32 volume written by a kbuild module whose reader and writer
+  share no code with each other or with the kernel, so a guest reads it and meets `EXDEV` when it
+  renames onto it. A rename across directories deletes the old entry before writing the new one,
+  because the other order would leave two names on one chain; a crash there leaves lost clusters,
+  the damage the ordering already allows. Long names are not built, and 8.3 names are refused
+  rather than mangled.
+- **The stress audit is judged in slices, and a soak runs unattended.** Nine of its bounds were
+  durations standing in for facts about the kernel, and under an emulator a duration measures the
+  host: workload parking and progress, the shootdown stall, sleeper lateness, the Linux pair's
+  waits, the post-move progress bound, a lost wake against a slow arrival, the waiting pair's
+  patience, and a starved thread against one that never ran. Each is now judged by what the
+  scheduler actually gave the thread, and each still fails when broken — the falsifications fail
+  in seconds rather than at the old bound's expiry. One of them, "ready on the right CPU, never
+  scheduled", was the single failure this round that reproduced on unmodified master. kbuild's
+  own harness was killing healthy guests as hung, because it allowed thirty seconds of wall time
+  between heartbeats a guest prints once per second of its own; that allowance is two minutes
+  now, so detection is later but never weaker. `kbuild soak` runs a stress image nobody watches,
+  keeps the audit trail whatever the outcome, and compares the first window against the last, so
+  a counter whose rate moves is a finding even when nothing fails. Both multiprocessor presets
+  passed thirty-minute gates on this code with no audit failed, on a host carrying five other
+  branches' work: aarch64 drifted +3% to +16% as its caches warmed, x86_64 −5% to −12% as the
+  host got busier, with 44 and 244 slices of margin against a 512-slice parking bound and every
+  other reportable count at zero. **The two-hour run is pending, not done**: thirty minutes shows
+  the bounds hold under load, but only the long run shows the books stay balanced over time,
+  since a counter gaining a few objects per thousand audits is invisible at that scale. Ten
+  attempts died before any of this landed, six of them inside ten minutes, none a kernel fault.
+  `spawn::PATIENCE` is deliberately untouched and documented with a reproduction: it is shared
+  with the boot checks and needs a thread's id plumbed out of the cycles that end it.
+
+**What merging six branches taught this round:**
+
+- **Numbers assigned in advance did not collide; numbers left to chance did.** Exit codes and
+  step ranges were handed out before the round started, and every branch stayed inside them.
+  Native system call numbers were not, and two branches both took 35 — `object_wait_any` and
+  `socket_send_to`. Next round the native numbers get the same treatment.
+- **The same sentence, edited by three branches, merges silently.** The count of rows in the
+  Linux system call tables was wrong twice before the round ended, each time because git took one
+  side of an identical-looking edit without reporting a conflict. It is now recomputed from the
+  tables themselves after every merge rather than trusted.
+- **A stale tool looks exactly like a passing test.** One branch's falsifications came back "not
+  caught" twice because a failed build left the old binary in place, and another had four boots
+  "pass" on stale code for the same reason. Both now check the build's own output before
+  believing a run. That is the third time this project has been fooled this way.
+- **Two helpers with one name is a compiler error; two modes with one exit code is not.** The
+  compiler caught `join` and `write_all`; nothing but reading caught four test modes sharing exit
+  codes 46 and 47 last round, which is why they were assigned in advance this time.
+
+**Still open.** Long file names; `statfs` reaching a program; FAT32 in the fuzz target, crash test
+and stress workload; selective acknowledgement and the sender's fast retransmit in a guest;
+floating-point state in a signal frame; queued real-time signals; `MSG_PEEK` and scatter/gather;
+ICMP errors reaching a socket; the wait-registration window a check cannot yet hit; and, as
+before, the 24-hour soak, real hardware, and Secure Boot with a TPM.
 
 ### The ninth round of landings
 
