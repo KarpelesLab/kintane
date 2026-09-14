@@ -347,17 +347,12 @@ impl Process {
 
     /// Ask for this process's exit to be posted to `queue` under `key`.
     pub fn wait_on(&self, queue: Handle, key: u64) -> Result<(), Error> {
-        call::process_wait(self.handle, queue, key).map(|_| ())
+        call::process_wait(self.handle, queue, key, NO_WAIT).map(|_| ())
     }
 
-    /// Wait for this process to end and return its exit code. Completions under other keys
-    /// are consumed and ignored.
-    pub fn join(&self, queue: Handle, key: u64) -> Result<u64, Error> {
-        loop {
-            let c = completion_wait(queue)?;
-            if c.key == key {
-                return Ok(c.value);
-            }
-        }
+    /// Wait up to `timeout_ns` for this process to end, and return its exit code. A process
+    /// still running when the wait runs out is `TimedOut`, or `ShouldWait` for [`NO_WAIT`].
+    pub fn join(&self, timeout_ns: u64) -> Result<u64, Error> {
+        call::process_wait(self.handle, Handle(0), 0, timeout_ns)
     }
 }

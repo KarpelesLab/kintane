@@ -92,9 +92,12 @@ program that has the handles to build it with — there is still no `fork`:
   read with `completion_poll`. Every step names the objects it acts on by handle, and every
   handle is checked for kind, then rights, before anything happens.
 - **Channels became the kernel's too.** A channel used to be a field of the process that made
-  it, which meant an endpoint handed to another process named nothing there. A channel now
-  lives in a kernel table keyed by its endpoints' identities, so a transferred endpoint works
-  in whichever table holds it.
+  it, which meant an endpoint handed to another process named nothing there. Each endpoint is
+  now an object in the store, so a transferred endpoint works in whichever table holds it. A
+  channel lives while any handle, queued message or system call in progress names either
+  end, and is destroyed when the last of them lets go — not when the process that made it is
+  torn down while another process still holds the far end. Nothing about the channel calls
+  changed.
 - **`lib/rt`**, the native runtime: typed wrappers (`Process::create`, `give`, `start`,
   `start_at`, `join`), channel, completion, event and timer helpers. Its waiting wrappers
   (`recv`, `completion_wait`, `Event::wait`, `Process::join`) block in the kernel; the
@@ -122,8 +125,12 @@ and the calls numbered 17–26 are built on them:
   receiver may keep — rights only narrow — all or nothing. **`channel_recv`** blocks for a
   message and returns its length and handle count. `channel_write` and `channel_read` remain,
   non-blocking and without handles.
-- **`completion_wait`** blocks for a completion. `process_wait` still only arms a completion; the
-  wait for a process is `completion_wait` on that queue, which `rt::Process::join` does.
+- **`completion_wait`** blocks for a completion.
+- **`process_wait`** has two forms. With a completion queue it arms that queue, as it always
+  did, and takes no timeout. With a zero completion handle it blocks for the process itself, up
+  to its timeout, and returns the exit code — `TimedOut` if the process is still running, like
+  every other wait. `rt::Process::join(timeout_ns)` is that form; `rt::Process::wait_on` is
+  the other.
 - **Events** (`event_create`, `event_signal`, `event_wait`): a latch. Signalling needs `SIGNAL`,
   waiting needs `WAIT`, and a wait consumes the signal.
 - **Timers** (`timer_create`, `timer_set`, `timer_cancel`) deliver to a completion queue, once or
@@ -140,13 +147,25 @@ user stack of its own, up to three beyond the first over the process's life. Two
 one process may be in the kernel on two CPUs at once, so a system call takes its process's
 lock and releases it around anything that blocks. A process ends when any thread calls
 `process_exit` or faults. Its other threads end at their next system call, or at once if
-they are waiting, because the exit wakes every wait. Its exit is posted to `process_wait`'s
+they are waiting, because the exit wakes every wait. A thread running user code, which does
+neither, is ended by interrupt: the exit sends a reschedule IPI to every other CPU, and a
+scheduler interrupt that arrived in user mode ends its thread on the way back if that thread's
+process has ended. Nothing of the process is freed until every thread is gone. Its exit is posted to `process_wait`'s
 queue when the last thread has gone.
 
-**A file service.** `lib/vfsproto` is a channel protocol (open, read, close, one 64-byte
-message each). The boot check serves it from a kernel thread over `kernel/vfs` on the
-mounted test volume, and `init` reads `/HELLO.TXT` through it. That is the VFS as a service a
-program reaches through a channel it was handed, not a set of system calls.
+**A file server.** `lib/vfsproto` is a channel protocol (open, read, close, one 64-byte
+message each). A kernel thread, `kernel/main/src/fileserver.rs`, serves it over `kernel/vfs`
+on the mounted test volume. The thread is started once at boot and never stopped. The kernel
+gives a process a connection — a channel of its own, one end in the process's table — and
+the server adopts the other end. Each connection has its own open files, and the server lets
+go of a connection when its client's end closes. It waits on every connection through one
+queue of its own, which each adopted channel also wakes. It holds the volume only for the
+request it is answering, through a lease the stress run's filesystem workload takes too, so
+an open file is a path and an offset rather than a handle into the volume. `init` reads
+`/HELLO.TXT` through it in the `waits` check, and a second process does the same after that
+check has ended. That is the VFS as a service a program reaches through a channel it was
+handed, not a set of system calls. No program can yet ask for a connection itself: the kernel
+hands one to the processes it starts.
 
 **What the check proves** (`kernel/main/src/waits.rs`, the `waits` banner line, gating the
 verdict on every x86_64 and aarch64 preset including both SMP ones). `init`:

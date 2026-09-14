@@ -68,9 +68,17 @@ impl Handler for Recorder {
         process: Handle,
         completion: Handle,
         key: u64,
+        timeout_ns: u64,
     ) -> Result<u64, Error> {
-        self.calls
-            .push(("process_wait", vec![u64::from(process.0), u64::from(completion.0), key]));
+        self.calls.push((
+            "process_wait",
+            vec![
+                u64::from(process.0),
+                u64::from(completion.0),
+                key,
+                timeout_ns,
+            ],
+        ));
         Ok(0)
     }
     fn completion_create(&mut self) -> Result<u64, Error> {
@@ -234,16 +242,16 @@ fn the_construction_calls_take_the_arguments_the_abi_documents() {
     assert!(TABLE.contains(&(number::process_create, "process_create", 1)));
     assert!(TABLE.contains(&(number::process_transfer, "process_transfer", 2)));
     assert!(TABLE.contains(&(number::thread_create, "thread_create", 3)));
-    assert!(TABLE.contains(&(number::process_wait, "process_wait", 3)));
+    assert!(TABLE.contains(&(number::process_wait, "process_wait", 4)));
     assert!(TABLE.contains(&(number::completion_create, "completion_create", 0)));
     assert!(TABLE.contains(&(number::completion_poll, "completion_poll", 2)));
     assert!(TABLE.contains(&(number::vm_region_create, "vm_region_create", 1)));
     assert!(TABLE.contains(&(number::vm_map_in, "vm_map_in", 2)));
 
     let mut r = Recorder::default();
-    let out = dispatch(&mut r, number::process_wait, [4, 9, 0x9001, 0, 0, 0]);
+    let out = dispatch(&mut r, number::process_wait, [4, 9, 0x9001, 7, 0, 0]);
     assert_eq!(out, Ok(0));
-    assert_eq!(r.calls, vec![("process_wait", vec![4, 9, 0x9001])]);
+    assert_eq!(r.calls, vec![("process_wait", vec![4, 9, 0x9001, 7])]);
 }
 
 #[test]

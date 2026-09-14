@@ -100,6 +100,19 @@ pub fn processes_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// A channel looked up by one thread and closed by another lives until the lookup lets go.
+/// Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn channels_check(c: &dyn EarlyConsole) -> Check {
+    crate::channels::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn channels_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// Blocking waits, events, timers, two threads in one process, and a file read through a
 /// service over a channel. Passed when USERSPACE is off.
 #[cfg(CONFIG_USERSPACE)]
@@ -111,6 +124,45 @@ pub fn waits_check(c: &dyn EarlyConsole) -> Check {
 pub fn waits_check(c: &dyn EarlyConsole) -> Check {
     let _ = c;
     Check::Passed
+}
+
+/// A process ends while another of its threads spins in user mode, and that thread is stopped.
+/// Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn sibling_check(c: &dyn EarlyConsole) -> Check {
+    crate::sibling::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn sibling_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
+/// The standing file server serves a second process after the check that started it has
+/// ended. Passed when USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn files_check(c: &dyn EarlyConsole) -> Check {
+    crate::fileserver::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn files_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
+/// Run a process whose second thread spins in user mode on another CPU, end it, and require
+/// the spinner stopped. `Ok` without USERSPACE.
+#[cfg(CONFIG_USERSPACE)]
+pub fn sibling_stress_cycle(round: u64) -> Result<(), &'static str> {
+    crate::sibling::stress_cycle(round)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn sibling_stress_cycle(round: u64) -> Result<(), &'static str> {
+    let _ = round;
+    Ok(())
 }
 
 /// The stress run's waiting-process cycle: claim the second stack its threads run on.
@@ -155,6 +207,14 @@ pub fn wait_stress_heartbeat(c: &dyn EarlyConsole) {
     c.write_str(", timeouts ");
     crate::write_usize(c, s.timeouts as usize);
     c.write_str(")");
+    let siblings = crate::sibling::stress_cycles();
+    if siblings > 0 {
+        c.write_str(", spinning siblings stopped ");
+        crate::write_usize(c, siblings as usize);
+        c.write_str(" (from an interrupt ");
+        crate::write_usize(c, crate::userproc::interrupt_kills() as usize);
+        c.write_str(")");
+    }
 }
 
 #[cfg(not(CONFIG_USERSPACE))]

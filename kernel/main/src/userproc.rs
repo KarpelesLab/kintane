@@ -61,7 +61,7 @@ use elf::Program;
 use hal::fault::PageFault;
 use hal::user::{UserHooks, UserTrap};
 use hal::{Arch, EarlyConsole, HasPageTables, HasUserMode, KernAddr, PhysAddr, UserAddr};
-use kobject::handle::{Handle, HandleTable};
+use kobject::handle::{Entry, Handle, HandleTable};
 use kobject::{ObjectId, ObjectIds, ObjectType, Rights};
 use mm::DirectMap;
 use mm::paged::{AddressSpace, FrameSource};
@@ -73,7 +73,7 @@ use time::Instant;
 use crate::demand::KernelFrames;
 use crate::objects::{self, Object};
 use crate::wait::{self, WaitQueue};
-use crate::{Check, Live, Locks, mp, preempt, timekeeping, write_hex, write_usize};
+use crate::{Check, Live, mp, preempt, timekeeping, write_hex, write_usize};
 
 /// The embedded program. `kbuild` links `user/init` for this target and sets the variable
 /// to its path; see the `user` unit kind in `kbuild/src/build.rs`.
@@ -95,9 +95,6 @@ const REGIONS: usize = 20;
 /// The user stack: below the top of the user half, its own guard of unmapped space above.
 const USER_STACK_PAGES: usize = 16;
 
-/// A channel, for `channel_create`.
-type Chan = ipc::Channel<Locks, 4, 64, 2>;
-
 /// A program names rights by `abi::rights`' bits, and the kernel checks them as
 /// `kobject::Rights`. They are one numbering, and a build where they are not fails here.
 const _: () = assert!(
@@ -115,91 +112,53 @@ const _: () = assert!(
     "lib/abi's rights disagree with kobject::Rights"
 );
 
-/// Channels that exist, and who made each.
+/// The channel the endpoint `object` belongs to, in whichever table holds a handle to it,
+/// held for as long as the result lives.
 ///
-/// Not a field of [`Process`], which is where this began. An endpoint given to another
-/// process — `process_transfer` — leaves its handle in that process's table, and the
-/// channel it names has to be reachable from there too. A channel is therefore the
-/// kernel's, like every other object, and a handle in either table finds it by the
-/// identity `Chan::new` gave that endpoint.
-///
-/// SAFETY INVARIANT: a slot is written once by `channel_create`, by a process holding no
-/// reference into it, and cleared by [`free_channels_of`] when its owner is torn down and
-/// no process can name either endpoint. Readers take `&'static Chan` and change it only
-/// through `Chan`'s own locks.
-const MAX_CHANNELS: usize = 8;
-static CHANNELS: [SyncUnsafeCell<Option<ChannelSlot>>; MAX_CHANNELS] =
-    [const { SyncUnsafeCell::new(None) }; MAX_CHANNELS];
-
-/// The threads waiting to receive on each channel, by its slot in [`CHANNELS`]: one queue
-/// for both ends, since a wake that finds nothing for its end costs only a second look.
-/// Woken by every send, by an endpoint closing, and by a channel being freed.
-static CHANNEL_WAITS: [WaitQueue; MAX_CHANNELS] = [const { WaitQueue::new() }; MAX_CHANNELS];
+/// Not a field of [`Process`], which is where channels began: an endpoint given to another
+/// process with `process_transfer` names its channel there too. A channel is the kernel's,
+/// like every other object, and lives in the object store ([`objects::channel`]). The
+/// reference this returns is counted there, so a channel closed by another thread while a
+/// call still uses it is freed when the call lets go, not under it.
+pub(crate) fn channel_of(object: ObjectId) -> Option<objects::ChanRef> {
+    objects::channel(object)
+}
 
 /// The wait queue of the channel the endpoint `object` belongs to.
 fn channel_queue(object: ObjectId) -> Option<&'static WaitQueue> {
-    CHANNELS.iter().zip(&CHANNEL_WAITS).find_map(|(c, queue)| {
-        // SAFETY: see `CHANNELS`.
-        let slot = unsafe { (*c.get()).as_ref() }?;
-        slot.ends.contains(&object).then_some(queue)
-    })
+    channel_of(object).map(|chan| chan.waiters())
 }
 
 /// Wake whoever waits on the channel the endpoint `object` belongs to.
 fn wake_channel(object: ObjectId) {
-    if let Some(queue) = channel_queue(object) {
-        queue.wake_all();
-    }
+    objects::wake_channel(object);
 }
 
 fn wake_all_channel_waiters() {
-    for queue in &CHANNEL_WAITS {
-        queue.wake_all();
-    }
+    objects::wake_all_channel_waiters();
 }
 
-struct ChannelSlot {
-    chan: Chan,
-    /// The identities of its two endpoints, as `Chan::new` issued them.
-    ends: [ObjectId; 2],
-    /// The process slot that created it; its teardown frees this.
-    owner: usize,
-}
-
-/// The channel the endpoint `object` belongs to, in whichever table holds a handle to it.
-fn channel_of(object: ObjectId) -> Option<&'static Chan> {
-    CHANNELS.iter().find_map(|c| {
-        // SAFETY: see `CHANNELS`: a written slot is not moved or dropped while a process
-        // can name it, and `Chan`'s own locks order its contents.
-        let slot = unsafe { (*c.get()).as_ref() }?;
-        slot.ends.contains(&object).then_some(&slot.chan)
-    })
-}
-
-/// Put `chan` in a free slot, owned by process `owner`.
-fn keep_channel(chan: Chan, ends: [ObjectId; 2], owner: usize) -> Option<()> {
-    for cell in CHANNELS.iter() {
-        // SAFETY: see `CHANNELS`; an empty slot is named by nothing.
-        let slot = unsafe { &mut *cell.get() };
-        if slot.is_none() {
-            *slot = Some(ChannelSlot { chan, ends, owner });
-            return Some(());
+/// Install both endpoints of a new channel in `table`, or give both back.
+fn install_pair<const M: usize>(
+    table: &mut HandleTable<M>,
+    [a, b]: [Entry; 2],
+) -> Result<(Handle, Handle), kobject::handle::Error> {
+    let ha = match table.insert(a.object, a.kind, a.rights) {
+        Ok(h) => h,
+        Err(e) => {
+            objects::release(a);
+            objects::release(b);
+            return Err(e);
         }
-    }
-    None
-}
-
-/// Drop every channel process `slot` created. Called from [`teardown`].
-fn free_channels_of(slot: usize) {
-    for (cell, queue) in CHANNELS.iter().zip(&CHANNEL_WAITS) {
-        // SAFETY: see `CHANNELS`; the owner's threads have exited, and no handle to either
-        // endpoint can be used once its table is gone.
-        let held = unsafe { &mut *cell.get() };
-        if held.as_ref().is_some_and(|c| c.owner == slot) {
-            *held = None;
-            // A thread of another process waiting on the far end looks again and finds the
-            // channel gone.
-            queue.wake_all();
+    };
+    match table.insert(b.object, b.kind, b.rights) {
+        Ok(hb) => Ok((ha, hb)),
+        Err(e) => {
+            if let Some(chan) = channel_of(a.object) {
+                let _ = objects::close_endpoint(&chan, table, ha);
+            }
+            objects::release(b);
+            Err(e)
         }
     }
 }
@@ -540,7 +499,7 @@ impl Process {
     pub(crate) fn close_handle(&mut self, h: Handle) -> bool {
         match self.table.close(h) {
             Ok(entry) => {
-                objects::retire(entry.object);
+                objects::release(entry);
                 true
             }
             Err(_) => false,
@@ -649,6 +608,35 @@ fn on_kill(trap: UserTrap) -> ! {
     finish_thread(slot, last, exit)
 }
 
+/// The way back to user code from an interrupt that arrived while it ran. A thread whose
+/// process has ended in the meantime ends here instead of returning.
+///
+/// A thread spinning in user mode makes no system call and waits on nothing, so this is the
+/// one place it can be stopped: at the next timer interrupt on its CPU, at the reschedule IPI
+/// [`record_exit`] sends to every other CPU, or, on the exiting thread's own CPU, when the
+/// scheduler resumes it inside the interrupt that preempted it. See `crate::sibling`.
+fn on_user_interrupt() {
+    let Some(slot) = current_slot() else {
+        return;
+    };
+    if !EXITING[slot].load(Ordering::Acquire) {
+        return;
+    }
+    INTERRUPT_KILLS.fetch_add(1, Ordering::Relaxed);
+    let (last, exit) = match lock(slot) {
+        Some(mut held) => (leave(slot), held.process().exit),
+        None => (leave(slot), Some(KILLED)),
+    };
+    finish_thread(slot, last, exit)
+}
+
+/// Threads [`on_user_interrupt`] has ended since boot.
+static INTERRUPT_KILLS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn interrupt_kills() -> u64 {
+    INTERRUPT_KILLS.load(Ordering::Relaxed)
+}
+
 /// Count one thread of process `slot` as ended, and say whether it was the last.
 ///
 /// A process whose threads were never counted — the boot-time slice starts its one thread
@@ -700,6 +688,11 @@ fn record_exit(p: &mut Process, code: u64) {
     // wait again.
     objects::wake_all_waiters();
     wake_all_channel_waiters();
+    // A thread of it running user code on another CPU neither calls nor waits; an interrupt
+    // is what reaches it ([`on_user_interrupt`]).
+    if threads_live(p.slot) > 1 {
+        preempt::interrupt_other_cpus();
+    }
 }
 
 /// End the running process with `code`, from its own system call. Never returns.
@@ -860,18 +853,8 @@ impl abi::Handler for Syscalls {
     }
 
     fn channel_create(&mut self, out: UserPtr) -> Result<u64, Error> {
-        let (ch, [a, b]) = Chan::new(objects::ids(), ipc::ENDPOINT_RIGHTS);
-        let ha = self
-            .p()
-            .table
-            .insert(a.object, a.kind, a.rights)
-            .map_err(handle_error)?;
-        let hb = self
-            .p()
-            .table
-            .insert(b.object, b.kind, b.rights)
-            .map_err(handle_error)?;
-        keep_channel(ch, [a.object, b.object], self.slot).ok_or(Error::Full)?;
+        let ends = objects::new_channel().ok_or(Error::Full)?;
+        let (ha, hb) = install_pair(&mut self.p().table, ends).map_err(handle_error)?;
         let mut pair = [0u8; 8];
         pair[0..4].copy_from_slice(&ha.raw().to_le_bytes());
         pair[4..8].copy_from_slice(&hb.raw().to_le_bytes());
@@ -919,10 +902,8 @@ impl abi::Handler for Syscalls {
         if let Some(ch) = channel_of(entry.object) {
             // Through the channel, so that its peer sees this end close: a thread waiting to
             // receive there is told `PeerClosed` rather than waiting for a message that
-            // cannot come. Handles still queued for this end are retired with it.
-            ch.close(&mut self.p().table, handle(h), |e| objects::retire(e.object))
-                .map_err(channel_error)?;
-            wake_channel(entry.object);
+            // cannot come. Handles still queued for this end are given back with it.
+            objects::close_endpoint(&ch, &mut self.p().table, handle(h)).map_err(channel_error)?;
             return Ok(0);
         }
         let entry = self.p().table.close(handle(h)).map_err(handle_error)?;
@@ -1016,7 +997,32 @@ impl abi::Handler for Syscalls {
         process: AbiHandle,
         completion: AbiHandle,
         key: u64,
+        timeout_ns: u64,
     ) -> Result<u64, Error> {
+        if completion.0 == 0 {
+            // Wait for the process itself, on its object's queue, which its exit wakes.
+            let id = self
+                .p()
+                .table
+                .get_checked(handle(process), ObjectType::Process, Rights::WAIT)
+                .map_err(handle_error)?
+                .object;
+            let waiters = objects::waiters(id).ok_or(Error::BadHandle)?;
+            return self.wait_for(
+                waiters,
+                timeout_ns,
+                || None,
+                move |_| match objects::exit_code(id) {
+                    Some(Some(code)) => Ok(Some(code)),
+                    Some(None) => Ok(None),
+                    None => Err(Error::BadHandle),
+                },
+            );
+        }
+        // Arming a queue waits for nothing, so a timeout on it is a caller's mistake.
+        if timeout_ns != 0 {
+            return Err(Error::InvalidArgument);
+        }
         let queue = self
             .p()
             .table
@@ -1530,6 +1536,8 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
         }
     };
 
+    // Before any process runs: a channel is made of store objects, and `main` makes one.
+    objects::init();
     // SAFETY: set once here before any process runs.
     unsafe { *DIRECT.get() = Some(direct) };
     let kernel_root = <Cpu as HasPageTables>::root();
@@ -1542,6 +1550,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
                 syscall: on_syscall,
                 fault: on_user_fault,
                 kill: on_kill,
+                interrupted: on_user_interrupt,
             },
             kernel_root,
         );
@@ -1864,16 +1873,22 @@ pub(crate) fn process_handle(slot: usize) -> Option<Handle> {
 /// runs.
 pub(crate) fn channel_pair(slot: usize) -> Option<(Handle, Handle)> {
     let p = self::slot(slot)?;
-    let (ch, [a, b]) = Chan::new(objects::ids(), ipc::ENDPOINT_RIGHTS);
-    let ha = p.table.insert(a.object, a.kind, a.rights).ok()?;
-    let hb = p.table.insert(b.object, b.kind, b.rights).ok()?;
-    keep_channel(ch, [a.object, b.object], slot)?;
-    Some((ha, hb))
+    install_pair(&mut p.table, objects::new_channel()?).ok()
+}
+
+/// The object handle `h` names in process `slot`'s table. Before any thread of it runs, or
+/// after the last has ended.
+pub(crate) fn endpoint_object(slot: usize, h: Handle) -> Option<ObjectId> {
+    self::slot(slot)?
+        .table
+        .get(h)
+        .ok()
+        .map(|entry| entry.object)
 }
 
 /// One end of a channel the kernel holds itself, for a service a program talks to: the
 /// other end is in the program's table, and this one in a small table of the kernel's own.
-/// `crate::waits`' file service is the first.
+/// `crate::fileserver` holds one per connection.
 pub(crate) struct KernelEnd {
     table: HandleTable<2>,
     handle: Handle,
@@ -1881,50 +1896,76 @@ pub(crate) struct KernelEnd {
 }
 
 /// Make a channel between process `slot` and the kernel. Returns the program's handle and
-/// the kernel's end. Before any thread of the process runs; the channel is freed with the
-/// process.
+/// the kernel's end. Before any thread of the process runs. The kernel's end closes when it
+/// is dropped, the program's when its handle is closed or the process torn down, and the
+/// channel is freed once both have.
 pub(crate) fn kernel_channel(slot: usize) -> Option<(Handle, KernelEnd)> {
     let p = self::slot(slot)?;
-    let (ch, [theirs, ours]) = Chan::new(objects::ids(), ipc::ENDPOINT_RIGHTS);
-    let given = p
-        .table
-        .insert(theirs.object, theirs.kind, theirs.rights)
-        .ok()?;
+    let [theirs, ours] = objects::new_channel()?;
     let mut table = HandleTable::new();
-    let handle = table.insert(ours.object, ours.kind, ours.rights).ok()?;
-    keep_channel(ch, [theirs.object, ours.object], slot)?;
-    Some((
-        given,
-        KernelEnd {
-            table,
-            handle,
-            object: ours.object,
-        },
-    ))
+    let Ok(handle) = table.insert(ours.object, ours.kind, ours.rights) else {
+        objects::release(theirs);
+        objects::release(ours);
+        return None;
+    };
+    // From here the kernel's end closes itself if the program's cannot be installed.
+    let end = KernelEnd {
+        table,
+        handle,
+        object: ours.object,
+    };
+    match p.table.insert(theirs.object, theirs.kind, theirs.rights) {
+        Ok(given) => Some((given, end)),
+        Err(_) => {
+            objects::release(theirs);
+            None
+        }
+    }
+}
+
+impl Drop for KernelEnd {
+    /// Close the kernel's end, so the program's sees `PeerClosed`.
+    fn drop(&mut self) {
+        if let Some(chan) = channel_of(self.object) {
+            let _ = objects::close_endpoint(&chan, &mut self.table, self.handle);
+        }
+    }
 }
 
 impl KernelEnd {
-    /// Receive one message into `buf`, waiting until `deadline` for it. On a kernel thread.
+    /// Receive one message into `buf` if one is queued: `ShouldWait` if none is, `PeerClosed`
+    /// once the program's end has closed and everything it sent has been received.
+    pub(crate) fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let ch = channel_of(self.object).ok_or(Error::PeerClosed)?;
+        let mut handles = [Handle::from_raw(0); 2];
+        ch.receive(&mut self.table, self.handle, buf, &mut handles)
+            .map(|got| got.bytes)
+            .map_err(channel_error)
+    }
+
+    /// Receive one message into `buf`, waiting until `deadline` for it: `TimedOut` if none
+    /// came. On a kernel thread. `crate::blockdomain` serves its domain this way.
+    #[cfg_attr(not(CONFIG_BLOCK_DOMAIN), allow(dead_code))]
     pub(crate) fn recv(
         &mut self,
         buf: &mut [u8],
         deadline: Option<Instant>,
     ) -> Result<usize, Error> {
         let queue = channel_queue(self.object).ok_or(Error::PeerClosed)?;
-        let (table, endpoint, object) = (&mut self.table, self.handle, self.object);
-        let mut handles = [Handle::from_raw(0); 2];
         queue
-            .wait_until(deadline, || {
-                let Some(ch) = channel_of(object) else {
-                    return Some(Err(Error::PeerClosed));
-                };
-                match ch.receive(table, endpoint, buf, &mut handles) {
-                    Ok(got) => Some(Ok(got.bytes)),
-                    Err(ipc::Error::Empty) => None,
-                    Err(e) => Some(Err(channel_error(e))),
-                }
+            .wait_until(deadline, || match self.try_recv(buf) {
+                Err(Error::ShouldWait) => None,
+                got => Some(got),
             })
             .unwrap_or(Err(Error::TimedOut))
+    }
+
+    /// Wake `queue` whenever this channel's waiters are woken: for a kernel thread that waits
+    /// on several channels in one queue of its own.
+    pub(crate) fn relay_to(&self, queue: &'static WaitQueue) {
+        if let Some(chan) = channel_of(self.object) {
+            chan.relay_to(queue);
+        }
     }
 
     /// Send `bytes` to the program, waking it if it waits.
@@ -2191,11 +2232,11 @@ pub(crate) fn teardown(slot: usize) {
         f.free(p.vm.space().root());
     });
     // Objects only this process's table named go with it: a table that is gone can close
-    // nothing, and an object nothing can name is a leak the accounting reports.
+    // nothing, and an object nothing can name is a leak the accounting reports. An endpoint
+    // goes back through its channel, so the far end sees it close, wherever that end is.
     for entry in p.table.entries() {
-        crate::objects::retire(entry.object);
+        crate::objects::release(entry);
     }
-    free_channels_of(slot);
     // What only a Linux process has: its descriptors and its thread pointer.
     if p.personality == Personality::Linux {
         crate::personality::release(slot);

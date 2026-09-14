@@ -130,11 +130,22 @@ impl Handler for Mock {
         }
     }
 
-    fn process_wait(&mut self, process: Handle, queue: Handle, cookie: u64) -> Result<u64, Error> {
+    fn process_wait(
+        &mut self,
+        process: Handle,
+        queue: Handle,
+        cookie: u64,
+        timeout_ns: u64,
+    ) -> Result<u64, Error> {
         self.calls += 1;
         self.last = cookie;
         let _ = (process, queue);
-        Ok(0)
+        // A real kernel refuses a timeout on the call that arms a completion queue.
+        if queue.0 != 0 && timeout_ns != 0 {
+            Err(Error::InvalidArgument)
+        } else {
+            Ok(0)
+        }
     }
 
     fn completion_create(&mut self) -> Result<u64, Error> {

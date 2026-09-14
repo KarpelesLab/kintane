@@ -258,6 +258,18 @@ unsafe fn try_user_sync(_index: u64, _frame: *mut TrapFrame) -> bool {
     false
 }
 
+/// The last thing an IRQ taken from EL0 does before it returns: the kernel may end the thread
+/// there instead (`hal::user::UserHooks::interrupted`). The two definitions keep the `cfg` at
+/// item level.
+#[cfg(CONFIG_USERSPACE)]
+fn returning_to_user() {
+    crate::user::interrupted();
+}
+
+/// No userspace port: nothing at EL0 to return to.
+#[cfg(not(CONFIG_USERSPACE))]
+fn returning_to_user() {}
+
 /// Install the vector table in `VBAR_EL1`.
 ///
 /// # Safety
@@ -298,6 +310,9 @@ extern "C" fn aarch64_exception(index: u64, frame: *mut TrapFrame) {
     // EL0 was ever interrupted, and index 9 was reported as unhandled.
     if index == VEC_CURRENT_SPX_IRQ || index == VEC_LOWER_A64_IRQ {
         crate::irq::dispatch();
+        if index == VEC_LOWER_A64_IRQ {
+            returning_to_user();
+        }
         return;
     }
 

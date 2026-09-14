@@ -353,6 +353,15 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
                 / 1_000_000_000;
             audit_failed(c, seconds, "waiting process", what);
         }
+        // And, every other interval, a process that ends while its second thread spins in user
+        // mode on another CPU: the exit must reach that thread by interrupt.
+        if let Err(what) = crate::model::sibling_stress_cycle(audits) {
+            let seconds = timekeeping::now()
+                .saturating_duration_since(start)
+                .as_nanos()
+                / 1_000_000_000;
+            audit_failed(c, seconds, "spinning sibling", what);
+        }
         sleep_until(next.min(end));
         let now = timekeeping::now();
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;

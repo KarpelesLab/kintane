@@ -24,6 +24,10 @@
 //!   kernel's file service; see [`waits`].
 //! * [`MODE_PAIR`] and [`MODE_PAIR_PEER`] are two threads of one process passing a counter back and
 //!   forth, each blocking for the other; the stress run pins them to two CPUs. See [`pair`].
+//! * [`MODE_SPIN`] and [`MODE_SPINNER`] are two threads of one process: the second spins in user
+//!   mode for ever, and the first ends the process under it. See [`spin`].
+//! * [`MODE_FILES`] reads a file through the kernel's file server, as a process that is not the
+//!   first the server has served; see [`files`].
 //!
 //! No step here decides whether the kernel is right. The program reports what it saw,
 //! and the kernel's check compares that with what it expected, so a kernel that lies to
@@ -50,6 +54,12 @@ const MODE_WAITS: usize = 5;
 const MODE_PAIR: usize = 6;
 /// The second thread of [`MODE_PAIR`]; see [`peer`].
 const MODE_PAIR_PEER: usize = 7;
+/// End the process under a thread spinning in user mode; see [`spin`].
+const MODE_SPIN: usize = 8;
+/// Spin in user mode for ever; see [`spinner`].
+const MODE_SPINNER: usize = 9;
+/// Read a file through the kernel's file server; see [`files`].
+const MODE_FILES: usize = 10;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -91,6 +101,9 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_WAITS => waits(handle(a), handle(b), handle(c)),
         MODE_PAIR => pair(handle(a)),
         MODE_PAIR_PEER => peer(handle(a)),
+        MODE_SPIN => spin(handle(a)),
+        MODE_SPINNER => spinner(handle(a)),
+        MODE_FILES => files(handle(a), handle(b)),
         _ => 0xbad0,
     };
     exit(code)
@@ -334,11 +347,16 @@ fn spawn(image: Handle, console: Handle) -> u64 {
     if rt::send(mine, CHILD_REPLY).is_err() {
         return 0x407;
     }
-    let Ok(code) = child.join(queue, CHILD_KEY) else {
+    let Ok(code) = child.join(WAKE_NS) else {
         return 0x408;
     };
     if code != CHILD_SUCCESS {
         return 0x409;
+    }
+    // The exit asked for on the queue arrives too, with the same code.
+    match rt::completion_wait_timeout(queue, WAKE_NS) {
+        Ok(c) if c.key == CHILD_KEY && c.value == code => {}
+        _ => return 0x40c,
     }
     let _ = rt::print(console, b"init: the process it created exited as expected\n");
     SPAWN_SUCCESS
@@ -365,6 +383,21 @@ const SPAWN_SUCCESS: u64 = 0x5a;
 const WAITS_SUCCESS: u64 = 0x6b;
 /// [`MODE_PAIR`]'s.
 const PAIR_SUCCESS: u64 = 0x6c;
+/// [`MODE_SPIN`]'s. Mirrors `kernel/main/src/sibling.rs`.
+const SPIN_SUCCESS: u64 = 0x6d;
+/// How long [`spin`] lets the spinner spin before ending the process under it.
+const SPIN_SETTLE_NS: u64 = 20_000_000;
+/// [`MODE_FILES`]'. Mirrors `kernel/main/src/fileserver.rs`.
+const FILES_SUCCESS: u64 = 0x6e;
+
+/// Read `/HELLO.TXT` through the file server `service` names, as [`MODE_WAITS`] does. Returns
+/// [`FILES_SUCCESS`], or the code of the step that did not behave.
+fn files(console: Handle, service: Handle) -> u64 {
+    match read_through_the_service(console, service) {
+        Ok(()) => FILES_SUCCESS,
+        Err(code) => code,
+    }
+}
 
 /// The timeout the timing steps use.
 const TIMEOUT_NS: u64 = 30_000_000;
@@ -416,6 +449,9 @@ fn waits(console: Handle, me: Handle, files: Handle) -> u64 {
     if !times_out_on_time(queue) {
         return 0x501;
     }
+    if !process_wait_times_out(me, queue) {
+        return 0x502;
+    }
     let steps = [
         timers(queue),
         two_threads(me),
@@ -442,6 +478,22 @@ fn times_out_on_time(queue: Handle) -> bool {
     }
     let start = rt::now_ns();
     let result = rt::completion_wait_timeout(queue, TIMEOUT_NS);
+    let took = rt::now_ns().wrapping_sub(start);
+    result == Err(Error::TimedOut) && took >= TIMEOUT_NS && took < TIMEOUT_NS + LATE_NS
+}
+
+/// A wait for a process runs out on time, as every other wait does. The process waited for is
+/// this one, which cannot end while its own thread waits. Arming a queue takes no timeout.
+fn process_wait_times_out(me: Handle, queue: Handle) -> bool {
+    let this = rt::Process { handle: me };
+    if this.join(rt::NO_WAIT) != Err(Error::ShouldWait) {
+        return false;
+    }
+    if call::process_wait(me, queue, 1, TIMEOUT_NS) != Err(Error::InvalidArgument) {
+        return false;
+    }
+    let start = rt::now_ns();
+    let result = this.join(TIMEOUT_NS);
     let took = rt::now_ns().wrapping_sub(start);
     result == Err(Error::TimedOut) && took >= TIMEOUT_NS && took < TIMEOUT_NS + LATE_NS
 }
@@ -674,6 +726,31 @@ fn ask<'a>(service: Handle, request: &[u8], buf: &'a mut [u8]) -> Option<vfsprot
     rt::send(service, request).ok()?;
     let n = rt::recv_timeout(service, buf, WAKE_NS).ok()?;
     vfsproto::parse_reply(buf.get(..n)?)
+}
+
+/// Wait for [`spinner`] to start, let it spin, and end the process under it. Returns
+/// [`SPIN_SUCCESS`], or `0x80x` for a step that did not behave. Whether the spinner ended too
+/// is for the kernel to see: nothing here could tell.
+fn spin(started: Handle) -> u64 {
+    let started = rt::Event { handle: started };
+    if !wait_promptly(&started) {
+        return 0x801;
+    }
+    // Long enough for the spinner to be deep in its loop, preempted here or running elsewhere.
+    if started.wait(SPIN_SETTLE_NS) != Err(Error::TimedOut) {
+        return 0x802;
+    }
+    SPIN_SUCCESS
+}
+
+/// Say this thread has started, then spin in user mode for ever without entering the kernel
+/// again. Only the kernel can end it.
+fn spinner(started: Handle) -> ! {
+    let _ = call::event_signal(started);
+    let mut spins = 0u64;
+    loop {
+        spins = core::hint::black_box(spins.wrapping_add(1));
+    }
 }
 
 /// Pass a counter to [`peer`] and back until a tenth of a second has gone, blocking in the

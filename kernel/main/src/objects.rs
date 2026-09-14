@@ -29,17 +29,19 @@
 #![allow(unsafe_code)]
 
 use core::cell::SyncUnsafeCell;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use arch::Cpu;
-use kobject::handle::{Handle, HandleTable};
-use kobject::store::{ObjectStore, StoreError};
+use kobject::handle::{Entry, Handle, HandleTable};
+use kobject::store::{ObjRef, ObjectStore, StoreError};
 use kobject::{ObjectId, ObjectIds, ObjectType, Rights};
 use sched::ThreadId;
 use sync::SpinLock;
 use sync::lockdep::LockClass;
 
-use crate::Locks;
 use crate::wait::WaitQueue;
+use crate::{AtomicBool, AtomicUsize, Locks};
 
 /// Objects that can exist at once, across every process. A spawn sequence uses six — an
 /// image, a process, a thread, a completion queue and two channel endpoints — so this is
@@ -84,6 +86,8 @@ pub enum Object {
     },
     /// A latch: signalled by one thread, consumed by the thread that waits on it.
     Event { signalled: bool },
+    /// One endpoint of the channel in [`CHANNELS`] slot `channel`. See "Channels" below.
+    Endpoint { channel: usize },
     /// A timer delivering to a completion queue. `deadline` is nanoseconds of the kernel
     /// clock, or [`DISARMED`].
     Timer {
@@ -117,6 +121,7 @@ impl Object {
             Object::Thread { .. } => ObjectType::Thread,
             Object::Completion { .. } => ObjectType::Completion,
             Object::Event { .. } => ObjectType::Event,
+            Object::Endpoint { .. } => ObjectType::Channel,
             Object::Timer { .. } => ObjectType::Timer,
         })
     }
@@ -168,11 +173,22 @@ static IDS: ObjectIds = ObjectIds::new();
 /// Give a destroyed object's cell back. Called by the store when the last reference to an
 /// object is gone, with no store lock held.
 fn destroy(_id: ObjectId, cell: &'static Cell) {
-    cell.with(|o| *o = Object::Free);
+    let endpoint_of = cell.with(|o| {
+        let channel = match o {
+            Object::Endpoint { channel } => Some(*channel),
+            _ => None,
+        };
+        *o = Object::Free;
+        channel
+    });
     // A thread waiting on the object checks again and finds it gone, rather than waiting
     // for a wake the object can no longer send.
     if let Some(waiters) = WAITS.get(cell.index()) {
         waiters.wake_all();
+    }
+    // After the cell's lock is released: freeing a channel wakes its queue.
+    if let Some(channel) = endpoint_of {
+        endpoint_gone(channel);
     }
 }
 
@@ -203,9 +219,14 @@ pub fn live() -> usize {
 /// Returns the identity, which is what a handle table entry holds. The object is alive
 /// until [`retire`] and every handle to it is gone.
 pub fn create(object: Object) -> Option<ObjectId> {
+    create_as(IDS.next(), object)
+}
+
+/// [`create`], under an identity already issued from [`ids`]: a channel's endpoints get
+/// theirs from `ipc::Channel::new`.
+fn create_as(id: ObjectId, object: Object) -> Option<ObjectId> {
     let store = store()?;
     let kind = object.kind()?;
-    let id = IDS.next();
     let mut object = Some(object);
     for cell in CELLS.iter() {
         let claimed = cell.with(|o| {
@@ -310,6 +331,7 @@ pub fn take(object: &mut Object) -> Option<(u64, u64)> {
 /// module documentation.
 pub fn on_process_exit(slot: usize, code: u64) {
     let mut post_to = None;
+    let mut waiting = None;
     for cell in CELLS.iter() {
         let found = cell.with(|o| match o {
             Object::Process {
@@ -326,11 +348,243 @@ pub fn on_process_exit(slot: usize, code: u64) {
             _ => false,
         });
         if found {
+            waiting = WAITS.get(cell.index());
             break;
         }
     }
     if let Some((queue, key)) = post_to {
         let _ = post(queue, key, code);
+    }
+    // After the post, so a thread woken from `process_wait` finds a queued exit there too.
+    if let Some(waiters) = waiting {
+        waiters.wake_all();
+    }
+}
+
+/// The exit code of the process `id` names: `Some(None)` while it runs, `None` if `id` is not
+/// a live process.
+pub fn exit_code(id: ObjectId) -> Option<Option<u64>> {
+    with(id, |o| match o {
+        Object::Process { exited, code, .. } => Some(exited.then_some(*code)),
+        _ => None,
+    })?
+}
+
+// ---- channels -----------------------------------------------------------------------------
+//
+// A channel's two endpoints are objects in the store like any other: found by identity,
+// retired when they close, destroyed when nothing references them. The channel itself — its
+// two inboxes — lives in a slot of `CHANNELS` for as long as either endpoint object exists,
+// and a lookup ([`channel`]) holds a counted reference to the endpoint it looked up. So a
+// channel whose last handle closes while another thread still uses what it looked up is not
+// freed under that thread: it is freed when that thread lets go.
+//
+// An endpoint is retired when its channel says it has closed — its last handle closed, or the
+// last message carrying it thrown away — not when one of several references to it goes. Every
+// path that gives an endpoint reference back goes through [`release`] or [`close_endpoint`],
+// so the channel's count and the store's cannot disagree.
+
+/// A channel: four messages each way, each of at most 64 bytes and two handles.
+pub type Chan = ipc::Channel<Locks, 4, 64, 2>;
+
+/// Channels that can exist at once.
+pub const MAX_CHANNELS: usize = 8;
+
+/// One channel's storage.
+struct ChannelSlot {
+    /// SAFETY INVARIANT: written by [`new_channel`] while it holds `claimed` and before any
+    /// endpoint object names this slot; taken by [`endpoint_gone`] once `ends` reaches zero,
+    /// when none does. In between it is only read — through a [`ChanRef`], which holds an
+    /// endpoint object alive — and changed only under `Chan`'s own lock.
+    chan: SyncUnsafeCell<Option<Chan>>,
+    claimed: AtomicBool,
+    /// Endpoint objects of this channel the store has not destroyed.
+    ends: AtomicUsize,
+    /// Threads waiting to receive on either end: one queue for both, since a wake that finds
+    /// nothing for its end costs only a second look. Woken by every send, by an end closing,
+    /// and by the channel being freed.
+    waits: WaitQueue,
+    /// A second queue every wake of `waits` also wakes, or null: for a thread that waits on
+    /// many channels at once in a queue of its own (`crate::fileserver`). Only `'static`
+    /// queues are stored here.
+    relay: AtomicPtr<WaitQueue>,
+}
+
+impl ChannelSlot {
+    /// Wake this channel's waiters, and its relay's.
+    fn wake(&self) {
+        self.waits.wake_all();
+        // SAFETY: see `relay`: null, or a `'static` queue.
+        if let Some(relay) = unsafe { self.relay.load(Ordering::Acquire).as_ref() } {
+            relay.wake_all();
+        }
+    }
+}
+
+static CHANNELS: [ChannelSlot; MAX_CHANNELS] = [const {
+    ChannelSlot {
+        chan: SyncUnsafeCell::new(None),
+        claimed: AtomicBool::new(false),
+        ends: AtomicUsize::new(0),
+        waits: WaitQueue::new(),
+        relay: AtomicPtr::new(core::ptr::null_mut()),
+    }
+}; MAX_CHANNELS];
+
+/// A channel, held through one of its endpoints: it is not freed while this lives.
+pub struct ChanRef {
+    _endpoint: ObjRef<'static, 'static, Cell, Locks, MAX_OBJECTS>,
+    slot: &'static ChannelSlot,
+    chan: &'static Chan,
+}
+
+impl ChanRef {
+    /// The queue threads waiting to receive on this channel wait in.
+    pub fn waiters(&self) -> &'static WaitQueue {
+        &self.slot.waits
+    }
+
+    /// From now until the channel is freed, wake `queue` too whenever this channel's waiters
+    /// are woken.
+    pub fn relay_to(&self, queue: &'static WaitQueue) {
+        self.slot
+            .relay
+            .store(core::ptr::from_ref(queue).cast_mut(), Ordering::Release);
+    }
+
+    /// Wake this channel's waiters, and its relay's.
+    pub fn wake(&self) {
+        self.slot.wake();
+    }
+}
+
+impl Deref for ChanRef {
+    type Target = Chan;
+
+    fn deref(&self) -> &Chan {
+        self.chan
+    }
+}
+
+/// Make a channel. Returns one entry per endpoint, each that endpoint's only reference, to be
+/// installed in a handle table or given back with [`release`]. `None` if no channel slot or
+/// no object is free.
+pub fn new_channel() -> Option<[Entry; 2]> {
+    let (index, slot) = CHANNELS.iter().enumerate().find(|(_, s)| {
+        s.claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })?;
+    let (chan, entries) = Chan::new(&IDS, ipc::ENDPOINT_RIGHTS);
+    // SAFETY: see `ChannelSlot::chan`: claimed above, and no endpoint object names it yet.
+    unsafe { *slot.chan.get() = Some(chan) };
+    slot.ends.store(0, Ordering::Release);
+    let mut first = None;
+    for entry in entries {
+        // Counted before the object exists, so its destruction always has a count to take.
+        slot.ends.fetch_add(1, Ordering::AcqRel);
+        if create_as(entry.object, Object::Endpoint { channel: index }).is_none() {
+            // This endpoint never existed. The other, if it did, is retired, and its
+            // destruction frees the slot; otherwise nothing names the slot and it is freed now.
+            endpoint_gone(index);
+            if let Some(made) = first {
+                retire(made);
+            }
+            return None;
+        }
+        first.get_or_insert(entry.object);
+    }
+    Some(entries)
+}
+
+/// The channel `endpoint` is an end of, held for as long as the result lives. `None` if
+/// `endpoint` names no live endpoint.
+pub fn channel(endpoint: ObjectId) -> Option<ChanRef> {
+    let reference = store()?.get(endpoint).ok()?;
+    let index = reference.with(|o| match o {
+        Object::Endpoint { channel } => Some(*channel),
+        _ => None,
+    })?;
+    let slot = CHANNELS.get(index)?;
+    // SAFETY: see `ChannelSlot::chan`: `reference` holds an endpoint object of this slot's
+    // channel alive, so the slot was filled before it and is not emptied while it lives.
+    let chan = unsafe { (*slot.chan.get()).as_ref() }?;
+    Some(ChanRef {
+        _endpoint: reference,
+        slot,
+        chan,
+    })
+}
+
+/// One endpoint object of the channel in slot `index` has been destroyed; free the channel
+/// with the last.
+fn endpoint_gone(index: usize) {
+    let Some(slot) = CHANNELS.get(index) else {
+        return;
+    };
+    if slot.ends.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    // SAFETY: see `ChannelSlot::chan`: no endpoint object of this channel exists, so no
+    // `ChanRef` to it does either.
+    drop(unsafe { (*slot.chan.get()).take() });
+    // A thread still waiting on it looks again and finds it gone.
+    slot.wake();
+    slot.relay.store(core::ptr::null_mut(), Ordering::Release);
+    slot.claimed.store(false, Ordering::Release);
+}
+
+/// Give back a reference to the object `entry` names that no handle table holds any more: a
+/// handle closed, a table torn down, a handle in a message nobody will receive. An endpoint
+/// goes back through its channel, so its peer sees it close, and is retired once the channel
+/// says it has closed; anything else is retired.
+pub fn release(entry: Entry) {
+    if entry.kind == ObjectType::Channel
+        && let Some(chan) = channel(entry.object)
+    {
+        // Handles queued for an end that closes come back here, one at a time.
+        let _ = chan.release(entry, release);
+        after_release(&chan, entry.object);
+        return;
+    }
+    retire(entry.object);
+}
+
+/// Close handle `h`, an endpoint of `chan`, in `table`, as [`release`] gives one back.
+pub fn close_endpoint<const N: usize>(
+    chan: &ChanRef,
+    table: &mut HandleTable<N>,
+    h: Handle,
+) -> Result<(), ipc::Error> {
+    let object = table.get(h).map_err(ipc::Error::Endpoint)?.object;
+    chan.close(table, h, release)?;
+    after_release(chan, object);
+    Ok(())
+}
+
+/// A reference to `endpoint` went back to `chan`: retire the endpoint if that closed it, and
+/// wake the channel's waiters either way.
+fn after_release(chan: &ChanRef, endpoint: ObjectId) {
+    if chan
+        .side_of(endpoint)
+        .is_some_and(|side| !chan.is_open(side))
+    {
+        retire(endpoint);
+    }
+    chan.wake();
+}
+
+/// Wake whoever waits on the channel `endpoint` is an end of.
+pub fn wake_channel(endpoint: ObjectId) {
+    if let Some(chan) = channel(endpoint) {
+        chan.wake();
+    }
+}
+
+/// Wake every thread waiting on any channel.
+pub fn wake_all_channel_waiters() {
+    for slot in &CHANNELS {
+        slot.wake();
     }
 }
 
@@ -340,14 +594,6 @@ pub fn on_process_exit(slot: usize, code: u64) {
 /// a waiter on an object that is destroyed and whose cell is reused may be woken spuriously,
 /// which a waiter tolerates by checking again.
 static WAITS: [WaitQueue; MAX_OBJECTS] = [const { WaitQueue::new() }; MAX_OBJECTS];
-
-/// The identities every object is issued from, store object or channel endpoint alike.
-///
-/// One source for both, and not one per process: a channel is found by its endpoints'
-/// identities in a kernel-wide table, so two processes' channels must never share one.
-pub fn ids() -> &'static ObjectIds {
-    &IDS
-}
 
 /// Wake every thread waiting on any object. For a process ending while some of its threads
 /// wait: each checks again, finds its process ending, and ends too.

@@ -84,9 +84,15 @@ mod fs;
 mod timekeeping;
 // The native userspace slice: only on a paged kernel with a userspace port.
 #[cfg(CONFIG_USERSPACE)]
+mod channels;
+#[cfg(CONFIG_USERSPACE)]
+mod fileserver;
+#[cfg(CONFIG_USERSPACE)]
 mod objects;
 #[cfg(CONFIG_USERSPACE)]
 mod procs;
+#[cfg(CONFIG_USERSPACE)]
+mod sibling;
 #[cfg(CONFIG_USERSPACE)]
 mod spawn;
 #[cfg(CONFIG_USERSPACE)]
