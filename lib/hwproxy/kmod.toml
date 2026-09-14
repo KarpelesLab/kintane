@@ -1,0 +1,16 @@
+# The proxy layer: how a driver reaches hardware, in one interface with two
+# implementations — directly in the kernel, or from inside an isolated domain.
+#
+# Layer `user`, the one layer both a kernel crate and an unprivileged program may link,
+# for exactly the reason `abi` is there: a driver body written against these traits has
+# to compile into the kernel image *and* into a domain program, and layering is what
+# guarantees it drags no kernel code into the unprivileged one.
+[unit]
+name = "hwproxy"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "user"
+
+[deps]
+units = []

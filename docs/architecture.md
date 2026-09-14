@@ -706,6 +706,60 @@ without hanging, when:
 A mutation that claims the GICv3 redistributor but leaves it out of the mapped windows
 faults on the redistributor's first register after the switch.
 
+### Driver isolation — the Phase 5 prototype
+
+Phase 5 promises that the same driver source runs in the kernel or confined to a domain of
+its own. The prototype makes that claim executable on aarch64, with `DRIVER_ISOLATION`, on
+every boot.
+
+**Where the shared code has to live.** A domain is an unprivileged program, and a user
+program may link only `user`-layer crates. That rule is enforced by kbuild, and it is why
+`abi` sits there. So everything a driver body touches in *both* modes lives at that layer
+too, and `device`-layer crates cannot be the driver — at most, they can be the glue that
+binds one:
+
+- **`lib/hwproxy`** is the proxy layer the roadmap names. `Regs` is register access, `Dma` is
+  memory the device addresses (kept apart from the CPU's addresses by type), and `Irq` is an
+  interrupt as a count. A driver takes one `Hw` and never names a pointer or a controller.
+  Its accessors refuse an out-of-bounds or misaligned access *silently*, where the device
+  layer's accessors `debug_assert!`. A window may be handed to a driver the host does not
+  trust, and a bad offset from one must be something it observes, never a way to panic
+  the host.
+- **`drivers/virtio-probe`** is the driver body: it reads a `virtio,mmio` slot's four
+  identification registers. It is small on purpose, because what is under test is the
+  boundary rather than the driver.
+- **`user/hwdomain`** is the domain program: it links `abi`, `hwproxy` and `virtio-probe`,
+  and nothing else.
+- **`kernel/main/src/isolation.rs`** runs the body twice over one physical window. The first
+  run is in the kernel, over the kernel's identity mapping of the window. The second is in a
+  domain whose address space holds its program, its stack, one page shared with the kernel
+  for the report, and that window. Both reports must agree.
+
+**What the boundary is made of.** The window is *mapped into* the domain, so a register
+access there is the same load the kernel executes, in ring 3 / EL0. The MMU is the proxy,
+and isolation costs at the edges rather than per access. `platform/fdt` grants an
+*unoccupied* slot, recorded during the enumeration scan it already makes. It is mapped like
+any claimed window, and it keeps the disk's slot out of an unprivileged grant. A slot is
+0x200 bytes and the MMU grants pages, so the domain is given the page that holds the window:
+
+- the proxy bounds the driver to the device's own 0x200 bytes;
+- the MMU bounds it to the page.
+
+A domain that reads the page after its grant is killed, the kernel continues, and every
+frame comes back.
+
+Matching registers are not enough on their own. Every unoccupied slot answers the same
+four identification values, so the check's first falsification granted the neighbouring
+empty slot and passed. A domain that succeeds therefore also has its grant audited: its
+window's address must translate, in the domain's own page tables, to exactly the physical
+window the platform recorded.
+
+**What it does not show.** The subject device does no DMA, and without an IOMMU a domain
+granted a DMA-capable device could program it to read or write any physical address anyway.
+The PCs have no memory-mapped device to grant: COM1 is in the port space, which cannot be
+mapped, and virtio-blk reaches x86 only over PCI. Measurements, and exactly what an IOMMU
+has to add, are in [isolation.md](isolation.md).
+
 ### `block` — the block layer, and the first driver with DMA
 
 `kernel/block` is what a storage driver implements and the bookkeeping above it. It does

@@ -135,6 +135,19 @@ fn direct() -> DirectMap {
     unsafe { (*DIRECT.get()).expect("direct map set before use") }
 }
 
+/// Device memory, mapped into a process: readable and writable by user code, and neither
+/// cached nor speculated into. What a granted register window is mapped with.
+#[cfg_attr(
+    not(CONFIG_DRIVER_ISOLATION),
+    expect(
+        dead_code,
+        reason = "used only by the driver-isolation check, which needs DRIVER_ISOLATION"
+    )
+)]
+pub(crate) fn user_device() -> hal::PageFlags {
+    user_rw() | hal::PageFlags::DEVICE
+}
+
 /// The kernel's own address space, recorded by [`check`]. What a thread with no process
 /// runs on, and what every process's root mirrors its upper half from.
 static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);

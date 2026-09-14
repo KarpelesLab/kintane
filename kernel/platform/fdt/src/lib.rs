@@ -109,6 +109,16 @@ static IRQS: SyncUnsafeCell<[Option<IrqClaim>; MAX_CLAIMS]> =
 /// What the address space maps, set by [`discover`].
 static WINDOWS: BootCell<([DeviceWindow; MAX_CLAIMS], usize)> = BootCell::new();
 
+/// The register window granted to the isolated driver domain: an unoccupied `virtio,mmio`
+/// slot, `(phys, len)`.
+///
+/// An *unoccupied* one on purpose. The domain is unprivileged code being handed real
+/// device registers, and the point of the prototype is that it can reach those and nothing
+/// else; granting it the slot the disk lives in would put the machine's storage behind that
+/// claim. An empty slot answers the same identification registers (virtio 1.1 §4.2.2), so
+/// the driver body reads real hardware either way. See `docs/isolation.md`.
+static ISOLATION: BootCell<(u64, u64)> = BootCell::new();
+
 /// The device model's interrupt handlers.
 ///
 /// Registered on the boot path by [`discover`], and read by [`dispatch`] from the IRQ
@@ -200,6 +210,13 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
             }
             Slot::Legacy { device_id } if device_id == virtio_blk::transport::DEVICE_ID_BLOCK => {
                 legacy += 1;
+            }
+            // An empty slot is what the driver-isolation prototype is granted. Recorded
+            // here because this loop is already reading every slot's registers, and the
+            // first empty one is as good as any.
+            Slot::Empty if kconfig::DRIVER_ISOLATION && ISOLATION.get().is_none() => {
+                // SAFETY: once, on the boot path, before anything reads it.
+                let _ = unsafe { ISOLATION.set((base as u64, len as u64)) };
             }
             _ => {}
         }
@@ -315,6 +332,19 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
                 what: claim.what,
             };
             count += 1;
+        }
+        // The domain's granted window is mapped too: the kernel runs the same driver body
+        // over it before handing it to the domain, and a window no driver claimed is in
+        // nobody's ledger. It is last, so the claimed windows keep their numbering.
+        if let Some(&(phys, len)) = ISOLATION.get() {
+            if let Some(slot) = windows.get_mut(count) {
+                *slot = DeviceWindow {
+                    phys,
+                    len,
+                    what: "isolation slot",
+                };
+                count += 1;
+            }
         }
         // SAFETY: once, on the boot path, before anything reads the windows.
         let _ = unsafe { WINDOWS.set((windows, count)) };
@@ -486,6 +516,14 @@ fn timer_agrees(c: &dyn EarlyConsole, tree: &DeviceTree<'_, '_>) -> bool {
 /// be the report of it, which could not be printed.
 pub fn device_windows() -> Option<&'static [DeviceWindow]> {
     WINDOWS.get().and_then(|(windows, n)| windows.get(..*n))
+}
+
+/// The register window the driver-isolation prototype may grant to a domain, `(phys, len)`.
+///
+/// `None` where nothing was recorded: a machine with no free `virtio,mmio` slot, or a
+/// build without `DRIVER_ISOLATION`.
+pub fn isolation_window() -> Option<(u64, u64)> {
+    ISOLATION.get().copied()
 }
 
 /// Start the CPUs the tree lists beyond the boot CPU, and prove each one is a CPU of its

@@ -1,0 +1,36 @@
+# The isolated driver domain: an unprivileged program whose whole job is to run a driver
+# body against hardware the kernel granted it.
+#
+# It links `hwproxy` and `virtio-probe` — the same two crates the kernel links to run that
+# body in-kernel — and `abi` to talk back. Layering is what makes "the same driver source,
+# either way" a checkable claim rather than a promise: a `device`-layer crate could not be
+# linked here at all, so anything this program runs is, by construction, code the kernel can
+# run too.
+#
+# `hwdomain` is a provider name: with DRIVER_ISOLATION off, `user/hwdomain-none` provides it
+# as an empty library, so the kernel image depends on the name in every configuration.
+[unit]
+name = "hwdomain"
+kind = "user"
+root = "src/main.rs"
+layer = "user"
+# As `user/init`: position-independent code at a static link address, because the kernel
+# targets' static relocation model cannot reach the user half at 512 GiB.
+#
+# Debug info is stripped at link. The kernel embeds this program in its own read-only data
+# and reads only its loadable segments, and those are under 4 KiB — but unstripped, the
+# DWARF for the parts of `core` it links (integer formatting, reached through a slice
+# copy's length-mismatch panic) was 2.2 MiB, which put every aarch64 image at 241% of its
+# size budget. Symbol names stay, so a domain's crash can still be named.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "strip=debuginfo",
+    "-C", "link-arg=-T$ROOT/user/hwdomain/link.ld",
+    "-C", "link-arg=--no-warnings",
+]
+
+[deps]
+units = ["abi", "hwproxy", "virtio-probe"]
+
+[config]
+requires = "DRIVER_ISOLATION"

@@ -1,0 +1,14 @@
+# `hwdomain` on a configuration without driver isolation: nothing to embed. The kernel
+# image depends on the name in every configuration; only this provider is selected when
+# DRIVER_ISOLATION is off, and the kernel's isolation module is not compiled then either.
+[unit]
+name = "hwdomain"
+kind = "lib"
+root = "src/lib.rs"
+layer = "user"
+
+[deps]
+units = []
+
+[config]
+requires = "!DRIVER_ISOLATION"

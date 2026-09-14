@@ -1194,6 +1194,16 @@ pub fn device_windows() -> Option<&'static [DeviceWindow]> {
     WINDOWS.get().and_then(|(windows, n)| windows.get(..*n))
 }
 
+/// No window is granted to a driver domain on the PCs.
+///
+/// Not a gap in the design but in the machines: a domain is granted a *mapping*, and the
+/// PC's own devices are not memory-mapped. COM1 lives in the port space, which cannot be
+/// mapped into an address space at all, and the disk reaches x86 only over PCI, which the
+/// virtio driver does not speak yet. See `docs/isolation.md`.
+pub fn isolation_window() -> Option<(u64, u64)> {
+    None
+}
+
 fn write_acpi_error(c: &dyn EarlyConsole, e: acpi::Error) {
     let (what, detail) = match e {
         acpi::Error::NoRsdp => ("no RSDP", None),
