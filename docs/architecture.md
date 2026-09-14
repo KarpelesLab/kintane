@@ -505,8 +505,10 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
     borrows the record that describes it (a `pci::Function` or a `table::Described`), and
     its name, `compatible` list and register windows are that record's. Windows are CPU
     addresses the enumerator already read, so `mmio()` skips the `ranges` walk. Binding,
-    claims and parent order work exactly as for device-tree nodes. Their interrupts are
-    not modelled yet.
+    claims and parent order work exactly as for device-tree nodes. A `Described` record
+    may also carry a range of I/O ports and one interrupt line: `ports()` returns the
+    range, and `interrupt()` returns a specifier whose one cell is the line itself, since a
+    firmware table names the line rather than cells for a controller to interpret.
 - **PCI.** `device::pci` enumerates buses through a `ConfigSpace` the platform provides,
   and is host-tested against a model bus whose BARs behave like hardware.
   - Buses are walked breadth first from the segment's first, following bridges, each bus
@@ -520,8 +522,15 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
   - A function's `compatible` list follows the Open Firmware PCI binding, most specific
     first: `pciVVVV,DDDD`, `pciclass,CCSSPP`, `pciclass,CCSS`. A chip driver and a class
     driver bind by the same rule as a device-tree driver.
-  - Not yet: resource assignment (BARs are read as firmware left them), INTx routing
-    (needs `_PRT`), capabilities and MSI, segments other than 0.
+  - Not yet: resource assignment (BARs are read as firmware left them), capabilities and
+    MSI, segments other than 0, and **INTx routing**. That last one is a named gap, not an
+    oversight: which I/O APIC input a PCI function's interrupt pin reaches is described
+    only by the `_PRT` objects in the ACPI namespace, which is AML. Reading it needs an AML
+    interpreter (or, on a legacy-only machine, the PCI BIOS routing table), and the
+    kernel has neither. The interrupt line register a function reports is what firmware
+    wrote for the 8259A, and is wrong under an I/O APIC often enough that using it would
+    be guessing. So no PCI function's interrupt is wired today, and the first PCI driver
+    that needs one needs `_PRT` first.
 - **ACPI.** `boot/acpi` parses the RSDP, RSDT/XSDT, MADT, MCFG and the FADT's PM timer
   and reset register. There is no `unsafe`: physical memory is read through a trait.
   Every table's length is capped and its checksum checked before any field is read. A
@@ -532,21 +541,62 @@ that breaks one rule per node. It compiles for rv32i, rv32imac and thumbv7m.
   error, and that fuzzed tables with valid checksums never panic.
 - **Binding.** The node's own `compatible` list decides specificity: its first entry that
   any driver knows wins. A disabled node binds nothing.
-- **Resources.** An MMIO window or an interrupt is claimed through the probe token and
-  comes back as a handle that is not `Copy`. Overlapping windows are refused, naming the
-  holder. A failed probe releases exactly its own claims: claims are tagged per probe,
-  not per node, so re-probing a bound node cannot strip the existing binding.
-  `Registers` checks every access against the window.
+- **Resources.** An MMIO window, a range of I/O ports or an interrupt is claimed through
+  the probe token and comes back as a handle that is not `Copy`. Overlapping windows, and
+  overlapping port ranges, are refused, naming the holder. A failed probe releases exactly
+  its own claims: claims are tagged per probe, not per node, so re-probing a bound node
+  cannot strip the existing binding. `Registers` checks every access against the window,
+  and `Ports` every access against the range. Ports exist only on the PC: a platform that
+  does not give the ledger port storage refuses every port claim.
 - **Phases as types.**
   - Only a probe produces `Bound`, and only a successful start produces `Started`.
   - Registering an interrupt handler requires `Bound`, plus an `IrqLine` claimed by that
     same binding. Enabling the handler requires `Started`.
   - Suspend, resume, stop and remove move between the tokens. Their default
     implementations are trivial, but they are in the interface.
-  - The handler table is not yet what the architectures dispatch through; aarch64's
-    interrupt path still knows only its timer.
+  - Unregistering a handler requires `Bound` and a handler that is already disabled, so the
+    removal order — disable, stop, unregister, remove — is the only one that works.
+- **Interrupt dispatch.** Device interrupts reach drivers through the device model's
+  handler table, `device::Handlers`:
+  - A driver says which line it wants through `Driver::interrupt()`: the `IrqLine` it
+    claimed at probe and the function to run. After the driver starts, the platform
+    translates the specifier with the machine's controller, registers and enables the
+    handler in the table, and only then unmasks the line at the controller. A line is
+    never live before its handler is.
+  - `arch` is below `device` and cannot name the table, so each architecture's interrupt
+    path calls a function the platform installs once at discovery
+    (`arch::irq::set_device_dispatch` on aarch64, `arch::interrupt::set_device_dispatch`
+    on the PCs). Everything that is neither an IPI nor the architecture's timer goes
+    there: GIC SPIs on aarch64, I/O APIC lines on x86_64 (with the MADT's source overrides
+    applied by the controller), 8259A lines on i686.
+  - The table lives in the platform, behind a spinlock of class `platform.handlers`,
+    because a device interrupt can be taken on any CPU and removing or rebinding a device
+    changes the table. Dispatch copies the handler out and **runs it with the lock
+    released**, so a handler may touch the table without deadlocking and a slow handler
+    does not stall other CPUs' dispatch.
+  - The rules a handler lives by: it runs in interrupt context on the CPU the line is
+    routed to, with that CPU's interrupts masked; it must not block or allocate; and it
+    may assume one instance of itself at a time only because every line is routed to one
+    CPU today (all SPIs to CPU 0, all I/O APIC lines to the boot CPU). A driver whose line
+    could reach two CPUs at once needs its own lock.
+  - An interrupt that finds no enabled handler is counted and its line masked. A
+    level-triggered source nobody quiets would otherwise be re-delivered at once and hold
+    the CPU; registering a UART's handler for the wrong line found exactly that hang.
 - **Drivers.** `drivers/irqchip/gic` holds GICv2 and GICv3, moved out of `arch/aarch64`.
-  `drivers/serial/pl011` takes its window and its baud divisors from the tree.
+  The serial drivers receive on interrupt, into a single-producer, single-consumer byte
+  queue (`device::Fifo`) that a kernel thread reads, and transmit polled, because a console
+  must be able to report a fault with nothing to wake it:
+  - `drivers/serial/pl011` takes its window and baud divisors from the tree, and its
+    receive interrupt (RX and receive timeout) from the node's `interrupts`.
+  - `drivers/serial/uart16550` drives a 16550 through a claimed port range. Its start
+    checks the part answers through the scratch register before it drives it. Its state
+    is kept per binding, so a removed device can be bound again, up to four times a boot.
+  - Both are transmit-only on a machine without atomics, where there is no queue to share
+    with a handler; `kbuild portability` compiles them for rv32i that way.
+  - The early consoles in `arch` stay, because they must work before anything is
+    discovered. ARMv7-M's CMSDK UART and riscv32's 16550 are still arch-side; riscv32's
+    interrupt controller is someone else's work in progress, and the dispatch seam is what
+    its driver will plug into.
 - **Platform.** A platform is the one unit that sees both the drivers and the
   architecture. It is layer `kernel`, because only the image may name `arch`.
   `kernel/platform/fdt` serves aarch64 and `kernel/platform/acpi` the PC ports, and
@@ -570,6 +620,13 @@ On a PC, `platform/acpi` does the following, before the kernel address space exi
    drive nothing. That port keeps the 8259A and the PIT, because its interrupt path has no
    controller seam and it has no second CPU for an APIC to start. The ECAM window is claimed
    by a placeholder on both.
+6. **Declares the serial port.** COM1 at ports `0x3f8`–`0x3ff` on ISA IRQ 4 is described
+   only in AML, so the platform declares it as a `LegacyUart` record, compatible
+   `ns16550a`. The 16550 driver binds it, and its start refuses if nothing answers there.
+7. **Wires device interrupts**, after the controller is installed: it runs
+   `arch::interrupt::init` first (on i686 that is what masks the 8259A, and a line
+   unmasked before it would be masked again), installs the dispatch function, and wires
+   each started driver's line through the table and the controller.
 
 x86_64's boot identity map was widened from 1 GiB to 4 GiB for this, so that discovery
 reaches the MMIO hole below 4 GiB. Discovery also moved ahead of the paging check, whose
@@ -592,6 +649,9 @@ Boot departs from the diagram below in one place: devices are enumerated **befor
 kernel address space is built, because that space maps exactly the windows the bound
 drivers claimed. Discovery runs on the boot identity map, which covers every device. On
 aarch64 it ends by installing the GIC as the interrupt path's controller.
+
+It then wires each started driver's interrupt through the handler table, after the GIC is
+installed: today that is the PL011's receive interrupt, SPI 1 (line 33).
 
 It refuses to go further, printing why, when the tree and the running kernel disagree:
 

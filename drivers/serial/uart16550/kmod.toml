@@ -1,0 +1,16 @@
+# A 16550-compatible UART in the PC's I/O port space, bound through the device model.
+#
+# The arch-side early console keeps its own writer at COM1, because it has to work
+# before anything is discovered. This is the driver: it claims the port range and the
+# interrupt the platform describes, verifies the part is there, and receives on
+# interrupt. Port access is the device model's, which compiles on every target, so it is
+# host-tested under every preset like the PL011.
+[unit]
+name = "uart16550"
+kind = "lib"
+root = "src/lib.rs"
+host-tests = true
+layer = "device"
+
+[deps]
+units = ["hal", "device"]

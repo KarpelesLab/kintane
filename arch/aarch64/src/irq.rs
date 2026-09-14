@@ -7,10 +7,11 @@
 //! `kernel/platform/fdt`, and [`dispatch`] calls through the vtable without knowing or
 //! caring which driver answered.
 //!
-//! The second is the handler table, which still has exactly one entry: the timer. The
-//! device model has a handler table gated on probe phases (`device::Handlers`); dispatch
-//! moves onto it when the first interrupt-driven driver needs one, because `arch` cannot
-//! name it and the hand-off has to be designed rather than bolted on.
+//! The second is what happens to an interrupt that is neither an IPI nor the timer: it
+//! goes to the device model's handler table, through a function the platform installs
+//! here with [`set_device_dispatch`]. `arch` is below `device` and may not name it, so
+//! the seam is a function pointer and the table, its lock and the probe-phase tokens that
+//! gate registration all stay in `kernel/platform`.
 //!
 //! # Concurrency
 //!
@@ -47,6 +48,33 @@ static CHIP: ChipSlot = ChipSlot(UnsafeCell::new(None));
 
 /// Number of timer interrupts observed. The selftest's evidence that a handler ran.
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Write-once storage for the device model's dispatch, on the same terms as [`ChipSlot`].
+struct DispatchSlot(UnsafeCell<Option<fn(IrqNumber) -> bool>>);
+
+// SAFETY: the invariant is [`ChipSlot`]'s. `set_device_dispatch` writes once, on the boot
+// CPU with interrupts masked, before any device line is enabled and so before any reader
+// can exist, and nothing writes again.
+unsafe impl Sync for DispatchSlot {}
+
+static DEVICE_DISPATCH: DispatchSlot = DispatchSlot(UnsafeCell::new(None));
+
+/// Send interrupts that are neither IPIs nor the timer to `dispatch`, which returns
+/// whether it found a handler for the line.
+///
+/// # Safety
+/// At most once, with interrupts masked, before any device line is enabled.
+pub unsafe fn set_device_dispatch(dispatch: fn(IrqNumber) -> bool) {
+    // SAFETY: the caller guarantees this is the only write and that no reader exists yet:
+    // with the masks set no interrupt can be delivered, and no line is enabled.
+    unsafe { *DEVICE_DISPATCH.0.get() = Some(dispatch) };
+}
+
+/// The device model's dispatch, once the platform has installed it.
+fn device_dispatch() -> Option<fn(IrqNumber) -> bool> {
+    // SAFETY: by the invariant the write happened before any reader could run.
+    unsafe { *DEVICE_DISPATCH.0.get() }
+}
 
 /// Install the interrupt controller for this machine.
 ///
@@ -93,7 +121,7 @@ pub(crate) fn dispatch() {
     let mut ticked = false;
     for _ in 0..MAX_PER_ENTRY {
         let Some(claimed) = chip.claim() else { break };
-        ticked |= handle(chip.id(claimed));
+        ticked |= handle(chip, chip.id(claimed));
         // The claimed value, not the ID: a GICv2 SGI is acknowledged with its sender.
         chip.eoi(claimed);
     }
@@ -110,7 +138,7 @@ const MAX_PER_ENTRY: u32 = 16;
 
 /// Handle one claimed interrupt. Returns whether the scheduler's hook should run after
 /// it: a timer tick, or a reschedule IPI once the scheduler owns every CPU.
-fn handle(irq: IrqNumber) -> bool {
+fn handle(chip: &dyn IrqChip, irq: IrqNumber) -> bool {
     if irq.0 < crate::smp::SGI_LIMIT {
         return crate::smp::on_ipi(irq.0);
     }
@@ -134,8 +162,37 @@ fn handle(irq: IrqNumber) -> bool {
         return true;
     }
 
-    // No handler. It has already been claimed, so it will be acknowledged by the
-    // caller and will not be redelivered; a source nobody owns should not have been
-    // enabled, and in Phase 0 nothing can enable one.
+    // Everything else belongs to a device, which means to the device model: a driver
+    // registered for this line when the platform bound it.
+    if let Some(dispatch) = device_dispatch() {
+        if dispatch(irq) {
+            DEVICE_IRQS.fetch_add(1, Ordering::Release);
+            return false;
+        }
+    }
+
+    // No handler. It has been claimed and will be acknowledged, but a level-triggered
+    // source that nobody quiets is asserted again the moment it is: left enabled, it would
+    // hold this CPU in the interrupt path for good. So the line is masked, and counted,
+    // and whoever enabled a line without a handler finds out from the count rather than
+    // from a machine that stopped. Found by registering a UART's handler for the wrong
+    // line, which hung the boot until this.
+    chip.disable(irq);
+    SPURIOUS.fetch_add(1, Ordering::Release);
     false
+}
+
+/// Device interrupts a registered handler ran for, and ones that reached no handler.
+static DEVICE_IRQS: AtomicU64 = AtomicU64::new(0);
+static SPURIOUS: AtomicU64 = AtomicU64::new(0);
+
+/// How many device interrupts have been dispatched to a handler.
+pub fn device_irqs() -> u64 {
+    DEVICE_IRQS.load(Ordering::Acquire)
+}
+
+/// How many interrupts arrived for a line with no enabled handler. Each such line was
+/// masked when it did.
+pub fn unhandled_irqs() -> u64 {
+    SPURIOUS.load(Ordering::Acquire)
 }

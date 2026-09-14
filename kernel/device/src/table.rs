@@ -46,6 +46,14 @@ pub enum Kind {
     /// PCI configuration space reached through I/O ports (configuration mechanism #1).
     /// No window: the ports are the whole interface.
     PortConfigSpace,
+    /// A 16550-compatible serial port in the PC's I/O port space, on an ISA interrupt.
+    ///
+    /// No table lists it. The PC's legacy devices are described in AML, which this kernel
+    /// does not interpret, so the platform declares the one at the architecture's first
+    /// address — and the driver verifies the hardware answers before it binds, so a
+    /// machine without one is refused rather than driven blind. See
+    /// `kernel/platform/acpi`.
+    LegacyUart,
     /// A node that exists only to hold other nodes, such as `cpus`.
     Group,
 }
@@ -60,6 +68,8 @@ pub struct Described {
     windows: [(u64, u64); MAX_WINDOWS],
     count: u8,
     name: Text<24>,
+    ports: Option<(u16, u16)>,
+    interrupt: Option<u32>,
 }
 
 impl Described {
@@ -68,6 +78,8 @@ impl Described {
         windows: [(0, 0); MAX_WINDOWS],
         count: 0,
         name: Text::EMPTY,
+        ports: None,
+        interrupt: None,
     };
 
     /// A record named `name`, with CPU physical `(base, length)` windows in the order a
@@ -88,12 +100,34 @@ impl Described {
         Some(d)
     }
 
+    /// The same record with a range of `len` I/O ports from `base`, and the interrupt
+    /// line it raises. A device that has one or the other passes `None` for the rest.
+    pub fn with_ports(self, ports: Option<(u16, u16)>, interrupt: Option<u32>) -> Described {
+        Described {
+            ports,
+            interrupt,
+            ..self
+        }
+    }
+
     pub fn name(&self) -> &[u8] {
         self.name.as_bytes()
     }
 
     pub fn windows(&self) -> &[(u64, u64)] {
         self.windows.get(..usize::from(self.count)).unwrap_or(&[])
+    }
+
+    /// The `(base, length)` of the device's I/O ports, for the machines that have a port
+    /// space.
+    pub fn ports(&self) -> Option<(u16, u16)> {
+        self.ports
+    }
+
+    /// The interrupt the device raises, as the platform's controller numbers them: an ISA
+    /// IRQ on a PC, which the I/O APIC driver maps to a global system interrupt.
+    pub fn interrupt(&self) -> Option<u32> {
+        self.interrupt
     }
 
     /// The `compatible` list for this kind: see the module documentation.
@@ -104,6 +138,9 @@ impl Described {
             Kind::IoInterruptController { .. } => b"acpi,io-apic\0",
             Kind::EcamConfigSpace { .. } => b"pci-host-ecam-generic\0",
             Kind::PortConfigSpace => b"pc,pci-config-mechanism-1\0",
+            // The device tree's binding for the same part, so one driver serves a PC's
+            // legacy port and a board that puts a 16550 in memory.
+            Kind::LegacyUart => b"ns16550a\0",
             Kind::Group => b"",
         }
     }

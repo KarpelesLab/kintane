@@ -17,6 +17,9 @@ pub struct Machine {
     pub success_code: i32,
     /// Bytes typed on the guest's serial console as it starts: `BOOT_TEST_KEYS`.
     pub input: Vec<u8>,
+    /// Whether to answer the kernel's serial receive check (`SERIAL_IRQ_TEST`): type each
+    /// of [`SERIAL_PROBES`] when the kernel prints its prompt.
+    pub serial_probe: bool,
 }
 
 pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine, String> {
@@ -81,6 +84,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             args,
             success_code: (0x10 << 1) | 1,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
+            serial_probe: res.is_on("SERIAL_IRQ_TEST"),
         });
     }
 
@@ -123,6 +127,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             .collect(),
             success_code: (0x10 << 1) | 1,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
+            serial_probe: res.is_on("SERIAL_IRQ_TEST"),
         });
     }
 
@@ -156,6 +161,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             .collect(),
             success_code: (0x10 << 1) | 1,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
+            serial_probe: res.is_on("SERIAL_IRQ_TEST"),
         });
     }
 
@@ -198,6 +204,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             .collect(),
             success_code: 0,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
+            serial_probe: res.is_on("SERIAL_IRQ_TEST"),
         });
     }
 
@@ -234,6 +241,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             // reason.
             success_code: 0,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
+            serial_probe: res.is_on("SERIAL_IRQ_TEST"),
         });
     }
 
@@ -453,6 +461,14 @@ impl MarkerCounter {
 /// `kinboot_menu::render` ends the entry list with, which that crate's tests pin.
 const MENU_PROMPT: &[u8] = b"boots an entry, Enter the marked one";
 
+/// What the kernel's serial receive check prints while it waits, and what to type when
+/// it does. The prompts and strings are `kernel/main/src/serial.rs`'s `PROBES`; the
+/// kernel compares what its receive interrupt queued against the same bytes.
+pub const SERIAL_PROBES: &[(&[u8], &[u8])] = &[
+    (b"serial probe 1: waiting for input", b"kintane-probe-1"),
+    (b"serial probe 2: waiting for input", b"kintane-probe-2"),
+];
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -475,7 +491,7 @@ pub fn run_watched(
 
     let mut child = Command::new(m.binary)
         .args(&m.args)
-        .stdin(if m.input.is_empty() {
+        .stdin(if m.input.is_empty() && !m.serial_probe {
             Stdio::inherit()
         } else {
             Stdio::piped()
@@ -484,12 +500,24 @@ pub fn run_watched(
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}\nis QEMU installed?", m.binary))?;
 
-    // Typed when the guest shows its boot menu, not at once. Bytes sent before then are
-    // lost: firmware and the loader both reset the UART's receive FIFO when they program
-    // it, which the first version of this, typing immediately, ran into. The pipe stays
-    // open until QEMU exits, because an end of file on `-serial stdio` is not something a
-    // guest expects.
-    let mut keys = child.stdin.take().map(|stdin| (stdin, m.input.clone()));
+    // Typed when the guest asks, not at once. Bytes sent before then are lost: firmware
+    // and the loader both reset the UART's receive FIFO when they program it, which the
+    // first version of this, typing the menu keys immediately, ran into. So each is typed
+    // when its prompt appears: the menu keys at the loader's menu, and each serial probe
+    // when the kernel's receive check says it is waiting. The pipe stays open until QEMU
+    // exits, because an end of file on `-serial stdio` is not something a guest expects.
+    let mut stdin = child.stdin.take();
+    let mut pending: Vec<(&'static [u8], Vec<u8>)> = Vec::new();
+    if !m.input.is_empty() {
+        pending.push((MENU_PROMPT, m.input.clone()));
+    }
+    if m.serial_probe {
+        pending.extend(
+            SERIAL_PROBES
+                .iter()
+                .map(|&(prompt, bytes)| (prompt, bytes.to_vec())),
+        );
+    }
 
     let mut pipe = child
         .stdout
@@ -507,7 +535,6 @@ pub fn run_watched(
             let mut buf = [0u8; 4096];
             let mut out = std::io::stdout();
             let mut counter = MarkerCounter::new(marker);
-            let mut stdin = None;
             // Ends when QEMU exits or is killed and its end of the pipe closes.
             while let Ok(n) = pipe.read(&mut buf) {
                 if n == 0 {
@@ -520,12 +547,21 @@ pub fn run_watched(
                     last_beat.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
                     beats.store(counter.count, Ordering::Relaxed);
                 }
-                if keys.is_some() && contains(&kept, MENU_PROMPT) {
-                    if let Some((mut pipe, input)) = keys.take() {
-                        let _ = pipe.write_all(&input);
-                        let _ = pipe.flush();
-                        stdin = Some(pipe);
-                    }
+                if !pending.is_empty() {
+                    // Only what just arrived, plus enough before it to hold a prompt split
+                    // across reads: scanning everything kept would make a long run quadratic.
+                    let reach = n + pending.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
+                    let recent = &kept[kept.len().saturating_sub(reach)..];
+                    pending.retain(|(prompt, bytes)| {
+                        if !contains(recent, prompt) {
+                            return true;
+                        }
+                        if let Some(pipe) = stdin.as_mut() {
+                            let _ = pipe.write_all(bytes);
+                            let _ = pipe.flush();
+                        }
+                        false
+                    });
                 }
             }
             drop(stdin);

@@ -32,6 +32,7 @@ mod mp;
 mod mp;
 mod persist;
 mod preempt;
+mod serial;
 mod shared;
 #[cfg(all(CONFIG_SMP, CONFIG_MM_PAGED))]
 mod shootdown;
@@ -260,6 +261,11 @@ fn banner(boot_arg: u64) -> (Check, Live) {
     // After interrupts, because the check waits through timer interrupts.
     c.write_str("\n  clock      ");
     let clock = clock::check(c);
+
+    // After the clock, which bounds its wait, and before preemption installs the tick's
+    // hook: a device interrupt taken while it waits must return to it.
+    c.write_str("\n  serial     ");
+    let serial = serial::check(c);
     c.write_str("\n  preempt    ");
     // Built on both of the above, so it runs only when both passed. Their failures
     // already gate the verdict, and a scheduler check on a broken switch or a silent
@@ -298,6 +304,7 @@ fn banner(boot_arg: u64) -> (Check, Live) {
         .and(Check::from_ok(irq_ok))
         .and(Check::from_ok(switch_ok))
         .and(clock)
+        .and(serial)
         .and(preempt)
         .and(Check::from_ok(backtrace_ok))
         .and(smp)

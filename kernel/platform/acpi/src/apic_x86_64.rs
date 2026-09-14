@@ -12,7 +12,12 @@ use hal::EarlyConsole;
 use crate::{ECAM, MadtFacts, write_usize};
 
 /// Every driver this image carries.
-pub(crate) const DRIVERS: &[&dyn Driver] = &[&apic::LOCAL_DRIVER, &apic::IO_DRIVER, &ECAM];
+pub(crate) const DRIVERS: &[&dyn Driver] = &[
+    &apic::LOCAL_DRIVER,
+    &apic::IO_DRIVER,
+    &ECAM,
+    &uart16550::DRIVER,
+];
 
 /// Build the controller from what bound and install it and its timer. Returns whether that
 /// worked, or whether there was legitimately nothing to install.
