@@ -11,6 +11,7 @@
 use crate::Target;
 
 pub mod acpi;
+pub mod aml;
 pub mod bootproto;
 pub mod elf;
 pub mod fdt;
@@ -59,6 +60,14 @@ pub const TARGETS: &[Target] = &[
         generate: acpi::generate,
         run: acpi::run,
         accepts: Some(acpi::accepts),
+    },
+    Target {
+        name: "aml",
+        what: "DSDT and SSDT bytecode, loaded and run as the kernel routes PCI interrupts with it",
+        needs_seeds: true,
+        generate: aml::generate,
+        run: aml::run,
+        accepts: Some(aml::accepts),
     },
     Target {
         name: "elf",
