@@ -679,6 +679,14 @@ fn heartbeat(c: &dyn EarlyConsole, seconds: u64, audits: u64) {
         }
         c.write_str(")");
     }
+    if let Some((woken, timers, polls)) = crate::model::network_wakes() {
+        c.write_str(", network waits woken by the card ");
+        write_usize(c, woken as usize);
+        c.write_str(", armed for a TCP timer ");
+        write_usize(c, timers as usize);
+        c.write_str(", polled ");
+        write_usize(c, polls as usize);
+    }
     if mp::CPUS > 1 {
         let s = preempt::stats();
         let (shootdowns, _, _) = mp::shootdown_stats();

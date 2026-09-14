@@ -1198,7 +1198,11 @@ The boot gates on three lines ([architecture.md](architecture.md#net--the-networ
              time-wait] and by kbuild [syn-sent established close-wait last-ack], 2 data
              retransmits; 46 frames in, 21 out, 50 interrupts, 0 polled, 0 stack buffers held ok
   sockets    tcp-client connected, sent, read its reply to kbuild's close; 1 established,
-             1 data retransmits; closed in order, every buffer back; 0 objects left, 0 frames left ok
+             1 data retransmits; waits woken by the card 5, armed for a TCP timer 5, polled 0;
+             closed in order, every buffer back; 0 objects left, 0 frames left ok
+  linux net  tcp client ok; server ok (kbuild told of its listener 1 time); waits woken by the
+             card 10, armed for a TCP timer 9, polled 0; closed in order, every buffer back;
+             0 objects left, 0 frames left ok
 ```
 
 That is aarch64, where every frame arrives by interrupt. i686 reads the same on line 10,
@@ -1218,6 +1222,48 @@ TCP retransmits after a second or so. Every buffer must be back afterwards, as b
 `sockets`, on x86_64 and aarch64, runs `user/tcp-client` over the socket calls on the scheduler
 ([userspace-abi.md](userspace-abi.md)); i686 has no userspace, and gates on the TCP part of
 `net` alone.
+
+**Waits woken by the card.** From `sockets` on, the card's interrupt handler runs the stack and
+wakes the socket calls' queue, and a waiter otherwise looks again only at the stack's next TCP
+timer ([architecture.md](architecture.md#net--the-network-stack-and-virtio-net)). Both
+`sockets` and `linux net` count the waits the card's handler woke, the waits armed for a TCP
+timer, and the waits armed on the 2 ms fallback, and on a card with an interrupt route they
+require at least one of the first and none of the last. The stress heartbeat carries the same
+three counts (`network waits woken by the card …, armed for a TCP timer …, polled …`), where the
+TCP workload's rounds wait the same way.
+
+**The Linux program's socket modes** (`linux net`, after `sockets`, on x86_64 and aarch64). The
+kept `/KINTANE/LINUX.ELF` runs twice more:
+
+- as `tcp <port>`, a client of kbuild's service. Before it connects it checks that another
+  family is `EAFNOSUPPORT`, a descriptor that is not a socket `ENOTSOCK`, and a send on an
+  unconnected socket `ENOTCONN`. Then it connects, checks `EISCONN`, both names, and that a
+  `MSG_DONTWAIT` receive is `EAGAIN` while kbuild waits for a request; sends the request, reads the
+  reply through `read` to kbuild's close, and checks `SHUT_RD` is `EOPNOTSUPP`. A second,
+  non-blocking socket's `connect` must be `EINPROGRESS`, then `EALREADY` until it is established
+  and `EISCONN` after, with no `SO_ERROR`, and a read on it `EAGAIN`; then it makes a whole
+  exchange on that socket without waiting, reading `EAGAIN` until the reply comes, to kbuild's
+  close. Every connection of the mode is closed by kbuild first, so none is left in TIME-WAIT;
+- as `serve`, a server. First it starts a second thread that waits in `accept` on port 7778,
+  where nobody connects, and leaves it waiting when the process ends: with no TCP timer pending
+  by then, only the process's end can end that wait. Then it binds `0.0.0.0:7777`, listens and
+  blocks in `accept4`. kbuild's QEMU
+  command line forwards a loopback port to guest port 7777 (`hostfwd=tcp:…-:7777`). Once the
+  listener is up the check sends kbuild's datagram peer `kintane-tcp-listening <n>`, repeated
+  every 500 ms while the program runs, and kbuild connects in once per number, sends
+  `kintane-tcp-inbound <n>`, and answers the reply with `kintane-tcp-inbound-verified <n>` only if
+  it is `kintane-tcp-inbound-reply <n>`, then closes. The program requires the peer's address to be
+  the gateway, the verification, and the end of the stream after it. kbuild answers and does not
+  judge: a wrong reply gets `kintane-tcp-inbound-wrong`, and the program fails. `<n>` is the
+  scheduler clock's nanoseconds when the check runs, so each boot's differs: the boot counter
+  test, which restarts one QEMU several times under the same kbuild, found that a fixed number was
+  served on the first boot only, and every later boot's server waited in `accept` for good.
+
+The check requires both exit codes, both processes' threads ended, the waits woken as above,
+every connection closed in order with every stack buffer back, every Linux socket let go of, and
+every object and frame back. The check tells kbuild only once something listens, because a
+connection kbuild made earlier would be refused with a reset, which the `net` check's linger
+forbids.
 
 The boot counter test, which resets one QEMU several times, found a fault the single boots
 could not. Every boot opened its first connections from port 49152 again, with nearly the same
@@ -1335,10 +1381,23 @@ The TCP checks, falsified the same way, each run on `x86_64-qemu`:
 | The retransmission timer runs out without going back to the oldest unacknowledged byte | the request the relay dropped is never sent again: `NO TCP REPLY ARRIVED`, and `sockets` reports `0 data retransmits, NONE, though kbuild drops the first data segment` |
 | A finished connection's send ring never given back to the pool | both rounds passed, then `2 stack buffers held, A STACK BUFFER WAS NOT GIVEN BACK`; `sockets` fails with `THE CONNECTION NEVER FINISHED CLOSING, OR A BUFFER IS MISSING` |
 
-**Not covered.** Fragment reassembly, IPv6, DHCP, TCP congestion control, an out-of-order queue
-and Linux socket calls do not exist. A socket waiter is not woken by the card's interrupt; it
-looks every 2 ms. `listen` and `accept` are host-tested only: no boot connects to the guest.
-The only network card driver is virtio-net, and it has run only under QEMU.
+The interrupt-woken waits and the Linux socket calls, each run on `x86_64-qemu`:
+
+| Mutation | What caught it |
+|---|---|
+| The 2 ms poll back: every wait armed on the fixed interval, and the card's handler waking nobody | both programs still succeeded, and both checks failed: `sockets` with `waits woken by the card 0, armed for a TCP timer 0, polled 121, NOT WOKEN BY THE CARD'S INTERRUPT`, `linux net` with `polled 108` |
+| A Linux receive that drops the last byte of what arrived | `linux net  tcp client exited 0x0000000000000078, WRONG`, step 120, the reply compared. The server passed, since it reads a byte at a time |
+| `accept4` answering the listener's descriptor again instead of the connection's | `server exited 0x0000000000000088, WRONG`, step 136: the read on the listener fails. The accepted connection was never let go of, and the check reports that too: `A CONNECTION NEVER FINISHED CLOSING`, `A LINUX SOCKET WAS NEVER LET GO OF`, `1 OBJECTS LEAKED` |
+| A Linux socket wait that never looks at whether its process is ending | `server NEVER EXITED, A THREAD NEVER ENDED`: `serve`'s second thread was woken (`waits woken by the card 62`) and waited again, and its process's socket, object and frames were left in place |
+| A process's end waking no socket waiter | **passed**. Every frame the card collects wakes every socket waiter, and kbuild's datagram probes arrive four times a second, so the waiting thread looked again, found its process ending and ended within a quarter of a second anyway. The wake matters on a quiet network; QEMU's is never quiet |
+| A non-blocking call that waits instead of answering `EAGAIN` | `tcp client NEVER EXITED, A THREAD NEVER ENDED`: its `MSG_DONTWAIT` receive at step 118 waited for a reply to a request it had not sent, past the check's 10 s patience. With its thread still holding the process slot the server `NEVER STARTED`, and the process's frames were left in place (`12 FRAMES LEAKED`) |
+
+**Not covered.** Fragment reassembly, IPv6, DHCP, TCP congestion control, an out-of-order
+queue, datagram sockets and `poll`/`select`/`epoll` do not exist. Native `listen` and
+`socket_accept` are host-tested and reached at boot only through the Linux personality's
+`accept4`. The 2 ms fallback for a card with no interrupt route is not run by any preset: every
+QEMU machine routes the card's interrupt. The only network card driver is virtio-net, and it has
+run only under QEMU.
 
 ### 3. Boot and integration tests
 

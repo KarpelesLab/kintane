@@ -18,31 +18,25 @@
 //! # Waiting
 //!
 //! Every call that can wait — connect, accept, send, receive, shutdown — blocks on [`WAITS`], a
-//! Phase 6a wait queue, with the caller's timeout. Nothing wakes that queue when a frame arrives:
-//! the card's interrupt does not reach it yet. Instead a waiter looks again every
-//! [`LOOK_EVERY_NS`], polling the card and the stack as it does, and a timeout ends the wait as
-//! for any other object. That is a poll with a blocked thread between looks, not a busy wait,
-//! and it is stated here rather than dressed up as interrupt-driven.
+//! Phase 6a wait queue, with the caller's timeout. From the first socket check on, the card's
+//! interrupt handler runs the stack over every frame that arrives and wakes the queue
+//! (`net::serve_by_interrupt`), so a waiter looks again when a segment has moved the connection
+//! it waits on, and not before. The one other thing that can move a connection without a frame
+//! is a TCP timer — a retransmission, TIME-WAIT's end — so a waiter also looks again when the
+//! stack's earliest timer runs out ([`next_look`]). Closing or shutting a socket down wakes the
+//! queue too, for another thread of the same process waiting on it.
 //!
-//! # Where Linux's calls would land
+//! [`wakes`] counts both kinds of look, and the check requires the first. On a port with no
+//! interrupt route for the card nothing can wake the queue, and a waiter falls back to looking
+//! every [`LOOK_EVERY_NS`]; those looks are counted as polls, and on a port that has a route the
+//! check requires that there were none.
 //!
-//! No Linux socket call is implemented: the Linux personality answers each with `-ENOSYS`. When
-//! it gains them, each is a thin layer over one of the native calls, as its file descriptors are
-//! already a view over handles:
+//! # Linux's calls
 //!
-//! * `socket(AF_INET, SOCK_STREAM, 0)` → `socket_create(STREAM)`, the descriptor naming the handle;
-//! * `bind` → `socket_bind`, the `sockaddr_in` packed into one address word; `listen` →
-//!   `socket_listen`; `accept` and `accept4` → `socket_accept`, with `O_NONBLOCK` a zero timeout
-//!   and `ShouldWait` as `-EAGAIN`;
-//! * `connect` → `socket_connect`, with `PeerClosed` as `-ECONNREFUSED` and `TimedOut` as
-//!   `-ETIMEDOUT`;
-//! * `send`, `sendto` without an address, and `write` → `socket_send`, looping past its 512-byte
-//!   chunk; `recv`, `recvfrom` and `read` → `socket_recv`, whose zero at the end of the stream is
-//!   Linux's too;
-//! * `shutdown(SHUT_WR)` → `socket_shutdown`; `close` → `handle_close`.
-//!
-//! Socket options, `SHUT_RD`, datagram sockets, and readiness through `poll` or `epoll` need
-//! more than exists.
+//! The Linux personality's socket calls (`personality::socket`) are a layer over the functions
+//! here, as the native calls are: a Linux socket descriptor names a socket object like the one
+//! a handle names, and waits on the same queue. Datagram sockets, `SHUT_RD`, and readiness
+//! through `poll` or `epoll` need more than exists.
 //!
 //! # The check
 //!
@@ -59,34 +53,111 @@
 //!   back in the pool;
 //! * every object and frame is back.
 
+use core::sync::atomic::Ordering;
+
 use abi::Error;
 use hal::EarlyConsole;
 use kobject::ObjectId;
 use net::tcp::{State, Status};
 use net::{Conn, TcpError};
-use time::Duration;
+use time::{Duration, Instant};
 
 use crate::objects::{self, Object};
 use crate::preempt::{self, sleep_until};
 use crate::wait::WaitQueue;
-use crate::{Check, spawn, timekeeping, userproc, write_hex, write_usize};
+use crate::{AtomicU64, Check, spawn, timekeeping, userproc, write_hex, write_usize};
 
 /// The most one send or receive moves: what the kernel copies on its own stack.
 pub const CHUNK: usize = 512;
 
-/// How often a waiting call looks at the network. See the module documentation.
+/// How often a waiting call looks at the network where nothing can wake it: a port with no
+/// interrupt route for the card. See the module documentation.
 pub const LOOK_EVERY_NS: u64 = 2_000_000;
+
+/// The soonest a wait armed for a TCP timer looks again, so a timer already due costs a look a
+/// millisecond rather than a spin.
+const TIMER_FLOOR_NS: u64 = 1_000_000;
 
 /// Every socket call waits here.
 static WAITS: WaitQueue = WaitQueue::new();
+
+/// Waiting threads the card's handler woke, waits armed for a TCP timer, and waits armed on
+/// the fixed interval. See [`wakes`].
+static WOKEN: AtomicU64 = AtomicU64::new(0);
+static TIMERS: AtomicU64 = AtomicU64::new(0);
+static POLLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn waits() -> &'static WaitQueue {
     &WAITS
 }
 
-/// When a waiting call must look again, whatever wakes it.
+/// When a waiting call must look again even if nothing wakes it: the stack's next TCP timer
+/// where the card's handler wakes the queue, and a fixed interval where nothing can.
 pub fn next_look() -> Option<u64> {
-    Some(timekeeping::now().as_nanos().saturating_add(LOOK_EVERY_NS))
+    let now = timekeeping::now().as_nanos();
+    if !crate::net::by_interrupt() {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+        return Some(now.saturating_add(LOOK_EVERY_NS));
+    }
+    let due = crate::net::tcp_next_deadline()?;
+    TIMERS.fetch_add(1, Ordering::Relaxed);
+    Some(due.max(now.saturating_add(TIMER_FLOOR_NS)))
+}
+
+/// The card's handler has run the stack over what arrived: wake every waiting call.
+pub fn wake_from_interrupt() {
+    let woke = WAITS.wake_all();
+    WOKEN.fetch_add(woke as u64, Ordering::Relaxed);
+}
+
+/// Wait on the network as a socket call does, for a kernel thread with no socket: until the
+/// card's handler has run the stack since `seen` was read, the stack's next TCP timer, or the
+/// end of the caller's wait. `false`, having waited for nothing, where nothing wakes the queue.
+pub fn await_activity(seen: crate::net::Seen) -> bool {
+    if !crate::net::by_interrupt() {
+        return false;
+    }
+    let now = timekeeping::now().as_nanos();
+    let until = match seen.due {
+        Some(due) => {
+            TIMERS.fetch_add(1, Ordering::Relaxed);
+            due.max(now.saturating_add(TIMER_FLOOR_NS)).min(seen.until)
+        }
+        None => seen.until,
+    };
+    let _ = WAITS.wait_once(Some(Instant::from_nanos(until)), || {
+        (crate::net::generation() != seen.generation).then_some(())
+    });
+    true
+}
+
+/// What the network's waiters have done since boot.
+#[derive(Clone, Copy)]
+pub struct Wakes {
+    /// Blocked waiters the card's interrupt handler made runnable.
+    pub woken: u64,
+    /// Waits armed to look again at the stack's next TCP timer.
+    pub timers: u64,
+    /// Waits armed to look again on the fixed interval, because nothing could wake them.
+    pub polls: u64,
+}
+
+impl Wakes {
+    fn since(self, before: Wakes) -> Wakes {
+        Wakes {
+            woken: self.woken - before.woken,
+            timers: self.timers - before.timers,
+            polls: self.polls - before.polls,
+        }
+    }
+}
+
+pub fn wakes() -> Wakes {
+    Wakes {
+        woken: WOKEN.load(Ordering::Relaxed),
+        timers: TIMERS.load(Ordering::Relaxed),
+        polls: POLLS.load(Ordering::Relaxed),
+    }
 }
 
 /// Whether this machine has a started card for sockets to use.
@@ -226,6 +297,31 @@ pub fn listen(id: ObjectId) -> Result<u64, Error> {
     Ok(0)
 }
 
+/// Socket `id`'s local port, and its peer's address and port once it has a connection.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "the Linux personality's names are its only users")
+)]
+pub fn endpoints(id: ObjectId) -> Result<(u16, Option<(net::Ipv4Addr, u16)>), Error> {
+    match state_of(id)? {
+        (Some(conn), _, false) => {
+            let (local, ip, port) =
+                stack(|s, _, _| s.tcp_endpoints(conn))?.ok_or(Error::BadHandle)?;
+            Ok((local, Some((ip, port))))
+        }
+        (_, port, _) => Ok((port, None)),
+    }
+}
+
+/// Whether something listens on `port`.
+#[cfg_attr(
+    not(CONFIG_ABI_LINUX),
+    expect(dead_code, reason = "the Linux socket check is its only user")
+)]
+pub fn listening_on(port: u16) -> bool {
+    crate::net::with_stack(|s, _, _| s.tcp_listening(port)).unwrap_or(false)
+}
+
 /// A new socket object for a connection `listener` has, or `None` while it has none.
 pub fn accept(listener: Conn, port: u16) -> Result<Option<ObjectId>, Error> {
     let conn = match stack(|s, _, _| s.tcp_accept(listener))? {
@@ -268,7 +364,10 @@ pub fn recv(conn: Conn, into: &mut [u8]) -> Result<Option<usize>, Error> {
 
 /// Queue a FIN after what is queued.
 pub fn shutdown(conn: Conn) -> Result<(), Error> {
-    stack(|s, card, t| s.tcp_shutdown(card, conn, t))?.map_err(error)
+    let done = stack(|s, card, t| s.tcp_shutdown(card, conn, t))?.map_err(error);
+    // Another thread may wait on this connection, for what the shutdown ends.
+    WAITS.wake_all();
+    done
 }
 
 /// `Some` once everything `conn` sent, its FIN included, is acknowledged.
@@ -283,6 +382,7 @@ pub fn shut(conn: Conn) -> Result<Option<u64>, Error> {
 /// Let go of a destroyed socket's connection: closed in order, and freed once it is over.
 pub fn release(conn: u64) {
     let _ = crate::net::with_stack(|s, card, t| s.tcp_close(card, Conn::from_raw(conn), t));
+    WAITS.wake_all();
 }
 
 // ---- the check ----------------------------------------------------------------------------
@@ -316,6 +416,8 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no network card");
         return Check::Skipped;
     }
+    // From here on the card's handler runs the stack and wakes the socket calls' queue.
+    let interrupt = crate::net::serve_by_interrupt();
     let Some(port) = crate::net::tcp_port() else {
         c.write_str("NO TCP PORT: the net check never heard kbuild announce one");
         return Check::Failed;
@@ -332,9 +434,11 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     let frames_before = free_frames();
     let objects_before = objects::live();
     let before = crate::net::with_stack(|s, _, _| s.tcp_counters());
+    let wakes_before = wakes();
 
     let address = abi::socket::address(crate::net::GATEWAY, port);
     let (started, code) = run(&program, address);
+    let woke = wakes().since(wakes_before);
 
     let ended = spawn::end_threads();
     if ended {
@@ -381,6 +485,20 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     if retransmits == 0 {
         c.write_str(", NONE, though kbuild drops the first data segment");
     }
+    c.write_str("; waits woken by the card ");
+    write_usize(c, woke.woken as usize);
+    c.write_str(", armed for a TCP timer ");
+    write_usize(c, woke.timers as usize);
+    c.write_str(", polled ");
+    write_usize(c, woke.polls as usize);
+    // Where the card has an interrupt route, a wait is ended by it or by a TCP timer, never by
+    // a look on a fixed interval.
+    let woken_ok = !interrupt || (woke.woken > 0 && woke.polls == 0);
+    if !interrupt {
+        c.write_str(" (no interrupt route for the card)");
+    } else if !woken_ok {
+        c.write_str(", NOT WOKEN BY THE CARD'S INTERRUPT");
+    }
     c.write_str(if settled {
         "; closed in order, every buffer back"
     } else {
@@ -407,6 +525,7 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         code == Some(SUCCESS)
             && established > 0
             && retransmits > 0
+            && woken_ok
             && settled
             && ended
             && leaked == 0

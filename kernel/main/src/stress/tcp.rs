@@ -25,10 +25,10 @@ use crate::preempt::{begin, sleep_until};
 const TIMEOUT_NS: u64 = 2_000_000_000;
 const TRIES: u32 = 3;
 
-/// The pause between polls while a round waits, and between rounds: paced as the datagram
-/// workload is, for the same reason. Polls are further apart than its, because a round spends
-/// most of its time in the 300 ms retransmission wait the relay's drop forces, and at 5 ms a
-/// single-CPU run once failed the user process's progress check at 3 s.
+/// The pause between polls while a round waits, where nothing wakes it (a kernel without
+/// userspace, or a port with no interrupt route), and between rounds. Where the card's handler
+/// runs the stack, a round instead waits for it or for the stack's next TCP timer
+/// (`sockets::await_activity`), and does not poll.
 const POLL_MS: u64 = 10;
 const ROUND_MS: u64 = 25;
 
@@ -82,8 +82,12 @@ fn now() -> u64 {
     crate::timekeeping::now().as_nanos()
 }
 
-fn nap() {
-    sleep_until(after_ms(POLL_MS));
+/// Wait for the card's handler to have run the stack, or for its next TCP timer; or, where
+/// nothing wakes a waiter, sleep a poll's worth.
+fn nap(seen: crate::net::Seen) {
+    if !crate::model::await_network(seen) {
+        sleep_until(after_ms(POLL_MS));
+    }
 }
 
 pub extern "C" fn worker(_: usize) -> ! {

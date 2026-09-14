@@ -139,6 +139,44 @@ pub fn sibling_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// The card's interrupt handler has run the stack: wake whoever waits on the network. Nothing
+/// does without userspace.
+#[cfg(CONFIG_USERSPACE)]
+pub fn network_changed() {
+    crate::sockets::wake_from_interrupt();
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn network_changed() {}
+
+/// Wait for the network to change, or for the stack's next TCP timer, as a socket call does.
+/// `false`, having waited for nothing, where nothing would wake the wait.
+#[cfg(CONFIG_USERSPACE)]
+pub fn await_network(seen: crate::net::Seen) -> bool {
+    crate::sockets::await_activity(seen)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn await_network(seen: crate::net::Seen) -> bool {
+    let _ = seen;
+    false
+}
+
+/// Network waits woken by the card's handler, armed for a TCP timer, and armed on a fixed
+/// interval, for the heartbeat. `None` where the handler does not run the stack.
+#[cfg(CONFIG_USERSPACE)]
+pub fn network_wakes() -> Option<(u64, u64, u64)> {
+    crate::net::by_interrupt().then(|| {
+        let w = crate::sockets::wakes();
+        (w.woken, w.timers, w.polls)
+    })
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn network_wakes() -> Option<(u64, u64, u64)> {
+    None
+}
+
 /// A native program talking TCP through the socket calls. Passed when USERSPACE is off.
 #[cfg(CONFIG_USERSPACE)]
 pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
@@ -147,6 +185,19 @@ pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
 
 #[cfg(not(CONFIG_USERSPACE))]
 pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
+/// The Linux program's socket modes: a TCP client, and a server kbuild connects to. Passed,
+/// silently, without the personality.
+#[cfg(CONFIG_USERSPACE)]
+pub fn linux_sockets_check(c: &dyn EarlyConsole) -> Check {
+    crate::personality::sockets_check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn linux_sockets_check(c: &dyn EarlyConsole) -> Check {
     let _ = c;
     Check::Passed
 }

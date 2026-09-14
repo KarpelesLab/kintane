@@ -562,6 +562,19 @@ impl Tcp {
         })
     }
 
+    /// `c`'s local port, and its peer's address and port.
+    pub fn endpoints(&self, c: Conn) -> Option<(u16, Ipv4Addr, u16)> {
+        let t = self.get(c).ok()?;
+        Some((t.local_port, t.remote_ip, t.remote_port))
+    }
+
+    /// Whether a listener is on `port`.
+    pub fn listening(&self, port: u16) -> bool {
+        self.tcbs
+            .iter()
+            .any(|t| t.active && t.state == State::Listen && t.local_port == port)
+    }
+
     /// The earliest instant any timer runs out, for an owner deciding how long to sleep.
     pub fn next_deadline(&self) -> Option<u64> {
         self.tcbs

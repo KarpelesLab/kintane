@@ -27,8 +27,9 @@
 //! the kernel has no console input to give it. A pipe end names one of a few kernel pipes,
 //! whose readers and writers block on the pipe's queue.
 //!
-//! A socket is the next variant of [`Descriptor`]. Its `read` and `write` go where a pipe's
-//! go, blocking on the socket's queue, and the table does not change shape.
+//! A socket descriptor names a socket object in the object store, counted across processes as
+//! a pipe's ends are; `read` and `write` on one are `recv` and `send`. Linux's socket calls, and
+//! what they refuse, are in [`socket`].
 //!
 //! # Processes and threads
 //!
@@ -56,8 +57,9 @@
 //! keeps the program. [`scheduled_check`] runs it again with the scheduler, in the mode that
 //! uses pipes, `fork`, `execve`, `wait4`, a thread and a futex, and requires that a pipe read
 //! and a futex wait really blocked, and then in the mode that exercises signals
-//! ([`signals::check`]). The stress run starts two of it at once on one CPU, each checking its
-//! own thread pointer across a hundred yields ([`stress_cycle`]).
+//! ([`signals::check`]). [`sockets_check`] runs it as a TCP client of kbuild's service and as
+//! a server kbuild connects to. The stress run starts two of it at once on one CPU, each
+//! checking its own thread pointer across a hundred yields ([`stress_cycle`]).
 
 #![allow(unsafe_code)]
 
@@ -83,6 +85,7 @@ use crate::wait::WaitQueue;
 use crate::{Check, Live, preempt, spawn, timekeeping, write_hex, write_usize};
 
 mod signals;
+mod socket;
 
 /// This kernel has the Linux personality, so [`userproc::personality_of`] tags programs
 /// with no KinTane note `linux` rather than refusing them.
@@ -127,6 +130,8 @@ enum Descriptor {
     PipeRead(usize),
     /// The write end of pipe `n`.
     PipeWrite(usize),
+    /// Socket `n` of [`socket`]'s table.
+    Socket(usize),
 }
 
 /// What a Linux process has that a native one does not.
@@ -256,7 +261,7 @@ fn dispatch(
     call: Call,
 ) -> Result<u64, Failure> {
     let a = frame.args();
-    let [a0, a1, a2, a3, _, _] = a;
+    let [a0, a1, a2, a3, a4, a5] = a;
     match call {
         Call::Read => read(slot, a0, a1, a2),
         Call::Write => write(slot, a0, a1, a2),
@@ -293,6 +298,19 @@ fn dispatch(
         Call::Sigaltstack => signals::altstack(a0, a1),
         Call::Kill => signals::kill(slot, a0, a1),
         Call::Tgkill => signals::tgkill(slot, a0, a1, a2),
+        Call::Socket => socket::socket(slot, a0, a1, a2),
+        Call::Connect => socket::connect(slot, a0, a1, a2),
+        Call::Accept => socket::accept4(slot, a0, a1, a2, 0),
+        Call::Accept4 => socket::accept4(slot, a0, a1, a2, a3),
+        Call::Bind => socket::bind(slot, a0, a1, a2),
+        Call::Listen => socket::listen(slot, a0, a1),
+        Call::Sendto => socket::sendto(slot, a0, a1, a2, a3),
+        Call::Recvfrom => socket::recvfrom(slot, a0, a1, a2, a3, a5),
+        Call::Shutdown => socket::shutdown(slot, a0, a1),
+        Call::Getsockname => socket::name(slot, a0, a1, a2, false),
+        Call::Getpeername => socket::name(slot, a0, a1, a2, true),
+        Call::Setsockopt => socket::setsockopt(slot, a0, a1, a2, a3, a4),
+        Call::Getsockopt => socket::getsockopt(slot, a0, a1, a2, a3, a4),
     }
 }
 
@@ -376,6 +394,7 @@ fn read(slot: usize, fd: u64, buf: u64, count: u64) -> Result<u64, Failure> {
         Descriptor::Stdin => Ok(0),
         Descriptor::File { fd, .. } => read_file(fd, buf, count),
         Descriptor::PipeRead(pipe) => read_pipe(slot, pipe, buf, count, nonblock),
+        Descriptor::Socket(i) => socket::recv(slot, i, nonblock, buf, count),
         _ => Err(Failure::BadDescriptor),
     }
 }
@@ -405,6 +424,7 @@ fn write(slot: usize, fd: u64, buf: u64, count: u64) -> Result<u64, Failure> {
     match d {
         Descriptor::Console(handle) => write_console(slot, handle, buf, count),
         Descriptor::PipeWrite(pipe) => write_pipe(slot, pipe, buf, count, nonblock),
+        Descriptor::Socket(i) => socket::send(slot, i, nonblock, buf, count),
         // Standard input is not open for writing, and every file is open read-only.
         _ => Err(Failure::BadDescriptor),
     }
@@ -442,6 +462,7 @@ fn close(slot: usize, fd: u64) -> Result<u64, Failure> {
         Descriptor::File { fd, .. } => with_ns(|ns| ns.close(fd).map_err(failure))?,
         Descriptor::PipeRead(pipe) => drop_end(pipe, End::Read),
         Descriptor::PipeWrite(pipe) => drop_end(pipe, End::Write),
+        Descriptor::Socket(i) => socket::drop_ref(i),
         Descriptor::Console(_) | Descriptor::Stdin | Descriptor::Closed => {}
     }
     Ok(0)
@@ -454,6 +475,7 @@ fn fstat(slot: usize, fd: u64, out: u64) -> Result<u64, Failure> {
         Descriptor::PipeRead(pipe) | Descriptor::PipeWrite(pipe) => {
             (FileKind::Fifo, 0, PIPE_INODES + pipe as u64)
         }
+        Descriptor::Socket(i) => (FileKind::Socket, 0, SOCKET_INODES + i as u64),
         _ => (FileKind::CharDevice, 0, fd + 1),
     };
     let bytes = linux::stat_bytes(ABI, kind, len, ino);
@@ -634,6 +656,8 @@ const PIPES: usize = 4;
 const PIPE_BYTES: usize = 512;
 /// `st_ino` of pipe 0; the others follow it.
 const PIPE_INODES: u64 = 0x7069_7065_0000;
+/// `st_ino` of socket 0; the others follow it.
+const SOCKET_INODES: u64 = 0x736f_636b_0000;
 
 struct Pipe {
     used: bool,
@@ -1177,6 +1201,10 @@ fn inherit(parent: usize, child: usize) -> Result<(), Failure> {
                 add_end(pipe, End::Write);
                 Descriptor::PipeWrite(pipe)
             }
+            Descriptor::Socket(i) => {
+                socket::add_ref(i);
+                Descriptor::Socket(i)
+            }
             other => other,
         };
     }
@@ -1397,6 +1425,7 @@ pub(crate) fn wake_all_waiters() {
     }
     CHILD_WAIT.wake_all();
     NS_WAIT.wake_all();
+    crate::sockets::waits().wake_all();
 }
 
 /// Release what a Linux process in `slot` holds beyond its handles and memory: its open
@@ -1423,7 +1452,7 @@ pub(crate) fn release(slot: usize) {
     close_all(s.fds);
 }
 
-/// Close what `fds` name beyond the process's own handles: files and pipe ends.
+/// Close what `fds` name beyond the process's own handles: files, pipe ends and sockets.
 fn close_all(fds: [Descriptor; MAX_FDS]) {
     for d in fds {
         match d {
@@ -1432,6 +1461,7 @@ fn close_all(fds: [Descriptor; MAX_FDS]) {
             }
             Descriptor::PipeRead(pipe) => drop_end(pipe, End::Read),
             Descriptor::PipeWrite(pipe) => drop_end(pipe, End::Write),
+            Descriptor::Socket(i) => socket::drop_ref(i),
             Descriptor::Console(_) | Descriptor::Stdin | Descriptor::Closed => {}
         }
     }
@@ -1883,6 +1913,12 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
 
 fn free_frames() -> usize {
     userproc::with_frames(|f| f.alloc.stats().free).unwrap_or(0)
+}
+
+/// Run the program in its socket modes with the scheduler, a client of kbuild's TCP service and
+/// a server kbuild connects to, and grade them. On the boot thread.
+pub fn sockets_check(c: &dyn EarlyConsole) -> Check {
+    socket::check(c)
 }
 
 // ---- the stress run ---------------------------------------------------------------------

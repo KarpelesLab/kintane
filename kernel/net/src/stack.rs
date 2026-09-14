@@ -411,6 +411,16 @@ impl Stack {
         self.st.tcp.slots_in_use()
     }
 
+    /// `c`'s local port, and its peer's address and port.
+    pub fn tcp_endpoints(&self, c: Conn) -> Option<(u16, Ipv4Addr, u16)> {
+        self.st.tcp.endpoints(c)
+    }
+
+    /// Whether a listener is on `port`.
+    pub fn tcp_listening(&self, port: u16) -> bool {
+        self.st.tcp.listening(port)
+    }
+
     /// When the next TCP timer runs out, for a caller deciding how long it may sleep.
     pub fn tcp_next_deadline(&self) -> Option<u64> {
         self.st.tcp.next_deadline()

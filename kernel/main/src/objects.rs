@@ -616,6 +616,9 @@ pub fn wake_all_waiters() {
     for waiters in &WAITS {
         waiters.wake_all();
     }
+    // A socket call waits on the network's one queue rather than its object's, and with nothing
+    // arriving and no TCP timer pending nothing else would wake it.
+    crate::sockets::waits().wake_all();
 }
 
 /// The wait queue of the object `id` names, while it is live.

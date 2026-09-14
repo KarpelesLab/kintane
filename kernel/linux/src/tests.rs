@@ -237,3 +237,41 @@ fn stat_and_utsname_have_linux_layouts() {
     assert_eq!(&u[130..130 + RELEASE.len()], RELEASE.as_bytes());
     assert_eq!(&u[260..267], b"x86_64\0");
 }
+
+#[test]
+fn the_socket_calls_have_each_architectures_numbers() {
+    let pairs = [
+        (Call::Socket, 41, 198),
+        (Call::Connect, 42, 203),
+        (Call::Accept, 43, 202),
+        (Call::Accept4, 288, 242),
+        (Call::Bind, 49, 200),
+        (Call::Listen, 50, 201),
+        (Call::Sendto, 44, 206),
+        (Call::Recvfrom, 45, 207),
+        (Call::Shutdown, 48, 210),
+        (Call::Getsockname, 51, 204),
+        (Call::Getpeername, 52, 205),
+        (Call::Setsockopt, 54, 208),
+        (Call::Getsockopt, 55, 209),
+    ];
+    for (call, x86_64, aarch64) in pairs {
+        assert_eq!(decode(Abi::X86_64, x86_64), Some(call), "{call:?}");
+        assert_eq!(decode(Abi::Aarch64, aarch64), Some(call), "{call:?}");
+    }
+    assert_eq!(ret(Err(Failure::TryAgain)) as i64, -11);
+    assert_eq!(ret(Err(Failure::InProgress)) as i64, -115);
+    assert_eq!(ret(Err(Failure::ConnectionRefused)) as i64, -111);
+    assert_eq!(ret(Err(Failure::NotConnected)) as i64, -107);
+}
+
+#[test]
+fn a_sockaddr_in_carries_its_port_and_address_in_network_order() {
+    let a = socket::sockaddr_in([10, 0, 2, 2], 0x1e61);
+    assert_eq!(a[..8], [2, 0, 0x1e, 0x61, 10, 0, 2, 2]);
+    assert_eq!(socket::parse_sockaddr_in(&a), Ok(([10, 0, 2, 2], 0x1e61)));
+    let mut inet6 = a;
+    inet6[0] = 10;
+    assert_eq!(socket::parse_sockaddr_in(&inet6), Err(Failure::AddressFamilyNotSupported));
+    assert_eq!(socket::parse_sockaddr_in(&a[..7]), Err(Failure::InvalidArgument));
+}

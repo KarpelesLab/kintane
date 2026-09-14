@@ -57,7 +57,7 @@ use time::Clock;
 use virtio::mem::Dma;
 use virtio_net::VirtioNet;
 
-use crate::{AtomicBool, AtomicU32, Check, Live, Locks, write_usize};
+use crate::{AtomicBool, AtomicU32, AtomicU64, Check, Live, Locks, write_usize};
 
 /// The one guest's address on QEMU's user-mode network: the defaults of `-netdev user`.
 pub const CONFIG: Config = Config {
@@ -126,6 +126,87 @@ static PEER_PORT: AtomicU32 = AtomicU32::new(0);
 /// announcement said. Zero until one has arrived.
 static TCP_PORT: AtomicU32 = AtomicU32::new(0);
 
+/// Whether the card's interrupt handler runs the stack itself ([`serve_by_interrupt`]). Until
+/// then, and on a port with no interrupt route, whoever uses the stack polls it.
+static BY_INTERRUPT: AtomicBool = AtomicBool::new(false);
+/// Bumped, under the stack's lock, each time the handler has run the stack over what arrived.
+/// A waiter that read one value under that lock and later finds another has something new to
+/// look at; see [`Seen`].
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Have the card's interrupt handler run the stack and wake whoever waits on it, from now on.
+/// Returns whether it does: `false` without a started card or on a port with no interrupt
+/// route, where waiters go on polling. On a thread, with the scheduler running.
+///
+/// Whatever arrived before is taken by one poll first, while `recv` still drains the ring
+/// itself: a frame the card finished before the handler was the only collector raised its
+/// interrupt already, and would otherwise wait for the next frame's.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "socket calls are what wait on the network")
+)]
+pub fn serve_by_interrupt() -> bool {
+    let Some(card) = nic() else {
+        return false;
+    };
+    if platform::net_line().is_none() {
+        return false;
+    }
+    if !BY_INTERRUPT.swap(true, Ordering::AcqRel) {
+        let _ = with_stack(|_, _, _| ());
+        card.set_interrupt_driven(true);
+    }
+    true
+}
+
+/// Whether the handler runs the stack.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "socket calls are what wait on the network")
+)]
+pub fn by_interrupt() -> bool {
+    BY_INTERRUPT.load(Ordering::Acquire)
+}
+
+/// The handler's generation; see [`GENERATION`].
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "socket calls are what wait on the network")
+)]
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+/// When the stack's earliest TCP timer runs out, in the scheduler clock's nanoseconds: the
+/// latest a thread waiting on the network may sleep without holding up a retransmission.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(dead_code, reason = "socket calls are what wait on the network")
+)]
+pub fn tcp_next_deadline() -> Option<u64> {
+    nic()?;
+    STACK.lock_irqsave().tcp_next_deadline()
+}
+
+/// What a wait over the stack saw, under its lock, the last time it looked: what a pause
+/// between two looks needs in order to sleep until something changes and no longer.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "only a socket wait reads what the stack's wait saw"
+    )
+)]
+pub struct Seen {
+    /// The handler's [`generation`] then.
+    pub generation: u64,
+    /// The stack's earliest TCP timer then.
+    pub due: Option<u64>,
+    /// When the wait gives up, on the clock it was given.
+    pub until: u64,
+}
+
 /// kbuild's TCP port, once it has announced it.
 pub fn tcp_port() -> Option<u16> {
     let port = TCP_PORT.load(Ordering::Acquire);
@@ -190,9 +271,24 @@ pub fn peer() -> Option<(Ipv4Addr, u16)> {
 
 /// The card's interrupt handler, installed with `virtio_net::set_handler`: as the disk's,
 /// it reaches the card through [`nic`], because the kernel owns the started card.
+///
+/// Once [`serve_by_interrupt`] has been called it also runs the stack over what arrived — the
+/// frames, the TCP state they move, the acknowledgements they call for — and wakes whoever
+/// waits on the network. The stack's lock is taken with interrupts masked everywhere, so no
+/// thread on this CPU holds it here, and one on another CPU holds it only for one poll.
 fn on_nic_interrupt() {
-    if let Some(n) = nic() {
-        n.on_interrupt();
+    let Some(n) = nic() else {
+        return;
+    };
+    if n.on_interrupt() && BY_INTERRUPT.load(Ordering::Acquire) {
+        let t = crate::timekeeping::now().as_nanos();
+        {
+            let mut s = STACK.lock_irqsave();
+            s.poll(n, t);
+            GENERATION.fetch_add(1, Ordering::AcqRel);
+        }
+        // After the lock: waking takes the scheduler's.
+        crate::model::network_changed();
     }
 }
 
@@ -383,7 +479,7 @@ fn exchange(
     card: &VirtioNet<Locks>,
     now: &mut dyn FnMut() -> u64,
 ) -> Option<&'static str> {
-    let spin = core::hint::spin_loop;
+    let spin: fn(Seen) = spin_once;
     // Forgotten first. QEMU asks for the guest's address before it forwards kbuild's first
     // probe, and the stack learns the gateway from that request. Resolved from that alone,
     // the check passed with a stack whose own requests no gateway could answer, so the
@@ -492,22 +588,37 @@ fn exchange(
     None
 }
 
+/// A pause that spins once, for the check, which runs with interrupts masked before the
+/// scheduler.
+fn spin_once(_: Seen) {
+    core::hint::spin_loop();
+}
+
 /// Poll the stack and run `step` on it until `step` has an answer or `timeout_ns` passes,
-/// calling `pause` between tries. The stack's lock is held for one try at a time.
+/// calling `pause` between tries with what the try saw. The stack's lock is held for one try
+/// at a time.
 fn wait<T>(
     card: &VirtioNet<Locks>,
     timeout_ns: u64,
     now: &mut dyn FnMut() -> u64,
-    pause: fn(),
+    pause: fn(Seen),
     mut step: impl FnMut(&mut Stack, u64) -> Option<T>,
 ) -> Option<T> {
     let start = now();
     loop {
         let t = now();
-        let got = {
+        let (got, seen) = {
             let mut s = STACK.lock_irqsave();
             s.poll(card, t);
-            step(&mut s, t)
+            let got = step(&mut s, t);
+            // Read under the lock the handler bumps it under: a frame it runs the stack over
+            // after this is one the pause sees as new.
+            let seen = Seen {
+                generation: GENERATION.load(Ordering::Acquire),
+                due: s.tcp_next_deadline(),
+                until: start.saturating_add(timeout_ns),
+            };
+            (got, seen)
         };
         if got.is_some() {
             return got;
@@ -515,7 +626,7 @@ fn wait<T>(
         if t.saturating_sub(start) >= timeout_ns {
             return None;
         }
-        pause();
+        pause(seen);
     }
 }
 
@@ -525,7 +636,7 @@ pub fn ping(
     seq: u16,
     timeout_ns: u64,
     now: &mut dyn FnMut() -> u64,
-    pause: fn(),
+    pause: fn(Seen),
 ) -> bool {
     let mut sent = false;
     wait(card, timeout_ns, now, pause, |s, t| {
@@ -548,7 +659,7 @@ pub fn udp_round(
     n: u32,
     timeout_ns: u64,
     now: &mut dyn FnMut() -> u64,
-    pause: fn(),
+    pause: fn(Seen),
 ) -> bool {
     let mut echo = [0u8; 32];
     let echo_len = numbered(&mut echo, ECHO, n);
@@ -610,7 +721,7 @@ pub fn tcp_round(
     n: u32,
     timeout_ns: u64,
     now: &mut dyn FnMut() -> u64,
-    pause: fn(),
+    pause: fn(Seen),
 ) -> Result<TcpRound, &'static str> {
     let mode: &[u8] = if guest_closes {
         b"guest-closes "
@@ -656,7 +767,7 @@ fn tcp_exchange(
     reply: &[u8],
     timeout_ns: u64,
     now: &mut dyn FnMut() -> u64,
-    pause: fn(),
+    pause: fn(Seen),
 ) -> Result<TcpRound, &'static str> {
     let mut visited = 0u16;
     let mut queued = 0;

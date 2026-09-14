@@ -123,11 +123,24 @@ pub enum Call {
     Sigaltstack,
     Kill,
     Tgkill,
+    Socket,
+    Connect,
+    Accept,
+    Accept4,
+    Bind,
+    Listen,
+    Sendto,
+    Recvfrom,
+    Shutdown,
+    Getsockname,
+    Getpeername,
+    Setsockopt,
+    Getsockopt,
 }
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 30] = [
+    pub const ALL: [Call; 43] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -158,6 +171,19 @@ impl Call {
         Call::Sigaltstack,
         Call::Kill,
         Call::Tgkill,
+        Call::Socket,
+        Call::Connect,
+        Call::Accept,
+        Call::Accept4,
+        Call::Bind,
+        Call::Listen,
+        Call::Sendto,
+        Call::Recvfrom,
+        Call::Shutdown,
+        Call::Getsockname,
+        Call::Getpeername,
+        Call::Setsockopt,
+        Call::Getsockopt,
     ];
 
     /// The name the tables give it.
@@ -193,6 +219,19 @@ impl Call {
             Call::Sigaltstack => "sigaltstack",
             Call::Kill => "kill",
             Call::Tgkill => "tgkill",
+            Call::Socket => "socket",
+            Call::Connect => "connect",
+            Call::Accept => "accept",
+            Call::Accept4 => "accept4",
+            Call::Bind => "bind",
+            Call::Listen => "listen",
+            Call::Sendto => "sendto",
+            Call::Recvfrom => "recvfrom",
+            Call::Shutdown => "shutdown",
+            Call::Getsockname => "getsockname",
+            Call::Getpeername => "getpeername",
+            Call::Setsockopt => "setsockopt",
+            Call::Getsockopt => "getsockopt",
         }
     }
 
@@ -230,6 +269,19 @@ impl Call {
             Call::Sigaltstack => (131, 132),
             Call::Kill => (62, 129),
             Call::Tgkill => (234, 131),
+            Call::Socket => (41, 198),
+            Call::Connect => (42, 203),
+            Call::Accept => (43, 202),
+            Call::Accept4 => (288, 242),
+            Call::Bind => (49, 200),
+            Call::Listen => (50, 201),
+            Call::Sendto => (44, 206),
+            Call::Recvfrom => (45, 207),
+            Call::Shutdown => (48, 210),
+            Call::Getsockname => (51, 204),
+            Call::Getpeername => (52, 205),
+            Call::Setsockopt => (54, 208),
+            Call::Getsockopt => (55, 209),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,
@@ -332,6 +384,62 @@ pub const FUTEX_CLOCK_REALTIME: u64 = 256;
 /// `wait4`'s "do not wait".
 pub const WNOHANG: u64 = 1;
 
+/// The socket calls' constants, and `struct sockaddr_in`, as far as the personality reads them.
+/// The values are the same on x86_64 and aarch64.
+pub mod socket {
+    use super::Failure;
+
+    pub const AF_INET: u64 = 2;
+    pub const SOCK_STREAM: u64 = 1;
+    /// The bits of `socket`'s type that name the type; the rest are flags.
+    pub const SOCK_TYPE_MASK: u64 = 0xf;
+    /// `socket`'s and `accept4`'s flags, which are `open`'s values.
+    pub const SOCK_NONBLOCK: u64 = super::O_NONBLOCK;
+    pub const SOCK_CLOEXEC: u64 = super::O_CLOEXEC;
+    pub const IPPROTO_TCP: u64 = 6;
+
+    pub const SOL_SOCKET: u64 = 1;
+    pub const SO_REUSEADDR: u64 = 2;
+    pub const SO_TYPE: u64 = 3;
+    pub const SO_ERROR: u64 = 4;
+    pub const SO_KEEPALIVE: u64 = 9;
+    pub const TCP_NODELAY: u64 = 1;
+
+    pub const MSG_DONTWAIT: u64 = 0x40;
+    pub const MSG_NOSIGNAL: u64 = 0x4000;
+
+    pub const SHUT_RD: u64 = 0;
+    pub const SHUT_WR: u64 = 1;
+    pub const SHUT_RDWR: u64 = 2;
+
+    /// Bytes of `struct sockaddr_in`: the family, the port and the address, then eight of
+    /// padding.
+    pub const SOCKADDR_IN_LEN: usize = 16;
+
+    /// `ip`:`port` as a `struct sockaddr_in`: the family in the machine's byte order, the port
+    /// and the address in the network's.
+    pub fn sockaddr_in(ip: [u8; 4], port: u16) -> [u8; SOCKADDR_IN_LEN] {
+        let mut a = [0u8; SOCKADDR_IN_LEN];
+        a[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[4..8].copy_from_slice(&ip);
+        a
+    }
+
+    /// The address and port a `struct sockaddr_in` of `bytes` names.
+    pub fn parse_sockaddr_in(bytes: &[u8]) -> Result<([u8; 4], u16), Failure> {
+        let (Some(family), Some(port), Some(ip)) =
+            (bytes.get(0..2), bytes.get(2..4), bytes.get(4..8))
+        else {
+            return Err(Failure::InvalidArgument);
+        };
+        if u16::from_le_bytes([family[0], family[1]]) != AF_INET as u16 {
+            return Err(Failure::AddressFamilyNotSupported);
+        }
+        Ok(([ip[0], ip[1], ip[2], ip[3]], u16::from_be_bytes([port[0], port[1]])))
+    }
+}
+
 /// The status `wait4` reports for a child that exited with `code`: the low 8 bits, shifted
 /// into place.
 pub const fn exited_status(code: u64) -> u32 {
@@ -365,7 +473,21 @@ pub mod errno {
     pub const EPIPE: i64 = 32;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
+    pub const ENOTSOCK: i64 = 88;
+    pub const ENOPROTOOPT: i64 = 92;
+    pub const EPROTONOSUPPORT: i64 = 93;
+    pub const EOPNOTSUPP: i64 = 95;
+    pub const EAFNOSUPPORT: i64 = 97;
+    pub const EADDRINUSE: i64 = 98;
+    pub const EADDRNOTAVAIL: i64 = 99;
+    pub const ENETDOWN: i64 = 100;
+    pub const ECONNRESET: i64 = 104;
+    pub const EISCONN: i64 = 106;
+    pub const ENOTCONN: i64 = 107;
     pub const ETIMEDOUT: i64 = 110;
+    pub const ECONNREFUSED: i64 = 111;
+    pub const EALREADY: i64 = 114;
+    pub const EINPROGRESS: i64 = 115;
 }
 
 /// Every way a call the personality implements can fail, before it is a Linux number.
@@ -415,6 +537,34 @@ pub enum Failure {
     Interrupted,
     /// `kill` or `tgkill` named no Linux process or thread.
     NoProcess,
+    /// A socket call named a descriptor that is not a socket.
+    NotASocket,
+    /// A socket of an address family other than IPv4.
+    AddressFamilyNotSupported,
+    /// A socket type or protocol other than TCP's byte stream.
+    ProtocolNotSupported,
+    /// A socket option the personality does not know.
+    NoProtocolOption,
+    /// A flag or mode the call has but the personality does not offer, such as `MSG_PEEK`.
+    OperationNotSupported,
+    /// A port already bound or listened on, or no free connection to make.
+    AddressInUse,
+    /// An address that is not this machine's.
+    AddressNotAvailable,
+    /// No started network card.
+    NetworkDown,
+    /// The peer reset the connection.
+    ConnectionReset,
+    /// `connect` on a socket that is connected.
+    AlreadyConnected,
+    /// A send, receive or peer name on a socket with no connection.
+    NotConnected,
+    /// Nobody listens at the address `connect` named.
+    ConnectionRefused,
+    /// A non-blocking `connect` already under way.
+    Already,
+    /// A non-blocking `connect` begun, and not yet finished.
+    InProgress,
 }
 
 /// The Linux error number for `f`. One exhaustive `match`, reviewed as a whole.
@@ -448,6 +598,20 @@ pub const fn errno(f: Failure) -> i64 {
         Failure::NotImplemented => ENOSYS,
         Failure::Interrupted => EINTR,
         Failure::NoProcess => ESRCH,
+        Failure::NotASocket => ENOTSOCK,
+        Failure::AddressFamilyNotSupported => EAFNOSUPPORT,
+        Failure::ProtocolNotSupported => EPROTONOSUPPORT,
+        Failure::NoProtocolOption => ENOPROTOOPT,
+        Failure::OperationNotSupported => EOPNOTSUPP,
+        Failure::AddressInUse => EADDRINUSE,
+        Failure::AddressNotAvailable => EADDRNOTAVAIL,
+        Failure::NetworkDown => ENETDOWN,
+        Failure::ConnectionReset => ECONNRESET,
+        Failure::AlreadyConnected => EISCONN,
+        Failure::NotConnected => ENOTCONN,
+        Failure::ConnectionRefused => ECONNREFUSED,
+        Failure::Already => EALREADY,
+        Failure::InProgress => EINPROGRESS,
     }
 }
 
@@ -590,6 +754,7 @@ pub enum FileKind {
     CharDevice,
     /// Either end of a pipe.
     Fifo,
+    Socket,
 }
 
 /// The largest `struct stat`: x86_64's, 144 bytes. aarch64's, the generic layout, is 128.
@@ -615,6 +780,7 @@ pub fn stat_bytes(abi: Abi, kind: FileKind, size: u64, ino: u64) -> [u8; STAT_BY
         FileKind::Directory => 0o040555,
         FileKind::CharDevice => 0o020620,
         FileKind::Fifo => 0o010600,
+        FileKind::Socket => 0o140777,
     };
     s[0..8].copy_from_slice(&1u64.to_le_bytes()); // st_dev
     s[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino

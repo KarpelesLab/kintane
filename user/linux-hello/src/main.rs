@@ -18,6 +18,8 @@
 //! * `churn`: [`churn`], anonymous pages mapped, faulted in and unmapped, over and over, run two at
 //!   a time on two CPUs.
 //! * `signals`: [`signals`], handlers, masks, `EINTR`, `SIGCHLD`, `SIGPIPE` and default actions.
+//! * `tcp <port>`: [`tcp`], a TCP client of kbuild's service on `<port>`, blocking and not;
+//! * `serve`: [`serve`], a TCP server kbuild connects to through a port QEMU forwards.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -116,6 +118,8 @@ struct Start {
     argc: u64,
     argv0: &'static [u8],
     mode: &'static [u8],
+    /// `argv[2]`: the mode's argument, if it takes one.
+    arg: &'static [u8],
     pagesz: u64,
     entry: u64,
     random: u64,
@@ -154,6 +158,7 @@ extern "C" fn start(sp: *const u64) -> ! {
             argc,
             argv0: arg(0),
             mode: arg(1),
+            arg: arg(2),
             pagesz,
             entry,
             random,
@@ -165,6 +170,8 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"tls" => tls(),
         b"churn" => churn(),
         b"signals" => signals(),
+        b"tcp" => tcp(s.arg),
+        b"serve" => serve(),
         _ => hello(&s),
     }
 }
@@ -784,6 +791,379 @@ fn signals() -> ! {
     let status = wait_child(child, 132);
     expect(status == SIGKILL as u32, if status == 131 << 8 { 131 } else { 132 });
     exit(SIGNALS_SUCCESS)
+}
+
+// ---- tcp and serve: sockets ---------------------------------------------------------------
+
+const TCP_SUCCESS: u64 = 48;
+const SERVE_SUCCESS: u64 = 49;
+
+const AF_INET: u64 = 2;
+const AF_INET6: u64 = 10;
+const SOCK_STREAM: u64 = 1;
+const SOCK_NONBLOCK: u64 = 0o4000;
+const SOCK_CLOEXEC: u64 = 0o2000000;
+const SOL_SOCKET: u64 = 1;
+const SO_REUSEADDR: u64 = 2;
+const SO_TYPE: u64 = 3;
+const SO_ERROR: u64 = 4;
+const IPPROTO_TCP: u64 = 6;
+const TCP_NODELAY: u64 = 1;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_NOSIGNAL: u64 = 0x4000;
+const SHUT_RD: u64 = 0;
+
+const EAGAIN: i64 = 11;
+const ENOTSOCK: i64 = 88;
+const EOPNOTSUPP: i64 = 95;
+const EAFNOSUPPORT: i64 = 97;
+const EISCONN: i64 = 106;
+const ENOTCONN: i64 = 107;
+const EALREADY: i64 = 114;
+const EINPROGRESS: i64 = 115;
+
+/// QEMU's gateway, through which kbuild is reached, and the machine's own address; mirror
+/// `GATEWAY` and `CONFIG` in `kernel/main/src/net.rs`.
+const GATEWAY: [u8; 4] = [10, 0, 2, 2];
+const OURS: [u8; 4] = [10, 0, 2, 15];
+/// The port `serve` listens on, which kbuild forwards a loopback port to; mirrors
+/// `INBOUND_PORT` in `kernel/main/src/personality/socket.rs`.
+const INBOUND_PORT: u16 = 7777;
+/// kbuild's protocols: `kbuild/src/qemu.rs`.
+const REQUEST: &[u8] = b"kintane-tcp-request peer-closes linux\n";
+const REPLY: &[u8] = b"kintane-tcp-reply peer-closes linux\n";
+const NB_REQUEST: &[u8] = b"kintane-tcp-request peer-closes linux-nonblocking\n";
+const NB_REPLY: &[u8] = b"kintane-tcp-reply peer-closes linux-nonblocking\n";
+const INBOUND: &[u8] = b"kintane-tcp-inbound ";
+const INBOUND_REPLY: &[u8] = b"kintane-tcp-inbound-reply ";
+const INBOUND_VERIFIED: &[u8] = b"kintane-tcp-inbound-verified ";
+
+/// Tries a non-blocking `connect` gets to see its connection established, and a non-blocking
+/// read to see its reply arrive.
+const CONNECT_TRIES: u32 = 2_000_000;
+
+/// The port `serve`'s second thread listens on, which nobody connects to; its listener; and the
+/// thread's tid word and whether it has started.
+const IDLE_PORT: u16 = 7778;
+static IDLE_LISTENER: AtomicU64 = AtomicU64::new(0);
+static IDLE_TID: AtomicU32 = AtomicU32::new(u32::MAX);
+static IDLE_STARTED: AtomicU32 = AtomicU32::new(0);
+
+/// `ip`:`port` as a `struct sockaddr_in`.
+fn sockaddr(ip: [u8; 4], port: u16) -> [u8; 16] {
+    let p = port.to_be_bytes();
+    let mut a = [0u8; 16];
+    for (to, from) in a
+        .iter_mut()
+        .zip([AF_INET as u8, 0, p[0], p[1], ip[0], ip[1], ip[2], ip[3]])
+    {
+        *to = from;
+    }
+    a
+}
+
+fn socket(kind: u64) -> i64 {
+    sys::call(sys::SOCKET, [AF_INET, kind, 0, 0, 0, 0])
+}
+
+fn connect(fd: u64, ip: [u8; 4], port: u16) -> i64 {
+    let a = sockaddr(ip, port);
+    sys::call(sys::CONNECT, [fd, a.as_ptr() as u64, a.len() as u64, 0, 0, 0])
+}
+
+fn set_opt(fd: u64, level: u64, option: u64, value: u32) -> i64 {
+    sys::call(sys::SETSOCKOPT, [fd, level, option, &raw const value as u64, 4, 0])
+}
+
+fn get_opt(fd: u64, level: u64, option: u64) -> Option<u32> {
+    let mut value = 0u32;
+    let mut len = 4u32;
+    let r = sys::call(
+        sys::GETSOCKOPT,
+        [
+            fd,
+            level,
+            option,
+            &raw mut value as u64,
+            &raw mut len as u64,
+            0,
+        ],
+    );
+    (r == 0 && len == 4).then_some(value)
+}
+
+/// `getsockname` or `getpeername`, as an address and a port.
+fn name(nr: u64, fd: u64) -> Option<([u8; 4], u16)> {
+    let mut a = [0u8; 16];
+    let mut len = a.len() as u32;
+    let r = sys::call(nr, [fd, a.as_mut_ptr() as u64, &raw mut len as u64, 0, 0, 0]);
+    (r == 0 && len == 16 && a[0] == AF_INET as u8)
+        .then_some(([a[4], a[5], a[6], a[7]], u16::from_be_bytes([a[2], a[3]])))
+}
+
+/// A port in decimal, or 0.
+fn decimal(digits: &[u8]) -> u16 {
+    let mut n: u32 = 0;
+    for &d in digits {
+        if !d.is_ascii_digit() || n > u32::from(u16::MAX) {
+            return 0;
+        }
+        n = n * 10 + u32::from(d - b'0');
+    }
+    u16::try_from(n).unwrap_or(0)
+}
+
+/// Write all of `bytes` to `fd`.
+fn write_all(fd: u64, bytes: &[u8]) -> bool {
+    let mut done = 0;
+    while let Some(rest) = bytes.get(done..) {
+        if rest.is_empty() {
+            return true;
+        }
+        let n = sys::call(sys::WRITE, [fd, rest.as_ptr() as u64, rest.len() as u64, 0, 0, 0]);
+        if n <= 0 {
+            return false;
+        }
+        done += n as usize;
+    }
+    false
+}
+
+/// Read one line from `fd` into `line`, a byte at a time so nothing after it is taken. Its
+/// length, newline included; short at the end of the stream or an error.
+fn read_line(fd: u64, line: &mut [u8]) -> usize {
+    let mut n = 0;
+    while let Some(byte) = line.get_mut(n) {
+        if sys::call(sys::READ, [fd, byte as *mut u8 as u64, 1, 0, 0, 0]) != 1 {
+            break;
+        }
+        n += 1;
+        if *byte == b'\n' {
+            break;
+        }
+    }
+    n
+}
+
+/// `a` then `b` into `buf`. The length written.
+fn join(buf: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+    let mut n = 0;
+    for (to, &from) in buf.iter_mut().zip(a.iter().chain(b)) {
+        *to = from;
+        n += 1;
+    }
+    n
+}
+
+fn tcp(port_arg: &[u8]) -> ! {
+    // 110: kbuild's port, as the kernel passed it.
+    let port = decimal(port_arg);
+    expect(port != 0, 110);
+    // 111: only IPv4: another family is EAFNOSUPPORT.
+    expect(
+        sys::call(sys::SOCKET, [AF_INET6, SOCK_STREAM, 0, 0, 0, 0]) == -EAFNOSUPPORT,
+        111,
+    );
+    // 112: a socket, with an option a client sets, of the type asked for.
+    let fd = socket(SOCK_STREAM | SOCK_CLOEXEC);
+    expect(fd >= 3, 112);
+    let fd = fd as u64;
+    expect(set_opt(fd, IPPROTO_TCP, TCP_NODELAY, 1) == 0, 112);
+    expect(get_opt(fd, SOL_SOCKET, SO_TYPE) == Some(SOCK_STREAM as u32), 112);
+    // 113: a descriptor that is not a socket is ENOTSOCK.
+    expect(connect(1, GATEWAY, port) == -ENOTSOCK, 113);
+    // 114: sending before connecting is ENOTCONN.
+    let len = REQUEST.len() as u64;
+    expect(
+        sys::call(sys::SENDTO, [fd, REQUEST.as_ptr() as u64, len, 0, 0, 0]) == -ENOTCONN,
+        114,
+    );
+    // 115: connect, waiting for the handshake.
+    expect(connect(fd, GATEWAY, port) == 0, 115);
+    // 116: connecting a connected socket is EISCONN.
+    expect(connect(fd, GATEWAY, port) == -EISCONN, 116);
+    // 117: the names at both ends.
+    expect(name(sys::GETPEERNAME, fd) == Some((GATEWAY, port)), 117);
+    expect(matches!(name(sys::GETSOCKNAME, fd), Some((OURS, p)) if p != 0), 117);
+    // 118: kbuild says nothing before a request, so a receive that must not wait is EAGAIN.
+    let mut buf = [0u8; 128];
+    let cap = buf.len() as u64;
+    expect(
+        sys::call(sys::RECVFROM, [fd, buf.as_mut_ptr() as u64, cap, MSG_DONTWAIT, 0, 0]) == -EAGAIN,
+        118,
+    );
+    // 119: the request, with a flag a server sets.
+    expect(
+        sys::call(sys::SENDTO, [fd, REQUEST.as_ptr() as u64, len, MSG_NOSIGNAL, 0, 0])
+            == len as i64,
+        119,
+    );
+    // 120: the reply, through `read`, to the end of the stream: kbuild closes once it replied.
+    let mut got = 0;
+    loop {
+        let Some(room) = buf.get_mut(got..) else {
+            exit(120)
+        };
+        expect(!room.is_empty(), 120);
+        let n = sys::call(sys::READ, [fd, room.as_mut_ptr() as u64, room.len() as u64, 0, 0, 0]);
+        if n == 0 {
+            break;
+        }
+        expect(n > 0, 120);
+        got += n as usize;
+    }
+    expect(buf.get(..got) == Some(REPLY), 120);
+    // 121: the receiving half alone cannot be shut down; the socket closes.
+    expect(sys::call(sys::SHUTDOWN, [fd, SHUT_RD, 0, 0, 0, 0]) == -EOPNOTSUPP, 121);
+    expect(call1(sys::CLOSE, fd) == 0, 121);
+
+    // 122: a non-blocking socket's connect starts the handshake and returns at once.
+    let nb = socket(SOCK_STREAM | SOCK_NONBLOCK);
+    expect(nb >= 3, 122);
+    let nb = nb as u64;
+    expect(connect(nb, GATEWAY, port) == -EINPROGRESS, 122);
+    // 123: again, EALREADY until the connection is established, then EISCONN.
+    let mut established = false;
+    for _ in 0..CONNECT_TRIES {
+        let r = connect(nb, GATEWAY, port);
+        if r == -EISCONN {
+            established = true;
+            break;
+        }
+        expect(r == -EALREADY, 123);
+        yield_now();
+    }
+    expect(established, 123);
+    // 124: no error pending, and nothing to read, which is EAGAIN rather than a wait.
+    expect(get_opt(nb, SOL_SOCKET, SO_ERROR) == Some(0), 124);
+    expect(sys::call(sys::READ, [nb, buf.as_mut_ptr() as u64, 8, 0, 0, 0]) == -EAGAIN, 124);
+    // 125: a whole exchange without waiting: EAGAIN until the reply comes, then to kbuild's
+    // close. kbuild closing first leaves no connection in TIME-WAIT, whose timer would wake
+    // every waiter on the network, behind for `serve`'s second thread.
+    expect(write_all(nb, NB_REQUEST), 125);
+    let mut got = 0;
+    let mut tries = 0;
+    loop {
+        let Some(room) = buf.get_mut(got..) else {
+            exit(125)
+        };
+        expect(!room.is_empty() && tries < CONNECT_TRIES, 125);
+        tries += 1;
+        let n = sys::call(sys::READ, [nb, room.as_mut_ptr() as u64, room.len() as u64, 0, 0, 0]);
+        if n == -EAGAIN {
+            yield_now();
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        expect(n > 0, 125);
+        got += n as usize;
+    }
+    expect(buf.get(..got) == Some(NB_REPLY), 125);
+    expect(call1(sys::CLOSE, nb) == 0, 126);
+    exit(TCP_SUCCESS)
+}
+
+/// `serve`'s second thread: it waits in `accept` on a listener nobody connects to, and so must
+/// be ended by its process's end, since nothing else will end the wait.
+extern "C" fn idle_acceptor() -> u64 {
+    IDLE_STARTED.store(1, Ordering::Release);
+    let l = IDLE_LISTENER.load(Ordering::Acquire);
+    sys::call(sys::ACCEPT4, [l, 0, 0, 0, 0, 0]);
+    // 142: the wait ended while the process lived.
+    exit(142)
+}
+
+fn serve() -> ! {
+    // 141: a second thread, waiting in `accept` on port 7778, where nobody connects. When the
+    // process ends below, no TCP timer is pending anywhere (every connection before this one was
+    // closed by kbuild first), so only the process's end can end that wait, and the kernel's
+    // check requires every thread of the process to have ended.
+    let idle = socket(SOCK_STREAM);
+    expect(idle >= 3, 141);
+    let idle = idle as u64;
+    let idle_at = sockaddr([0; 4], IDLE_PORT);
+    expect(
+        sys::call(sys::BIND, [idle, idle_at.as_ptr() as u64, idle_at.len() as u64, 0, 0, 0]) == 0
+            && sys::call(sys::LISTEN, [idle, 1, 0, 0, 0, 0]) == 0,
+        141,
+    );
+    IDLE_LISTENER.store(idle, Ordering::Release);
+    let stack = map(4 * PAGE);
+    let block = map(PAGE);
+    expect(stack > 0 && block > 0, 141);
+    let mut parent_tid = 0u32;
+    let tid = sys::clone_thread(
+        (stack as u64) + 4 * PAGE,
+        &raw mut parent_tid,
+        IDLE_TID.as_ptr(),
+        block as u64,
+        idle_acceptor,
+    );
+    expect(tid > 0, 141);
+    while IDLE_STARTED.load(Ordering::Acquire) == 0 {
+        yield_now();
+    }
+
+    // 130: a listener, on any of this machine's addresses, at the port kbuild forwards to.
+    let l = socket(SOCK_STREAM);
+    expect(l >= 3, 130);
+    let l = l as u64;
+    expect(set_opt(l, SOL_SOCKET, SO_REUSEADDR, 1) == 0, 130);
+    let any = sockaddr([0; 4], INBOUND_PORT);
+    expect(
+        sys::call(sys::BIND, [l, any.as_ptr() as u64, any.len() as u64, 0, 0, 0]) == 0,
+        131,
+    );
+    expect(sys::call(sys::LISTEN, [l, 1, 0, 0, 0, 0]) == 0, 132);
+    expect(name(sys::GETSOCKNAME, l) == Some(([0; 4], INBOUND_PORT)), 133);
+    // 134: accept, waiting for kbuild, which the kernel's check tells once this listens.
+    let mut peer = [0u8; 16];
+    let mut len = peer.len() as u32;
+    let c = sys::call(
+        sys::ACCEPT4,
+        [
+            l,
+            peer.as_mut_ptr() as u64,
+            &raw mut len as u64,
+            SOCK_CLOEXEC,
+            0,
+            0,
+        ],
+    );
+    expect(c >= 3, 134);
+    let c = c as u64;
+    // 135: the connection came in through QEMU's gateway.
+    expect(
+        len == 16 && peer[0] == AF_INET as u8 && peer.get(4..8) == Some(&GATEWAY[..]),
+        135,
+    );
+    // 136: kbuild's request, and the tag it carries.
+    let mut line = [0u8; 64];
+    let n = read_line(c, &mut line);
+    let Some(tag) = line.get(..n).and_then(|l| l.strip_prefix(INBOUND)) else {
+        exit(136)
+    };
+    let mut tag_buf = [0u8; 32];
+    let tag_len = join(&mut tag_buf, tag, b"");
+    let tag = tag_buf.get(..tag_len).unwrap_or(&[]);
+    // 137: the reply.
+    let mut reply = [0u8; 64];
+    let r = join(&mut reply, INBOUND_REPLY, tag);
+    expect(write_all(c, reply.get(..r).unwrap_or(&[])), 137);
+    // 138: kbuild checked the reply, and says so.
+    let n = read_line(c, &mut line);
+    let mut verified = [0u8; 64];
+    let v = join(&mut verified, INBOUND_VERIFIED, tag);
+    expect(line.get(..n) == verified.get(..v), 138);
+    // 139: then kbuild closes its end.
+    expect(sys::call(sys::READ, [c, line.as_mut_ptr() as u64, 1, 0, 0, 0]) == 0, 139);
+    // 140: both sockets close.
+    expect(call1(sys::CLOSE, c) == 0, 140);
+    expect(call1(sys::CLOSE, l) == 0, 140);
+    // The second thread is still waiting in `accept`: the process's end has to end it.
+    exit(SERVE_SUCCESS)
 }
 
 #[panic_handler]
