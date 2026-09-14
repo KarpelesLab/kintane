@@ -53,6 +53,16 @@ pub const PROGRAM_PATH: &str = "/KINTANE/INIT.ELF";
 /// Where the static Linux program is, when the image carries one. In the program's own
 /// directory, so the root lists exactly what it did before the Linux personality.
 pub const LINUX_PROGRAM_PATH: &str = "/KINTANE/LINUX.ELF";
+/// Where the file server's write check leaves a file for kbuild to read after the guest
+/// exits, how long it is, and the seed of its bytes ([`out_byte`]). kbuild writes neither
+/// file: the kernel does, and kbuild checks it did.
+pub const NATIVE_OUT_PATH: &str = "/KINTANE/NATIVE.OUT";
+pub const NATIVE_OUT_LEN: usize = 1000;
+pub const NATIVE_OUT_SEED: u8 = 0x4e;
+/// The same for the Linux program's files mode.
+pub const LINUX_OUT_PATH: &str = "/KINTANE/LINUX.OUT";
+pub const LINUX_OUT_LEN: usize = 2000;
+pub const LINUX_OUT_SEED: u8 = 0x4c;
 
 /// The byte at `offset` of sector `sector`, for a sector below [`FS_START`].
 ///
@@ -75,6 +85,26 @@ pub const fn big_byte(i: usize) -> u8 {
         .wrapping_add(i as u32 >> 7);
     (x >> 17) as u8
 }
+
+/// The byte at offset `i` of a file a writing check leaves on the volume, for a check of
+/// `seed`'s. Unlike [`pattern`] and [`big_byte`] in shape, so a file that ends up holding
+/// another's bytes, or the pattern region's, matches nothing.
+pub const fn out_byte(seed: u8, i: usize) -> u8 {
+    let x = (i as u32).wrapping_mul(2_654_435_761) ^ (seed as u32).wrapping_mul(0x9E37_79B9);
+    (x >> 23) as u8 ^ seed
+}
+
+/// `(seed, offset, byte)` of [`out_byte`], which both sides assert.
+pub const PINNED_OUT: [(u8, usize, u8); 8] = [
+    (0x4e, 0, 0x27),
+    (0x4e, 1, 0x1b),
+    (0x4e, 511, 0x86),
+    (0x4e, 999, 0xf3),
+    (0x4c, 0, 0xbc),
+    (0x4c, 1, 0x80),
+    (0x4c, 511, 0x1d),
+    (0x4c, 999, 0x68),
+];
 
 /// `(sector, offset, byte)` triples both sides assert.
 pub const PINNED: [(u64, usize, u8); 4] = [
@@ -128,6 +158,13 @@ pub fn header(sector0: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pinned_bytes_of_a_written_file_are_what_out_byte_gives() {
+        for (seed, offset, byte) in PINNED_OUT {
+            assert_eq!(out_byte(seed, offset), byte, "seed {seed:#x} offset {offset}");
+        }
+    }
 
     #[test]
     fn the_pinned_bytes_are_what_the_pattern_gives() {

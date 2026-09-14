@@ -23,6 +23,9 @@ pub struct Machine {
     /// The loopback ports the kernel's network check (`QEMU_NET_TEST`) is reached on, which
     /// [`run_watched`] serves: see [`udp_peer`], [`tcp_service`] and [`relay`].
     pub net_port: Option<NetPorts>,
+    /// The run's copy of the test disk, which [`crate::main`]'s `boot` makes fresh before the
+    /// guest starts and reads back after it exits; `None` without `QEMU_BLOCK_TEST`.
+    pub disk: Option<std::path::PathBuf>,
 }
 
 pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine, String> {
@@ -41,6 +44,9 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
     let s = |x: &str| x.to_string();
     let net_port = net_port(res)?;
+    let disk = res
+        .is_on(crate::testdisk::SYMBOL)
+        .then(|| crate::diskcheck::run_copy(image));
     let mem = format!("{}M", {
         let m = res.int("QEMU_MEMORY_MB");
         if m > 0 { m } else { 128 }
@@ -114,6 +120,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            disk: disk.clone(),
         });
     }
 
@@ -165,6 +172,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            disk: disk.clone(),
         });
     }
 
@@ -200,6 +208,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            disk: disk.clone(),
         });
     }
 
@@ -246,6 +255,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            disk: disk.clone(),
         });
     }
 
@@ -307,6 +317,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port: None,
+            disk: None,
         });
     }
 
@@ -320,15 +331,17 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
 /// The test disk, attached to a virtio-blk device of the given kind, when the
 /// configuration asks for it.
 ///
-/// `snapshot=on` keeps a run's writes off the file, so every boot reads the bytes kbuild
-/// wrote and the image stays reproducible. On `virt` a `virtio-blk-device` lands in one of
+/// The run's own copy of the image is attached, written for real: `boot` makes it fresh from
+/// the bytes kbuild wrote before the guest starts, so every boot reads those bytes and the image
+/// stays reproducible, and reads it back after the guest exits (`diskcheck`). On `virt` a
+/// `virtio-blk-device` lands in one of
 /// the memory-mapped virtio slots the device tree already lists; which one is for the
 /// kernel's enumeration to find out, not for this command line to promise.
 fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
     if !res.is_on(crate::testdisk::SYMBOL) {
         return Vec::new();
     }
-    let disk = crate::testdisk::beside(image);
+    let disk = crate::diskcheck::run_copy(image);
     // With an IOMMU in front of it, the device's DMA goes through the platform IOMMU: it
     // negotiates VIRTIO_F_ACCESS_PLATFORM and treats descriptor addresses as device
     // addresses the IOMMU translates. QEMU refuses the handshake unless `iommu_platform=on`
@@ -340,7 +353,7 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
     };
     let mut args = vec![
         "-drive".to_string(),
-        format!("file={},if=none,id=kt_disk,format=raw,snapshot=on", disk.display()),
+        format!("file={},if=none,id=kt_disk,format=raw", disk.display()),
         "-device".to_string(),
         format!("{device},drive=kt_disk"),
     ];

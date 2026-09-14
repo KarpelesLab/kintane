@@ -527,6 +527,9 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `sibling`, whose process slot and stack slots it reuses; and after `waits` has
     // finished, so the file server is serving a second process, not the check that started it.
     let files = crate::model::files_check(c);
+    // After `files`, whose process slot and stack slots it reuses once that check has torn its
+    // process down: the server writes the disk for one connection and refuses another.
+    let files_write = crate::model::files_write_check(c);
     // After `files`, which has torn its process down by now, and reusing its process slot:
     // the Linux program with the scheduler, forking and starting a thread.
     let linux = crate::model::linux_check(c);
@@ -557,6 +560,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(waits)
         .and(sibling)
         .and(files)
+        .and(files_write)
         .and(linux)
         .and(sockets)
         .and(isolation)

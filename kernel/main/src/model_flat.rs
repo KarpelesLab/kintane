@@ -67,6 +67,10 @@ pub fn files_check(_c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+pub fn files_write_check(_c: &dyn EarlyConsole) -> Check {
+    Check::Passed
+}
+
 pub fn waits_check(_c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }

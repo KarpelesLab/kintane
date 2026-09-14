@@ -37,4 +37,8 @@ units = [
     "net",
     "device",
     "virtio-blk",
+    "fat",
+    "bcache",
+    "vfs",
+    "block",
 ]

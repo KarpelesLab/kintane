@@ -9,6 +9,8 @@ mod build;
 mod buildid;
 mod cache;
 mod codegen;
+mod crashtest;
+mod diskcheck;
 mod dwarf;
 mod esp;
 mod fat16;
@@ -75,6 +77,10 @@ COMMANDS:
     stress --duration <len>
                          build a stress image and run it for <len> of guest time
                          (e.g. 90s, 10m, 24h), failing if its heartbeat stops
+    crashtest [--count <n>] [--seed <s>]
+                         build with FS_CRASH_TEST, kill the guest <n> times (default
+                         20) at random points while it writes its test disk, and
+                         check every image it leaves with kbuild's own FAT reader
     symbolize [log]      decode the backtrace in a guest console log against the
                          symbol bundle (default: the last `run` or `test --target`)
     clean                remove build outputs (the cache is kept)
@@ -460,6 +466,33 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                 None => Err("QEMU was terminated by a signal".into()),
             }
         }
+        "crashtest" => {
+            let mut copts = opts.clone();
+            // The workload never lets the boot finish, and nothing here serves the network
+            // check's peers or types the serial check's probes.
+            for (k, v) in [
+                ("QEMU_EXIT", "y"),
+                ("FS_CRASH_TEST", "y"),
+                ("QEMU_NET_TEST", "n"),
+                ("SERIAL_IRQ_TEST", "n"),
+            ] {
+                copts.sets.push((k.into(), v.into()));
+            }
+            let (image, res) = do_build(&root, &copts)?;
+            let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
+            let m = qemu::machine_for(&res, &image, &log)?;
+            let disk = m
+                .disk
+                .clone()
+                .ok_or("crashtest needs a configuration with QEMU_BLOCK_TEST")?;
+            println!(
+                "\n\x1b[36mcrashtest\x1b[0m {} cuts: {} {}\n",
+                opts.count,
+                m.binary,
+                m.args.join(" ")
+            );
+            crashtest::campaign(&m, &disk, opts.count, opts.seed.unwrap_or(1))
+        }
         "symbolize" => {
             let (_, res) = resolve_config(&root, &opts)?;
             let dir = root.join("build").join(res.str("TARGET"));
@@ -644,8 +677,12 @@ impl UserFlavor {
 }
 
 /// The names of `unit`'s transitive dependencies, walked over `ordered`.
-fn transitive_deps(unit: &graph::Unit, ordered: &[graph::Unit]) -> std::collections::BTreeSet<String> {
-    let by_name: BTreeMap<&str, &graph::Unit> = ordered.iter().map(|u| (u.name.as_str(), u)).collect();
+fn transitive_deps(
+    unit: &graph::Unit,
+    ordered: &[graph::Unit],
+) -> std::collections::BTreeSet<String> {
+    let by_name: BTreeMap<&str, &graph::Unit> =
+        ordered.iter().map(|u| (u.name.as_str(), u)).collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<String> = unit.deps.clone();
     while let Some(name) = stack.pop() {
@@ -856,6 +893,9 @@ fn boot(
     watch: Option<qemu::Watch>,
 ) -> Result<qemu::Outcome, String> {
     let dir = root.join("build").join(res.str("TARGET"));
+    if let Some(disk) = &m.disk {
+        diskcheck::fresh(disk)?;
+    }
     let outcome = qemu::run_watched(m, timeout, watch)?;
     let console = dir.join("console.log");
     std::fs::write(&console, &outcome.console)
@@ -877,6 +917,12 @@ fn boot(
     }
     if outcome.timed_out {
         return Err(format!("timed out after {timeout}s with no exit signal from the guest"));
+    }
+    // What the guest wrote to its disk, read back by kbuild's own reader. Only after a run the
+    // guest passed: a failed one has already failed, and its disk says nothing more.
+    if let (Some(disk), true) = (&m.disk, outcome.passed) {
+        let line = diskcheck::after_run(disk, &outcome.console)?;
+        println!("\n  {line}");
     }
     Ok(outcome)
 }

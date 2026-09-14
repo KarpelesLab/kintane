@@ -40,6 +40,8 @@
 pub mod memfs;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_tests;
 
 /// The longest single path component, and the longest name a directory entry can report.
 /// Eight-and-three names fit in twelve bytes; this leaves room for a filesystem with
@@ -75,6 +77,10 @@ pub enum Error {
     ReadOnly,
     /// The filesystem has no room for what was asked.
     Full,
+    /// Something already has the name a creation asked for.
+    Exists,
+    /// A directory to be removed, or replaced by a rename, still names something.
+    NotEmpty,
     /// The volume does not hold what its format requires. The string names the field, so
     /// a console with no formatter can still say what was wrong.
     Corrupt(&'static str),
@@ -154,11 +160,46 @@ pub trait FileSystem {
     /// the file, and zero once `offset` is at or past it.
     fn read_at(&mut self, node: NodeId, offset: u64, into: &mut [u8]) -> Result<usize, Error>;
 
-    /// Write `from` at `offset`, returning how much was written. Read-only by default,
-    /// which is what the on-disk filesystem is today.
+    /// Write `from` at `offset`, returning how much was written. Writing past the end
+    /// grows the file, with the bytes between its old end and `offset` reading as zeros.
+    /// Read-only by default: every operation that changes a filesystem is, so a filesystem
+    /// that only reads implements none of them.
     fn write_at(&mut self, node: NodeId, offset: u64, from: &[u8]) -> Result<usize, Error> {
         let _ = (node, offset, from);
         Err(Error::ReadOnly)
+    }
+
+    /// Create `name` in `dir`, an empty file or an empty directory. [`Error::Exists`] if
+    /// `dir` already names something `name`.
+    fn create(&mut self, dir: NodeId, name: &[u8], kind: Kind) -> Result<NodeId, Error> {
+        let _ = (dir, name, kind);
+        Err(Error::ReadOnly)
+    }
+
+    /// Make a file `len` bytes long: shorter gives back what is past it, longer reads as
+    /// zeros.
+    fn truncate(&mut self, node: NodeId, len: u64) -> Result<(), Error> {
+        let _ = (node, len);
+        Err(Error::ReadOnly)
+    }
+
+    /// Remove `name` from `dir`. A directory must be empty ([`Error::NotEmpty`]).
+    fn unlink(&mut self, dir: NodeId, name: &[u8]) -> Result<(), Error> {
+        let _ = (dir, name);
+        Err(Error::ReadOnly)
+    }
+
+    /// Give `from`, in `dir`, the name `to`, replacing what `to` named: a file by a file, or
+    /// an empty directory by a directory.
+    fn rename(&mut self, dir: NodeId, from: &[u8], to: &[u8]) -> Result<(), Error> {
+        let _ = (dir, from, to);
+        Err(Error::ReadOnly)
+    }
+
+    /// Make everything written so far durable. A filesystem that holds nothing back has
+    /// nothing to do.
+    fn sync(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 
     /// The `index`th entry of `dir`, or `None` once there are no more. `.` and `..` are
@@ -183,6 +224,37 @@ impl Fd {
     }
 }
 
+/// How [`Vfs::open_with`] opens a path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct OpenFlags {
+    /// Writes through the handle are allowed. Without it they are [`Error::ReadOnly`].
+    pub write: bool,
+    /// Create the file if nothing has the name.
+    pub create: bool,
+    /// With `create`, refuse a name that already exists ([`Error::Exists`]).
+    pub exclusive: bool,
+    /// With `write`, empty the file on opening it.
+    pub truncate: bool,
+    /// With `write`, every write goes at the end of the file, wherever the position is.
+    pub append: bool,
+}
+
+impl OpenFlags {
+    /// Reading only.
+    pub const READ: OpenFlags = OpenFlags {
+        write: false,
+        create: false,
+        exclusive: false,
+        truncate: false,
+        append: false,
+    };
+    /// Reading and writing a file that exists.
+    pub const READ_WRITE: OpenFlags = OpenFlags {
+        write: true,
+        ..OpenFlags::READ
+    };
+}
+
 /// Where a seek counts from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Whence {
@@ -199,6 +271,8 @@ struct Open {
     pos: u64,
     generation: u16,
     used: bool,
+    writable: bool,
+    append: bool,
 }
 
 impl Open {
@@ -209,6 +283,8 @@ impl Open {
         pos: 0,
         generation: 0,
         used: false,
+        writable: false,
+        append: false,
     };
 }
 
@@ -350,15 +426,72 @@ impl<'fs, const MOUNTS: usize, const OPEN: usize> Vfs<'fs, MOUNTS, OPEN> {
         Ok((slot, node, stat))
     }
 
+    /// Walk `path` to the directory holding its last component, and that component.
+    ///
+    /// The last component must be a name: the root, a path ending in `.` or a component too
+    /// long is [`Error::BadPath`]. Trailing slashes are ignored, so `/dir/` names `dir`.
+    fn resolve_parent<'p>(&mut self, path: &'p str) -> Result<(usize, NodeId, &'p [u8]), Error> {
+        let trimmed = path.trim_end_matches('/');
+        let cut = trimmed.rfind('/').ok_or(Error::BadPath)?;
+        let name = &trimmed.as_bytes()[cut + 1..];
+        if name.is_empty() || name == b"." || name == b".." || name.len() > MAX_NAME {
+            return Err(Error::BadPath);
+        }
+        let parent = if cut == 0 { "/" } else { &trimmed[..cut] };
+        let (mount, dir, stat) = self.resolve(parent)?;
+        if stat.kind != Kind::Dir {
+            return Err(Error::NotADirectory);
+        }
+        // A name that is itself a mount point belongs to the mount, not to the directory
+        // it covers.
+        let (covering, _) = self.mount_for(trimmed.as_bytes())?;
+        if covering != mount {
+            return Err(Error::BadPath);
+        }
+        Ok((mount, dir, name))
+    }
+
     /// What `path` names, without opening it.
     pub fn stat(&mut self, path: &str) -> Result<Stat, Error> {
         self.resolve(path).map(|(_, _, stat)| stat)
     }
 
-    /// Open `path`. Directories open too, so a caller can read them with
-    /// [`readdir`](Self::readdir); reading one as a file is refused.
+    /// Open `path`: a file for reading and writing, a directory for reading. Directories
+    /// open so a caller can read them with [`readdir`](Self::readdir); reading one as a
+    /// file is refused, and so is a write on a filesystem that does not write.
     pub fn open(&mut self, path: &str) -> Result<Fd, Error> {
-        let (mount, node, stat) = self.resolve(path)?;
+        let flags = match self.resolve(path)?.2.kind {
+            Kind::Dir => OpenFlags::READ,
+            Kind::File => OpenFlags::READ_WRITE,
+        };
+        self.open_with(path, flags)
+    }
+
+    /// Open `path` as `flags` say: creating it, emptying it, or refusing writes through the
+    /// handle.
+    pub fn open_with(&mut self, path: &str, flags: OpenFlags) -> Result<Fd, Error> {
+        if !self.open.iter().any(|o| !o.used) {
+            // Refused before anything is created, so a full table leaves no file behind.
+            return Err(Error::TooManyOpen);
+        }
+        let (mount, node, stat) = match self.resolve(path) {
+            Ok(_) if flags.create && flags.exclusive => return Err(Error::Exists),
+            Ok(found) => found,
+            Err(Error::NotFound) if flags.create => {
+                let (mount, dir, name) = self.resolve_parent(path)?;
+                let fs = self.fs_of(mount)?;
+                let node = fs.create(dir, name, Kind::File)?;
+                let stat = fs.stat(node)?;
+                (mount, node, stat)
+            }
+            Err(e) => return Err(e),
+        };
+        if flags.write && stat.kind == Kind::Dir {
+            return Err(Error::IsADirectory);
+        }
+        if flags.write && flags.truncate && stat.len != 0 {
+            self.fs_of(mount)?.truncate(node, 0)?;
+        }
         let index = self
             .open
             .iter()
@@ -376,6 +509,8 @@ impl<'fs, const MOUNTS: usize, const OPEN: usize> Vfs<'fs, MOUNTS, OPEN> {
             pos: 0,
             generation,
             used: true,
+            writable: flags.write,
+            append: flags.write && flags.append,
         };
         Ok(Fd {
             index: index as u16,
@@ -421,19 +556,82 @@ impl<'fs, const MOUNTS: usize, const OPEN: usize> Vfs<'fs, MOUNTS, OPEN> {
         Ok(n)
     }
 
-    /// Write at the handle's position, advancing it by what was written.
+    /// Write at the handle's position, advancing it by what was written. A handle opened
+    /// to append writes at the end of the file, and its position follows.
     pub fn write(&mut self, fd: Fd, from: &[u8]) -> Result<usize, Error> {
         let index = self.slot_of(fd)?;
-        let (mount, node, pos, kind) = {
+        let (mount, node, mut pos, kind, writable, append) = {
             let o = &self.open[index];
-            (o.mount, o.node, o.pos, o.kind)
+            (o.mount, o.node, o.pos, o.kind, o.writable, o.append)
         };
         if kind != Kind::File {
             return Err(Error::IsADirectory);
         }
-        let n = self.fs_of(mount)?.write_at(node, pos, from)?;
+        if !writable {
+            return Err(Error::ReadOnly);
+        }
+        let fs = self.fs_of(mount)?;
+        if append {
+            pos = fs.stat(node)?.len;
+        }
+        let n = fs.write_at(node, pos, from)?;
         self.open[index].pos = pos.saturating_add(n as u64);
         Ok(n)
+    }
+
+    /// Make the handle's file `len` bytes long. The position does not move.
+    pub fn truncate(&mut self, fd: Fd, len: u64) -> Result<(), Error> {
+        let index = self.slot_of(fd)?;
+        let o = &self.open[index];
+        let (mount, node, kind, writable) = (o.mount, o.node, o.kind, o.writable);
+        if kind != Kind::File {
+            return Err(Error::IsADirectory);
+        }
+        if !writable {
+            return Err(Error::ReadOnly);
+        }
+        self.fs_of(mount)?.truncate(node, len)
+    }
+
+    /// Make everything written to the handle's filesystem durable.
+    pub fn fsync(&mut self, fd: Fd) -> Result<(), Error> {
+        let mount = self.open[self.slot_of(fd)?].mount;
+        self.fs_of(mount)?.sync()
+    }
+
+    /// Make everything written to every mounted filesystem durable.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        let mut first = Ok(());
+        for m in self.mounts.iter_mut().flatten() {
+            if let Err(e) = m.fs.sync() {
+                first = first.and(Err(e));
+            }
+        }
+        first
+    }
+
+    /// Create an empty directory at `path`.
+    pub fn mkdir(&mut self, path: &str) -> Result<(), Error> {
+        let (mount, dir, name) = self.resolve_parent(path)?;
+        self.fs_of(mount)?.create(dir, name, Kind::Dir).map(|_| ())
+    }
+
+    /// Remove the file or empty directory at `path`.
+    pub fn unlink(&mut self, path: &str) -> Result<(), Error> {
+        let (mount, dir, name) = self.resolve_parent(path)?;
+        self.fs_of(mount)?.unlink(dir, name)
+    }
+
+    /// Rename `from` to `to`, which must be in the same directory: a rename that moves
+    /// something between directories is [`Error::BadPath`], because no filesystem here can
+    /// do one atomically.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        let (mount, dir, old) = self.resolve_parent(from)?;
+        let (to_mount, to_dir, new) = self.resolve_parent(to)?;
+        if mount != to_mount || dir != to_dir {
+            return Err(Error::BadPath);
+        }
+        self.fs_of(mount)?.rename(dir, old, new)
     }
 
     /// Move the handle's position. Seeking past the end is allowed and reads there return
@@ -457,6 +655,13 @@ impl<'fs, const MOUNTS: usize, const OPEN: usize> Vfs<'fs, MOUNTS, OPEN> {
         .ok_or(Error::OutOfRange)?;
         self.open[index].pos = next;
         Ok(next)
+    }
+
+    /// What the handle's file is now: its size after every write so far.
+    pub fn fstat(&mut self, fd: Fd) -> Result<Stat, Error> {
+        let o = &self.open[self.slot_of(fd)?];
+        let (mount, node) = (o.mount, o.node);
+        self.fs_of(mount)?.stat(node)
     }
 
     /// The handle's position, without moving it.

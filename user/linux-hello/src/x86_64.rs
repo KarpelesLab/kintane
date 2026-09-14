@@ -21,6 +21,14 @@ pub const GETTID: u64 = 186;
 pub const FUTEX: u64 = 202;
 pub const EXIT_GROUP: u64 = 231;
 pub const OPENAT: u64 = 257;
+pub const LSEEK: u64 = 8;
+pub const FSYNC: u64 = 74;
+pub const FTRUNCATE: u64 = 77;
+pub const MKDIRAT: u64 = 258;
+pub const UNLINKAT: u64 = 263;
+pub const RENAMEAT: u64 = 264;
+/// `open`, which x86_64 keeps beside `openat`.
+pub const OPEN: Option<u64> = Some(2);
 pub const PIPE2: u64 = 293;
 pub const GETRANDOM: u64 = 318;
 

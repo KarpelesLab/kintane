@@ -21,6 +21,14 @@ pub const GETTID: u64 = 178;
 pub const FUTEX: u64 = 98;
 pub const EXIT_GROUP: u64 = 94;
 pub const OPENAT: u64 = 56;
+pub const LSEEK: u64 = 62;
+pub const FSYNC: u64 = 82;
+pub const FTRUNCATE: u64 = 46;
+pub const MKDIRAT: u64 = 34;
+pub const UNLINKAT: u64 = 35;
+pub const RENAMEAT: u64 = 38;
+/// aarch64 has no `open`: a C library opens with `openat`.
+pub const OPEN: Option<u64> = None;
 pub const PIPE2: u64 = 59;
 pub const GETRANDOM: u64 = 278;
 

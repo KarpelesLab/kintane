@@ -97,6 +97,7 @@ mod tests {
             input: Vec::new(),
             serial_probe: false,
             net_port: None,
+            disk: None,
         });
         assert_eq!(m.args, ["-d", "guest_errors,cpu_reset", "-m"]);
     }

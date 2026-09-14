@@ -32,7 +32,7 @@ use fat::Fat16;
 use hal::{EarlyConsole, PhysAddr};
 use mm::phys::FrameAllocator;
 use time::{Duration, Instant};
-use vfs::{Error, Kind, Vfs, Whence};
+use vfs::{Error, Kind, OpenFlags, Vfs, Whence};
 
 use crate::{Check, Live, preempt, timekeeping, write_usize};
 
@@ -115,6 +115,29 @@ static LEASED: AtomicBool = AtomicBool::new(false);
 /// How often a thread waiting for the volume looks again.
 const LEASE_POLL: Duration = Duration::from_nanos(1_000_000);
 
+/// Bits for [`consistency`]: one per cluster of the test disk's volume, with room to spare.
+const BITMAP_BYTES: usize = 2048;
+
+/// SAFETY INVARIANT: borrowed only by [`consistency`], while [`BITMAP_BUSY`] is held.
+static BITMAP: SyncUnsafeCell<[u8; BITMAP_BYTES]> = SyncUnsafeCell::new([0; BITMAP_BYTES]);
+static BITMAP_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Walk `volume` for what a crash must never leave — see `fat::Fat16::check_consistency` — with
+/// a bitmap of this module's, so no caller needs a kilobyte of stack for one.
+/// [`Error::Device`] if another thread is walking at the same moment.
+pub fn consistency(volume: &mut Fat16<'_, '_>) -> Result<fat::Consistency, Error> {
+    if BITMAP_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Error::Device("another consistency walk holds the bitmap"));
+    }
+    // SAFETY: see `BITMAP`: the claim is this thread's.
+    let result = volume.check_consistency(unsafe { &mut *BITMAP.get() });
+    BITMAP_BUSY.store(false, Ordering::Release);
+    result
+}
+
 /// The volume, held by one thread until this is dropped.
 ///
 /// Every user of the volume once other threads can run takes one: the file server for each
@@ -175,7 +198,7 @@ pub fn lease(deadline: Option<Instant>) -> Option<Lease> {
 }
 
 /// What an error names, for a console with no formatter.
-fn describe(e: Error) -> &'static str {
+pub(crate) fn describe(e: Error) -> &'static str {
     match e {
         Error::NotFound => "not found",
         Error::NotADirectory => "not a directory",
@@ -188,6 +211,8 @@ fn describe(e: Error) -> &'static str {
         Error::OutOfRange => "out of range",
         Error::ReadOnly => "read-only",
         Error::Full => "full",
+        Error::Exists => "it already exists",
+        Error::NotEmpty => "a directory that is not empty",
         Error::Corrupt(what) | Error::Device(what) => what,
     }
 }
@@ -245,6 +270,9 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'static, Cpu>, li
     }
     ok &= cache_books(c, &fat);
     ok &= write_through(c, disk);
+    if kconfig::FS_CRASH_TEST {
+        crash_writes(c, fat);
+    }
 
     // SAFETY: the one write to `VOLUME`, before `MOUNTED` makes it reachable.
     unsafe { *VOLUME.0.get() = Some(fat) };
@@ -551,4 +579,143 @@ fn write_through(c: &dyn EarlyConsole, disk: &dyn BlockDevice) -> bool {
     }
     c.write_str("; a write through the cache read back fresh");
     true
+}
+
+// ---- the crash test's workload -----------------------------------------------------------
+
+/// The directory `FS_CRASH_TEST`'s workload writes, its files, and the seed of every byte it
+/// writes there; mirrored in `kbuild/src/diskcheck.rs`, which checks them after each cut.
+const CRASH_DIR: &str = "/CRASH";
+const CRASH_FILES: [&str; 6] = [
+    "/CRASH/F0.BIN",
+    "/CRASH/F1.BIN",
+    "/CRASH/F2.BIN",
+    "/CRASH/F3.BIN",
+    "/CRASH/F4.BIN",
+    "/CRASH/F5.BIN",
+];
+const CRASH_SEED: u8 = 0x41;
+
+/// `FS_CRASH_TEST`: write the volume for ever, for `kbuild crashtest` to cut off at a random
+/// point. Every byte of every file below [`CRASH_DIR`] is `out_byte(CRASH_SEED, offset)`,
+/// whichever file it was written through and however it was renamed since, so after any cut a
+/// byte below a file's size that is anything else was never written there. Never returns.
+fn crash_writes(c: &dyn EarlyConsole, mut fat: Fat16<'static, 'static>) -> ! {
+    let mut ns = Vfs::<1, 1>::new();
+    if ns.mount("/", &mut fat).is_err() {
+        c.write_str("\nfscrash: THE VOLUME DID NOT MOUNT\n");
+        halt();
+    }
+    let _ = ns.mkdir(CRASH_DIR);
+    let _ = ns.sync();
+    c.write_str("\nfscrash: writing\n");
+    // Where the cut lands decides what it catches; the operations it catches vary too.
+    let mut rng = 0x2545_f491_4f6c_dd1d
+        ^ timekeeping::now()
+            .saturating_duration_since(Instant::from_nanos(0))
+            .as_nanos() as u64;
+    let mut ops = 0usize;
+    loop {
+        let r = xorshift(&mut rng);
+        let pick = |bits: u64| CRASH_FILES[(bits % CRASH_FILES.len() as u64) as usize];
+        let file = pick(r);
+        let result = match (r >> 8) % 10 {
+            0..=3 => crash_append(&mut ns, file, 1 + (r >> 16) % 3000),
+            4 | 5 => crash_overwrite(&mut ns, file, r >> 20),
+            6 => crash_truncate(&mut ns, file, r >> 24),
+            7 => ns.unlink(file),
+            8 => match pick(r >> 32) {
+                to if to == file => Ok(()),
+                to => ns.rename(file, to),
+            },
+            _ => ns.mkdir("/CRASH/D").or_else(|_| ns.unlink("/CRASH/D")),
+        };
+        // A missing file, a full volume: the workload's own business. A corrupt volume is not.
+        if let Err(Error::Corrupt(what)) = result {
+            c.write_str("fscrash: THE VOLUME IS CORRUPT: ");
+            c.write_str(what);
+            c.write_str("\n");
+            halt();
+        }
+        if (r >> 40) % 8 == 0 {
+            let _ = ns.sync();
+        }
+        ops += 1;
+        if ops % 32 == 0 {
+            c.write_str("fscrash: ");
+            write_usize(c, ops);
+            c.write_str(" ops\n");
+        }
+    }
+}
+
+fn halt() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Write `len` of the crash workload's bytes at `start` of the open file `fd`, whose position is
+/// already there.
+fn crash_fill(ns: &mut Vfs<'_, 1, 1>, fd: vfs::Fd, start: u64, len: u64) -> Result<(), Error> {
+    let mut chunk = [0u8; 512];
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(chunk.len() as u64) as usize;
+        for (i, b) in chunk[..n].iter_mut().enumerate() {
+            *b = testdisk::out_byte(CRASH_SEED, (start + done) as usize + i);
+        }
+        ns.write(fd, &chunk[..n])?;
+        done += n as u64;
+    }
+    Ok(())
+}
+
+/// Run `f` on `path` opened as `flags` say, closing it whatever `f` did.
+fn crash_with(
+    ns: &mut Vfs<'_, 1, 1>,
+    path: &str,
+    flags: OpenFlags,
+    f: impl FnOnce(&mut Vfs<'_, 1, 1>, vfs::Fd, u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let fd = ns.open_with(path, flags)?;
+    let result = match ns.fstat(fd) {
+        Ok(stat) => f(ns, fd, stat.len),
+        Err(e) => Err(e),
+    };
+    let _ = ns.close(fd);
+    result
+}
+
+fn crash_append(ns: &mut Vfs<'_, 1, 1>, path: &str, len: u64) -> Result<(), Error> {
+    let flags = OpenFlags {
+        write: true,
+        create: true,
+        append: true,
+        ..OpenFlags::READ
+    };
+    crash_with(ns, path, flags, |ns, fd, size| crash_fill(ns, fd, size, len))
+}
+
+fn crash_overwrite(ns: &mut Vfs<'_, 1, 1>, path: &str, r: u64) -> Result<(), Error> {
+    crash_with(ns, path, OpenFlags::READ_WRITE, |ns, fd, size| {
+        if size == 0 {
+            return Ok(());
+        }
+        let at = r % size;
+        let len = (1 + (r >> 12) % 700).min(size - at);
+        ns.seek(fd, Whence::Start, at as i64)?;
+        crash_fill(ns, fd, at, len)
+    })
+}
+
+fn crash_truncate(ns: &mut Vfs<'_, 1, 1>, path: &str, r: u64) -> Result<(), Error> {
+    crash_with(ns, path, OpenFlags::READ_WRITE, |ns, fd, size| ns.truncate(fd, r % (size + 1)))
 }

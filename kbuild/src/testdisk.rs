@@ -13,8 +13,9 @@
 //!   builds one — the user program, so the kernel can load a program from a disk.
 //!
 //! The image is a pure function of its constants and the program's bytes, so it is
-//! byte-identical on every build. QEMU attaches it with `snapshot=on`, so a test run's
-//! writes never reach the file and every boot starts from the same bytes.
+//! byte-identical on every build. A run attaches a fresh copy of it (see `diskcheck`), so a
+//! test run's writes never reach the file and every boot starts from the same bytes, and kbuild
+//! reads the copy back after the guest exits to check what the kernel wrote.
 
 use std::path::{Path, PathBuf};
 
@@ -23,11 +24,11 @@ use crate::fat16::{self, File, Params};
 const MAGIC: &[u8; 8] = b"KTBLKDSK";
 const VERSION: u32 = 2;
 const HEADER_BYTES: usize = 16;
-const SECTOR: usize = 512;
+pub const SECTOR: usize = 512;
 const SCRATCH_START: u64 = 4096;
 const SCRATCH_SECTORS: u64 = 256;
 /// The volume's first sector: right after the scratch area.
-const FS_START: u64 = SCRATCH_START + SCRATCH_SECTORS;
+pub const FS_START: u64 = SCRATCH_START + SCRATCH_SECTORS;
 /// 4 MiB of FAT16 with one sector per cluster, which is 8 095 clusters: FAT16 by the
 /// specification's count, and small enough to write on every build.
 const FS_SECTORS: u64 = 8192;
@@ -49,6 +50,24 @@ const BIG_LEN: usize = 100_000;
 const PROGRAM: &str = "KINTANE/INIT.ELF";
 /// Where the static Linux program goes; mirrors `LINUX_PROGRAM_PATH` in the kernel's copy.
 const LINUX_PROGRAM: &str = "KINTANE/LINUX.ELF";
+/// What the kernel's writing checks leave on the volume, which kbuild reads back from the
+/// disk after the guest exits; mirrors `NATIVE_OUT_*` and `LINUX_OUT_*` in the kernel's copy.
+pub const NATIVE_OUT: (&str, usize, u8) = ("KINTANE/NATIVE.OUT", 1000, 0x4e);
+pub const LINUX_OUT: (&str, usize, u8) = ("KINTANE/LINUX.OUT", 2000, 0x4c);
+/// Names the writing checks make and remove again, which must be gone.
+pub const REMOVED: [&str; 5] = [
+    "KINTANE/NWTMP.TXT",
+    "KINTANE/NWREN.TXT",
+    "KINTANE/NWDIR",
+    "KINTANE/LXTMP.TXT",
+    "KINTANE/LXDIR",
+];
+
+/// The byte at offset `i` of a file a writing check of `seed`'s leaves on the volume.
+pub const fn out_byte(seed: u8, i: usize) -> u8 {
+    let x = (i as u32).wrapping_mul(2_654_435_761) ^ (seed as u32).wrapping_mul(0x9E37_79B9);
+    (x >> 23) as u8 ^ seed
+}
 
 const fn pattern(sector: u64, offset: usize) -> u8 {
     let s = (sector as u32).wrapping_mul(2_654_435_761);
@@ -140,14 +159,28 @@ pub fn write(out: &Path, program: Option<&Path>, linux: Option<&Path>) -> Result
     Ok(path)
 }
 
-/// The image's path, for a QEMU command line, given the kernel image QEMU boots.
-pub fn beside(image: &Path) -> PathBuf {
-    image.parent().unwrap_or(Path::new(".")).join(FILE)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(seed, offset, byte)` of `out_byte`: the same triples the kernel's side pins.
+    const PINNED_OUT: [(u8, usize, u8); 8] = [
+        (0x4e, 0, 0x27),
+        (0x4e, 1, 0x1b),
+        (0x4e, 511, 0x86),
+        (0x4e, 999, 0xf3),
+        (0x4c, 0, 0xbc),
+        (0x4c, 1, 0x80),
+        (0x4c, 511, 0x1d),
+        (0x4c, 999, 0x68),
+    ];
+
+    #[test]
+    fn the_pinned_bytes_of_a_written_file_match_the_kernels_side() {
+        for (seed, offset, byte) in PINNED_OUT {
+            assert_eq!(out_byte(seed, offset), byte, "seed {seed:#x} offset {offset}");
+        }
+    }
 
     /// `(sector, offset, byte)`: the same triples `kernel/block/src/testdisk.rs` pins.
     const PINNED: [(u64, usize, u8); 4] = [
