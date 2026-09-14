@@ -28,6 +28,10 @@ pub const VERSION_1_BIT: u32 = 1 << 0;
 /// The virtio device type for a block device (virtio 1.1 §5.2).
 pub const DEVICE_ID_BLOCK: u32 = 2;
 
+/// What a vector field holds when no MSI-X vector is assigned, and what a device reads back
+/// when it refuses one (virtio 1.1 §4.1.4.3, §4.1.5.1.3).
+pub const NO_VECTOR: u16 = 0xffff;
+
 /// Why bring-up failed. Each is a distinct thing that can be wrong with a device, because
 /// "the disk did not come up" is not a diagnosis.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,6 +54,9 @@ pub enum Error {
     BadGeometry,
     /// The device did not answer a request in time.
     Timeout,
+    /// The device would not take the MSI-X vector it was given for a queue: it read back
+    /// [`NO_VECTOR`], which is how a device says the vector is out of its table.
+    VectorRefused { queue: u16 },
 }
 
 /// Where a virtio device's registers are, and how to reach them.
@@ -76,6 +83,21 @@ pub trait Transport {
     /// Read and acknowledge the interrupt status, returning what was pending. Zero when
     /// the device did not raise the interrupt, which is how a shared line is shared.
     fn ack_interrupt(&self) -> u32;
+
+    /// Give configuration-change interrupts MSI-X vector `vector`, and return what the
+    /// device reads back: [`NO_VECTOR`] when it refused. A transport without MSI-X — the
+    /// memory-mapped one — answers `NO_VECTOR` to everything.
+    fn set_config_vector(&self, vector: u16) -> u16 {
+        let _ = vector;
+        NO_VECTOR
+    }
+
+    /// Give queue `index`'s interrupts MSI-X vector `vector`, and return what the device reads
+    /// back, on the same terms as [`Self::set_config_vector`].
+    fn set_queue_vector(&self, index: u16, vector: u16) -> u16 {
+        let _ = (index, vector);
+        NO_VECTOR
+    }
 
     /// A byte of the device-specific configuration.
     fn config_read8(&self, offset: usize) -> u8;

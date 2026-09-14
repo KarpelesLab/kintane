@@ -196,6 +196,18 @@ impl Transport for AnyTransport {
             AnyTransport::Pci(t) => t.ack_interrupt(),
         }
     }
+    fn set_config_vector(&self, vector: u16) -> u16 {
+        match self {
+            AnyTransport::Mmio(t) => t.set_config_vector(vector),
+            AnyTransport::Pci(t) => t.set_config_vector(vector),
+        }
+    }
+    fn set_queue_vector(&self, index: u16, vector: u16) -> u16 {
+        match self {
+            AnyTransport::Mmio(t) => t.set_queue_vector(index, vector),
+            AnyTransport::Pci(t) => t.set_queue_vector(index, vector),
+        }
+    }
     fn config_read8(&self, offset: usize) -> u8 {
         match self {
             AnyTransport::Mmio(t) => t.config_read8(offset),
@@ -295,6 +307,9 @@ pub struct VirtioBlk<L: LockFamily, T: Transport = AnyTransport> {
     /// Polls of the used ring before a request is called lost; [`POLL_LIMIT`] unless a
     /// test shortens it.
     poll_limit: u32,
+    /// Whether the queue signals on an MSI-X vector of its own, in which case the device does
+    /// not set the interrupt status register for it and [`Self::on_interrupt`] must not ask.
+    msix: bool,
 }
 
 /// The lock class of a device's queue, for the lock-order checker.
@@ -305,9 +320,37 @@ impl<L: LockFamily, T: Transport> VirtioBlk<L, T> {
     /// geometry read out of its configuration space.
     ///
     /// `dma` is memory the device may read and write for as long as the driver lives.
-    pub fn bring_up(transport: T, mut dma: Dma) -> Result<VirtioBlk<L, T>, Error> {
+    pub fn bring_up(transport: T, dma: Dma) -> Result<VirtioBlk<L, T>, Error> {
+        Self::bring_up_with_vector(transport, dma, None)
+    }
+
+    /// [`Self::bring_up`], with the request queue's interrupts on MSI-X table entry `vector`
+    /// when it is `Some`.
+    ///
+    /// For a device whose platform wired that entry: its table programmed, MSI-X enabled
+    /// and a handler registered. One vector, for the one queue. Configuration changes are
+    /// given none, because the driver reads the configuration once, here, and never asks
+    /// again; a device that signals a change has nobody to tell.
+    ///
+    /// The vector is written after `negotiate`'s reset, which forgets it, and before the
+    /// queue is enabled, and read back: a device refuses one that is not in its table by
+    /// reading [`transport::NO_VECTOR`], and a queue that silently kept no vector would
+    /// never interrupt at all. So a refusal fails bring-up with [`Error::VectorRefused`].
+    pub fn bring_up_with_vector(
+        transport: T,
+        mut dma: Dma,
+        vector: Option<u16>,
+    ) -> Result<VirtioBlk<L, T>, Error> {
         let wanted = [F_BLK_SIZE | F_FLUSH, transport::VERSION_1_BIT];
         let accepted = transport::negotiate(&transport, transport::DEVICE_ID_BLOCK, wanted)?;
+
+        transport.set_config_vector(transport::NO_VECTOR);
+        if let Some(v) = vector {
+            if transport.set_queue_vector(QUEUE_INDEX, v) != v {
+                transport.set_status(transport::status::FAILED);
+                return Err(Error::VectorRefused { queue: QUEUE_INDEX });
+            }
+        }
 
         let ring = transport::carve_ring(&mut dma, QUEUE_SIZE)?;
         transport::setup_queue(&transport, QUEUE_INDEX, &ring)?;
@@ -377,7 +420,13 @@ impl<L: LockFamily, T: Transport> VirtioBlk<L, T> {
             read_only: accepted[0] & F_RO != 0,
             flush_supported: accepted[0] & F_FLUSH != 0,
             poll_limit: POLL_LIMIT,
+            msix: vector.is_some(),
         })
+    }
+
+    /// Whether the queue was given an MSI-X vector at bring-up.
+    pub fn uses_msix(&self) -> bool {
+        self.msix
     }
 
     /// Give up on a request after `polls` empty polls of the used ring. For a test of the
@@ -435,9 +484,13 @@ impl<L: LockFamily, T: Transport> VirtioBlk<L, T> {
     ///
     /// Returns whether the interrupt was this device's, which is how a shared line is
     /// shared.
+    ///
+    /// On an MSI-X vector there is nothing to acknowledge and nothing to share: the vector is
+    /// this queue's alone, and the device does not set the status register for a queue
+    /// interrupt it delivers that way (virtio 1.1 §4.1.4.5). Asking would read zero and
+    /// throw away every completion the interrupt announced, so the handler does not ask.
     pub fn on_interrupt(&self) -> bool {
-        let pending = self.transport.ack_interrupt();
-        if pending == 0 {
+        if !self.msix && self.transport.ack_interrupt() == 0 {
             return false;
         }
         L::with(&self.inner, |inner| {
@@ -673,6 +726,9 @@ impl<L: LockFamily, T: Transport> BlockDevice for VirtioBlk<L, T> {
 /// configuration space once the enumerator is gone.
 struct Claims {
     mmio: MmioClaim,
+    /// The window the MSI-X table is in, when it is not the registers' BAR. Claimed for the
+    /// platform, which programs the table through it.
+    table: Option<MmioClaim>,
     irq: Option<IrqLine>,
     bus: Bus,
 }
@@ -697,6 +753,23 @@ pub fn window() -> Option<(u64, u64)> {
 /// Whether an interrupt line was claimed for the device.
 pub fn has_irq() -> bool {
     CLAIMS.get().is_some_and(|c| c.irq.is_some())
+}
+
+/// The MSI-X table entry the device's interrupt was claimed as, if it was one: what
+/// [`VirtioBlk::bring_up_with_vector`] is given once the platform has wired it.
+pub fn msix_entry() -> Option<u16> {
+    let line = CLAIMS.get()?.irq.as_ref()?;
+    device::msi::vector_of(line.specifier().cells())
+}
+
+/// The window claimed for the MSI-X table, as a physical `(address, length)`, when it is
+/// not the registers' window.
+pub fn msix_table_window() -> Option<(u64, u64)> {
+    CLAIMS
+        .get()?
+        .table
+        .as_ref()
+        .map(|t| (t.phys(), t.len()))
 }
 
 /// The transport for the bound device, of whichever kind its bus is.
@@ -787,11 +860,44 @@ impl Driver for VirtioBlkDriver {
                 (mmio, Bus::Mmio)
             }
         };
+        // The interrupt, best first. MSI-X where the platform delivers messages and the
+        // function has a table: it needs no route, and its entry can name any CPU. The table
+        // is programmed by the platform through a window this probe claimed, so its BAR is
+        // claimed too when it is not the registers' BAR (QEMU puts it in BAR 1, the
+        // structures in BAR 4). Otherwise the line.
+        //
         // A device whose interrupt is malformed or taken can still be polled, so an
         // interrupt that cannot be claimed is not a reason to refuse the disk.
-        let irq = p.claim_irq(0).ok();
+        let mut table = None;
+        let mut irq = None;
+        if let (Some(f), Bus::Pci { bar, .. }) = (function, &bus) {
+            if let Some(cap) = device::msi::msix(f).filter(|_| p.msi_available()) {
+                let reachable = if cap.table_bar == *bar {
+                    true
+                } else if let Some(index) = f.memory_bar_index(cap.table_bar) {
+                    table = Some(p.claim_mmio(index, "virtio-blk MSI-X table")?);
+                    true
+                } else {
+                    false
+                };
+                if reachable {
+                    irq = p.claim_msi(0).ok();
+                }
+            }
+        }
+        let irq = match irq {
+            Some(vector) => Some(vector),
+            None => p.claim_irq(0).ok(),
+        };
         // SAFETY: probe runs during single-threaded boot.
-        unsafe { CLAIMS.set(Claims { mmio, irq, bus }) }
+        unsafe {
+            CLAIMS.set(Claims {
+                mmio,
+                table,
+                irq,
+                bus,
+            })
+        }
             .map(|_| ())
             .map_err(|_| ProbeError::Declined("one virtio-blk device is supported"))
     }

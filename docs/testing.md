@@ -365,14 +365,35 @@ a waiting caller never drains the ring itself, interrupts are enabled, and 32 re
 each return the pattern with every completion collected in the handler and none polled:
 
 ```
-  block irq  line 79; 32 requests, 32 completions in 32 interrupts, 0 polled ok
+  block irq  line 16, MSI-X; 32 requests, 32 completions in 32 interrupts, 0 polled ok
 ```
 
-On i686 the line is the one firmware programmed into the PCI function (11 under QEMU's
-`pc`), wired through the 8259A. On x86_64 the check reports the disk as polled and skips:
-the I/O APIC is reached only through `_PRT` or MSI-X, neither of which the kernel has
-([architecture.md](architecture.md#device--the-device-framework)). A lost interrupt is a
-request that times out, which fails the check rather than hanging it.
+The interrupt differs by port:
+
+- **x86_64** (`x86_64-qemu`, `x86_64-efi`, `x86_64-efistub`, `x86_64-qemu-smp`): MSI-X entry 0
+  of QEMU's virtio-blk-pci function, delivered to the boot CPU's local APIC. Discovery reports
+  `virtio-blk receives MSI-X entry 0 on line 16, vector 48`. It fails the boot if a test run's
+  disk came up on anything else, so a fallback cannot quietly turn these checks into skips
+  ([architecture.md](architecture.md#device--the-device-framework), "PCI interrupts").
+- **i686**: the line firmware programmed into the PCI function, 11 under QEMU's `pc`, wired
+  through the 8259A.
+- **aarch64**: the slot's SPI.
+
+A lost interrupt is a request that times out, which fails the check rather than hanging it.
+
+After the secondary CPUs start, the `block cpu` line moves the disk's interrupt to CPU 1. It
+repeats the reads from CPU 0 with CPU 0's interrupts masked, so only a handler running on CPU 1
+can collect a completion. The platform counts which CPU each interrupt's handler ran on. Every
+interrupt in the run must be on CPU 1 and none on CPU 0, and the interrupt is moved back
+afterwards, pass or fail:
+
+```
+  block cpu  line 16 to CPU 1; 32 requests, 32 completions in 32 interrupts, 0 polled; taken on CPU 1: 32, on CPU 0: 0 ok
+```
+
+It runs on `x86_64-qemu-smp`. It skips where the interrupt is a line, which cannot be moved,
+and where no second CPU is online. A kernel built with `SMP` whose QEMU has a second CPU that
+is not online fails instead of skipping.
 
 The driver's protocol is host-tested without QEMU:
 
@@ -380,12 +401,30 @@ The driver's protocol is host-tested without QEMU:
   offset, and answers virtio-blk requests against a RAM disk.
 - The tests cover the handshake and every refusal in it, reads, writes, splits, a device
   error, a device that never answers, and a thousand requests with no descriptor lost.
+- The queue's MSI-X vector is written after the reset and before the queue is enabled. A
+  vector past the table fails bring-up, and an MSI-X interrupt collects completions without
+  reading the status register.
+- Beneath the driver, `device::msi` has its own tests:
+  - capabilities decoded, including a reserved BAR refused;
+  - MSI and MSI-X enabled through a configuration space that keeps read-only bits and records
+    the order of writes;
+  - an MSI-X table over a buffer that refuses a message to an unmasked entry and any entry past
+    its end;
+  - `Probe::claim_msi`, which grants a vector only where the platform delivers messages and
+    only up to the table's size.
+
+  `apic::msi` is tested for the address and data a message carries, including a destination
+  above 255 being refused rather than truncated.
 
 In a stress run two block workloads, `block` and `block B`, each write random runs of their
 own half of the scratch area and read them back, read the untouched part against the
 pattern, and flush. At every audit the driver must report nothing in flight and every
 descriptor on the ring, and a run with a disk fails if the two were never outstanding at
-once: the heartbeat's `peak in flight` must reach 2.
+once: the heartbeat's `peak in flight` must reach 2. Where the disk has an interrupt, the
+run puts the driver in interrupt-driven mode throughout. Every audit fails the run if even
+one completion was collected by polling, and the heartbeat reports `by interrupt` and
+`polled`. On `x86_64-qemu-smp` at 8 CPUs for 60 s both block workloads ran on MSI-X:
+82,177 requests, 130,271 completions by interrupt, 0 polled, 60 audits.
 
 Letting a request wait with the lock released, rather than polling to completion under
 it, roughly doubled what the disk serves under the same load. Requests in 20 s of guest

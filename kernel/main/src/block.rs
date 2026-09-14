@@ -117,7 +117,11 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         c.write_str("the device's window is outside the address space");
         return Check::Failed;
     };
-    let blk = match VirtioBlk::<Locks>::bring_up(transport, dma) {
+    // The queue on its MSI-X entry when that is how the platform wired the disk's interrupt;
+    // on a line, or polled, bring-up needs to know nothing.
+    let vector = virtio_blk::msix_entry()
+        .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi));
+    let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(b) => b,
         Err(e) => {
             c.write_str("bring-up FAILED: ");
@@ -302,16 +306,158 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
     };
     c.write_str("line ");
     write_usize(c, line as usize);
+    if blk.uses_msix() {
+        c.write_str(", MSI-X");
+    }
 
+    // SAFETY: the interrupt path is up (the interrupt selftest ran), the disk's handler is
+    // registered and its line enabled, and the scheduler's hook is not installed yet, so an
+    // interrupt taken here returns to the reads.
+    let run = unsafe { reads_by_interrupt(blk, true) };
+    if run.report(c) {
+        c.write_str(" ok");
+        Check::Passed
+    } else {
+        Check::Failed
+    }
+}
+
+/// The CPU the disk's interrupt is moved to, and back from.
+const ROUTED_CPU: usize = 1;
+
+/// The disk's interrupt, delivered to a CPU other than the one waiting for it.
+///
+/// Where the platform can move the interrupt — a message-signalled one, whose target CPU is
+/// a field of the message — it is pointed at CPU 1, and the interrupt check's reads are made
+/// again from the boot CPU with the boot CPU's interrupts left masked. A completion can then
+/// be collected only by the handler running on CPU 1. The platform's per-CPU count must
+/// show that every interrupt of the run was taken there and none on CPU 0. The interrupt is
+/// moved back before the result is reported, pass or fail.
+///
+/// Skipped where the interrupt is a line, or there is one CPU; failed where QEMU was given a
+/// second CPU that is not online, which would otherwise skip what it should prove.
+pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
+    let Some(blk) = disk() else {
+        c.write_str("skipped: no block device");
+        return Check::Skipped;
+    };
+    let Some(line) = platform::block_line().filter(|l| platform::interrupt_is_msi(*l)) else {
+        c.write_str("skipped: the disk's interrupt is not one the platform can move");
+        return Check::Skipped;
+    };
+    if !platform::secondary_online(ROUTED_CPU) {
+        if kconfig::SMP && kconfig::QEMU_CPUS > ROUTED_CPU {
+            c.write_str("CPU 1 IS NOT ONLINE, THOUGH QEMU HAS IT");
+            return Check::Failed;
+        }
+        c.write_str("skipped: no second CPU online");
+        return Check::Skipped;
+    }
+    if let Err(why) = platform::route_interrupt(line, ROUTED_CPU) {
+        c.write_str("LINE NOT ROUTED TO CPU 1: ");
+        c.write_str(why);
+        return Check::Failed;
+    }
+    c.write_str("line ");
+    write_usize(c, line as usize);
+    c.write_str(" to CPU 1");
+
+    let taken = |cpu| platform::interrupts_on_cpu(line, cpu);
+    let (boot_before, routed_before) = (taken(0), taken(ROUTED_CPU));
+    // SAFETY: interrupts stay masked on this CPU, which is the point: the handler has to run
+    // on the one the line was routed to.
+    let run = unsafe { reads_by_interrupt(blk, false) };
+    let (boot, routed) = (taken(0) - boot_before, taken(ROUTED_CPU) - routed_before);
+    let back = platform::route_interrupt(line, 0);
+
+    let mut ok = run.report(c);
+    c.write_str("; taken on CPU 1: ");
+    write_usize(c, routed as usize);
+    c.write_str(", on CPU 0: ");
+    write_usize(c, boot as usize);
+    if routed == 0 || routed != run.interrupts {
+        c.write_str(", NOT EVERY INTERRUPT WAS TAKEN ON CPU 1");
+        ok = false;
+    }
+    if boot != 0 {
+        c.write_str(", AN INTERRUPT WAS TAKEN ON CPU 0");
+        ok = false;
+    }
+    if let Err(why) = back {
+        c.write_str(", NOT ROUTED BACK TO CPU 0: ");
+        c.write_str(why);
+        ok = false;
+    }
+    if ok {
+        c.write_str(" ok");
+        Check::Passed
+    } else {
+        Check::Failed
+    }
+}
+
+/// What a run of reads with completions collected only by the handler came to.
+struct IrqRun {
+    made: u64,
+    by_interrupt: u64,
+    interrupts: u64,
+    polled: u64,
+    failure: Option<&'static str>,
+    leaked: bool,
+}
+
+impl IrqRun {
+    /// Write the run's numbers, then whatever is wrong with it. Returns whether nothing is.
+    fn report(&self, c: &dyn EarlyConsole) -> bool {
+        c.write_str("; ");
+        write_usize(c, self.made as usize);
+        c.write_str(" requests, ");
+        write_usize(c, self.by_interrupt as usize);
+        c.write_str(" completions in ");
+        write_usize(c, self.interrupts as usize);
+        c.write_str(" interrupts, ");
+        write_usize(c, self.polled as usize);
+        c.write_str(" polled");
+
+        if let Some(why) = self.failure {
+            c.write_str(", ");
+            c.write_str(why);
+            return false;
+        }
+        if self.polled != 0 {
+            c.write_str(", A COMPLETION WAS COLLECTED WITHOUT ITS INTERRUPT");
+            return false;
+        }
+        if self.by_interrupt != self.made || self.interrupts == 0 {
+            c.write_str(", NOT EVERY COMPLETION ARRIVED BY INTERRUPT");
+            return false;
+        }
+        if self.leaked {
+            c.write_str(", A REQUEST OR DESCRIPTOR LEAKED");
+            return false;
+        }
+        true
+    }
+}
+
+/// Make [`IRQ_REQUESTS`] reads with the driver in interrupt-driven mode, and count.
+///
+/// With `enable`, interrupts are enabled on this CPU for the reads and masked again after.
+///
+/// # Safety
+/// With `enable`, the interrupt path must be up, the disk's handler registered and its
+/// interrupt enabled, and an interrupt taken on this CPU must return here: the scheduler's
+/// hook not yet installed.
+unsafe fn reads_by_interrupt(blk: &VirtioBlk<Locks>, enable: bool) -> IrqRun {
     let (irqs_before, via_irq_before) = blk.interrupt_counts();
     let polled_before = blk.polled_completions();
     let (issued_before, _, _, _) = blk.counters();
 
     blk.set_interrupt_driven(true);
-    // SAFETY: the interrupt path is up (the interrupt selftest ran), the disk's handler is
-    // registered and its line enabled, and the scheduler's hook is not installed yet, so an
-    // interrupt taken here returns to this loop.
-    unsafe { arch::tick::enable_interrupts() };
+    if enable {
+        // SAFETY: the caller's contract.
+        unsafe { arch::tick::enable_interrupts() };
+    }
     let mut sector = [0u8; testdisk::SECTOR];
     let mut failure = None;
     for i in 0..IRQ_REQUESTS {
@@ -331,44 +477,22 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
             }
         }
     }
-    // Masked again for the rest of bring-up, which runs masked.
-    let _ = Cpu::irq_save();
+    if enable {
+        // Masked again for the rest of bring-up, which runs masked.
+        let _ = Cpu::irq_save();
+    }
     blk.set_interrupt_driven(false);
 
     let (irqs, via_irq) = blk.interrupt_counts();
-    let polled = blk.polled_completions() - polled_before;
     let (issued, completed, in_flight, clean) = blk.counters();
-    let made = issued - issued_before;
-    let by_interrupt = via_irq - via_irq_before;
-    c.write_str("; ");
-    write_usize(c, made as usize);
-    c.write_str(" requests, ");
-    write_usize(c, by_interrupt as usize);
-    c.write_str(" completions in ");
-    write_usize(c, (irqs - irqs_before) as usize);
-    c.write_str(" interrupts, ");
-    write_usize(c, polled as usize);
-    c.write_str(" polled");
-
-    if let Some(why) = failure {
-        c.write_str(", ");
-        c.write_str(why);
-        return Check::Failed;
+    IrqRun {
+        made: issued - issued_before,
+        by_interrupt: via_irq - via_irq_before,
+        interrupts: irqs - irqs_before,
+        polled: blk.polled_completions() - polled_before,
+        failure,
+        leaked: issued != completed || in_flight != 0 || !clean,
     }
-    if polled != 0 {
-        c.write_str(", A COMPLETION WAS COLLECTED WITHOUT ITS INTERRUPT");
-        return Check::Failed;
-    }
-    if by_interrupt != made || irqs == irqs_before {
-        c.write_str(", NOT EVERY COMPLETION ARRIVED BY INTERRUPT");
-        return Check::Failed;
-    }
-    if issued != completed || in_flight != 0 || !clean {
-        c.write_str(", A REQUEST OR DESCRIPTOR LEAKED");
-        return Check::Failed;
-    }
-    c.write_str(" ok");
-    Check::Passed
 }
 
 fn failed(c: &dyn EarlyConsole, what: &str, e: BlockError) -> bool {
@@ -399,5 +523,6 @@ fn bring_up_error(e: virtio_blk::transport::Error) -> &'static str {
         Error::NoRoom => "not enough memory for the rings",
         Error::BadGeometry => "an unusable geometry",
         Error::Timeout => "the device did not answer",
+        Error::VectorRefused { .. } => "the device refused its MSI-X vector",
     }
 }

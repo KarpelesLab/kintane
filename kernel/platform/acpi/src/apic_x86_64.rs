@@ -18,10 +18,33 @@ use crate::{ECAM, MadtFacts, write_usize};
 /// a global system interrupt from 16 up, level-triggered and active low — and which one is
 /// written only in the ACPI namespace's `_PRT`, as AML. Wiring the register's value would
 /// program an input nothing drives: the handler would be registered, the line enabled, and
-/// no interrupt would ever come. So PCI devices poll on this port until either an AML
-/// interpreter reads `_PRT`, or MSI-X delivers straight to a local APIC and needs no
-/// routing at all. See `docs/architecture.md`, "Interrupt routing".
+/// no interrupt would ever come. So a PCI device without MSI or MSI-X polls on this port
+/// until an AML interpreter reads `_PRT`. See `docs/architecture.md`, "PCI interrupts".
 pub(crate) const PCI_LINE_TRUSTED: bool = false;
+
+/// Whether a PCI function's message-signalled interrupts can be delivered.
+///
+/// Yes: the message is a write to a local APIC's address naming one CPU and a vector, so it
+/// needs no route through the I/O APIC and no `_PRT`.
+pub(crate) const MSI: bool = true;
+
+/// The device lines message-signalled interrupts are dispatched on.
+pub(crate) const MSI_LINES: core::ops::Range<u32> = arch::interrupt::MSI_LINES;
+
+/// The `(address, data)` that delivers device line `line` to CPU `cpu`: that CPU's local
+/// APIC, on the line's vector. `None` for a line that is not a message-signalled one, a CPU
+/// that has not reported its APIC ID, or an ID the message format cannot carry.
+pub(crate) fn msi_message(line: u32, cpu: usize) -> Option<(u64, u32)> {
+    let vector = arch::interrupt::msi_vector(line)?;
+    // The boot CPU's ID is the controller's to know; a secondary's is recorded when it
+    // reports in.
+    let apic_id = if cpu == 0 {
+        apic::installed()?.boot_id()
+    } else {
+        arch::smp::apic_id(cpu)?
+    };
+    apic::msi::message(apic_id, vector)
+}
 
 /// Every driver this image carries.
 pub(crate) const DRIVERS: &[&dyn Driver] = &[

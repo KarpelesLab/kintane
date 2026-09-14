@@ -13,7 +13,7 @@ use core::ptr::{
     read_volatile, with_exposed_provenance, with_exposed_provenance_mut, write_volatile,
 };
 
-use crate::resource::Mmio;
+use crate::resource::{Mmio, MmioClaim};
 
 /// A window of 32-bit device registers a driver may read and write.
 #[derive(Debug)]
@@ -38,6 +38,24 @@ impl Registers {
         Some(Registers {
             base: usize::try_from(mmio.phys()).ok()?,
             len: usize::try_from(mmio.len()).ok()?,
+        })
+    }
+
+    /// Registers for a window the ledger records, reached by someone other than the driver
+    /// holding its handle: the platform programming an MSI-X table in a window the driver
+    /// claimed.
+    ///
+    /// The same translation as [`Self::new`], kept beside it so that where a claimed window
+    /// is mapped is decided in one place. `None` on the same terms.
+    ///
+    /// # Safety
+    /// As [`Self::new`], for `[claim.phys, claim.phys + claim.len)`; and the caller must be
+    /// the only code touching the registers it uses in that window, which the driver that
+    /// claimed it has agreed to by leaving them to the platform.
+    pub unsafe fn for_claim(claim: &MmioClaim) -> Option<Registers> {
+        Some(Registers {
+            base: usize::try_from(claim.phys).ok()?,
+            len: usize::try_from(claim.len).ok()?,
         })
     }
 

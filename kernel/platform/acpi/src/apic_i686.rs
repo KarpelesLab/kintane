@@ -29,6 +29,20 @@ static IO_APIC: Reserve = Reserve {
 /// answer, and no interpreter for the ACPI namespace's `_PRT` is needed to find it.
 pub(crate) const PCI_LINE_TRUSTED: bool = true;
 
+/// Whether a PCI function's message-signalled interrupts can be delivered.
+///
+/// No: a message is a write to a local APIC, and this port leaves the APICs alone. A
+/// function keeps the line firmware routed, which on this port is trusted.
+pub(crate) const MSI: bool = false;
+
+/// No lines for message-signalled interrupts.
+pub(crate) const MSI_LINES: core::ops::Range<u32> = 0..0;
+
+/// No message reaches a CPU on this port.
+pub(crate) fn msi_message(_line: u32, _cpu: usize) -> Option<(u64, u32)> {
+    None
+}
+
 /// Every driver this image carries.
 pub(crate) const DRIVERS: &[&dyn Driver] = &[
     &LOCAL_APIC,

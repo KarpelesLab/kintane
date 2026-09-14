@@ -37,6 +37,14 @@ struct FakeTransport {
     /// Take requests off the ring and never answer.
     silent: Cell<bool>,
     notifies: Cell<u32>,
+    /// Entries in the MSI-X table; 0 for a device without one, which refuses every vector.
+    msix_entries: u16,
+    queue_vector: Cell<u16>,
+    config_vector: Cell<u16>,
+    /// The queue's vector when the queue was set up, which is when it must already be set.
+    vector_at_setup: Cell<Option<u16>>,
+    /// Reads of the interrupt status register.
+    isr_reads: Cell<u32>,
 }
 
 impl FakeTransport {
@@ -61,6 +69,20 @@ impl FakeTransport {
             fail_io: Cell::new(false),
             silent: Cell::new(false),
             notifies: Cell::new(0),
+            msix_entries: 2,
+            queue_vector: Cell::new(transport::NO_VECTOR),
+            config_vector: Cell::new(transport::NO_VECTOR),
+            vector_at_setup: Cell::new(None),
+            isr_reads: Cell::new(0),
+        }
+    }
+
+    /// What a device answers to a vector: kept when it is in the table, refused otherwise.
+    fn take_vector(&self, vector: u16) -> u16 {
+        if vector < self.msix_entries {
+            vector
+        } else {
+            transport::NO_VECTOR
         }
     }
 }
@@ -75,6 +97,11 @@ impl Transport for FakeTransport {
     }
 
     fn set_status(&self, value: u8) {
+        if value == 0 {
+            // A reset forgets the vectors, as it forgets everything else.
+            self.queue_vector.set(transport::NO_VECTOR);
+            self.config_vector.set(transport::NO_VECTOR);
+        }
         if value & status::FEATURES_OK != 0 && self.refuse_features {
             // A device refusing the features leaves FEATURES_OK clear.
             self.status.set(value & !status::FEATURES_OK);
@@ -101,6 +128,7 @@ impl Transport for FakeTransport {
     }
 
     fn setup_queue(&self, _index: u16, size: u16, desc: u64, avail: u64, used: u64) {
+        self.vector_at_setup.set(Some(self.queue_vector.get()));
         *self.device.borrow_mut() = Some(FakeDevice::at(self.view, desc, avail, used, size));
     }
 
@@ -118,7 +146,19 @@ impl Transport for FakeTransport {
     }
 
     fn ack_interrupt(&self) -> u32 {
+        // Nothing pending, ever: what a device delivering on an MSI-X vector reports.
+        self.isr_reads.set(self.isr_reads.get() + 1);
         0
+    }
+
+    fn set_config_vector(&self, vector: u16) -> u16 {
+        self.config_vector.set(self.take_vector(vector));
+        self.config_vector.get()
+    }
+
+    fn set_queue_vector(&self, _index: u16, vector: u16) -> u16 {
+        self.queue_vector.set(self.take_vector(vector));
+        self.queue_vector.get()
     }
 
     fn config_read8(&self, _offset: usize) -> u8 {
@@ -142,6 +182,71 @@ fn started(backing: &mut Backing, sectors: u64, bounce: usize) -> Result<Blk, Er
     let dma = backing.take(dma_bytes(bounce), 4096);
     let transport = FakeTransport::new(backing, sectors);
     Blk::bring_up(transport, dma)
+}
+
+#[test]
+fn a_queue_is_given_its_msix_vector_after_the_reset_and_before_it_is_enabled() {
+    let mut backing = Backing::new(1 << 20);
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    let blk = Blk::bring_up_with_vector(transport, dma, Some(1)).unwrap();
+    assert!(blk.uses_msix());
+    assert_eq!(blk.transport.vector_at_setup.get(), Some(1));
+    assert_eq!(
+        blk.transport.config_vector.get(),
+        transport::NO_VECTOR,
+        "configuration changes are given no vector"
+    );
+
+    // Without a vector the queue keeps none, and the driver says so.
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    let blk = Blk::bring_up(transport, dma).unwrap();
+    assert!(!blk.uses_msix());
+    assert_eq!(blk.transport.vector_at_setup.get(), Some(transport::NO_VECTOR));
+}
+
+#[test]
+fn a_vector_the_device_refuses_fails_bring_up() {
+    let mut backing = Backing::new(1 << 20);
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    match Blk::bring_up_with_vector(transport, dma, Some(2)) {
+        Err(e) => assert_eq!(e, Error::VectorRefused { queue: 0 }),
+        Ok(_) => panic!("a vector past the table was accepted"),
+    }
+}
+
+#[test]
+fn an_msix_interrupt_collects_completions_without_asking_the_status_register() {
+    let mut backing = Backing::new(1 << 20);
+    let dma = backing.take(dma_bytes(64 * SECTOR), 4096);
+    let transport = FakeTransport::new(&backing, 64);
+    let blk = Blk::bring_up_with_vector(transport, dma, Some(0))
+        .unwrap()
+        .with_poll_limit(16);
+    blk.set_interrupt_driven(true);
+    // The fake answers at once, but in interrupt-driven mode only the handler may collect
+    // the answer, and there is no interrupt in a host test: the request times out with its
+    // completion on the ring.
+    let mut sector = [0u8; SECTOR];
+    assert_eq!(blk.read_blocks(0, &mut sector), Err(BlockError::Timeout));
+    assert_eq!(blk.interrupt_counts(), (0, 0));
+
+    // The interrupt arrives. The status register would say nothing is pending, and the
+    // handler must not ask it.
+    assert!(blk.on_interrupt());
+    assert_eq!(blk.interrupt_counts(), (1, 1));
+    assert_eq!(blk.transport.isr_reads.get(), 0);
+}
+
+#[test]
+fn a_line_interrupt_with_nothing_pending_is_not_this_devices() {
+    let mut backing = Backing::new(1 << 20);
+    let blk = started(&mut backing, 64, 64 * SECTOR).unwrap();
+    assert!(!blk.on_interrupt(), "a shared line's interrupt with nothing pending");
+    assert_eq!(blk.transport.isr_reads.get(), 1);
+    assert_eq!(blk.interrupt_counts(), (0, 0));
 }
 
 #[test]

@@ -806,3 +806,151 @@ fn described_devices_carry_their_windows_and_a_compatible_per_kind() {
     assert!(Described::new(Kind::Group, format_args!("x"), &[(0, 1); 3]).is_none());
     assert!(Described::new(Kind::Group, format_args!("{:>40}", "long"), &[]).is_none());
 }
+
+// --- message-signalled vectors ------------------------------------------------------
+
+/// Claims one message-signalled vector, and nothing else.
+struct Vectors(u16);
+
+impl Driver for Vectors {
+    fn name(&self) -> &'static str {
+        "vectors"
+    }
+    fn compatible(&self) -> &'static [&'static str] {
+        &["pci1af4,1042"]
+    }
+    fn probe(&self, p: &mut Probe<'_, '_, '_, '_>) -> Result<(), ProbeError> {
+        p.claim_msi(self.0)?;
+        Ok(())
+    }
+    fn start(&self, _: &Bound) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+/// One virtio-like function at 00:05.0 with a memory BAR and the capabilities given.
+fn function_with(caps: &[(u8, u16, [u32; 6])]) -> Vec<Function> {
+    let m = Model::default();
+    m.endpoint(
+        Address::new(0, 5, 0),
+        (0x1af4, 0x1042),
+        ETHERNET,
+        &[Spec::Mem32 {
+            base: 0xfeb0_0000,
+            size: 0x1000,
+            prefetch: false,
+        }],
+    );
+    if !caps.is_empty() {
+        m.capability_words(caps);
+    }
+    enumerate(&m)
+}
+
+/// MSI-X with a table of `entries` in BAR 0.
+fn msix_cap(entries: u32) -> (u8, u16, [u32; 6]) {
+    (msi::CAP_MSIX, 0x40, [(entries - 1) << 16, 0, 0x800, 0, 0, 0])
+}
+
+#[test]
+fn a_vector_is_claimed_only_where_the_platform_delivers_messages() {
+    let fns = function_with(&[msix_cap(2)]);
+    let mut storage = vec![Node::EMPTY; 4];
+    let mut b = Builder::new(&mut storage).unwrap();
+    let id = b
+        .add(NodeId::ROOT, fns[0].name(), fns[0].compatible(), Origin::Pci(&fns[0]))
+        .unwrap();
+    let tree = b.finish();
+
+    let (mut mmio, mut irqs) = (vec![None; 2], vec![None; 4]);
+    let mut res = Resources::new(&mut mmio, &mut irqs);
+    assert_eq!(
+        driver::probe(&Vectors(0), &tree, id, &mut res).err(),
+        Some(ProbeError::Declined(
+            "this platform delivers no message-signalled interrupts"
+        ))
+    );
+    assert_eq!(res.irq_claims().count(), 0);
+}
+
+#[test]
+fn msix_vectors_are_claimed_up_to_the_table_size_and_once_each() {
+    let fns = function_with(&[msix_cap(2)]);
+    let mut storage = vec![Node::EMPTY; 4];
+    let mut b = Builder::new(&mut storage).unwrap();
+    let id = b
+        .add(NodeId::ROOT, fns[0].name(), fns[0].compatible(), Origin::Pci(&fns[0]))
+        .unwrap();
+    let tree = b.finish();
+
+    let (mut mmio, mut irqs) = (vec![None; 2], vec![None; 4]);
+    let mut res = Resources::new(&mut mmio, &mut irqs).with_msi(true);
+    driver::probe(&Vectors(0), &tree, id, &mut res).unwrap();
+    driver::probe(&Vectors(1), &tree, id, &mut res).unwrap();
+    let claimed: Vec<(NodeId, Vec<u32>)> = res
+        .irq_claims()
+        .map(|c| (c.spec.controller, c.spec.cells().to_vec()))
+        .collect();
+    assert_eq!(
+        claimed,
+        [(id, vec![msi::VECTOR_TAG]), (id, vec![msi::VECTOR_TAG | 1])],
+        "each vector names the function itself, tagged, so no line can collide with it"
+    );
+    assert!(matches!(
+        driver::probe(&Vectors(2), &tree, id, &mut res),
+        Err(ProbeError::Tree(Error::NoSuchEntry { index: 2, .. }))
+    ));
+    assert!(matches!(
+        driver::probe(&Vectors(0), &tree, id, &mut res),
+        Err(ProbeError::Claim(ClaimError::IrqTaken { holder })) if holder == id
+    ));
+}
+
+#[test]
+fn msi_without_msix_is_one_vector_and_a_function_with_neither_has_none() {
+    let fns = function_with(&[(msi::CAP_MSI, 0x50, [0; 6])]);
+    let mut storage = vec![Node::EMPTY; 4];
+    let mut b = Builder::new(&mut storage).unwrap();
+    let id = b
+        .add(NodeId::ROOT, fns[0].name(), fns[0].compatible(), Origin::Pci(&fns[0]))
+        .unwrap();
+    let tree = b.finish();
+    let (mut mmio, mut irqs) = (vec![None; 2], vec![None; 4]);
+    let mut res = Resources::new(&mut mmio, &mut irqs).with_msi(true);
+    driver::probe(&Vectors(0), &tree, id, &mut res).unwrap();
+    assert!(matches!(
+        driver::probe(&Vectors(1), &tree, id, &mut res),
+        Err(ProbeError::Tree(Error::NoSuchEntry { index: 1, .. }))
+    ));
+
+    let fns = function_with(&[]);
+    let mut storage = vec![Node::EMPTY; 4];
+    let mut b = Builder::new(&mut storage).unwrap();
+    let id = b
+        .add(NodeId::ROOT, fns[0].name(), fns[0].compatible(), Origin::Pci(&fns[0]))
+        .unwrap();
+    let tree = b.finish();
+    let (mut mmio, mut irqs) = (vec![None; 2], vec![None; 4]);
+    let mut res = Resources::new(&mut mmio, &mut irqs).with_msi(true);
+    assert!(matches!(
+        driver::probe(&Vectors(0), &tree, id, &mut res),
+        Err(ProbeError::Tree(Error::NoSuchEntry { index: 0, .. }))
+    ));
+}
+
+#[test]
+fn a_function_reports_its_msix_table_through_enumeration() {
+    // Firmware left MSI-X enabled with the function masked; the record says so, and the
+    // table and pending bits are where the capability put them.
+    let fns = function_with(&[(
+        msi::CAP_MSIX,
+        0x40,
+        [(1 << 31) | (1 << 30) | (3 << 16), 0x2000, 0x3000, 0, 0, 0],
+    )]);
+    let cap = msi::msix(&fns[0]).unwrap();
+    assert_eq!(cap.table_size, 4);
+    assert_eq!((cap.table_bar, cap.table_offset), (0, 0x2000));
+    assert_eq!((cap.pba_bar, cap.pba_offset), (0, 0x3000));
+    assert!(cap.enabled && cap.function_masked);
+    assert_eq!(msi::msi(&fns[0]), None);
+}

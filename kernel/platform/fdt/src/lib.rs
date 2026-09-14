@@ -439,6 +439,24 @@ pub fn block_line() -> Option<u32> {
     BLOCK_LINE.get().map(|n| n.0)
 }
 
+/// Whether `line` is a message-signalled interrupt's. Never here: every device on these
+/// machines interrupts on an input of its controller.
+pub fn interrupt_is_msi(_line: u32) -> bool {
+    false
+}
+
+/// Interrupts on `line` taken on CPU `cpu`. Counted only for message-signalled lines, which
+/// these machines' devices do not use.
+pub fn interrupts_on_cpu(_line: u32, _cpu: usize) -> u64 {
+    0
+}
+
+/// Move `line` to CPU `cpu`. Not here: an SPI's target is the interrupt controller's
+/// business, and every SPI is delivered to CPU 0.
+pub fn route_interrupt(_line: u32, _cpu: usize) -> Result<(), &'static str> {
+    Err("no message-signalled interrupts on this platform")
+}
+
 /// Receive interrupts the console driver has taken, and the bytes they carried.
 pub fn console_received() -> (u32, u32) {
     pl011::received()

@@ -8,6 +8,8 @@
 //!   as CPU addresses, and (for device-tree nodes) interrupts resolved to their controller.
 //! * [`pci`] — enumerating PCI and PCI Express buses through whichever configuration access the
 //!   platform has, and sizing BARs without disturbing them.
+//! * [`msi`] — a PCI function's message-signalled interrupts: MSI and MSI-X capabilities, enabling
+//!   them, and the MSI-X table, which is how a PCI device interrupts without pin routing.
 //! * [`table`] — records for devices a firmware table lists directly, such as ACPI's processors and
 //!   interrupt controllers.
 //! * [`driver`] — binding a driver to a node by `compatible` string, and the phases a bound device
@@ -29,6 +31,7 @@
 pub mod cell;
 pub mod driver;
 pub mod fifo;
+pub mod msi;
 pub mod pci;
 pub mod ports;
 pub mod registers;
@@ -56,6 +59,9 @@ pub use tree::{Builder, DeviceTree, Node, NodeId, Origin, Specifier};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod msi_tests;
 
 #[cfg(test)]
 mod pci_tests;
