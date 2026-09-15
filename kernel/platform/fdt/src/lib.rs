@@ -143,8 +143,11 @@ static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
 
 /// The console UART's receive line, once its handler is wired.
 static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
-/// The block device's interrupt line, once its handler is wired.
-static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
+/// Each block device's interrupt line, once its handler is wired, indexed the way
+/// `virtio_blk`'s disk slots are: a boot that binds two disks wires two lines, and a cell
+/// per slot is what keeps the second from being discarded by the first.
+static BLOCK_LINES: [BootCell<IrqNumber>; virtio_blk::MAX_DISKS] =
+    [const { BootCell::new() }; virtio_blk::MAX_DISKS];
 /// The network card's interrupt line, once its handler is wired.
 static NET_LINE: BootCell<IrqNumber> = BootCell::new();
 
@@ -450,9 +453,12 @@ fn wire(
         // SAFETY: once, on the single-threaded boot path.
         let _ = unsafe { CONSOLE_LINE.set(number) };
     }
-    if drv.name() == virtio_blk::DRIVER.name() {
-        // SAFETY: once, on the single-threaded boot path.
-        let _ = unsafe { BLOCK_LINE.set(number) };
+    if drv.name() == virtio_blk::DRIVER.name()
+        && let Some(i) = virtio_blk::slot(started.bound().node())
+        && let Some(cell) = BLOCK_LINES.get(i)
+    {
+        // SAFETY: once per slot, on the single-threaded boot path.
+        let _ = unsafe { cell.set(number) };
     }
     if drv.name() == virtio_net::DRIVER.name() {
         // SAFETY: once, on the single-threaded boot path.
@@ -470,10 +476,10 @@ pub fn console_line() -> Option<u32> {
     CONSOLE_LINE.get().map(|n| n.0)
 }
 
-/// The block device's interrupt line, once its handler is wired. `None` when the device
-/// is polled.
-pub fn block_line() -> Option<u32> {
-    BLOCK_LINE.get().map(|n| n.0)
+/// Block device `i`'s interrupt line, once its handler is wired. `None` when the device
+/// is polled, and for a slot no disk claimed.
+pub fn block_line(i: usize) -> Option<u32> {
+    BLOCK_LINES.get(i)?.get().map(|n| n.0)
 }
 
 /// The network card's interrupt line, once its handler is wired. `None` when the card is

@@ -129,13 +129,18 @@ static HANDLERS_CLASS: LockClass = LockClass::new("platform.handlers");
 
 /// The console UART's receive line, once wired. It does not change across a rebind.
 static CONSOLE_LINE: BootCell<IrqNumber> = BootCell::new();
-/// The block device's interrupt line, once its handler is wired.
-static BLOCK_LINE: BootCell<IrqNumber> = BootCell::new();
+/// Each block device's interrupt line, once its handler is wired, indexed the way
+/// `virtio_blk`'s disk slots are: a boot that binds two disks wires two lines, and a cell
+/// per slot is what keeps the second from being discarded by the first.
+static BLOCK_LINES: [BootCell<IrqNumber>; virtio_blk::MAX_DISKS] =
+    [const { BootCell::new() }; virtio_blk::MAX_DISKS];
 /// The network card's interrupt line, once its handler is wired.
 static NET_LINE: BootCell<IrqNumber> = BootCell::new();
 
-/// Whether the block device's PCI function has an MSI-X table, whatever it came up on.
-static BLOCK_MSIX: BootCell<bool> = BootCell::new();
+/// Whether each block device's PCI function has an MSI-X table, whatever it came up on,
+/// indexed the way `virtio_blk`'s disk slots are.
+static BLOCK_MSIX: [BootCell<bool>; virtio_blk::MAX_DISKS] =
+    [const { BootCell::new() }; virtio_blk::MAX_DISKS];
 
 /// Lines past the ISA ones there can be; `controller::MSI_LINES` is at most this long.
 const MAX_MSI_ROUTES: usize = 16;
@@ -1008,18 +1013,24 @@ unsafe fn wire_all(
             Origin::Pci(f) => Some(f),
             _ => None,
         };
-        if drv.name() == virtio_blk::DRIVER.name() {
+        if drv.name() == virtio_blk::DRIVER.name()
+            && let Some(i) = virtio_blk::slot(s.bound().node())
+            && let Some(cell) = BLOCK_MSIX.get(i)
+        {
             let msix = function.is_some_and(|f| msi::msix(f).is_some());
-            // SAFETY: once, on the single-threaded boot path.
-            let _ = unsafe { BLOCK_MSIX.set(msix) };
+            // SAFETY: once per slot, on the single-threaded boot path.
+            let _ = unsafe { cell.set(msix) };
         }
         match wire(c, chip, drv, s, function, Some(messages)) {
             Wired::Nothing => {}
             Wired::Failed => ok = false,
             Wired::Line(line) => {
-                if drv.name() == virtio_blk::DRIVER.name() {
-                    // SAFETY: once, on the single-threaded boot path.
-                    let _ = unsafe { BLOCK_LINE.set(line) };
+                if drv.name() == virtio_blk::DRIVER.name()
+                    && let Some(i) = virtio_blk::slot(s.bound().node())
+                    && let Some(cell) = BLOCK_LINES.get(i)
+                {
+                    // SAFETY: once per slot, on the single-threaded boot path.
+                    let _ = unsafe { cell.set(line) };
                 }
                 if drv.name() == virtio_net::DRIVER.name() {
                     // SAFETY: once, on the single-threaded boot path.
@@ -1467,9 +1478,13 @@ pub fn check_pin_entry(line: u32) -> Result<PinRoute, &'static str> {
     controller::check_pin(line, &route).map(|()| route)
 }
 
-/// Whether the block device's PCI function has an MSI-X table, whatever it came up on.
-pub fn block_has_msix() -> bool {
-    BLOCK_MSIX.get().copied().unwrap_or(false)
+/// Whether block device `i`'s PCI function has an MSI-X table, whatever it came up on.
+pub fn block_has_msix(i: usize) -> bool {
+    BLOCK_MSIX
+        .get(i)
+        .and_then(BootCell::get)
+        .copied()
+        .unwrap_or(false)
 }
 
 /// The console UART's receive line, once its handler is wired.
@@ -1477,10 +1492,11 @@ pub fn console_line() -> Option<u32> {
     CONSOLE_LINE.get().map(|n| n.0)
 }
 
-/// The block device's interrupt line, once its handler is wired. `None` when the device
-/// is polled, including on a port whose controller no PCI interrupt route reaches.
-pub fn block_line() -> Option<u32> {
-    BLOCK_LINE.get().map(|n| n.0)
+/// Block device `i`'s interrupt line, once its handler is wired. `None` when the device
+/// is polled, including on a port whose controller no PCI interrupt route reaches, and
+/// for a slot no disk claimed.
+pub fn block_line(i: usize) -> Option<u32> {
+    BLOCK_LINES.get(i)?.get().map(|n| n.0)
 }
 
 /// The network card's interrupt line, once its handler is wired. `None` when the card is

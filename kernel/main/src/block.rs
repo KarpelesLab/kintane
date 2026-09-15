@@ -173,7 +173,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         c.write_str("; ");
         // On MSI-X, the disk's interrupt goes through the IOMMU as well: its table entry, not
         // its message, then names the CPU, and only the disk may use it.
-        if let Some(line) = platform::block_line().filter(|&l| platform::interrupt_is_msi(l)) {
+        if let Some(line) = platform::block_line(0).filter(|&l| platform::interrupt_is_msi(l)) {
             if !iommu::remap_disk_interrupt(c, frames, line) {
                 return Check::Failed;
             }
@@ -193,7 +193,7 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
     // The queue on its MSI-X entry when that is how the platform wired the disk's interrupt;
     // on a line, or polled, bring-up needs to know nothing.
     let vector = virtio_blk::msix_entry(0)
-        .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi));
+        .filter(|_| platform::block_line(0).is_some_and(platform::interrupt_is_msi));
     let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(b) => b,
         Err(e) => {
@@ -383,7 +383,7 @@ fn restart(c: &dyn EarlyConsole, virt: usize, phys: u64, len: usize, buf: &mut [
     // vector, but the platform's MSI-X table entry still stands, so bring-up sets the vector
     // again. Otherwise the restarted disk would drop to polling and the block-irq check fail.
     let vector = virtio_blk::msix_entry(0)
-        .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi));
+        .filter(|_| platform::block_line(0).is_some_and(platform::interrupt_is_msi));
     let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(b) => b,
         Err(e) => {
@@ -559,9 +559,9 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
     // anything else fell back somewhere; one whose function has none must be on its pin,
     // routed through `_PRT`. Falling back to polling would turn this check and the next into
     // skips where they should have measured.
-    let pin = platform::block_line().and_then(intx::pin_route);
+    let pin = platform::block_line(0).and_then(intx::pin_route);
     if kconfig::QEMU_BLOCK_TEST && platform::delivers_msi() && !blk.uses_msix() {
-        if intx::block_has_msix() {
+        if intx::block_has_msix(0) {
             c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
             return Check::Failed;
         }
@@ -570,7 +570,7 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
             return Check::Failed;
         }
     }
-    let Some(line) = platform::block_line() else {
+    let Some(line) = platform::block_line(0) else {
         c.write_str("skipped: the disk is polled, no interrupt route on this port");
         return Check::Skipped;
     };
@@ -653,7 +653,7 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no block device");
         return Check::Skipped;
     };
-    let Some(line) = platform::block_line().filter(|&l| platform::interrupt_is_msi(l)) else {
+    let Some(line) = platform::block_line(0).filter(|&l| platform::interrupt_is_msi(l)) else {
         c.write_str("THE DISK IS NOT ON MSI-X, SO NOTHING IS REMAPPED");
         return Check::Failed;
     };
@@ -863,7 +863,7 @@ pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no block device");
         return Check::Skipped;
     };
-    let Some(line) = platform::block_line().filter(|l| platform::interrupt_is_msi(*l)) else {
+    let Some(line) = platform::block_line(0).filter(|l| platform::interrupt_is_msi(*l)) else {
         c.write_str("skipped: the disk's interrupt is not one the platform can move");
         return Check::Skipped;
     };
