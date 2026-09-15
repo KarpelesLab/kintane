@@ -25,6 +25,9 @@
 //! unit. A disk on PCIe is therefore the first device here whose DMA could be confined, and
 //! this is the first step toward one. See `docs/isolation.md`.
 
+use core::cell::SyncUnsafeCell;
+
+use device::pci::{self, Address, ConfigSpace, Function};
 use device::{DeviceTree, NodeId};
 use hal::EarlyConsole;
 
@@ -195,4 +198,134 @@ fn ranges(
 fn msi_map(tree: &DeviceTree<'_, '_>, id: NodeId) -> Option<(u32, u32)> {
     let bytes = tree.property(id, b"msi-map")?;
     Some((cell(bytes, 1)?, cell(bytes, 3)?))
+}
+
+/// A claim-only driver for the host bridge.
+///
+/// It takes the ECAM window and drives nothing, which is the whole job: a window no driver
+/// claimed is in nobody's ledger, and the kernel's address space would not map it. The same
+/// shape `platform/acpi` uses for the bridge it finds through the MCFG.
+pub struct Ecam;
+
+impl device::Driver for Ecam {
+    fn name(&self) -> &'static str {
+        "ecam"
+    }
+
+    fn compatible(&self) -> &'static [&'static str] {
+        &["pci-host-ecam-generic"]
+    }
+
+    fn probe(
+        &self,
+        probe: &mut device::driver::Probe<'_, '_, '_, '_>,
+    ) -> Result<(), device::driver::ProbeError> {
+        probe.claim_mmio(0, "PCI Express configuration space")?;
+        Ok(())
+    }
+
+    fn start(&self, _bound: &device::Bound) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+pub static DRIVER: Ecam = Ecam;
+
+/// Configuration space through the ECAM window.
+///
+/// Usable only once the kernel's address space maps the claim above. During discovery this
+/// window is a quarter of a terabyte beyond what the boot tables reach, which is why the walk
+/// is a later stage than discovery on this port.
+struct Window {
+    base: u64,
+}
+
+impl Window {
+    /// The register at `offset` of `at`, as an address in the device window.
+    ///
+    /// ECAM addressing is the same arithmetic everywhere: a bus is a megabyte, a device
+    /// thirty-two kilobytes, a function four.
+    fn register(&self, at: Address, offset: u16) -> Option<*mut u32> {
+        if offset % 4 != 0 || u64::from(offset) >= 4096 {
+            return None;
+        }
+        let within = (u64::from(at.bus) << 20)
+            | (u64::from(at.device) << 15)
+            | (u64::from(at.function) << 12)
+            | u64::from(offset);
+        let virt = hal::paging::device_virt(self.base.checked_add(within)?)?;
+        Some(core::ptr::with_exposed_provenance_mut(virt))
+    }
+}
+
+#[allow(unsafe_code)]
+impl ConfigSpace for Window {
+    fn read(&self, at: Address, offset: u16) -> u32 {
+        match self.register(at, offset) {
+            // SAFETY: an aligned register inside the window the bridge's `reg` named and the
+            // `ecam` driver claimed, which the kernel's space maps at `DEVICE_WINDOW_BASE`
+            // above its physical address. Reading the standard header has no side effects.
+            Some(p) => unsafe { core::ptr::read_volatile(p) },
+            None => u32::MAX,
+        }
+    }
+
+    fn write(&self, at: Address, offset: u16, value: u32) {
+        if let Some(p) = self.register(at, offset) {
+            // SAFETY: as for `read`; what the write does is the enumerator's to know.
+            unsafe { core::ptr::write_volatile(p, value) }
+        }
+    }
+}
+
+/// What walking the bus found.
+#[derive(Clone, Copy)]
+pub struct PcieScan {
+    /// Functions found, host bridges included.
+    pub functions: usize,
+    /// How many of them are host bridges.
+    pub bridges: usize,
+    /// The buffer filled before the walk finished, so there may be more.
+    pub truncated: bool,
+    /// Every base address register read back as enumeration left it.
+    pub restored: bool,
+}
+
+/// Room for what `virt` can present: the bridge's own function and whatever the command line
+/// attaches. Far more than either, and small enough to sit in the image rather than on the
+/// boot stack, which a `Function` array of this width would overrun.
+const MAX_FUNCTIONS: usize = 32;
+
+/// SAFETY INVARIANT: written once by [`enumerate`] on the single-threaded boot path.
+static FUNCTIONS: SyncUnsafeCell<[Function; MAX_FUNCTIONS]> =
+    SyncUnsafeCell::new([Function::EMPTY; MAX_FUNCTIONS]);
+
+/// Walk the buses behind the bridge and report what is there.
+///
+/// Called from the check phase rather than from `discover`, because only by then does the
+/// kernel's address space map the window this reads. `None` where no bridge was found, which
+/// is a build that asked for PCIe on a machine without one.
+#[allow(unsafe_code)]
+pub fn enumerate(c: &dyn EarlyConsole) -> Option<PcieScan> {
+    let f = facts()?;
+    let cfg = Window { base: f.ecam_base };
+    // SAFETY: once, on the boot path, single-threaded, and nothing else reads this.
+    let out = unsafe { &mut *FUNCTIONS.get() };
+    let (n, truncated) = match pci::enumerate(&cfg, f.bus_start, f.bus_end, out) {
+        Ok(n) => (n, false),
+        // More functions than the buffer holds is not a failure of the bus: what was found
+        // is still what is there, and the report says the rest went unseen.
+        Err(pci::Error::TooManyFunctions { .. }) => (out.len(), true),
+        Err(_) => {
+            c.write_str("; the bus could not be walked");
+            return None;
+        }
+    };
+    let found = out.get(..n).unwrap_or(&[]);
+    Some(PcieScan {
+        functions: n,
+        bridges: found.iter().filter(|f| f.is_host_bridge()).count(),
+        truncated,
+        restored: pci::verify_restored(&cfg, found).is_ok(),
+    })
 }

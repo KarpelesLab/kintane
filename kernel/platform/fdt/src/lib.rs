@@ -47,7 +47,7 @@ use device::{
 };
 use hal::paging::DeviceWindow;
 use hal::{EarlyConsole, IrqChip, IrqNumber};
-pub use pcie::{PcieFacts, facts as pcie};
+pub use pcie::{PcieFacts, PcieScan, enumerate as pcie_enumerate, facts as pcie};
 pub use smmuv3::{SmmuFacts, facts as smmu};
 use sync::{LockClass, SpinLock};
 
@@ -62,6 +62,7 @@ use sync::{LockClass, SpinLock};
 const DRIVERS: &[&dyn Driver] = &[
     &gic::v2::DRIVER,
     &gic::v3::DRIVER,
+    &pcie::DRIVER,
     &pl011::DRIVER,
     &virtio_blk::DRIVER,
     &virtio_net::DRIVER,
@@ -69,6 +70,7 @@ const DRIVERS: &[&dyn Driver] = &[
 #[cfg(all(CONFIG_GIC_V2, not(CONFIG_GIC_V3)))]
 const DRIVERS: &[&dyn Driver] = &[
     &gic::v2::DRIVER,
+    &pcie::DRIVER,
     &pl011::DRIVER,
     &virtio_blk::DRIVER,
     &virtio_net::DRIVER,
@@ -76,6 +78,7 @@ const DRIVERS: &[&dyn Driver] = &[
 #[cfg(all(CONFIG_GIC_V3, not(CONFIG_GIC_V2)))]
 const DRIVERS: &[&dyn Driver] = &[
     &gic::v3::DRIVER,
+    &pcie::DRIVER,
     &pl011::DRIVER,
     &virtio_blk::DRIVER,
     &virtio_net::DRIVER,

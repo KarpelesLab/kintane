@@ -48,3 +48,48 @@ pub fn facts() -> Option<PcieFacts> {
 
 /// No bridge to find.
 pub fn discover(_c: &dyn EarlyConsole, _tree: &DeviceTree<'_, '_>) {}
+
+/// The bridge driver's place on a build without PCIe.
+///
+/// It lists no `compatible` string, so `best_match` never picks it and no node binds to it.
+/// That keeps one entry in the driver table on every build instead of multiplying the table
+/// by another `cfg`, which is how the interrupt-controller tables already have to work.
+pub struct Ecam;
+
+impl device::Driver for Ecam {
+    fn name(&self) -> &'static str {
+        "ecam"
+    }
+
+    /// Nothing. A driver that matches no string is never chosen.
+    fn compatible(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn probe(
+        &self,
+        _probe: &mut device::driver::Probe<'_, '_, '_, '_>,
+    ) -> Result<(), device::driver::ProbeError> {
+        Ok(())
+    }
+
+    fn start(&self, _bound: &device::Bound) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+pub static DRIVER: Ecam = Ecam;
+
+/// What a walk would have found. Never built here.
+#[derive(Clone, Copy)]
+pub struct PcieScan {
+    pub functions: usize,
+    pub bridges: usize,
+    pub truncated: bool,
+    pub restored: bool,
+}
+
+/// No bridge, so no bus to walk.
+pub fn enumerate(_c: &dyn EarlyConsole) -> Option<PcieScan> {
+    None
+}

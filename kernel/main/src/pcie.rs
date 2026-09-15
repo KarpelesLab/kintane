@@ -1,18 +1,19 @@
 //! The boot's check of the PCI Express host bridge the platform found (only with `PCIE`).
 //!
-//! Reading is the whole of it. The bridge is described by the tree, and what the tree says
-//! is checked for the coherence enumeration would depend on: a window that exists, and one
-//! big enough to address every bus the same tree claims lies behind it. A bridge whose
-//! `bus-range` outruns its `reg` would have an enumerator read one bus's configuration
-//! space believing it was another's, and find devices that are not there.
+//! Two things happen here, and the split between them is the point. The bridge is *described*
+//! by the device tree during discovery, and what the tree says is checked for the coherence
+//! enumeration depends on: a window that exists, and one big enough to address every bus the
+//! same tree claims lies behind it. A bridge whose `bus-range` outruns its `reg` would have an
+//! enumerator read one bus's configuration space believing it was another's.
 //!
-//! Nothing is enumerated, and the reason is a fact about this port rather than a missing
-//! piece of code. Discovery runs on the boot tables, which map two gigabytes; `virt` puts
-//! configuration space at a quarter of a terabyte. So the window is out of reach exactly
-//! when the PC's is in reach, which is why `platform/acpi` enumerates during discovery and
-//! this does not. The last line below reports that distance rather than assuming it, so the
-//! day a machine puts the window low, the boot says the topology changed and enumeration
-//! could move earlier.
+//! Then the bus is *walked*, here rather than during discovery, because only by now does the
+//! kernel's own address space map the window. Discovery runs on the boot tables, which map two
+//! gigabytes; `virt` puts configuration space a quarter of a terabyte up. So the window is out
+//! of reach exactly when the PC's is in reach, which is why `platform/acpi` enumerates during
+//! discovery and this does not. The window is claimed by the `ecam` driver so that the address
+//! space maps it at all — a window no driver claimed is in nobody's ledger.
+//!
+//! The walk itself lives in the platform, which owns the device model. This reports it.
 
 use hal::EarlyConsole;
 
@@ -22,14 +23,14 @@ use crate::{Check, write_usize};
 ///
 /// `arch/aarch64/src/paging.rs` builds two identity regions: a gigabyte of device memory and
 /// a gigabyte of RAM. Configuration space above this is unreadable until the kernel's own
-/// address space exists, which is the whole reason enumeration is a later stage.
+/// address space exists, which is the whole reason the walk is a later stage than discovery.
 const BOOT_TABLES_END: u64 = 0x8000_0000;
 
-/// Report the bridge and gate the boot on the description being coherent.
+/// Report the bridge, walk the buses behind it, and gate the boot on both.
 ///
-/// Passes when a bridge was found, its window is real, and the window can address every bus
-/// `bus-range` claims. Fails when a build that asked for PCIe has no bridge, or when what
-/// the tree says could not be enumerated even once the window is mapped.
+/// Passes when a bridge was found, its window is real and big enough for the buses claimed,
+/// its messages are mapped somewhere, and the walk found at least the bridge's own function
+/// with every base address register put back as it was.
 pub fn check(c: &dyn EarlyConsole) -> Check {
     c.write_str("\n  pcie       ");
     let Some(f) = platform::pcie() else {
@@ -75,12 +76,46 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
             c.write_str(what);
         }
     }
-    // Why nothing is enumerated here, stated as an observation rather than a belief.
+    // Why the walk waited, stated as an observation rather than a belief: the day a machine
+    // puts the window inside the boot tables, this says so and enumeration could move earlier.
     if f.ecam_base < BOOT_TABLES_END {
         c.write_str("; THE WINDOW IS INSIDE THE BOOT TABLES, so configuration space is readable");
-        c.write_str(" during discovery on this machine and enumeration need not wait");
+        c.write_str(" during discovery on this machine and the walk need not have waited");
         return Check::Failed;
     }
-    c.write_str("; the window is above what the boot tables map, so nothing is enumerated yet");
+    c.write_str("; the window is above what the boot tables map");
+    let Some(scan) = platform::pcie_enumerate(c) else {
+        c.write_str(", AND THE BUS BEHIND IT COULD NOT BE WALKED");
+        return Check::Failed;
+    };
+    // A bridge presents at least its own function. Finding none means configuration space read
+    // back as nothing — an unmapped window reads all ones, which is no function at all, and is
+    // exactly what a claim that failed to reach the address space would look like.
+    if scan.functions == 0 {
+        c.write_str(", AND CONFIGURATION SPACE HELD NO FUNCTION, NOT EVEN THE BRIDGE'S OWN");
+        return Check::Failed;
+    }
+    if scan.bridges == 0 {
+        c.write_str(", AND NO HOST BRIDGE ANSWERED ON A BUS THAT HAS ONE");
+        return Check::Failed;
+    }
+    // Sizing a register writes to it and puts it back. One left disturbed works until a driver
+    // maps it, which is the kind of damage that surfaces far from its cause.
+    if !scan.restored {
+        c.write_str(", AND A BASE ADDRESS REGISTER DID NOT READ BACK AS ENUMERATION LEFT IT");
+        return Check::Failed;
+    }
+    c.write_str("; walked ");
+    write_usize(c, scan.functions);
+    c.write_str(" functions, ");
+    write_usize(c, scan.bridges);
+    c.write_str(" host bridge");
+    if scan.bridges != 1 {
+        c.write_str("s");
+    }
+    if scan.truncated {
+        c.write_str(", the buffer filled before the walk finished");
+    }
+    c.write_str(", every register restored");
     Check::Passed
 }
