@@ -13,9 +13,70 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 2 — Core kernel | **every item landed**; the stress audit is judged in slices rather than wall-clock windows, and `kbuild soak` runs it unattended; **a two-hour soak at 8 CPUs passed 7,200 audits of 7,200** while five branches shared the host, and the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
+| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on PCIe |
 | 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Queued real-time signals, `MSG_PEEK`, scattered and gathered messages, and floating-point state carried in a signal frame and validated on return are built too. Stopping signals too: a stop parks a process at its next system call and `SIGCONT` resumes it, reported to a parent by `wait4` with `WUNTRACED` and `WCONTINUED`. What remains unbuilt is alternate signal stacks, `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd`, and `SIGCHLD` on a child's stop |
-| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, and a disk sharing an interrupt line serviced rather than silently unwired, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end, where a partial acknowledgement is reachable in a guest and the measurement shows the blocks themselves saving nothing; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The fifteenth round of landings
+
+Twenty presets build and boot, with `aarch64-smmu` new. Four briefs ran, and the round's most
+valuable output is not a feature: three of the previous round's claims turned out to be wrong, and
+each was overturned by a measurement rather than an argument.
+
+- **A disk that shares an interrupt line is serviced, and one that is not wired says so.** Since the
+  second drive landed, a disk on a shared INTx line has been bound, usable, and **silently without an
+  interrupt handler**: a second claim on a held line is refused, the refusal was swallowed into a
+  `None`, and the one code path that failed without printing was the one that mattered. The disk was
+  brought up anyway — polled reads need no interrupt — and then asserted a level-triggered line nobody
+  could acknowledge, seven million times at a single unchanging instruction pointer. x86_64 escaped it
+  entirely because MSI-X gives each disk its own vector. The refusal is now recorded and printed by
+  both platforms, and the shared line's handler services every started disk, so a second INTx disk
+  genuinely works rather than merely failing loudly.
+- **And the round before had blamed that hang on a size budget.** The correction is the useful part:
+  the same code, reading one disk instead of two, links to an image measuring **byte-for-byte the same
+  1,048,576 bytes — and boots**. Two true facts had been joined by a false cause. `kbuild size` is
+  unchanged, and two further numbers were corrected on the way: the growth was 1,413 bytes rather than
+  a page, and the linked file is 561,532 bytes, because a budget bounds what the machine must hold
+  rather than a file on a disk.
+- **A partial acknowledgement is reachable in a guest — and selective acknowledgement's blocks still
+  save nothing.** Five boots per arm, zero variance in every arm: blocks honoured 610 bytes, blocks
+  ignored 610, ratio **1.00**. The previous round's null result stands, now with the mechanism
+  demonstrably running rather than merely unreachable — withholding the blocks takes `selective` from
+  two to zero and the check fires. What pays is the **partial-acknowledgement path**, which needs no
+  blocks at all: 610 against 799, one whole segment and one fewer resend. That is RFC 6582's rule, not
+  selective acknowledgement, and reporting the two as one would have turned a null result into a false
+  headline. The reasoning that blamed ring size was also wrong: while the peer withholds a
+  connection's first segment nothing is acknowledged before recovery begins, so the window never grows
+  and the acknowledgement that follows is full **by definition**. It cost sixteen bytes and no extra
+  memory.
+- **A process can be stopped and continued**, which closes the last item the personality's status row
+  listed as unbuilt. Stopped is a personality state rather than a fifth scheduler state: to the
+  scheduler a parked thread is blocked, and the difference that matters is that a blocked call ends
+  with `EINTR` while a stop **resumes the very call it interrupted**. A stop lands at the thread's next
+  system call, because that is the one place the kernel holds a Linux thread's registers; a thread
+  spinning in user mode is not stopped until it calls. `SIGCONT` resumes where it is sent rather than
+  where it is delivered, since a stopped process has no running thread to deliver to. What is not
+  promised is written down beside what is: no atomic whole-process stop, no `SIGCHLD` on stop or
+  continue, no process groups, job control or `ptrace`.
+- **An SMMUv3 is found, and nothing here is behind it.** Discovery lands; confinement does not, and
+  the reason is the machine's topology rather than an unfinished implementation. Dumping the device
+  tree with and without the option and diffing it shows that enabling the unit adds exactly one node
+  and one property, mapping stream ids from the **PCIe root complex** — while all thirty-two
+  memory-mapped virtio slots, where this port's disk actually lives, carry no such property at all.
+  Confining a disk here means first putting it on PCIe. The finding is recorded as a **failing
+  assertion** rather than a sentence: if a machine ever puts a virtio slot behind the unit, the check
+  breaks and says the topology changed.
+
+**What the round taught about checks — again, and more sharply.** Six times, a guard failed while the
+code it guarded was sound, and every one of them *passed* before being caught: an anchor matching
+nothing while also pointing at the wrong function; a guard reading a property that is absent in
+precisely the case it existed to catch; a fixed-string search treating a three-line pattern as three
+separate patterns; an expected message that did not exist in the code; a mutation that was
+semantically inert because a different guard refused the input first; and a verdict that read the exit
+status of a pipeline instead of the command. The habit that answers it is now explicit in every
+falsification: confirm a mutation was **applied**, and separately that it was **exercised** — the boot
+still reporting two disks bound, so the path genuinely ran. "Applied" alone is a standard that every
+one of those six failures could have satisfied.
 
 ### The fourteenth round of landings
 

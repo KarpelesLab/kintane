@@ -1775,7 +1775,7 @@ address or port refuses nothing — remain what prove the parsing. On `x86_64-pe
 required, and a boot fails without it.
 
 That is aarch64, where every frame arrives by interrupt. i686 reads the same on line 10,
-through the 8259A, and x86_64 on `line 17, MSI-X`. On a platform that delivers
+through the 8259A, and x86_64 on `line 18, MSI-X`. On a platform that delivers
 message-signalled interrupts, a card that came up on anything but MSI-X fails with `THE CARD
 IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT`. Every wait is bounded by the clock: 5 s for
 the gateway, 3 s for each reply, 15 s for kbuild's first probe. A broken path fails the boot
@@ -2037,12 +2037,12 @@ listener — a TCP endpoint that both accepts and originates.
   user-mode network has a relay between the guest and the network to drop and swap segments, here
   there is no between: every condition the check gates on, the peer produces by choosing what to
   send.
-  - **Each connection's first in-order data segment is dropped, once.** A lost segment is one
+  - **Every connection's first in-order data segment is dropped once, except the bulk round's.** A lost segment is one
     that never arrived, so the peer answers it with silence rather than a refusal and the guest
     must notice by itself. With a one-segment request its retransmission timer does that; with
-    the bulk round's four, the three behind the hole draw three duplicate acknowledgements and
-    its fast retransmit sends the lost one at once — which is the only way that path is reachable
-    in a guest.
+    the bulk round's eight, whose third and seventh are withheld, the segments behind each
+    hole draw duplicate acknowledgements and fast retransmit sends the lost ones at once.
+    Two holes rather than one make the acknowledgement that follows partial, not full.
   - **Segments past the hole are held, not discarded**, and each earns an acknowledgement naming
     what is still missing. Discarding them would cost a window of retransmissions where the
     protocol costs one.
@@ -2062,26 +2062,26 @@ A boot of `x86_64-peer` reports it from both ends at once, the guest's check and
 own count:
 
 ```
-  net        line 17, MSI-X; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555,
-             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 51981,
+  net        line 18, MSI-X; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555,
+             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 59613,
              closed by the kernel [syn-sent established fin-wait-1 fin-wait-2 time-wait]
              and by kbuild [syn-sent established close-wait last-ack], 2 data retransmits,
-             3 segments held out of order, 3 runs joined up, bulk round 1 fast retransmits
-             in 1 resends, 1 selective; 116 frames in, 33 out, 69 interrupts, 0 polled,
-             0 stack buffers held ok
+             3 segments held out of order, 3 runs joined up, bulk round 2 fast retransmits
+             in 2 resends, 2 selective, 1 partial; 120 frames in, 38 out, 69 interrupts,
+             0 polled, 0 stack buffers held ok
   sockets    ... udp-client: a reply from the service, a truncation reported whole, a
              foreign datagram refused, the quiet port refused ...
   linux net  tcp client ok; server ok; poll ok (two connections, 4 announcements);
              udp ok; peek ok (kbuild told of its listener 1 time); waits woken by the
              card 35, armed for a TCP timer 13, polled 0; closed in order, every buffer
              back; 0 objects left, 0 frames left ok
-  net peer:  95 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
+  net peer:  100 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
              3 acknowledgements, 12 service replies, 47 rounds of announcements,
-             7 connections, 7 first segments dropped, 3 duplicate acknowledgements,
-             7 replies sent back to front, 3 connections opened, 3 verdicts sent,
-             3 selective acknowledgements naming 3 runs, 7 acknowledgements with blocks
-             of the guest's own, 7 segments the guest sent again (610 bytes),
-             2 datagrams refused
+             7 connections, 6 first segments dropped, 2 later segments dropped,
+             4 duplicate acknowledgements, 7 replies sent back to front,
+             3 connections opened, 3 verdicts sent, 5 selective acknowledgements
+             naming 6 runs, 7 acknowledgements with blocks of the guest's own,
+             8 segments the guest sent again (610 bytes), 2 datagrams refused
 ```
 
 The peer counts the two kinds of connection separately, because they are not the same thing to
@@ -2134,22 +2134,24 @@ the first refactor that renames what it patches.
 
 | mutation | what the boot did |
 | --- | --- |
-| **The guest ignores the peer's blocks.** `kernel/net/src/tcp.rs`, in `segment`'s duplicate-acknowledgement arm: `t.record_sack(&seg.sack);` → `t.record_sack(&[None; wire::SACK_BLOCKS]);` | `bulk round 1 fast retransmits in 1 resends, 0 selective`, and the check fails with `NO RETRANSMISSION STEPPED OVER A RUN THE PEER ACKNOWLEDGED SELECTIVELY`. Recovery is go-back-N again |
+| **The guest ignores the peer's blocks.** `kernel/net/src/tcp.rs`, in `segment`'s duplicate-acknowledgement arm: `t.record_sack(&seg.sack);` → `t.record_sack(&[None; wire::SACK_BLOCKS]);` | `0 selective`, and the check fails with `NO RETRANSMISSION STEPPED OVER A RUN THE PEER ACKNOWLEDGED SELECTIVELY`. Recovery is go-back-N again |
 | **The peer names data the guest never sent.** `kbuild/src/netpeer.rs`, in `held_blocks`, immediately before `runs.truncate(SACK_BLOCKS);` insert `let mut runs: Vec<(u32, u32)> = runs.iter().map(\|(s, e)\| (*s, e.wrapping_add(4096))).collect();`, stretching every run past anything sent | `0 selective`, and the same failure — which is the point. `record_sack`'s clamp to `snd_max` drops such a block whole rather than believing it, so nothing is stepped over; a guest that believed it would have stepped over bytes the peer never held |
 | **The unreachable message quotes another connection.** `kbuild/src/netpeer.rs`, in `unreachable`: make `let quoted = frame.get(14..14 + ihl + 8)?.to_vec();` a `let mut`, then add `quoted[ihl] ^= 0xff;`, which corrupts the quoted source port so the message names a port that never sent | `udp-client: … nothing on the quiet port`, where the truth reads `the quiet port refused`: the refusal is not applied, the program times out, and the `sockets` check fails for want of the refusal this preset requires. Selective acknowledgement is untouched — still `1 selective` |
 | **The peer offers no `SACK-permitted`.** `kbuild/src/netpeer.rs`, in `tcp_frame_with`, delete `options.extend_from_slice(&[TCP_OPT_NOP, TCP_OPT_NOP, TCP_OPT_SACK_PERMITTED, 2]);` | `0 selective` *and* `0 acknowledgements with blocks of the guest's own`: both halves fall silent together, with the same gate failure. To confirm this one applied, count that line as written into a SYN — the bare option bytes also match the test fixture `SACK_PERMITTED_OPT` further down the file, which made a first check report a failure for a mutation that had in fact applied |
 
-**What selective retransmission saves here, measured: nothing.** The guest sent the same
-`7 segments ... (610 bytes)` again in every one of those five boots — blocks sent, ignored,
-disbelieved, or never offered. That is arithmetic rather than a defect. A send ring is one pool
-buffer, so `SEND_SEG` is a quarter of it and the bulk round is exactly four segments; a fast
-retransmit needs three duplicate acknowledgements, so the peer can afford to drop exactly one of
-them. With a single hole, filling it lets the receiver deliver everything contiguous and
-acknowledge all of it — a *full* acknowledgement, never a partial one — and NewReno already
-resends exactly one segment per recovery event. So go-back-N and selective recovery send the
-identical segment, and what the blocks change is where `snd_nxt` lands afterwards: the counter,
-not the wire. The saving lives at a *partial* acknowledgement, which needs two holes, which
-needs five segments in flight to still draw three duplicates — one more than the ring holds.
+**What the blocks themselves save here, measured: nothing.** The guest sent the same
+`8 segments ... (610 bytes)` again in every one of five boots — blocks sent, ignored,
+disbelieved, or never offered — 610 bytes against 610, a ratio of 1.00. That is neither a
+defect nor a ring size. While the peer withholds a connection's *first* segment, nothing is
+acknowledged before recovery starts, so the window never grows past its initial four,
+`recover` is the end of the fourth, and the acknowledgement following the retransmission lands
+exactly on it: *full* by definition, never partial. NewReno already resends exactly one segment
+per recovery event, so go-back-N and selective recovery put the identical bytes on the wire, and
+what the blocks change is where `snd_nxt` lands afterwards — the counter, not the wire. What
+does pay is the *partial* acknowledgement itself, reached by withholding the bulk round's third
+and seventh rather than its first: 610 bytes against 799, one whole segment and one fewer
+resend. That is RFC 6582 §3.2's rule rather than selective acknowledgement, and it needs no
+blocks at all.
 That case is the host test `only_the_holes_are_resent_when_the_peer_acknowledges_selectively`,
 which constructs it deliberately. And this is an emulated peer over a loopback socket in any
 case: the figure is a ratio between two arrangements of the same guest, not a throughput claim
