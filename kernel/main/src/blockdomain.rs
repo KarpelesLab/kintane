@@ -539,7 +539,8 @@ fn contain_rogue(c: &dyn EarlyConsole, client: &mut Client, dma_phys: u64, dma_l
     }
     // The grant translates and the canary does not: the device is confined to exactly the
     // grant.
-    if !iommu::domain_maps(dma_phys) || iommu::domain_maps(cphys) {
+    let owned = crate::block::primary();
+    if !iommu::domain_maps(owned, dma_phys) || iommu::domain_maps(owned, cphys) {
         c.write_str("; THE IOMMU DOMAIN DOES NOT MAP EXACTLY THE GRANT");
         return false;
     }
@@ -570,15 +571,24 @@ fn contain_rogue(c: &dyn EarlyConsole, client: &mut Client, dma_phys: u64, dma_l
     // while the *data* write to the canary faulted. What proves containment is the fault log
     // and the untouched canary, not whether the descriptor was returned.
     let _ = reply;
+    // As in the kernel's own confinement check: the fault must name the device the domain
+    // drives, not merely land at the canary. The unit's log is shared by every device behind
+    // it, so an address-only match would take another device's fault for this one.
+    let expected = iommu::source_of(owned);
     let stopped = match fault {
-        Some((f, source)) if f.address == cphys && f.write => {
+        Some(f) if f.address == cphys && f.write && Some(f.source_id) == expected => {
             c.write_str("; the domain's out-of-grant DMA stopped at ");
             write_hex(c, f.address);
             c.write_str(" from ");
-            write_hex(c, u64::from(source));
+            write_hex(c, u64::from(f.source_id));
             true
         }
-        Some((f, _)) => {
+        Some(f) if f.address == cphys && f.write => {
+            c.write_str("; THE DOMAIN'S ROGUE DMA STOPPED BUT THE FAULT NAMES ANOTHER DEVICE: ");
+            write_hex(c, u64::from(f.source_id));
+            false
+        }
+        Some(f) => {
             c.write_str("; A FAULT AT ");
             write_hex(c, f.address);
             c.write_str(" BUT NOT THE ROGUE ONE");
@@ -743,8 +753,8 @@ pub fn smp_check(c: &dyn EarlyConsole) -> Check {
         return Check::Failed;
     }
     let route = |cpu| {
-        if iommu::disk_interrupt_remapped() {
-            iommu::route_disk_interrupt(line, cpu)
+        if iommu::disk_interrupt_remapped(crate::block::primary()) {
+            iommu::route_disk_interrupt(crate::block::primary(), line, cpu)
         } else {
             platform::route_interrupt(line, cpu)
         }
@@ -769,7 +779,7 @@ pub fn smp_check(c: &dyn EarlyConsole) -> Check {
     let flushes_ns = timekeeping::now()
         .saturating_duration_since(flushes_from)
         .as_nanos();
-    if iommu::disk_interrupt_remapped() {
+    if iommu::disk_interrupt_remapped(crate::block::primary()) {
         c.write_str("; an entry change flushed in ");
         write_usize(c, (flushes_ns / FLUSH_SAMPLES) as usize);
         c.write_str(" ns");

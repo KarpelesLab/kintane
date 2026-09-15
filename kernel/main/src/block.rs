@@ -239,14 +239,14 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         // check reads. The IOMMU presets therefore attach a single drive, which is why this
         // is slot 0 rather than `i` — the loop runs once there.
         if kconfig::IOMMU && i == 0 {
-            if !iommu::confine_disk(c, frames, direct, phys, len as u64) {
+            if !iommu::confine_disk(c, frames, direct, i, phys, len as u64) {
                 return Check::Failed;
             }
             c.write_str("; ");
             // On MSI-X, the disk's interrupt goes through the IOMMU as well: its table
             // entry, not its message, then names the CPU, and only the disk may use it.
             if let Some(line) = platform::block_line(0).filter(|&l| platform::interrupt_is_msi(l)) {
-                if !iommu::remap_disk_interrupt(c, frames, line) {
+                if !iommu::remap_disk_interrupt(c, frames, i, line) {
                     return Check::Failed;
                 }
                 c.write_str("; ");
@@ -430,7 +430,7 @@ fn iommu_checks(
     // domain and the device reads a sector into it; then it is unmapped with the flush the unit
     // needs. The unit caches what the device translated, so without that flush the rogue DMA
     // below would reach the canary through the translation it used a moment ago.
-    if !iommu::grant_page(frames, cphys) {
+    if !iommu::grant_page(frames, primary(), cphys) {
         c.write_str("\n  iommu      THE CANARY COULD NOT BE MAPPED FOR THE DEVICE");
         return false;
     }
@@ -444,7 +444,7 @@ fn iommu_checks(
         c.write_str("\n  iommu      A READ INTO A PAGE MAPPED FOR THE DEVICE DID NOT ARRIVE");
         return false;
     }
-    if !iommu::revoke_page(cphys) {
+    if !iommu::revoke_page(primary(), cphys) {
         c.write_str("\n  iommu      THE CANARY COULD NOT BE UNMAPPED AND FLUSHED");
         return false;
     }
@@ -454,7 +454,7 @@ fn iommu_checks(
     }
 
     // The grant must translate and the canary must not: the domain maps exactly the grant.
-    if !iommu::domain_maps(phys) || iommu::domain_maps(cphys) {
+    if !iommu::domain_maps(primary(), phys) || iommu::domain_maps(primary(), cphys) {
         c.write_str("\n  iommu      THE DOMAIN DOES NOT MAP EXACTLY THE GRANT");
         return false;
     }
@@ -472,15 +472,25 @@ fn iommu_checks(
     }
 
     c.write_str("\n  iommu      in-grant DMA served behind VT-d; a page the device used was unmapped and flushed");
+    // Stopped is not enough: the fault must name *this* device. The log is the unit's and every
+    // device behind it records there, so a fault matched only by address would be satisfied by
+    // another device's fault at the same page — which is the thing a second confined device
+    // makes possible.
+    let expected = iommu::source_of(primary());
     let stopped = match fault {
-        Some((f, source)) if f.address == cphys && f.write => {
+        Some(f) if f.address == cphys && f.write && Some(f.source_id) == expected => {
             c.write_str("; out-of-grant DMA stopped at ");
             write_hex(c, f.address);
             c.write_str(" from ");
-            write_hex(c, u64::from(source));
+            write_hex(c, u64::from(f.source_id));
             true
         }
-        Some((f, _)) => {
+        Some(f) if f.address == cphys && f.write => {
+            c.write_str("; THE ROGUE DMA WAS STOPPED BUT THE FAULT NAMES ANOTHER DEVICE: ");
+            write_hex(c, u64::from(f.source_id));
+            false
+        }
+        Some(f) => {
             c.write_str("; A FAULT AT ");
             write_hex(c, f.address);
             c.write_str(" BUT NOT THE ROGUE ONE");
@@ -802,7 +812,7 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("THE DISK IS NOT ON MSI-X, SO NOTHING IS REMAPPED");
         return Check::Failed;
     };
-    let extended = match iommu::check_disk_interrupt(line) {
+    let extended = match iommu::check_disk_interrupt(primary(), line) {
         Ok(extended) => extended,
         Err(why) => {
             c.write_str(why);
@@ -826,7 +836,7 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
     for (how, what) in blocked {
         c.write_str(what);
         if !blocked_and_logged(c, blk, how) {
-            let _ = iommu::tamper_disk_interrupt(iommu::Tamper::Restore);
+            let _ = iommu::tamper_disk_interrupt(primary(), iommu::Tamper::Restore);
             return Check::Failed;
         }
     }
@@ -836,13 +846,13 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("NO EXTENDED INTERRUPT MODE, SO NO DESTINATION ABOVE 255");
         return Check::Failed;
     }
-    if !iommu::tamper_disk_interrupt(iommu::Tamper::WideDestination) {
+    if !iommu::tamper_disk_interrupt(primary(), iommu::Tamper::WideDestination) {
         c.write_str("THE ENTRY DID NOT TAKE THE DESTINATION");
         return Check::Failed;
     }
     // SAFETY: as above.
     let taken = unsafe { interrupts_during_polled_read(blk) };
-    let _ = iommu::tamper_disk_interrupt(iommu::Tamper::Restore);
+    let _ = iommu::tamper_disk_interrupt(primary(), iommu::Tamper::Restore);
     while iommu::take_fault().is_some() {}
     match taken {
         Ok(0) => c.write_str("not taken by the boot CPU"),
@@ -884,7 +894,7 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
     c.write_str("; ");
     let flushes_from = timekeeping::now();
     for _ in 0..FLUSH_SAMPLES {
-        if let Err(why) = iommu::route_disk_interrupt(line, 0) {
+        if let Err(why) = iommu::route_disk_interrupt(primary(), line, 0) {
             c.write_str("; ");
             c.write_str(why);
             return Check::Failed;
@@ -922,14 +932,15 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
 /// take no interrupt, and the fault log must hold an interrupt-remapping fault from the disk
 /// for entry 0. The entry is restored afterwards.
 fn blocked_and_logged(c: &dyn EarlyConsole, blk: &VirtioBlk<Locks>, how: iommu::Tamper) -> bool {
-    if !iommu::tamper_disk_interrupt(how) {
+    let i = primary();
+    if !iommu::tamper_disk_interrupt(i, how) {
         c.write_str("THE ENTRY COULD NOT BE CHANGED");
         return false;
     }
     // SAFETY: as `remap_check`'s.
     let taken = unsafe { interrupts_during_polled_read(blk) };
     let fault = iommu::take_fault();
-    let restored = iommu::tamper_disk_interrupt(iommu::Tamper::Restore);
+    let restored = iommu::tamper_disk_interrupt(i, iommu::Tamper::Restore);
     while iommu::take_fault().is_some() {}
     match taken {
         Ok(0) => c.write_str("blocked"),
@@ -942,14 +953,15 @@ fn blocked_and_logged(c: &dyn EarlyConsole, blk: &VirtioBlk<Locks>, how: iommu::
             return false;
         }
     }
+    let source = iommu::source_of(i);
     match fault {
-        Some((f, disk)) if f.source_id == disk && f.interrupt_index() == Some(0) => {
+        Some(f) if Some(f.source_id) == source && f.interrupt_index() == Some(i as u16) => {
             c.write_str(", fault ");
             write_hex(c, u64::from(f.reason));
             c.write_str(" from ");
             write_hex(c, u64::from(f.source_id));
         }
-        Some((f, _)) => {
+        Some(f) => {
             c.write_str(", A FAULT THAT IS NOT THE DISK'S ENTRY: REASON ");
             write_hex(c, u64::from(f.reason));
             return false;
@@ -1023,10 +1035,10 @@ pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
     }
     // A remapped interrupt goes where its table entry says, so the entry is changed, with its cache
     // flushed; any other message-signalled interrupt is moved in its MSI-X entry.
-    let remapped = iommu::disk_interrupt_remapped();
+    let remapped = iommu::disk_interrupt_remapped(primary());
     let route = |cpu| {
         if remapped {
-            iommu::route_disk_interrupt(line, cpu)
+            iommu::route_disk_interrupt(primary(), line, cpu)
         } else {
             platform::route_interrupt(line, cpu)
         }

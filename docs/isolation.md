@@ -223,7 +223,9 @@ with its DMA translated — the in-grant DMA working end to end. The `iommu` lin
 - **Out-of-grant DMA stopped and logged.** A deliberate read into the canary (a descriptor pointing
   outside the grant, which a driver never does and an isolated one must not be able to get away
   with) is stopped by the hardware. The unit's fault log names the canary's address and the disk's
-  own source id, `00:03.0`, and the canary still holds its sentinel.
+  own source id, `00:02.0`, and the canary still holds its sentinel. The check compares the
+  fault's source id against the one *that disk* was attached with, so a fault matched only by
+  address — which another device behind the same unit could produce — is not taken for this one.
 - **Restart.** The faulted device is reset and brought up again over the same grant, and serves a
   read — so the host survives a device fault and the stress run still has a disk.
 
