@@ -14,6 +14,7 @@ pub mod acpi;
 pub mod aml;
 pub mod bootproto;
 pub mod dgram;
+pub mod dirent;
 pub mod elf;
 pub mod fat;
 pub mod fdt;
@@ -49,6 +50,14 @@ fn menu_accepts(input: &[u8]) -> bool {
 /// Every target. Seeded ones (`needs_seeds`) read `corpus/<name>/seed-*.bin`; the rest
 /// build their own input and use the corpus only for what has failed before.
 pub const TARGETS: &[Target] = &[
+    Target {
+        name: "dirent",
+        what: "the directory entries `getdents64` packs into a program's buffer",
+        needs_seeds: false,
+        generate: dirent::generate,
+        run: dirent::run,
+        accepts: Some(dirent::accepts),
+    },
     Target {
         name: "fdt",
         what: "device tree blobs, as firmware hands them to every port without ACPI",

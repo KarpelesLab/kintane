@@ -1062,10 +1062,15 @@ steps that only ask may follow it. What must still be refused is a component lon
 namespace holds, which creates nothing, and a name the driver will not write, which reaches the
 program as `ENAMETOOLONG` rather than as a shortened name.
 
-**A Linux program cannot list a long name**, because no `getdents` of any kind exists
-([userspace-abi.md](userspace-abi.md#as-built--static-programs-x86_64-and-aarch64)). Create, open,
-rename and unlink carry a long name end to end; enumeration is not available rather than working.
-Listing is checked through the file server and the `fat` host tests instead.
+**A Linux program lists a long name as itself.** `getdents64` answers on both architectures
+([userspace-abi.md](userspace-abi.md#as-built--static-programs-x86_64-and-aarch64)). Steps 230 to
+239 of the files mode make a long name and a directory beside it, list `/KINTANE` in 128-byte
+pieces, and require all of: the long name present and never the short alias it also answers to;
+`LSDIR` carrying `DT_DIR` where the long name carries `DT_REG`; no entry seen twice across the
+pieces and none lost between them; a buffer too small for even one record refused with `EINVAL`,
+rather than the zero a caller would read as the end of the directory; and a listing rewound with
+`lseek` reproducing its first batch. The steps write, so they run before the step that syncs, and
+they make and remove their own names rather than looking for a name an earlier step removed.
 
 | Mutation | What catches it |
 |---|---|
@@ -1073,6 +1078,10 @@ Listing is checked through the file server and the `fat` host tests instead.
 | An alias that ignores what the directory already holds | `an_alias_never_takes_a_name_something_else_answers_to` |
 | A name with a reserved character, or a trailing dot, written rather than refused | `a_name_this_driver_will_not_write_is_refused`, and the boot's step 96 |
 | `fstatfs` answers for the filesystem at the root instead of the one its descriptor's file is on | the `linux` check: files mode exited **`0xc6`**, step 198, and the boot failed `rc=1`; restored, it exits `0x32` and the boot passes |
+| A long name listed as the short alias it also answers to (`fat`'s `readdir` reporting the short entry) | files mode exited **`0xeb`**, step 235, and the guest exited 35 rather than 33 |
+| A record that does not fit consumed anyway, so an entry is lost between two calls | files mode exited **`0xec`**, step 236, and the guest exited 35 |
+| A directory carrying a regular file's `d_type` | files mode exited **`0xec`**, step 236, and the guest exited 35 |
+| A Linux `statfs` answer overstating the free count by 64 clusters | **the program still exited `0x32`** — its own steps cannot catch a fabricated number — and the kernel's walk failed the boot with `THE PROGRAM WAS TOLD SOMETHING ELSE ABOUT /`, the guest exiting 35 |
 
 #### What the volumes say they are
 
@@ -1100,11 +1109,19 @@ Listing is checked through the file server and the `fat` host tests instead.
   the step whose `fsync` makes the writing durable, leaving nothing in the cache for the walk that
   follows.
 
-  **What is not built:** nothing holds a *Linux* program's `statfs` answers against the kernel's own
-  walk, as `files size` does for `init`. The Linux side proves the two calls are coherent with each
-  other and that the path decides which filesystem answers; it does not prove the numbers are true.
-  A `statfs` that answered plausible fabricated numbers would pass the Linux steps and be caught
-  only through the native path.
+  **And the kernel holds those answers against its own walk.** The program leaves both `statfs`
+  answers, and a listing of `/KINTANE` taken after its last change to that directory, in
+  `/KINTANE/LINUX.DIR`, synced. The kernel then reads the file back and compares: each answer
+  against `vfs::statfs` of the same path — the allocation unit, the unit count and the longest name
+  exactly, the free count ahead by at most eight clusters for the same reason as `files size` — and
+  the listing against the kernel's own `readdir` walk of that directory, requiring every name the
+  walk finds to appear with a matching `d_type`, and requiring the two to hold the same number of
+  entries, so an invented name is caught as well as a dropped one. The program's own steps prove
+  only that it was answered coherently; a driver reporting the same fabricated numbers to every
+  asker would pass them. This is the half that says the answers were true.
+
+  It asks the namespace where a volume is mounted rather than naming a sector, so it is unaffected
+  by which drive the FAT32 volume lives on.
 
 ```
   files size init: asked the file service what the volumes are; both volumes answered for themselves; the same server thread; 0 objects left, 0 frames left ok
