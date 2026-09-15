@@ -1877,36 +1877,54 @@ own count:
 
 ```
   net        line 17, MSI-X; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555,
-             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 59503,
+             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 61753,
              closed by the kernel [syn-sent established fin-wait-1 fin-wait-2 time-wait]
-             and by kbuild [syn-sent established close-wait last-ack],
-             2 data retransmits, 3 segments held out of order, 3 runs joined up,
-             bulk round 1 fast retransmits in 1 resends; 116 frames in, 30 out,
-             64 interrupts, 0 polled, 0 stack buffers held ok
-  net peer:  76 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
-             3 acknowledgements, 3 service replies, 112 rounds of announcements,
-             6 connections, 6 first segments dropped, 3 duplicate acknowledgements,
-             6 replies sent back to front
+             and by kbuild [syn-sent established close-wait last-ack], ...
+  linux net  tcp client ok; server ok; poll ok (two connections, 4 announcements);
+             udp ok; peek ok (kbuild told of its listener 1 time); waits woken by the
+             card 33, armed for a TCP timer 15, polled 0; closed in order, every buffer
+             back; 0 objects left, 0 frames left ok
+  net peer:  87 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
+             3 acknowledgements, 12 service replies, 51 rounds of announcements,
+             7 connections, 7 first segments dropped, 3 duplicate acknowledgements,
+             7 replies sent back to front, 3 connections opened, 3 verdicts sent
 ```
 
-Six connections for three rounds, because each round's first segment is dropped and the guest
-opens the round again rather than waiting; six replies sent back to front for the same reason.
-Those four counts, and everything the check gates on, are the same every boot. Four figures in
-that transcript are not, and should not be read as fixed: the guest's ephemeral port, its
-interrupt count, and the peer's frames-in and rounds of announcements, which depend on how long
-the guest takes to reach the check while the peer is announcing into it.
+The peer counts the two kinds of connection separately, because they are not the same thing to
+it. Seven *connections* are ones the guest opened and this end accepted, and each contributes one
+first segment dropped and one reply sent back to front — the disturbances of stage three, which
+are why seven connections serve fewer rounds than seven: a dropped first segment makes the guest
+open the round again rather than wait. Three *connections opened* are the ones this end originated
+into the guest's listener, one for each tag the guest announced, and each earns one verdict. The
+drop never applies to those: losing the guest's reply on a connection this end opened would slow
+the exchange with no check asking for it.
 
-**`x86_64-peer` is still absent from `scratchpad/verify.sh`'s preset list, and a boot of it still
-ends in failure.** The `net` check passes, but `linux net` does not: its `server`, `poll` and
-`peek` modes need kbuild to *originate* a connection into the guest's own listener, having heard
-the `kintane-tcp-listening <tag>` datagram that announces it — an endpoint that connects as well
-as accepts, which is stage four. Without one the guest waits for a connection that never comes and
-the run ends `timed out after 30s with no exit signal from the guest`. The gate
-enumerates its presets explicitly, so a preset outside the list is a stage rather than a
-regression; it joins the list when the whole check passes. **Nothing said above about selective
-acknowledgement or the quiet port changes yet**: both stay host-tested until the peer offers
-SACK-permitted and sends a destination-unreachable, which is stage five and wants a solid endpoint
-beneath it.
+Those counts, and everything the check gates on, are the same every boot. Four figures in that
+transcript are not, and should not be read as fixed: the guest's ephemeral port, its interrupt
+count, and the peer's frames-in and rounds of announcements, which depend on how long the guest
+takes to reach the check while the peer is announcing into it.
+
+**`x86_64-peer` boots rc=0 and is in `scratchpad/verify.sh`'s preset list**, in both the boot loop
+and the in-kernel loop. It joined at stage four, which is the endpoint that connects as well as
+accepts. `linux net`'s `server`, `poll` and `peek` modes each open a listener and wait for a
+connection to arrive at it, so until kbuild could *originate* one they waited for a connection
+that never came and the run ended `timed out after 30s with no exit signal from the guest`.
+
+Nothing sends unprompted, and nothing needed to. The guest announces each listener with
+`kintane-tcp-listening <tag>` every 500ms for as long as it is waiting, so the announcement is
+itself the prompt: the peer answers it with a SYN. A tag it has already served earns nothing, and
+a tag whose SYN went unanswered earns that same SYN again, which makes a lost one recoverable on
+the next announcement without a retransmit timer anywhere in the peer.
+
+Two things about the guest's side shape how a connection is identified. `poll` announces two
+different tags for one listener, so both of its connections reach guest port 7777 and the guest's
+port alone cannot tell them apart; the peer keys a connection by both ports and speaks from a port
+of its own, drawn from 49152 upwards. And the guest's `serve` reads the verdict line and then
+reads again expecting end-of-stream, so the peer sends the verdict and the FIN in one batch.
+
+**Nothing said above about selective acknowledgement or the quiet port changes yet**: both stay
+host-tested until the peer offers SACK-permitted and sends a destination-unreachable, which is
+stage five and wants a solid endpoint beneath it.
 
 ### 2h. Waiting on many things at once
 
