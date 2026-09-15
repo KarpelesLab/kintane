@@ -1258,7 +1258,9 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
     // load a program from a disk rather than only from its own image. `userinit` is a
     // provider name: only the real program has a path to embed, and the empty provider a
     // configuration without userspace selects has none.
-    if res.is_on(testdisk::SYMBOL) {
+    // `QEMU_PCIE_BLOCK` attaches a function to the PCIe bus rather than a disk a driver
+    // drives, but it still needs a file behind it, so the image is written for it too.
+    if res.is_on(testdisk::SYMBOL) || res.is_on("QEMU_PCIE_BLOCK") {
         let program = built
             .get("userinit")
             .filter(|b| b.embed.is_some())

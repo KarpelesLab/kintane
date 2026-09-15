@@ -104,6 +104,14 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         c.write_str(", AND NO HOST BRIDGE ANSWERED ON A BUS THAT HAS ONE");
         return Check::Failed;
     }
+    // A bridge presents its own function whether or not anything is plugged in, so the number
+    // of functions alone cannot say a device was found. What a machine presents is the
+    // machine's business and is reported rather than asserted — except that a run which
+    // attached one must find one, or the walk saw nothing the bridge did not present by itself.
+    if kconfig::QEMU_PCIE_BLOCK && scan.endpoints == 0 {
+        c.write_str(", AND NOTHING BEHIND THE BRIDGE, THOUGH THE RUN ATTACHED A FUNCTION");
+        return Check::Failed;
+    }
     // Sizing a register writes to it and puts it back. One left disturbed works until a driver
     // maps it, which is the kind of damage that surfaces far from its cause.
     if !scan.restored {
@@ -116,6 +124,12 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     write_usize(c, scan.bridges);
     c.write_str(" host bridge");
     if scan.bridges != 1 {
+        c.write_str("s");
+    }
+    c.write_str(", ");
+    write_usize(c, scan.endpoints);
+    c.write_str(" endpoint");
+    if scan.endpoints != 1 {
         c.write_str("s");
     }
     if scan.truncated {

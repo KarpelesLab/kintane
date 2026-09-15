@@ -239,6 +239,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
                 .into_iter()
                 .chain(smp)
                 .chain(block_disk(res, image, "virtio-blk-device"))
+                .chain(pcie_endpoint(res, image))
                 .chain(net_card(res, "virtio-net-device", net_port))
                 .chain([
                     s("-kernel"),
@@ -336,6 +337,36 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
 
     Err("no QEMU machine is defined for this configuration".into())
+}
+
+/// A virtio-blk function on the PCIe bus, when the configuration asks for one.
+///
+/// Attached so that walking the bus finds something beyond the bridge's own function, which a
+/// bridge presents whether or not anything is plugged in. Nothing binds it, which is why this
+/// is deliberately not [`block_disk`]: that one's contract is a disk a driver drives and the
+/// boot reads. A PCI function cannot be bound on this port yet — the walk happens in the check
+/// phase, because configuration space is out of reach until the kernel's address space maps the
+/// ECAM window, and the ledger `discover` binds through is gone by then.
+fn pcie_endpoint(res: &Resolution, image: &Path) -> Vec<String> {
+    if !res.is_on("QEMU_PCIE_BLOCK") {
+        return Vec::new();
+    }
+    // Its own file, and read-only. Two `-drive`s on one image make QEMU refuse the run with
+    // `Failed to get "write" lock`, and on this port the memory-mapped disks already hold both
+    // run copies — `QEMU_BLOCK_TEST` defaults on for aarch64, so a preset that never names it
+    // still attaches them. This one points at the second disk's *pristine* image, which nothing
+    // else attaches, and takes no write lock at all: nothing binds this function, so nothing
+    // writes it, and saying so on the command line keeps it that way.
+    let pristine = image
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(crate::testdisk::FILE2);
+    vec![
+        "-drive".to_string(),
+        format!("file={},if=none,id=kt_pcie,format=raw,readonly=on", pristine.display()),
+        "-device".to_string(),
+        "virtio-blk-pci,disable-legacy=on,drive=kt_pcie".to_string(),
+    ]
 }
 
 /// The test disk, attached to a virtio-blk device of the given kind, when the
