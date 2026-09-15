@@ -58,6 +58,12 @@ mod iommu;
 #[cfg(not(CONFIG_IOMMU))]
 #[path = "iommu_off.rs"]
 mod iommu;
+// Discovering an Arm SMMUv3 and reporting what it covers; without one, a skipped check.
+#[cfg(CONFIG_SMMUV3)]
+mod smmu;
+#[cfg(not(CONFIG_SMMUV3))]
+#[path = "smmu_off.rs"]
+mod smmu;
 // PCI pins routed through `_PRT`, which only the PC platform does; elsewhere, none routed.
 #[cfg(any(CONFIG_ARCH_X86_64, CONFIG_ARCH_I686))]
 mod intx;
@@ -651,6 +657,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(model::userspace_check(c, &mut frames, live))
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(block::check(c, &mut frames, live))
+        .and(smmu::check(c))
         .and(net::bring_up(c, &mut frames, live))
         .and(fs::check(c, &mut frames, live))
         .and(personality::check(c, &mut frames, live))

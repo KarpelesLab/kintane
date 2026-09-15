@@ -280,6 +280,44 @@ read. The 4.5 µs is two traps into the emulator and its descriptor processing, 
 asynchronous queue, which drains in its own time; there the bound the driver waits under is what
 matters, and only the host tests exercise it.
 
+## Discovering an SMMUv3 (aarch64), and why confinement stops there
+
+aarch64 has no IOMMU integration, so a driver domain on that port is confined by nothing — the
+gap the prototype above names. With `SMMUV3` (the `aarch64-smmu` preset) the kernel finds the
+machine's unit and reports what it could translate for. It programs nothing, and the reason it
+stops there is a fact about the machine rather than a missing piece of code.
+
+### What runs
+
+QEMU is started with `-machine virt,iommu=smmuv3`. On boot, `kernel/platform/fdt` finds the
+`arm,smmu-v3` node and reads the unit's identification registers **on the boot identity map** —
+the same way the memory-mapped virtio slots are identified before any driver is bound, so no
+window has to be claimed and no driver exists to claim it. Nothing is programmed.
+
+What the unit reports under QEMU 11.0.3: 16-bit stream ids (`IDR1.SIDSIZE`), 4 KiB and 64 KiB
+granules (`IDR5.GRAN4K`, `GRAN64K`), a 44-bit output address (`IDR5.OAS`), and 65 536 stream ids
+mapped to it from the PCIe root complex.
+
+### Why nothing is confined
+
+**QEMU wires the SMMU to the PCIe root complex and to nothing else.** `iommu-map` appears on
+`pcie@10000000` and on no other node, and the 32 `virtio,mmio` slots carry no `iommus` property
+at all. That was established by dumping the machine's own tree (`-machine dumpdtb`) and diffing
+it against the same machine without the option: `iommu=smmuv3` adds exactly one node and that
+one property.
+
+This port's disk is a `virtio-blk-device` in one of those memory-mapped slots. So there is no
+device here whose DMA the unit could translate, and confining one would mean first putting the
+disk on PCIe — an ECAM host bridge driver, enumeration from the tree, and message-signalled
+interrupts through the ITS. That is a separate piece of work rather than a step inside this one:
+`kernel/device/src/pci.rs` reaches configuration space through the windows an ACPI MCFG
+describes, and the FDT platform never builds one.
+
+The `smmu` check asserts that coverage fact rather than leaving it in this document. While no
+virtio-mmio slot sits behind the unit, the next stage is known to be unreachable; if a machine
+ever puts one there, the check fails and says the topology changed, instead of the claim quietly
+going stale.
+
 ## Running the driver in a domain (x86_64)
 
 With `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the two halves above are joined: the disk's

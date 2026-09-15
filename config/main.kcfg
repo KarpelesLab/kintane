@@ -848,6 +848,32 @@ config IOMMU
         `-device intel-iommu` and the disk with `iommu_platform=on`, which the
         `x86_64-iommu` preset does. See docs/isolation.md.
 
+config SMMUV3
+    bool "Discover an Arm SMMUv3 and report what it covers"
+    depends on ARCH_AARCH64
+    help
+        Find the machine's `arm,smmu-v3` node, read the unit's identification
+        registers on the boot identity map, and report what it could translate
+        for: the stream id width, the granules it walks tables with, its output
+        address size, and how many stream ids the device tree maps to it.
+
+        Discovery only. No stream table is built and no device is confined,
+        because on QEMU's `virt` there is no device here to confine: the SMMU is
+        wired to the PCIe root complex alone -- `iommu-map` is on `pcie@…` and
+        nowhere else -- while this port's disk is a memory-mapped virtio slot
+        carrying no `iommus` property. Confining it would mean first putting the
+        disk on PCIe, which is an ECAM host bridge, FDT enumeration and MSI
+        routing: a separate piece of work, not a step inside this one.
+
+        The `smmu` check gates the boot on the discovery being coherent, and
+        asserts the coverage fact as well: while no virtio-mmio slot is behind
+        the unit, the next stage is known to be unreachable, and if one ever is,
+        the check fails rather than letting the claim go stale.
+
+        aarch64 only, and off by default: QEMU must be started with
+        `-machine virt,iommu=smmuv3`, which the `aarch64-smmu` preset does. See
+        docs/isolation.md.
+
 config BLOCK_DOMAIN
     bool "Serve the disk from an isolated driver domain"
     depends on IOMMU && USERSPACE && MM_PAGED
