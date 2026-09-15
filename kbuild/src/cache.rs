@@ -60,11 +60,25 @@ fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Some(p) = to.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let _ = std::fs::remove_file(to);
-    match std::fs::hard_link(from, to) {
-        Ok(()) => Ok(()),
+    // Land the artifact by renaming a temporary sibling over `to`, never by unlinking
+    // `to` and then recreating it. Every preset built for one target shares
+    // `build/<target>/out/`, and a build running beside this one names these very paths
+    // in `--extern`: the gap between an unlink and the link that follows is a moment in
+    // which a dependency does not exist, which rustc reports as `E0463: can't find
+    // crate` against a crate that was built and is about to be there again. `rename` is
+    // atomic, so a concurrent reader sees the old file or the new one and never absence.
+    let tmp = to.with_extension(format!("tmp{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    if std::fs::hard_link(from, &tmp).is_err() {
         // Across filesystems, or where hardlinks are unavailable.
-        Err(_) => std::fs::copy(from, to).map(|_| ()),
+        std::fs::copy(from, &tmp)?;
+    }
+    match std::fs::rename(&tmp, to) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -191,5 +205,67 @@ mod tests {
         let c = Cache::new(dir.clone()).unwrap();
         assert!(!c.restore("0".repeat(64).as_str(), "x.rlib", &dir.join("x.rlib")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How long a destination is observed missing while an artifact lands on it, over
+    /// `ROUNDS` landings watched by a spinning reader.
+    fn absences(tag: &str, land: fn(&Path, &Path)) -> usize {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const ROUNDS: usize = 3000;
+        let dir = std::env::temp_dir().join(format!("kbuild-land-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.rlib");
+        let dest = dir.join("dest.rlib");
+        std::fs::write(&src, b"an artifact").unwrap();
+        std::fs::write(&dest, b"an artifact").unwrap();
+
+        let watching = Arc::new(AtomicBool::new(true));
+        let absent = Arc::new(AtomicUsize::new(0));
+        let (w, a, watched) = (watching.clone(), absent.clone(), dest.clone());
+        let reader = std::thread::spawn(move || {
+            while w.load(Ordering::Relaxed) {
+                if !watched.exists() {
+                    a.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        for _ in 0..ROUNDS {
+            land(&src, &dest);
+        }
+        watching.store(false, Ordering::Relaxed);
+        reader.join().unwrap();
+        let n = absent.load(Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+        n
+    }
+
+    /// Landing an artifact must never leave the destination absent, even for an instant.
+    /// Every preset built for one target shares `build/<target>/out/`, and a build
+    /// running beside this one names those paths in `--extern`; a file missing there is
+    /// reported as `E0463: can't find crate` against a crate that was just built. The
+    /// unsafe strategy is measured too, so a test that cannot detect a window fails
+    /// loudly rather than passing for the wrong reason.
+    #[test]
+    fn landing_an_artifact_never_leaves_the_destination_absent() {
+        fn unlink_then_link(from: &Path, to: &Path) {
+            let _ = std::fs::remove_file(to);
+            let _ = std::fs::hard_link(from, to);
+        }
+        fn land(from: &Path, to: &Path) {
+            link_or_copy(from, to).unwrap();
+        }
+
+        assert!(
+            absences("unsafe", unlink_then_link) > 0,
+            "unlink-then-recreate showed no window, so this test cannot detect one"
+        );
+        assert_eq!(
+            absences("rename", land),
+            0,
+            "link_or_copy left the destination absent; a build beside this one would see E0463"
+        );
     }
 }
