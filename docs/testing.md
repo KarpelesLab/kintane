@@ -1822,6 +1822,54 @@ queue, datagram sockets and `poll`/`select`/`epoll` do not exist. Native `listen
 QEMU machine routes the card's interrupt. The only network card driver is virtio-net, and it has
 run only under QEMU.
 
+
+**kbuild as the whole network** (`QEMU_NET_PEER`, the `x86_64-peer` preset). Everything above is
+QEMU's user-mode network with kbuild disturbing frames in flight. That network is also what keeps
+two things out of reach of a guest: it offers no SACK-permitted on a SYN and sends no ICMP
+destination-unreachable, so neither selective acknowledgement nor a refused datagram can be
+exercised however the frames are mutated. The alternative is to be the network:
+
+```
+-netdev dgram,id=kt_net,local.type=inet,local.host=127.0.0.1,local.port=<local>,
+        remote.type=inet,remote.host=127.0.0.1,remote.port=<remote>
+```
+
+One raw Ethernet frame per datagram, both ways, with no NAT, no gateway and no filters: a
+disturbance this peer wants to make, it makes by choosing what to send. It is built in stages,
+because the `net` check gates on three TCP rounds and an inbound connection into the guest's own
+listener — a TCP endpoint that both accepts and originates.
+
+- **Stage one** answers ARP and counts what crosses, which proves the socket carries frames both
+  ways rather than inferring it from the backend's existence. An earlier attempt hand-built a
+  QEMU command line, omitted what the platform supplies, and never brought the card up, so no
+  frame arriving proved nothing: the netdev is substituted inside kbuild's own machine
+  construction for that reason.
+- **Stage two** is the datagram half: an echo reply for each request to the gateway, the four
+  datagrams that tell the guest which ports to use, an acknowledgement for each echo it returns,
+  a service answering `kintane-udp-request <tag>` at the gateway's address, a port that answers
+  nothing, and one datagram sent as two IPv4 fragments. Under `-netdev user` those services are
+  loopback sockets QEMU forwards to, and the fragmenting is the downstream relay's; with no NAT
+  there is nowhere else for them to live, so the peer sends the two fragments itself — the same
+  thing seen from the other side.
+
+A boot of `x86_64-peer` reports it from both ends at once, the guest's check and then the peer's
+own count:
+
+```
+  net        line 17, MSI-X; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555,
+             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 57965;
+             THE TCP CONNECTION WAS NEVER ESTABLISHED
+  net peer:  70 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
+             3 acknowledgements, 3 service replies
+```
+
+That failure is the stage boundary, and it is why **`x86_64-peer` is deliberately absent from
+`scratchpad/verify.sh`'s preset list**. No partial peer passes a check gating on three TCP rounds,
+and the gate enumerates its presets explicitly, so a preset outside the list is a stage rather
+than a regression; it joins the list when the peer can finish a round. **Nothing said above about
+selective acknowledgement or the quiet port changes yet**: both stay host-tested until the peer
+has a TCP endpoint to offer SACK-permitted from, which is stage five.
+
 ### 2h. Waiting on many things at once
 
 Two checks, one native and one Linux, for the one mechanism: a wait over a set of things, where
