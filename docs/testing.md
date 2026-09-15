@@ -851,6 +851,65 @@ non-zero — the check gates rather than only printing:
 The last is the one worth keeping: it is the check that fails if QEMU ever puts the memory-mapped
 transport behind the SMMU, which is exactly when the next stage becomes possible.
 
+### 2c-quinquies. Reading and walking the PCIe host bridge (aarch64)
+
+On aarch64 with `PCIE` (the `aarch64-pcie` preset), the kernel reads the machine's
+`pci-host-ecam-generic` node, claims its configuration window, and walks the buses behind it. The
+`pcie` line gates the boot:
+
+```
+  pcie       256 buses at 262400 MiB, a 256 MiB window holding 256; 65536 requester ids mapped to an MSI controller; forwards io 32-bit memory 64-bit memory; the window is above what the boot tables map; walked 1 functions, 1 host bridge, every register restored
+```
+
+**It happens in two phases, and the split is the machine's doing rather than a choice.** The
+bridge is *described* during discovery, from the tree alone; the bus is *walked* later, in the
+check phase. Discovery runs on the boot tables, which map `0x0000_0000..0x4000_0000` as one
+device block and `0x4000_0000..0x8000_0000` as RAM — two gigabytes, and nothing above. QEMU's
+`virt` puts the ECAM window at `0x40_1000_0000`, a quarter of a terabyte up, so a configuration
+read during discovery would fault rather than answer. The PC has the opposite luck: its window
+sits below four gigabytes, inside the boot tables' device alias, which is why `platform/acpi`
+enumerates during discovery and this cannot. The window is claimed by a driver named `ecam` that
+takes it and drives nothing, because a window no driver claimed is in nobody's ledger and the
+kernel's address space would never map it. `docs/isolation.md` records why this matters beyond
+PCI.
+
+The line requires all of:
+
+- a `pci-host-ecam-generic` node with a readable `reg`, decoded with the *parent's* address
+  cells — the bridge's own `#address-cells` of three describe its children, not itself;
+- a window that is not empty, and one big enough to address every bus `bus-range` claims. One bus
+  is a megabyte of configuration space, so the tree can contradict itself here, and a bridge whose
+  range outran its window would have an enumerator read one bus's space believing it was another's;
+- an `msi-map` naming a controller, since a bridge whose messages go nowhere could carry a device
+  that could never interrupt;
+- the window lying **above** what the boot tables map. This is asserted rather than assumed: if a
+  machine ever puts it lower, the check fails and says configuration space is readable during
+  discovery, so the walk need not have waited;
+- at least one function found, and at least one of them a host bridge. A bridge presents its own
+  function, so finding none means the window answered with nothing;
+- every base address register reading back as enumeration left it. Sizing a register writes to it
+  and puts it back; one left disturbed works until a driver maps it.
+
+One function is what `virt` presents with nothing attached to the bus. That number rises the day a
+device is, which is the next stage.
+
+Each mutation below was confirmed applied *and* exercised before its verdict was believed —
+"applied" alone is satisfied by a mutation that lands somewhere the check never reaches. Every one
+exits the boot non-zero:
+
+| Mutation | Result |
+|---|---|
+| Halve the buses the window is taken to hold, so the range outruns it | `bus-range CLAIMS 256 BUSES AND THE WINDOW HOLDS 128` |
+| Drop the `msi-map` lookup | `NO msi-map ON THE BRIDGE, SO NOTHING BEHIND IT COULD RAISE A MESSAGE` |
+| Look for `pci-host-ecam-generic-absent`, so the node is never found | `NO pci-host-ecam-generic NODE ON A BUILD THAT ASKED FOR ONE` |
+| Walk a window one function above the real one | `CONFIGURATION SPACE HELD NO FUNCTION, NOT EVEN THE BRIDGE'S OWN` |
+| **Remove the `ecam` driver's claim of the window** | the walk takes a **translation fault** — `unhandled exception: vector 4` inside `enumerate` — and the boot times out |
+
+The last is the one worth keeping, and it corrected a belief rather than confirming one. An
+unclaimed window is not an empty one: an absent PCI function answers all ones *from the hardware*,
+while an unmapped page answers nothing at all and faults. So the claim is load-bearing, and the
+failure when it is missing is louder and earlier than the no-function guard above it.
+
 ### 2c-ter. The disk's driver in a domain
 
 On x86_64 with `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the disk's driver runs in an

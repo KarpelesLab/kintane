@@ -318,6 +318,74 @@ virtio-mmio slot sits behind the unit, the next stage is known to be unreachable
 ever puts one there, the check fails and says the topology changed, instead of the claim quietly
 going stale.
 
+## Reaching the bridge the SMMU translates for (aarch64)
+
+The section above stops at a specific obstacle: confining a device on this port "would mean first
+putting the disk on PCIe — an ECAM host bridge driver, enumeration from the tree, and
+message-signalled interrupts through the ITS". With `PCIE` (the `aarch64-pcie` preset) the first
+two of those three are built. The disk is still not on PCIe, so nothing is confined yet, but the
+bus the SMMU translates for is now reachable and walked.
+
+### What runs
+
+The kernel finds the `pci-host-ecam-generic` node and reads what the tree says about it: the ECAM
+window from `reg`, the buses from `bus-range`, the windows the bridge forwards from `ranges`, and
+the controller its requester ids map to from `msi-map`. A claim-only driver named `ecam` takes the
+window during discovery — touching nothing, as a probe must not — so the kernel's address space
+maps it when that space is built. The bus is then walked in the check phase, and every base
+address register is verified to read back as enumeration left it.
+
+On QEMU 11.0.3: the window is at `0x40_1000_0000`, 256 MiB wide, holding the 256 buses
+`bus-range` claims; 65 536 requester ids are mapped to an MSI controller; the bridge forwards I/O,
+32-bit memory and 64-bit memory; and the walk finds one function, which is the host bridge itself,
+because nothing else is attached to that bus.
+
+### Why the walk cannot happen during discovery
+
+The boot tables map two regions and no more: `0x0000_0000..0x4000_0000` as one gigabyte-sized
+device block, and `0x4000_0000..0x8000_0000` as RAM. The ECAM window sits at `0x40_1000_0000` — a
+quarter of a terabyte up — so a configuration read during discovery faults rather than answers.
+This is the mirror image of the PC's situation, where the window lies below four gigabytes inside
+the boot tables' device alias, which is precisely why `platform/acpi` enumerates during discovery
+and the FDT platform cannot. The check phase is the first moment the window is reachable, because
+the kernel's own address space has been built by then and maps every claimed window at
+`DEVICE_WINDOW_BASE` above its physical address.
+
+That constraint is asserted in the boot rather than left here: the `pcie` check fails if the
+window is ever found *inside* the boot tables, saying that configuration space is readable during
+discovery and the walk need not have waited.
+
+### Two things that turned out smaller than they looked
+
+`kernel/device/src/pci.rs` needed **no change at all**. The section above notes that it reaches
+configuration space through the windows an ACPI MCFG describes and that the FDT platform never
+builds one — both true, but the seam is `ConfigSpace`, a two-method trait the platform implements.
+ECAM addressing is the same arithmetic on every machine (a bus is a megabyte, a device
+thirty-two kilobytes, a function four), so the FDT platform implements that trait over its own
+window and the generic enumerator is reused unmodified.
+
+The walk lives in `platform/fdt` rather than in `kernel/main`, and deliberately. `kernel/main` does
+not depend on `device`: the platform exists so that `kmain` never learns what kind of machine it is
+on, and `platform/none` says so in as many words. Putting enumeration in the kernel image would
+have meant adding that dependency and crossing a line this tree drew on purpose, so the platform
+walks the bus and `kmain` reports what it found.
+
+### What the next stage needs
+
+A disk on PCIe, which is where confinement becomes reachable:
+
+- `virtio-blk-pci` on the QEMU command line for this port, in place of the `virtio-blk-device` that
+  lands in a memory-mapped slot today;
+- the block driver binding through PCI on aarch64 — the enumerator already produces `compatible`
+  strings for a function the same way the device tree produces them for a node, so the binding path
+  exists, but it has never run on this port;
+- message-signalled interrupts through the ITS, which `msi-map` shows the tree routes but nothing
+  has yet used.
+
+Once a disk is a PCI function, it is behind the root complex the SMMU translates for, and the
+coverage assertion in the `smmu` check — that no `virtio,mmio` slot sits behind the unit — stops
+being the thing that blocks confinement.
+
 ## Running the driver in a domain (x86_64)
 
 With `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the two halves above are joined: the disk's
