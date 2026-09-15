@@ -42,11 +42,22 @@ pub const FS32_START: u64 = FS_START + FS_SECTORS;
 const FS32_SECTORS: u64 = 66_600;
 pub const SECTORS: u64 = FS32_START + FS32_SECTORS;
 
+/// Sectors in the second disk's image; mirrors the kernel's `SECTORS2`.
+///
+/// The second disk carries no volume — both stay on the first, where the filesystem checks and
+/// the crash campaign expect them — so it is pattern all the way down and ends where the first
+/// disk's volume would begin.
+pub const SECTORS2: u64 = FS_START;
+
 /// The config symbol that attaches the disk.
 pub const SYMBOL: &str = "QEMU_BLOCK_TEST";
 
 /// The file name, next to the image in the build's output directory.
 pub const FILE: &str = "testdisk.img";
+
+/// The second disk's file name. Its own file, not a second attachment of the first: two
+/// `-drive`s on one image make QEMU refuse the run with `Failed to get shared "write" lock`.
+pub const FILE2: &str = "testdisk2.img";
 
 /// `/HELLO.TXT`: one cluster.
 const HELLO: &[u8] = b"hello from the KinTane test disk\n";
@@ -87,6 +98,22 @@ const fn pattern(sector: u64, offset: usize) -> u8 {
     let s = (sector as u32).wrapping_mul(2_654_435_761);
     let o = (offset as u32).wrapping_mul(40_503);
     (s.wrapping_add(o).wrapping_add(sector as u32 >> 3) >> 13) as u8
+}
+
+/// The byte at `offset` of sector `sector` on disk `disk`; mirrors the kernel's `pattern_on`.
+///
+/// The disk's index is folded into the same hash before its shift, so each disk's pattern is
+/// its own and a sector read from the wrong disk matches nothing. Disk 0 adds zero and so is
+/// [`pattern`] exactly — the first disk's image is byte for byte what it was before there was
+/// a second, and every pinned byte still holds.
+pub const fn pattern_on(disk: usize, sector: u64, offset: usize) -> u8 {
+    let s = (sector as u32).wrapping_mul(2_654_435_761);
+    let o = (offset as u32).wrapping_mul(40_503);
+    let d = (disk as u32).wrapping_mul(0x9E37_79B9);
+    (s.wrapping_add(o)
+        .wrapping_add(sector as u32 >> 3)
+        .wrapping_add(d)
+        >> 13) as u8
 }
 
 /// The byte at offset `i` of `/BIG.BIN`. Unlike the sector pattern in shape, so a read of
@@ -189,6 +216,36 @@ pub fn image(program: Option<&[u8]>, linux: Option<&[u8]>) -> Result<Vec<u8>, St
     Ok(disk)
 }
 
+/// The second disk's image: header and pattern, no volume.
+///
+/// A pure function of its constants like [`image`], so it is byte-identical on every build.
+pub fn image2() -> Vec<u8> {
+    let mut disk = vec![0u8; SECTORS2 as usize * SECTOR];
+    for (sector, bytes) in disk.chunks_exact_mut(SECTOR).enumerate() {
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = pattern_on(DISK2, sector as u64, i);
+        }
+    }
+    disk[..8].copy_from_slice(MAGIC);
+    disk[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    disk[12..HEADER_BYTES].copy_from_slice(&(SECTORS2 as u32).to_le_bytes());
+    disk
+}
+
+/// The second disk's index, in [`pattern_on`]'s terms.
+pub const DISK2: usize = 1;
+
+/// Write the second disk's image into `out`, unless the file already holds these bytes.
+pub fn write2(out: &Path) -> Result<PathBuf, String> {
+    let path = out.join(FILE2);
+    let bytes = image2();
+    if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+        return Ok(path);
+    }
+    std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// Write the image into `out`, unless the file already holds exactly these bytes. With
 /// `program`, that file's bytes go on the volume as `/KINTANE/INIT.ELF`; with `linux`, as
 /// `/KINTANE/LINUX.ELF`.
@@ -256,6 +313,42 @@ mod tests {
         for (offset, byte) in PINNED_BIG {
             assert_eq!(big_byte(offset), byte, "BIG.BIN offset {offset}");
         }
+    }
+
+    #[test]
+    fn the_first_disks_image_is_unchanged_by_there_being_a_second() {
+        // Disk 0 folds in zero: every pinned byte of the first image still holds.
+        let disk = image(None, None).unwrap();
+        for (sector, offset, byte) in PINNED {
+            let at = sector as usize * SECTOR + offset;
+            assert_eq!(disk[at], byte, "sector {sector} offset {offset}");
+            assert_eq!(pattern_on(0, sector, offset), pattern(sector, offset));
+        }
+    }
+
+    #[test]
+    fn the_second_disk_shares_no_sector_with_the_first() {
+        let first = image(None, None).unwrap();
+        let second = image2();
+        assert_eq!(second.len(), SECTORS2 as usize * SECTOR);
+        assert_eq!(&second[..8], MAGIC, "the second disk carries the same format");
+        assert_eq!(
+            u32::from_le_bytes(second[12..16].try_into().unwrap()),
+            SECTORS2 as u32,
+            "and names its own length, so a swap is caught by geometry too"
+        );
+        // Past the header, the two disks share almost no byte of any sector.
+        for sector in [1usize, 7, 1000, SECTORS2 as usize - 1] {
+            let a = &first[sector * SECTOR..][..SECTOR];
+            let b = &second[sector * SECTOR..][..SECTOR];
+            let same = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+            assert!(same < SECTOR / 16, "sector {sector}: {same} of {SECTOR} bytes equal");
+        }
+    }
+
+    #[test]
+    fn the_second_disks_image_is_the_same_on_every_build() {
+        assert_eq!(image2(), image2());
     }
 
     #[test]

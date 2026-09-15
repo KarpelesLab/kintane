@@ -480,9 +480,10 @@ is not exercised under load yet.
 ### 2b. Block storage
 
 With `QEMU_BLOCK_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild
-writes `testdisk.img` beside the image. It is 6 MiB in three regions: 4096 sectors in which every
-byte is a function of its sector and offset, with a header in sector 0; a scratch area the
-write checks use; and a FAT16 volume for the [files check](#2e-files). Each run attaches a fresh
+writes `testdisk.img` beside the image. It is 79,144 sectors — about 39 MiB — in four regions:
+4096 sectors in which every byte is a function of its sector and offset, with a header in
+sector 0; a scratch area the write checks use; a FAT16 volume for the
+[files check](#2e-files); and the FAT32 volume that follows it. Each run attaches a fresh
 copy of it, written for real, which kbuild reads back after a passing run
 ([2e](#the-disk-image-after-a-run)), so the image kbuild built never changes: to a
 `virtio-blk-device` in a memory-mapped
@@ -490,6 +491,22 @@ slot on aarch64, and to a modern-only `virtio-blk-pci` function on the PCs, thro
 path they have (`-kernel`, BIOS and UEFI). The format is written twice, in
 `kernel/block/src/testdisk.rs` and `kbuild/src/testdisk.rs`, and a pinned set of bytes
 that both sides' tests assert keeps the two in step.
+
+A PCI run without an IOMMU attaches a **second disk** as well, `testdisk2.img`, on its own
+virtio-blk function and its own file — two `-drive`s on one image make QEMU refuse the run with
+`Failed to get shared "write" lock`. It carries no volume: both volumes stay on the first disk,
+so `FS_START` and `FS32_START` are unchanged. Its bytes are the same pattern with the disk's
+index folded into the hash, so disk 0's image is untouched and a sector read from the wrong disk
+matches nothing. The `block` line reports how many disks the boot bound, so a run that attached
+two and bound one is visible there rather than only as a later check quietly skipping:
+
+```
+  block      2 disks bound; 79144 sectors of 512 bytes, 15 per request; 32 sectors read back
+             the pattern; ...
+```
+
+The IOMMU presets and the memory-mapped transport still attach one, for the reasons given under
+"A second disk" in [architecture.md](architecture.md).
 
 The boot gates on the `block` line ([architecture.md](architecture.md#block--the-block-layer-and-the-first-driver-with-dma)):
 

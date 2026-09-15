@@ -365,6 +365,34 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
         "-device".to_string(),
         format!("{device},drive=kt_disk"),
     ];
+    // A second disk, on its own function: what the checks that one device cannot reach
+    // another's data, and that a fault in one driver leaves the other serving, are true of.
+    // It carries its own file — two `-drive`s on one image make QEMU refuse the run with
+    // `Failed to get shared "write" lock` — holding its own pattern, so a read served by the
+    // wrong device's binding comes back as bytes that match nothing.
+    //
+    // Two deferrals, both of which need work above this file before a second drive is honest
+    // here, and neither of which is hidden by attaching one anyway:
+    //
+    // * Not behind an IOMMU. Translation is enabled for the whole unit, and only the first
+    //   disk is attached to a domain, so a second function there is unconfined: its faults
+    //   land in the same log the confinement check reads, which then takes a fault that is
+    //   not the rogue one. Attached there once each device has its own domain and faults are
+    //   attributed by source id.
+    // * Not on the memory-mapped transport. QEMU fills `virt`'s virtio-mmio slots downwards
+    //   from the highest as devices are created, while enumeration walks the tree upwards, so
+    //   the slots come out in the reverse of the order the drives were given — and slot 0 is
+    //   then the second drive. Attached there once the kernel picks the disk carrying the
+    //   volume by reading its header rather than by trusting the slot's number.
+    if !res.is_on("IOMMU") && device.starts_with("virtio-blk-pci") {
+        let disk2 = crate::diskcheck::run_copy2(image);
+        args.extend([
+            "-drive".to_string(),
+            format!("file={},if=none,id=kt_disk2,format=raw", disk2.display()),
+            "-device".to_string(),
+            format!("{device},drive=kt_disk2"),
+        ]);
+    }
     // QEMU's memory-mapped virtio transport presents the legacy (version 1) register
     // layout unless told otherwise, and the driver speaks only virtio 1.x. Found when the
     // first boot with a disk attached reported the slot as legacy and bound nothing.

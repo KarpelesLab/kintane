@@ -23,6 +23,10 @@ use crate::testdisk;
 /// The run's copy of the image, beside the pristine one.
 pub const RUN_FILE: &str = "testdisk.run.img";
 
+/// The second disk's run copy. Its own file, not a second attachment of the first: two
+/// `-drive`s on one image make QEMU refuse the run with `Failed to get shared "write" lock`.
+pub const RUN_FILE2: &str = "testdisk2.run.img";
+
 /// The directory the crash test's workload writes, and the seed of every byte it writes there;
 /// mirrors `CRASH_DIR` and `CRASH_SEED` in `kernel/main/src/fs.rs`.
 const CRASH_DIR: &str = "CRASH";
@@ -36,9 +40,23 @@ pub fn run_copy(image: &Path) -> PathBuf {
     image.parent().unwrap_or(Path::new(".")).join(RUN_FILE)
 }
 
-/// Replace the run's copy with the pristine image beside it.
+/// Where the second disk's run copy goes, beside the first's.
+pub fn run_copy2(image: &Path) -> PathBuf {
+    image.parent().unwrap_or(Path::new(".")).join(RUN_FILE2)
+}
+
+/// Replace both disks' run copies with the pristine images beside them.
+///
+/// `run` is the first disk's copy; the second's sits beside it under [`RUN_FILE2`]. Both are
+/// restored together because a run attaches both, so a campaign that refreshed only the first
+/// would have the second carrying the previous cut's writes.
 pub fn fresh(run: &Path) -> Result<(), String> {
-    let pristine = run.with_file_name(testdisk::FILE);
+    restore(run, testdisk::FILE)?;
+    restore(&run.with_file_name(RUN_FILE2), testdisk::FILE2)
+}
+
+fn restore(run: &Path, pristine_name: &str) -> Result<(), String> {
+    let pristine = run.with_file_name(pristine_name);
     std::fs::copy(&pristine, run)
         .map(|_| ())
         .map_err(|e| format!("copying {} to {}: {e}", pristine.display(), run.display()))

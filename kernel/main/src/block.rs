@@ -136,6 +136,12 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         c.write_str("skipped: no block device");
         return Check::Skipped;
     }
+    // How many disks this boot bound, reported so a run that attached two and bound one is
+    // visible here rather than only as a later check quietly skipping. What the machine
+    // attaches varies by preset, so the count is reported, not asserted; the checks that need
+    // two devices assert it themselves.
+    write_usize(c, virtio_blk::bound());
+    c.write_str(" disks bound; ");
     let Some(direct) = live.direct else {
         c.write_str("no kernel address space to map the device's memory through");
         return Check::Failed;
