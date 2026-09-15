@@ -3352,7 +3352,11 @@ only because of `kbuild`'s content-addressed cache.
 
 ## Size budgets
 
-Each preset declares a maximum image size in `config/presets/` as `SIZE_BUDGET_KIB`.
+Each preset declares a maximum in `config/presets/` as `SIZE_BUDGET_KIB`. It bounds not the
+packaged image's size on disk but every allocated section of the linked kernel — `.bss`, stacks
+and all — because that is what the machine must hold. The two differ by a lot: an i686 build at
+100% of a 1024 KiB budget links to a file of roughly half that, so a preset sitting at its budget
+is not a megabyte that some loader is struggling to place.
 `kbuild size --preset P` builds the preset and reports every allocated section and
 every crate against the budget and a baseline. It fails when the total exceeds the
 budget.
