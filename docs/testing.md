@@ -1979,16 +1979,18 @@ if it is zero. Its *receiving* half is drawn out by the deferred half-reply desc
 a datagram to the quiet port earns an ICMP destination-unreachable quoting the offending IPv4
 header and the eight bytes behind it, which is what names the socket the refusal belongs to.
 
-**Four falsifications**, each one mutation, booted, and put back by a `trap ... EXIT` restoring
-the source *and* rebuilding kbuild — because a mutated build tool left behind would poison every
-later run:
+**Four falsifications**, each a single edit, applied alone and booted on `x86_64-peer`. The
+source *and* the kbuild binary were put back before the next one: a mutated build tool left in
+place reports success from stale artifacts, which has cost this project a day before. Each is
+spelled out here rather than kept in a script, because a script nothing in the gate runs rots at
+the first refactor that renames what it patches.
 
 | mutation | what the boot did |
 | --- | --- |
-| The guest throws the peer's blocks away | `0 selective`, and the check fails: `NO RETRANSMISSION STEPPED OVER A RUN THE PEER ACKNOWLEDGED SELECTIVELY` |
-| The peer names runs stretched past anything the guest sent | `0 selective`, same failure — the clamp drops such a block whole rather than believing it, so nothing is stepped over |
-| The unreachable message quotes a port other than the one that sent | `nothing on the quiet port`: the refusal is not applied, the program times out, and the check fails for want of one |
-| The peer offers no `SACK-permitted` | `0 selective` *and* `0 acknowledgements with blocks of the guest's own` — both halves fall silent together |
+| **The guest ignores the peer's blocks.** `kernel/net/src/tcp.rs`, in `segment`'s duplicate-acknowledgement arm: `t.record_sack(&seg.sack);` → `t.record_sack(&[None; wire::SACK_BLOCKS]);` | `bulk round 1 fast retransmits in 1 resends, 0 selective`, and the check fails with `NO RETRANSMISSION STEPPED OVER A RUN THE PEER ACKNOWLEDGED SELECTIVELY`. Recovery is go-back-N again |
+| **The peer names data the guest never sent.** `kbuild/src/netpeer.rs`, in `held_blocks`, immediately before `runs.truncate(SACK_BLOCKS);` insert `let mut runs: Vec<(u32, u32)> = runs.iter().map(\|(s, e)\| (*s, e.wrapping_add(4096))).collect();`, stretching every run past anything sent | `0 selective`, and the same failure — which is the point. `record_sack`'s clamp to `snd_max` drops such a block whole rather than believing it, so nothing is stepped over; a guest that believed it would have stepped over bytes the peer never held |
+| **The unreachable message quotes another connection.** `kbuild/src/netpeer.rs`, in `unreachable`: make `let quoted = frame.get(14..14 + ihl + 8)?.to_vec();` a `let mut`, then add `quoted[ihl] ^= 0xff;`, which corrupts the quoted source port so the message names a port that never sent | `udp-client: … nothing on the quiet port`, where the truth reads `the quiet port refused`: the refusal is not applied, the program times out, and the `sockets` check fails for want of the refusal this preset requires. Selective acknowledgement is untouched — still `1 selective` |
+| **The peer offers no `SACK-permitted`.** `kbuild/src/netpeer.rs`, in `tcp_frame_with`, delete `options.extend_from_slice(&[TCP_OPT_NOP, TCP_OPT_NOP, TCP_OPT_SACK_PERMITTED, 2]);` | `0 selective` *and* `0 acknowledgements with blocks of the guest's own`: both halves fall silent together, with the same gate failure. To confirm this one applied, count that line as written into a SYN — the bare option bytes also match the test fixture `SACK_PERMITTED_OPT` further down the file, which made a first check report a failure for a mutation that had in fact applied |
 
 **What selective retransmission saves here, measured: nothing.** The guest sent the same
 `7 segments ... (610 bytes)` again in every one of those five boots — blocks sent, ignored,
