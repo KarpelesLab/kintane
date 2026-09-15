@@ -445,7 +445,7 @@ fn x86_platform(
 pub(crate) const NET_GUEST_PORT: u16 = 5555;
 /// The guest port kbuild forwards a loopback TCP port to, where the Linux program's `serve` mode
 /// listens: `INBOUND_PORT` in `kernel/main/src/personality/socket.rs`.
-const NET_GUEST_TCP_PORT: u16 = 7777;
+pub(crate) const NET_GUEST_TCP_PORT: u16 = 7777;
 pub(crate) const NET_PROBE: &[u8] = b"kintane-udp-probe";
 pub(crate) const NET_ECHO: &[u8] = b"kintane-udp-echo ";
 pub(crate) const NET_ACK: &[u8] = b"kintane-udp-ack ";
@@ -467,11 +467,11 @@ pub(crate) const NET_TCP_REPLY: &[u8] = b"kintane-tcp-reply ";
 /// What the guest sends [`udp_peer`] once a listener is up on [`NET_GUEST_TCP_PORT`], with a
 /// number; and [`tcp_inbound`]'s side of the connection kbuild then makes into the guest. The
 /// guest's check in `kernel/main/src/personality/socket.rs`, and its program, mirror them.
-const NET_TCP_LISTENING: &[u8] = b"kintane-tcp-listening ";
-const NET_TCP_INBOUND: &[u8] = b"kintane-tcp-inbound ";
-const NET_TCP_INBOUND_REPLY: &[u8] = b"kintane-tcp-inbound-reply ";
-const NET_TCP_INBOUND_VERIFIED: &[u8] = b"kintane-tcp-inbound-verified ";
-const NET_TCP_INBOUND_WRONG: &[u8] = b"kintane-tcp-inbound-wrong ";
+pub(crate) const NET_TCP_LISTENING: &[u8] = b"kintane-tcp-listening ";
+pub(crate) const NET_TCP_INBOUND: &[u8] = b"kintane-tcp-inbound ";
+pub(crate) const NET_TCP_INBOUND_REPLY: &[u8] = b"kintane-tcp-inbound-reply ";
+pub(crate) const NET_TCP_INBOUND_VERIFIED: &[u8] = b"kintane-tcp-inbound-verified ";
+pub(crate) const NET_TCP_INBOUND_WRONG: &[u8] = b"kintane-tcp-inbound-wrong ";
 
 /// [`udp_service`]'s protocol, and the datagrams that tell the guest which port it is on and
 /// which port nothing answers on. `kernel/main/src/net.rs` has the same four.
