@@ -1,0 +1,12 @@
+# x86_64 with kbuild as the whole network, instead of QEMU's user-mode one.
+#
+# Deliberately NOT in scratchpad/verify.sh while the peer is incomplete: a preset whose peer
+# cannot finish a TCP round fails its own `net` check, and the gate's list is explicit, so a
+# preset outside it can be a stage rather than a regression.
+ARCH_X86_64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+QEMU_NET_PEER=y
+SIZE_BUDGET_KIB=2048

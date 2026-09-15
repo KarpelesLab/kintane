@@ -23,6 +23,8 @@ pub struct Machine {
     /// The loopback ports the kernel's network check (`QEMU_NET_TEST`) is reached on, which
     /// [`run_watched`] serves: see [`udp_peer`], [`tcp_service`] and [`relay`].
     pub net_port: Option<NetPorts>,
+    /// Whether kbuild is the whole network rather than QEMU's user-mode one: `QEMU_NET_PEER`.
+    pub net_peer: bool,
     /// The run's copy of the test disk, which [`crate::main`]'s `boot` makes fresh before the
     /// guest starts and reads back after it exits; `None` without `QEMU_BLOCK_TEST`.
     pub disk: Option<std::path::PathBuf>,
@@ -44,6 +46,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
     }
     let s = |x: &str| x.to_string();
     let net_port = net_port(res)?;
+    let net_peer = res.is_on("QEMU_NET_PEER");
     let disk = res
         .is_on(crate::testdisk::SYMBOL)
         .then(|| crate::diskcheck::run_copy(image));
@@ -120,6 +123,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            net_peer,
             disk: disk.clone(),
         });
     }
@@ -172,6 +176,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            net_peer,
             disk: disk.clone(),
         });
     }
@@ -208,6 +213,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            net_peer,
             disk: disk.clone(),
         });
     }
@@ -255,6 +261,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port,
+            net_peer,
             disk: disk.clone(),
         });
     }
@@ -317,6 +324,7 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),
             net_port: None,
+            net_peer: false,
             disk: None,
         });
     }
@@ -494,6 +502,11 @@ pub struct NetPorts {
     pub udp_service: u16,
     /// A port nothing ever binds, for the guest's check of a datagram nobody answers.
     pub quiet: u16,
+    /// With `QEMU_NET_PEER`, the socket pair carrying raw Ethernet: kbuild binds `peer_local`
+    /// and QEMU binds `peer_remote`, and each sends to the other's. One frame per datagram,
+    /// with no length prefix — unlike the relay's chardevs, which are byte streams.
+    pub peer_local: u16,
+    pub peer_remote: u16,
 }
 
 /// Free loopback ports for the guest's network check, when the configuration attaches a card.
@@ -527,7 +540,12 @@ fn net_port(res: &Resolution) -> Result<Option<NetPorts>, String> {
     };
     let (service, out, inject, inbound) = (tcp()?, tcp()?, tcp()?, tcp()?);
     let (down_out, down_in) = (tcp()?, tcp()?);
+    // The peer's pair, found the way the others are: bound to learn a free number, then let
+    // go. kbuild binds its own again in the peer thread; QEMU binds the other as it starts.
+    let (peer_local, peer_remote) = (udp_port()?, udp_port()?);
     Ok(Some(NetPorts {
+        peer_local,
+        peer_remote,
         udp,
         tcp: port(&service)?,
         relay_out: port(&out)?,
@@ -561,6 +579,31 @@ fn net_card(res: &Resolution, device: &str, ports: Option<NetPorts>) -> Vec<Stri
     let Some(ports) = ports else {
         return Vec::new();
     };
+    // With `QEMU_NET_PEER` there is no user-mode network at all: one socket pair carries raw
+    // Ethernet to kbuild, which answers as the whole network. No `hostfwd`, because nothing
+    // NATs; no filter-redirectors, because there is no network to sit between — a disturbance
+    // this peer wants to make, it makes by sending the frame it chooses.
+    if res.is_on("QEMU_NET_PEER") {
+        let mut args = vec![
+            "-netdev".to_string(),
+            format!(
+                "dgram,id=kt_net,local.type=inet,local.host=127.0.0.1,local.port={},\
+                 remote.type=inet,remote.host=127.0.0.1,remote.port={}",
+                ports.peer_remote, ports.peer_local
+            )
+            .replace(['\\', '\n'], "")
+            .replace(' ', ""),
+            "-device".to_string(),
+            format!("{device},netdev=kt_net"),
+        ];
+        if device == "virtio-net-device" && !res.is_on(crate::testdisk::SYMBOL) {
+            args.extend([
+                "-global".to_string(),
+                "virtio-mmio.force-legacy=false".to_string(),
+            ]);
+        }
+        return args;
+    }
     let mut args = vec![
         "-netdev".to_string(),
         format!(
@@ -1421,12 +1464,18 @@ pub fn run_watched(
                 format!("cannot listen on loopback port {port} for the network check: {e}")
             })
         };
-        let service = listen(ports.tcp)?;
-        let (from_guest, to_network) = (listen(ports.relay_out)?, listen(ports.relay_in)?);
-        let (from_network, to_guest) = (listen(ports.down_out)?, listen(ports.down_in)?);
-        peers.push(tcp_service(service, stop_peer.clone()));
-        peers.push(relay(from_guest, to_network, ports.tcp, stop_peer.clone()));
-        peers.push(downstream(from_network, to_guest, ports.tcp, stop_peer.clone()));
+        if m.net_peer {
+            // kbuild is the network: one thread owning the socket pair, in place of the
+            // service, the relay and the downstream relay, which all assume a NAT answers.
+            peers.push(crate::netpeer::serve(ports, stop_peer.clone()));
+        } else {
+            let service = listen(ports.tcp)?;
+            let (from_guest, to_network) = (listen(ports.relay_out)?, listen(ports.relay_in)?);
+            let (from_network, to_guest) = (listen(ports.down_out)?, listen(ports.down_in)?);
+            peers.push(tcp_service(service, stop_peer.clone()));
+            peers.push(relay(from_guest, to_network, ports.tcp, stop_peer.clone()));
+            peers.push(downstream(from_network, to_guest, ports.tcp, stop_peer.clone()));
+        }
     }
 
     let mut child = Command::new(m.binary)
