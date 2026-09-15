@@ -302,6 +302,19 @@ pub fn files_statfs_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// Arithmetic in a hard-float program, and two threads holding vector registers across a
+/// context switch. Passed when USERSPACE is off, where no such program is built.
+#[cfg(CONFIG_USERSPACE)]
+pub fn fpu_check(c: &dyn EarlyConsole) -> Check {
+    crate::fpu::check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn fpu_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// Run a process whose second thread spins in user mode on another CPU, end it, and require
 /// the spinner stopped. `Ok` without USERSPACE.
 #[cfg(CONFIG_USERSPACE)]

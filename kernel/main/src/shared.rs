@@ -548,6 +548,9 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `sockets`, which has torn its process down by now, reusing the same process slot:
     // the Linux program as a TCP client, and as a server kbuild connects to.
     let linux_net = crate::model::linux_sockets_check(c);
+    // After the Linux checks, whose process slot and stacks it reuses: the hard-float
+    // program, whose second phase is what a switch that drops vector registers fails.
+    let fpu = crate::model::fpu_check(c);
     // After `linux net`, which has torn its processes down by now: this borrows the process
     // check's frame pool and reuses its process slot and stack. Before tickless, which
     // wants everything but idle gone.
@@ -579,6 +582,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(waitrace)
         .and(sockets)
         .and(linux_net)
+        .and(fpu)
         .and(isolation)
         .and(blk_domain)
         .and(tickless)
