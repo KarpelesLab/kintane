@@ -40,5 +40,6 @@ pub fn machine(res: &Resolution, image: &Path, log: &Path) -> Machine {
         serial_probe: res.is_on("SERIAL_IRQ_TEST"),
         disk: None,
         net_port: None,
+        net_peer: false,
     }
 }
