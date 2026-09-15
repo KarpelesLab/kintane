@@ -1189,6 +1189,19 @@ not allocate, cache or block:
 
 It is host-tested against a RAM disk that fails on request.
 
+**Position or identity.** Two numbers here are easy to confuse and are not the same. A *slot* is
+where a device sits: the index `virtio_blk` claimed for it at probe, and what the register window,
+the interrupt line, the IOMMU source id and the DMA grant each belong to -- properties of a place,
+correctly keyed by index. An *image* is what a medium carries, and bytes are its property: which
+disk holds the volume, and which pattern a sector should match. The two agree on PCI, where
+enumeration follows the order the drives were attached, and disagree on memory-mapped virtio, where
+QEMU fills `virt`'s slots downwards while enumeration walks upwards. So the kernel reads each disk's
+header to decide which slot carries the volume (`block::choose_primary`), `block::image_of` turns a
+slot into the image it holds, and `virtio_blk::slot` turns a device's node back into its slot, which
+is how a platform wires the right line to the right disk. Keying an identity by position yields a
+check that passes where it is written and fails where it is needed: one did, for two rounds, because
+every gate that ran it used PCI -- where the two numberings happen to agree.
+
 #### virtio-blk (`drivers/block/virtio-blk`)
 
 virtio 1.x over two transports: memory-mapped, bound from the device tree on aarch64, and
