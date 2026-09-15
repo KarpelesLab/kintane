@@ -3536,6 +3536,50 @@ $ kbuild size --preset x86_64-qemu --compare origin/master
 - **Falsified:** adding a 256 KiB static to `kmain` failed x86_64-qemu at 108% of its
   budget, with the growth attributed to `kintane`'s rodata.
 
+### A delta on a port that has none of the feature
+
+Round 16 added one link to the verdict chain in `memory()` — `.and(pcie::check(c))`, whose body on
+every port but aarch64 returns `Check::Skipped` — and `riscv32-virt`'s `kintane` crate grew **2,837
+bytes**, on a port that compiles no PCIe code at all. The image total read `+0`, because page padding
+absorbed it. The crate figure is the one that showed it.
+
+The cause is inlining, not the feature. At `opt-level=1`, which `DEBUG_BUILD` selects, `memory()` is
+inlined whole into `kmain`, and so are most of the chain's callees: neither `memory` nor
+`block::check`, `smmu::check`, `net::bring_up`, `fs::check` nor `personality::check` has a symbol of
+its own. A fourteenth link pushes that tree past LLVM's inlining budget, and five functions that had
+been folded in are emitted standalone instead:
+
+| function | bytes |
+|---|---|
+| `kintane::kheap::install` | 1,404 |
+| `kintane::bootstack::check` | 674 |
+| `kintane::lockcheck::verdict` | 552 |
+| `kintane::write_hex` | 128 |
+| `kintane::kheap::region` | 70 |
+| | **2,828** |
+
+That is the measured text delta to the byte — 33,590 against 30,762 — and removing the link moves
+`kmain` the other way, 4,534 to 7,636, as they fold back in. Naming them is the point: an
+unattributed kilobyte invites a hunt for a leak that is not there.
+
+**It is a threshold artifact of the enclosing function's size, not of the thing added.** Any
+fourteenth statement of comparable weight would do it, which is why routing the same link through a
+different dispatch measured byte-for-byte identical — what a link calls cannot change how large
+`memory()` is.
+
+**Ports built for size do not pay.** At `opt-level=z`, which `OPTIMIZE_FOR_SIZE` selects, those
+functions are already outlined with the link present — `armv7m-tiny`'s `kmain` is 2,180 bytes against
+`riscv32-virt`'s 4,534 — so there is no threshold left to cross. Built without the link, it measures
+byte-for-byte identical.
+
+**So, reading a size report:** a crate delta on a port that compiles none of what was added is
+expected rather than suspicious, should be attributed to named symbols before anyone calls it a
+regression, and is not proportional to the change that triggered it. `riscv32i-virt` pays by the same
+mechanism; which functions flip there was not measured.
+
+One gap, recorded rather than rounded away: `kmain` grows 3,102 bytes while the five sum to 2,828, so
+roughly 274 bytes redistribute across other symbols that were not accounted for individually.
+
 A 300-byte regression on a Cortex-M matters and is invisible on x86_64. Tracking it
 per-commit is the only way small targets stay viable, and it is what keeps "supports
 microcontrollers" from quietly becoming false. The bootloader stages carry their own
