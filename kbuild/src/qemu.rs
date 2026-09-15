@@ -442,25 +442,25 @@ fn x86_platform(
 
 /// The guest port the kernel's network check listens on, and the messages it exchanges with
 /// [`udp_peer`]: `kernel/main/src/net.rs`'s `PORT`, `PROBE`, `ECHO` and `ACK`.
-const NET_GUEST_PORT: u16 = 5555;
+pub(crate) const NET_GUEST_PORT: u16 = 5555;
 /// The guest port kbuild forwards a loopback TCP port to, where the Linux program's `serve` mode
 /// listens: `INBOUND_PORT` in `kernel/main/src/personality/socket.rs`.
 const NET_GUEST_TCP_PORT: u16 = 7777;
-const NET_PROBE: &[u8] = b"kintane-udp-probe";
-const NET_ECHO: &[u8] = b"kintane-udp-echo ";
-const NET_ACK: &[u8] = b"kintane-udp-ack ";
+pub(crate) const NET_PROBE: &[u8] = b"kintane-udp-probe";
+pub(crate) const NET_ECHO: &[u8] = b"kintane-udp-echo ";
+pub(crate) const NET_ACK: &[u8] = b"kintane-udp-ack ";
 /// The datagram [`downstream`] always splits into two IPv4 fragments on its way to the guest,
 /// and the pattern after its marker, which the guest checks byte for byte once it has put the
 /// datagram back together: `kernel/main/src/net.rs`'s `FRAGMENTED` and `pattern`.
-const NET_UDP_FRAGMENTED: &[u8] = b"kintane-udp-fragmented ";
-const NET_FRAGMENT_PATTERN: usize = 64;
+pub(crate) const NET_UDP_FRAGMENTED: &[u8] = b"kintane-udp-fragmented ";
+pub(crate) const NET_FRAGMENT_PATTERN: usize = 64;
 
 /// How often [`udp_peer`] sends its probe.
 const NET_PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// [`tcp_service`]'s protocol, and the datagram that tells the guest its port:
 /// `kernel/main/src/net.rs`'s `TCP_ANNOUNCE`, `TCP_REQUEST` and `TCP_REPLY`.
-const NET_TCP_ANNOUNCE: &[u8] = b"kintane-tcp-port ";
+pub(crate) const NET_TCP_ANNOUNCE: &[u8] = b"kintane-tcp-port ";
 const NET_TCP_REQUEST: &[u8] = b"kintane-tcp-request ";
 const NET_TCP_REPLY: &[u8] = b"kintane-tcp-reply ";
 
@@ -480,10 +480,10 @@ const NET_TCP_INBOUND_WRONG: &[u8] = b"kintane-tcp-inbound-wrong ";
 /// `request`, so a reply names the request it answers and a datagram from anywhere else is
 /// visibly not it. The quiet port is one kbuild found free and never bound: what a datagram
 /// sent there earns is the point of the check that sends one.
-const NET_UDP_ANNOUNCE: &[u8] = b"kintane-udp-port ";
-const NET_UDP_QUIET: &[u8] = b"kintane-udp-quiet ";
-const NET_UDP_REQUEST: &[u8] = b"kintane-udp-request ";
-const NET_UDP_REPLY: &[u8] = b"kintane-udp-reply ";
+pub(crate) const NET_UDP_ANNOUNCE: &[u8] = b"kintane-udp-port ";
+pub(crate) const NET_UDP_QUIET: &[u8] = b"kintane-udp-quiet ";
+pub(crate) const NET_UDP_REQUEST: &[u8] = b"kintane-udp-request ";
+pub(crate) const NET_UDP_REPLY: &[u8] = b"kintane-udp-reply ";
 
 /// The loopback ports a run with a network card is served on: the UDP port QEMU forwards to
 /// the guest, the TCP port of [`tcp_service`], which the guest reaches at the gateway's
@@ -1182,7 +1182,7 @@ fn tcp_data_from(frame: &[u8], port: u16) -> bool {
 }
 
 /// An IPv4 packet's header length and total length, for a frame that carries one whole.
-fn ipv4_header(frame: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn ipv4_header(frame: &[u8]) -> Option<(usize, usize)> {
     if frame.get(12..14) != Some(&[0x08, 0x00]) {
         return None;
     }
@@ -1196,7 +1196,7 @@ fn ipv4_header(frame: &[u8]) -> Option<(usize, usize)> {
 
 /// `frame`'s datagram as two IPv4 fragments, split at an eight-byte boundary, each with its
 /// own header checksum. The payload of the two, concatenated, is the payload of the one.
-fn fragment_datagram(frame: &[u8]) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn fragment_datagram(frame: &[u8]) -> Option<Vec<Vec<u8>>> {
     let (ihl, total) = ipv4_header(frame)?;
     let payload = frame.get(14 + ihl..14 + total)?;
     if payload.len() < 16 {
@@ -1223,7 +1223,7 @@ fn fragment_datagram(frame: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 /// The Internet checksum of a header (RFC 1071), as `net::wire::checksum` computes it.
-fn ipv4_checksum(header: &[u8]) -> u16 {
+pub(crate) fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for pair in header.chunks(2) {
         let word = match pair {
