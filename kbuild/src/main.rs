@@ -40,6 +40,7 @@ mod symbolize;
 mod testdisk;
 mod toml;
 mod toolchain;
+mod trace;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1016,6 +1017,28 @@ fn boot(
         diskcheck::fresh(disk)?;
     }
     let outcome = qemu::run_watched(m, timeout, watch)?;
+    // Bounded here rather than at the end of this function, because the hung and timed-out
+    // returns below leave early and a storm *is* a timeout: a trace cut only on the way out
+    // would never be cut in the one case it exists for. A trace that cannot be cut is still a
+    // trace, so a failure here is reported and the verdict is unchanged.
+    match trace::bound(&dir.join("qemu.log")) {
+        // A cut on a run that PASSED is the one case this must never cause quietly: the trace
+        // was legitimate and this preset's normal output is past the bound. Say so, with the
+        // constants to raise, so a port whose traces were never measured -- a preset added
+        // after the bound was set, or an old one grown noisier -- announces itself here
+        // instead of leaving a shortened artifact for someone to puzzle over later.
+        Ok(Some(cut)) if outcome.passed => println!(
+            "\n  \x1b[33mqemu.log cut on a PASSING run\x1b[0m: {} bytes, {} removed. This \
+             preset's normal trace is past trace::BOUND; raise it and trace::LARGEST_MEASURED.",
+            cut.was, cut.removed
+        ),
+        Ok(Some(cut)) => println!(
+            "\n  \x1b[33mqemu.log cut\x1b[0m: {} bytes, {} removed from the middle",
+            cut.was, cut.removed
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("\n\x1b[33mqemu.log not cut\x1b[0m: {e}"),
+    }
     let console = dir.join("console.log");
     std::fs::write(&console, &outcome.console)
         .map_err(|e| format!("{}: {e}", console.display()))?;
