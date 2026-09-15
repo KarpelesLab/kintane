@@ -90,11 +90,7 @@ field — so a seed that decays into a no-op fails loudly instead of replaying n
   reported insufficient rather than abandoned quietly. Raising three budgets to carry a
   verification-only check, in a round whose brief was to defend them, is a trade worth refusing.
 
-**The round found a hole in its own gate.** `kbuild size` returns success at *exactly* 100% of
-budget, so the size check passed the two i686 presets while their boots hung — every "all nineteen
-within budget" statement this round rested on a check that cannot tell "fits" from "exactly fills and
-will not boot". It was found by the one brief that pushed an image hard enough to sit on the
-boundary, which is the argument for briefs that defend a budget rather than raise it.
+**A claim this round made about its own gate, and the correction that followed.** Round 14 reported that `kbuild size` returning success at *exactly* 100% of budget had let the two i686 presets pass while their boots hung. The first half is true and harmless; the causal half was wrong, and the next round settled it with a control rather than an argument: the same image carrying the same code, brought up with one disk instead of two, measures **byte-for-byte the same 1,048,576 bytes and boots**. The hang is an interrupt storm. A second device claiming an already-held INTx line is refused, the refusal is swallowed into a `None`, and the disk is brought up regardless — polled reads need no interrupt — after which it asserts a level-triggered line whose only handler reads the *first* disk's status register, so the line never clears. Two true facts joined by a false cause. The size check stays exactly as it is, and the real finding is larger than the one claimed: **the second drive has been bound, usable, and silently without an interrupt handler on every INTx platform since it landed** — x86_64 hid it by giving each disk its own MSI-X vector.
 
 ### The thirteenth round of landings
 
