@@ -89,8 +89,13 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         return Check::Failed;
     };
     // A bridge presents at least its own function. Finding none means configuration space read
-    // back as nothing — an unmapped window reads all ones, which is no function at all, and is
-    // exactly what a claim that failed to reach the address space would look like.
+    // back as nothing, which is what an *absent function* returns: all ones, from the hardware.
+    //
+    // It is not what an unclaimed window looks like. That was measured rather than assumed:
+    // removing the `ecam` driver's claim leaves the window unmapped, and reading it takes a
+    // translation fault inside the walk — an unhandled exception, not a value. So this guard
+    // catches a bus that answers with nothing, while a claim that never reached the address
+    // space fails earlier and louder, and neither failure is silent.
     if scan.functions == 0 {
         c.write_str(", AND CONFIGURATION SPACE HELD NO FUNCTION, NOT EVEN THE BRIDGE'S OWN");
         return Check::Failed;
