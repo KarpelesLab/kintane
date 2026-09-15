@@ -131,14 +131,22 @@ const REPLY_NS: u64 = 3_000_000_000;
 const PROBE_NS: u64 = 15_000_000_000;
 /// The longest one TCP round may take: a handshake, a retransmission or two, and a close.
 const TCP_NS: u64 = 10_000_000_000;
-/// The bulk round's request, in bytes: four segments' worth, which is the whole send ring.
+/// The bulk round's request, in bytes: a ring's worth, as many segments as fit.
 ///
-/// kbuild's relay drops each connection's first data segment. With a one-line request that
-/// is the only segment there is, and the timer is what sends it again; with four, the three
+/// kbuild's peer withholds a data segment from every connection. With a one-line request that
+/// is the only segment there is, and the timer is what sends it again; with several, the ones
 /// behind it draw the three duplicate acknowledgements the sender's fast retransmit needs
 /// (`net::tcp::SEND_SEG`, `DUP_ACK_THRESHOLD`). It is the one round that proves that path in
 /// a guest rather than in a host test.
-const BULK_LEN: usize = 4 * net::tcp::SEND_SEG;
+///
+/// This round alone loses **two**, the third and the seventh, which is what a *partial*
+/// acknowledgement needs. Both holes must already be outstanding when recovery begins, since
+/// an acknowledgement can reach `recover` but no further; the first two segments are let
+/// through so their acknowledgements grow the window past its initial four; three arrivals
+/// behind the first hole draw the duplicates; and one segment behind the second hole gives the
+/// peer a run to name in a block, so the retransmission has something to step over. Anything
+/// less and the round measures nothing — each of those constraints cost a boot to find.
+const BULK_LEN: usize = net::tcp::SEGMENTS_IN_FLIGHT * net::tcp::SEND_SEG;
 /// How long the check keeps listening after its TCP rounds, for anything the peer sends again.
 /// QEMU's TCP retransmits no sooner than a second.
 pub const LINGER_NS: u64 = 3_000_000_000;
@@ -682,7 +690,9 @@ fn exchange(
     write_usize(c, bulk.retransmits as usize);
     c.write_str(" resends, ");
     write_usize(c, (rounds.sack_retransmits - before.sack_retransmits) as usize);
-    c.write_str(" selective");
+    c.write_str(" selective, ");
+    write_usize(c, (rounds.partial_acks - before.partial_acks) as usize);
+    c.write_str(" partial");
 
     let through = |round: &TcpRound, states: &[State]| {
         round.closed && states.iter().all(|s| round.visited & s.bit() != 0)
@@ -710,6 +720,16 @@ fn exchange(
     // proving itself on a wire, which no boot could do before the peer existed.
     if kconfig::QEMU_NET_PEER && rounds.sack_retransmits == before.sack_retransmits {
         return Some("NO RETRANSMISSION STEPPED OVER A RUN THE PEER ACKNOWLEDGED SELECTIVELY");
+    }
+    // A partial acknowledgement is the only place selective retransmission can save anything:
+    // with one hole the acknowledgement that ends recovery is a full one, and the stack would
+    // have resent that single segment with or without blocks. The peer withholds a second
+    // segment so recovery is still unfinished when the first is acknowledged. Asked for only
+    // where the peer offers blocks, for the same reason as the check above.
+    if kconfig::QEMU_NET_PEER && rounds.partial_acks == before.partial_acks {
+        return Some(
+            "NO ACKNOWLEDGEMENT DURING RECOVERY WAS PARTIAL, SO NO SECOND HOLE WAS EVER REACHED",
+        );
     }
     if rounds.out_of_order_queued == before.out_of_order_queued {
         return Some("NO SEGMENT WAS HELD OUT OF ORDER, THOUGH KBUILD'S RELAY SWAPS A PAIR");
