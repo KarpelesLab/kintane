@@ -71,10 +71,22 @@ fn sigkill_and_sigstop_take_no_disposition_and_the_defaults_are_linuxs() {
     };
     assert_eq!(effect(SIGKILL, &handler), Effect::Terminate);
     assert_eq!(effect(SIGKILL, &ignore), Effect::Terminate);
-    // Stopping is not implemented, so a stop is ignored, handler or not.
-    assert_eq!(effect(SIGSTOP, &handler), Effect::Ignore);
-    assert_eq!(effect(SIGTSTP, &Action::DEFAULT), Effect::Ignore);
+    // `SIGSTOP` takes no disposition at all: it stops whatever the program installed for it,
+    // which is the half of "unblockable" that a mask cannot express.
+    assert_eq!(effect(SIGSTOP, &handler), Effect::Stop);
+    assert_eq!(effect(SIGSTOP, &ignore), Effect::Stop);
+    assert_eq!(effect(SIGSTOP, &Action::DEFAULT), Effect::Stop);
+    // The other stop signals do take one: their default stops, a handler catches them, and
+    // `SIG_IGN` discards them like any other signal.
+    assert_eq!(effect(SIGTSTP, &Action::DEFAULT), Effect::Stop);
+    assert_eq!(effect(SIGTTIN, &Action::DEFAULT), Effect::Stop);
+    assert_eq!(effect(SIGTTOU, &Action::DEFAULT), Effect::Stop);
+    assert_eq!(effect(SIGTSTP, &ignore), Effect::Ignore);
     assert_eq!(effect(SIGTSTP, &handler), Effect::Handle);
+    // `SIGCONT` delivers as a no-op by default. Resuming a stopped process is not a delivery:
+    // it happens where the signal is sent, since a stopped thread is not running to deliver to.
+    assert_eq!(effect(SIGCONT, &Action::DEFAULT), Effect::Ignore);
+    assert_eq!(effect(SIGCONT, &handler), Effect::Handle);
     assert_eq!(effect(SIGCHLD, &Action::DEFAULT), Effect::Ignore);
     assert_eq!(effect(SIGSEGV, &Action::DEFAULT), Effect::Terminate);
     assert_eq!(effect(SIGTERM, &ignore), Effect::Ignore);

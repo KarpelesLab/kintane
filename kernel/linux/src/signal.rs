@@ -213,17 +213,26 @@ pub enum Effect {
     Terminate,
     /// Run the handler.
     Handle,
+    /// Stop the process until `SIGCONT`.
+    Stop,
 }
 
-/// The effect of `sig` under `action`. `SIGKILL` and `SIGSTOP` never take a disposition, and a
-/// stop, which this kernel does not implement, is ignored.
+/// The effect of `sig` under `action`. `SIGKILL` and `SIGSTOP` never take a disposition: one
+/// always ends the process and the other always stops it, whatever the program installed.
+///
+/// `SIGCONT` is [`Effect::Ignore`] here when its disposition is the default, and that is not an
+/// oversight: what it does to a *stopped* process is not a delivery at all. It resumes the
+/// process where it is sent, before any thread of it reaches a delivery point — a stopped thread
+/// is not running to deliver anything to — and only then does a handler for it run, if there is
+/// one. The personality's send path does the resuming; this function says what *delivery* does.
 pub const fn effect(sig: u64, action: &Action) -> Effect {
     if sig == SIGKILL {
         return Effect::Terminate;
     }
     let default = match default_action(sig) {
         Default::Terminate | Default::Core => Effect::Terminate,
-        Default::Ignore | Default::Stop => Effect::Ignore,
+        Default::Ignore => Effect::Ignore,
+        Default::Stop => Effect::Stop,
     };
     if sig == SIGSTOP {
         return default;

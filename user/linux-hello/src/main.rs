@@ -189,6 +189,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"faults" => faults(),
         b"rtsig" => rtsig(),
         b"fp" => fp_mode(),
+        b"stop" => stop_mode(),
         b"poll" => poll_mode(),
         b"peek" => peek_mode(s.arg),
         _ => hello(&s),
@@ -594,6 +595,91 @@ fn churn() -> ! {
         expect(unmapped == 0, 97);
     }
     exit(CHURN_SUCCESS)
+}
+
+// ---- stop: a child parked by a stop signal, reported, continued, and killed while stopped ---
+
+const STOP_SUCCESS: u64 = 55;
+const SIGCONT: u64 = 18;
+const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
+/// What `wait4` reports for a continued child, which carries no signal number.
+const CONTINUED_STATUS: u32 = 0xffff;
+/// The code the stopped child exits with once something has continued it.
+const STOP_CHILD_CODE: u64 = 7;
+
+/// What `wait4` reports for a child a stop signal parked: the signal in the second byte, `0x7f`
+/// in the low one. Mirrors `linux::stopped_status`.
+fn stopped_status(sig: u64) -> u32 {
+    ((sig as u32) << 8) | 0x7f
+}
+
+/// `wait4` with options, answering the status it wrote.
+fn wait_status(child: i64, options: u64, step: u64) -> u32 {
+    let mut status = 0u32;
+    let reaped = sys::call(sys::WAIT4, [child as u64, &raw mut status as u64, options, 0, 0, 0]);
+    expect(reaped == child, step);
+    status
+}
+
+/// Say we are about to stop, then stop. `SIGSTOP` is blocked first, which must not help: no mask
+/// holds it. Returns only once something has continued this process.
+fn stop_self(ready: u64) {
+    sigprocmask(SIG_BLOCK, bit(SIGSTOP));
+    let byte = [1u8];
+    sys::call(sys::WRITE, [ready, byte.as_ptr() as u64, 1, 0, 0, 0]);
+    let pid = sys::call(sys::GETPID, [0; 6]) as u64;
+    // Returns 0 rather than `EINTR`, so the stop parks this thread on its way *out* of a call
+    // that has already done its work: being continued returns from it rather than repeating it.
+    sys::call(sys::KILL, [pid, SIGSTOP, 0, 0, 0, 0]);
+}
+
+fn stop_mode() -> ! {
+    // `SIGSTOP` takes no disposition: the action is refused before it is even read.
+    let act = [0u64; 4];
+    expect(
+        sys::call(sys::RT_SIGACTION, [SIGSTOP, act.as_ptr() as u64, 0, 8, 0, 0]) == -EINVAL,
+        201,
+    );
+
+    // A child that stops itself, is reported stopped, is continued, and then exits.
+    let fds = pipe(202);
+    let child = sys::fork();
+    expect(child >= 0, 203);
+    if child == 0 {
+        stop_self(fds[1]);
+        exit(STOP_CHILD_CODE);
+    }
+    let mut byte = [0u8; 1];
+    expect(sys::call(sys::READ, [fds[0], byte.as_mut_ptr() as u64, 1, 0, 0, 0]) == 1, 204);
+    // The child said it was about to stop, so this cannot be answered by anything that happened
+    // earlier: the wait blocks until the stop actually parks it.
+    expect(wait_status(child, WUNTRACED, 205) == stopped_status(SIGSTOP), 205);
+    // A stopped child is not reaped: it is still there, so asking again finds it still running
+    // as far as `wait4` is concerned, and answers nothing.
+    expect(sys::call(sys::WAIT4, [child as u64, 0, WNOHANG, 0, 0, 0]) == 0, 206);
+    expect(sys::call(sys::KILL, [child as u64, SIGCONT, 0, 0, 0, 0]) == 0, 207);
+    expect(wait_status(child, WCONTINUED, 207) == CONTINUED_STATUS, 207);
+    expect(wait_status(child, 0, 208) == ((STOP_CHILD_CODE as u32) << 8), 208);
+
+    // A second child, killed while it is stopped: a stop must not hold `SIGKILL` off.
+    let waiting = pipe(209);
+    let killed = sys::fork();
+    expect(killed >= 0, 209);
+    if killed == 0 {
+        stop_self(waiting[1]);
+        exit(STOP_CHILD_CODE);
+    }
+    expect(
+        sys::call(sys::READ, [waiting[0], byte.as_mut_ptr() as u64, 1, 0, 0, 0]) == 1,
+        209,
+    );
+    expect(wait_status(killed, WUNTRACED, 209) == stopped_status(SIGSTOP), 209);
+    expect(sys::call(sys::KILL, [killed as u64, SIGKILL, 0, 0, 0, 0]) == 0, 209);
+    expect(wait_status(killed, 0, 209) == SIGKILL as u32, 209);
+
+    exit(STOP_SUCCESS)
 }
 
 // ---- signals: handlers, masks, EINTR, SIGCHLD, SIGPIPE and default actions -----------------
