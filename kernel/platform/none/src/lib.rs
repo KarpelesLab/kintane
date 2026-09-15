@@ -54,8 +54,8 @@ pub fn console_line() -> Option<u32> {
     None
 }
 
-/// No block device is bound on these ports, so there is no line to report.
-pub fn block_line() -> Option<u32> {
+/// No block device is bound on these ports, so no slot has a line to report.
+pub fn block_line(_i: usize) -> Option<u32> {
     None
 }
 

@@ -232,7 +232,7 @@ fn stop_forwarder(id: ThreadId) -> bool {
 
 /// Interrupts the platform dispatched on the disk's line, on every CPU.
 fn line_taken() -> u64 {
-    platform::block_line().map_or(0, |line| {
+    platform::block_line(0).map_or(0, |line| {
         (0..mp::CPUS)
             .map(|cpu| platform::interrupts_on_cpu(line, cpu))
             .sum()
@@ -303,7 +303,7 @@ fn grant(c: &dyn EarlyConsole) -> Result<Setup, Check> {
         return Err(Check::Failed);
     };
     let vector = match virtio_blk::msix_entry(0)
-        .filter(|_| platform::block_line().is_some_and(platform::interrupt_is_msi))
+        .filter(|_| platform::block_line(0).is_some_and(platform::interrupt_is_msi))
     {
         Some(v) => v,
         None => {
@@ -726,7 +726,7 @@ pub fn smp_check(c: &dyn EarlyConsole) -> Check {
         Ok(setup) => setup,
         Err(check) => return check,
     };
-    let (Some(line), Some(me)) = (platform::block_line(), preempt::current_thread()) else {
+    let (Some(line), Some(me)) = (platform::block_line(0), preempt::current_thread()) else {
         c.write_str("NO DISK LINE, OR NOT ON A SCHEDULED THREAD");
         return Check::Failed;
     };

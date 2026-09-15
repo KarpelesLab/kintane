@@ -31,6 +31,6 @@ pub fn check_pin_entry(_line: u32) -> Result<PinRoute, &'static str> {
 }
 
 /// Not recorded on this port. Only a platform that delivers messages asks, and none here does.
-pub fn block_has_msix() -> bool {
+pub fn block_has_msix(_i: usize) -> bool {
     false
 }

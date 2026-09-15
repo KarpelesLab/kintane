@@ -498,6 +498,16 @@ impl Disk {
 static DISKS: [Disk; MAX_DISKS] = [const { Disk::new() }; MAX_DISKS];
 
 /// The slot a probe claimed for `node`, if one did.
+///
+/// Public because every layer above must agree with this numbering rather than keep a
+/// counter of its own: a platform wiring a device's interrupt asks which slot claimed it,
+/// so `block_line(i)` and `window(i)` name the same disk even if probe order and wiring
+/// order differ.
+pub fn slot(node: NodeId) -> Option<usize> {
+    slot_of(node)
+}
+
+/// The slot a probe claimed for `node`, if one did.
 fn slot_of(node: NodeId) -> Option<usize> {
     DISKS.iter().position(|d| d.node.get() == Some(&node))
 }

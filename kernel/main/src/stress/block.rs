@@ -82,7 +82,7 @@ pub fn setup() -> Result<(), &'static str> {
     // Every completion by interrupt, where the disk has one: a waiter then never drains the
     // ring itself, so a lost interrupt is a request that times out and fails its workload,
     // instead of one a poll quietly rescues.
-    if platform::block_line().is_some() {
+    if platform::block_line(0).is_some() {
         disk.set_interrupt_driven(true);
     }
     BY_INTERRUPT_AT_START.store(disk.interrupt_counts().1, Ordering::Relaxed);
@@ -102,7 +102,7 @@ pub fn audit() -> Result<(), &'static str> {
     if !clean {
         return Err("descriptors are missing from the ring with nothing in flight (a leak)");
     }
-    if platform::block_line().is_some() && completions().1 != 0 {
+    if platform::block_line(0).is_some() && completions().1 != 0 {
         return Err("a completion was collected by polling in a run driven by interrupts");
     }
     Ok(())
