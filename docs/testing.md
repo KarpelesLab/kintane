@@ -517,6 +517,32 @@ two source ids on the `block` line — `disk 00:02.0 mapped to its grant only` a
 `disk 00:03.0 mapped to its grant only`. See "Each device is confined to its own grant" in
 [architecture.md](architecture.md).
 
+A boot that bound more than one disk then gates on the `two disks` line:
+
+```
+  two disks  each device read its own disk's sector; the second disk's out-of-grant DMA
+             stopped, fault from 0x0000000000000018; the volume's disk served on through it ok
+```
+
+It requires that each device's binding reads back *that* disk's pattern and not the other's;
+that the second disk's deliberate out-of-grant DMA is stopped with the fault naming **its** source
+id (`0x18`, that is `00:03.0`) rather than the volume disk's `0x10`; and that the volume's disk
+still serves its own data afterwards. Without an IOMMU only the first of the three runs.
+
+What a disk holds follows the **image** it was attached from, not the slot it was bound in. The
+two agree on PCI, where enumeration follows the order the drives were given, and differ on
+virtio-mmio, where QEMU fills `virt`'s slots downwards so the volume's disk arrives in the higher
+one. The check asks `image_of`, which reuses what `choose_primary` already established by reading
+each disk's header, rather than trusting a slot number — the same rule `kbuild/src/qemu.rs`
+states for the drives it attaches.
+
+Each was falsified. Keying the expected contents by slot index rather than by image — the bug
+this check shipped with — fails on `aarch64-virt` with `DISK 1 DID NOT READ BACK ITS OWN
+PATTERN, FIRST AT BYTE 0` while still *passing* on `x86_64-qemu`, which is why it survived a
+round: on PCI the two numberings agree. giving both slots one source id fails with
+`BOTH DISKS HAVE THE SAME SOURCE ID`; and mapping the canary into the second disk's own domain
+fails with `THE SECOND DISK'S ROGUE DMA WAS NOT STOPPED` and the sentinel gone.
+
 The boot gates on the `block` line ([architecture.md](architecture.md#block--the-block-layer-and-the-first-driver-with-dma)):
 
 ```

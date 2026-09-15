@@ -368,12 +368,213 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
     if ok && kconfig::IOMMU {
         ok = iommu_checks(c, frames, direct, virt, phys, len, buf);
     }
+    // With a second disk bound, what having two devices is *for*: that one device's binding
+    // reaches only its own disk, and behind an IOMMU that one device's fault is its own.
+    if ok && virtio_blk::bound() > 1 {
+        ok = two_device_checks(c, frames, direct, buf);
+    }
     if ok {
         c.write_str(" ok");
         Check::Passed
     } else {
         Check::Failed
     }
+}
+
+/// The sector the two-disk checks read through each device. Below the scratch area, so it is
+/// the pattern on both disks and neither check can be satisfied by something a write left.
+const PROBE_LBA: u64 = 7;
+
+/// Which *image* the disk in slot `i` carries, which is what its bytes are keyed by.
+///
+/// Not the slot number. `choose_primary` has already read each disk's header and recorded which
+/// slot holds the volumes, so the volume's disk is image 0 and the only other bound disk is
+/// image [`testdisk::DISK2`]. On PCI the two numberings agree, because enumeration follows the
+/// order the drives were attached; on virtio-mmio they do not, because QEMU fills the slots
+/// downwards and the volume's disk lands in the higher one. Keying by slot reads the right bytes
+/// on one port and the wrong ones on the other, which is a check that passes where it is written
+/// and fails where it is needed.
+fn image_of(slot: usize) -> usize {
+    if slot == primary() {
+        0
+    } else {
+        testdisk::DISK2
+    }
+}
+
+/// The slot of a bound disk that is not the volume's, if there is one.
+fn other_disk() -> Option<usize> {
+    (0..virtio_blk::MAX_DISKS).find(|&i| i != primary() && disk_at(i).is_some())
+}
+
+/// What two bound devices make checkable, and one device could not.
+///
+/// 1. **Each binding reaches its own disk.** The same sector is read through each device and must
+///    hold *that disk's* pattern: the images differ in almost every byte ([`pattern_on`] folds the
+///    image's index into the hash), so a read served by the wrong device is caught by content
+///    rather than by trusting the binding that served it. Without this, a driver that bound one
+///    device and read through another would pass every other check here.
+/// 2. **A fault is attributed to the device that caused it.** Behind an IOMMU, the *second* disk is
+///    pointed at a page outside its own grant. The unit's log is shared, so proving it was stopped
+///    is not enough: the fault must name that disk's source id and not the other's.
+/// 3. **A fault in one device leaves the other serving.** After the second disk's DMA is stopped,
+///    the volume's disk must still read its own data — the devices fail apart.
+///
+/// [`pattern_on`]: testdisk::pattern_on
+fn two_device_checks(
+    c: &dyn EarlyConsole,
+    frames: &mut FrameAllocator<'_, Cpu>,
+    direct: mm::DirectMap,
+    buf: &mut [u8],
+) -> bool {
+    let Some(other) = other_disk() else {
+        return true;
+    };
+    c.write_str("\n  two disks  ");
+
+    // 1. Each device's binding reaches its own disk, proved by content.
+    let sector = &mut buf[..testdisk::SECTOR];
+    for i in [primary(), other] {
+        let Some(blk) = disk_at(i) else {
+            c.write_str("A BOUND DISK WENT AWAY");
+            return false;
+        };
+        if blk.read_blocks(PROBE_LBA, sector).is_err() {
+            c.write_str("A DISK WOULD NOT SERVE THE READ");
+            return false;
+        }
+        if let Some(at) = testdisk::first_mismatch_on(image_of(i), PROBE_LBA, sector) {
+            c.write_str("DISK ");
+            write_usize(c, i);
+            c.write_str(" DID NOT READ BACK ITS OWN PATTERN, FIRST AT BYTE ");
+            write_usize(c, at);
+            return false;
+        }
+        // And it is not the *other* disk's bytes: the two images must actually differ here, or
+        // reading through the wrong binding would have passed the check above.
+        let twin = if i == primary() { other } else { primary() };
+        if testdisk::first_mismatch_on(image_of(twin), PROBE_LBA, sector).is_none() {
+            c.write_str("THE TWO DISKS' SECTORS ARE INDISTINGUISHABLE");
+            return false;
+        }
+    }
+    c.write_str("each device read its own disk's sector");
+
+    second_disk_confined(c, frames, direct, buf, other)
+}
+
+/// Without an IOMMU nothing confines either device, so there is nothing here to check — and
+/// none of the code that would check it is built.
+///
+/// A `#[cfg]` on the item, not on a branch inside one: `kconfig::IOMMU` is a runtime constant,
+/// so an `if` on it still links the canary frame, the deliberate DMA and their reporting into
+/// images that can never run them. That cost the i686 presets the whole of their remaining
+/// 4,096 bytes and hung them at boot.
+#[cfg(not(CONFIG_IOMMU))]
+fn second_disk_confined(
+    _c: &dyn EarlyConsole,
+    _frames: &mut FrameAllocator<'_, Cpu>,
+    _direct: mm::DirectMap,
+    _buf: &mut [u8],
+    _other: usize,
+) -> bool {
+    true
+}
+
+/// Behind an IOMMU: the second disk's fault is its own, and the first disk survives it.
+#[cfg(CONFIG_IOMMU)]
+fn second_disk_confined(
+    c: &dyn EarlyConsole,
+    frames: &mut FrameAllocator<'_, Cpu>,
+    direct: mm::DirectMap,
+    buf: &mut [u8],
+    other: usize,
+) -> bool {
+    // 2. The second disk's own rogue DMA, attributed to the second disk.
+    let Ok(canary) = frames.alloc_frame() else {
+        c.write_str("; NO CANARY FRAME");
+        return false;
+    };
+    let cphys = canary.start().raw();
+    let Ok(cvirt) = direct.to_virt(PhysAddr::new(cphys)) else {
+        c.write_str("; CANARY OUTSIDE THE DIRECT MAP");
+        return false;
+    };
+    let cp = cvirt.raw() as *mut u8;
+    const SENTINEL: u8 = 0xa5;
+    for i in 0..testdisk::SECTOR {
+        // SAFETY: `cp` is the canary frame through the direct map, a whole page; writing a
+        // sector of it is in bounds. Volatile, because the device may write it behind us.
+        unsafe { cp.add(i).write_volatile(SENTINEL) };
+    }
+    if iommu::domain_maps(other, cphys) {
+        c.write_str("; THE SECOND DISK'S DOMAIN ALREADY MAPS THE CANARY");
+        return false;
+    }
+    // Drain first, so the fault read below is the one this check caused.
+    while iommu::take_fault().is_some() {}
+
+    let Some(second) = disk_at(other) else {
+        c.write_str("; THE SECOND DISK WENT AWAY");
+        return false;
+    };
+    let completed = second.dma_probe(0, cphys, testdisk::SECTOR as u32, ROGUE_POLLS);
+    let fault = iommu::take_fault();
+    let mut untouched = true;
+    for i in 0..testdisk::SECTOR {
+        // SAFETY: as the fill above.
+        if unsafe { cp.add(i).read_volatile() } != SENTINEL {
+            untouched = false;
+            break;
+        }
+    }
+    let mine = iommu::source_of(other);
+    let theirs = iommu::source_of(primary());
+    let stopped = match fault {
+        Some(f) if f.address == cphys && f.write && Some(f.source_id) == mine => {
+            c.write_str("; the second disk's out-of-grant DMA stopped, fault from ");
+            write_hex(c, u64::from(f.source_id));
+            true
+        }
+        Some(f) if f.address == cphys && Some(f.source_id) == theirs => {
+            c.write_str("; THE FAULT NAMES THE OTHER DISK: ");
+            write_hex(c, u64::from(f.source_id));
+            false
+        }
+        Some(f) => {
+            c.write_str("; A FAULT AT ");
+            write_hex(c, f.address);
+            c.write_str(" BUT NOT THE SECOND DISK'S");
+            false
+        }
+        None => {
+            let _ = completed;
+            c.write_str("; THE SECOND DISK'S ROGUE DMA WAS NOT STOPPED");
+            false
+        }
+    };
+    if !untouched {
+        c.write_str("; THE CANARY WAS OVERWRITTEN");
+    }
+    if mine == theirs {
+        c.write_str("; BOTH DISKS HAVE THE SAME SOURCE ID");
+        return false;
+    }
+
+    // 3. The other device is undisturbed: the volume's disk still reads its own data.
+    let Some(blk) = disk_at(primary()) else {
+        c.write_str("; THE VOLUME'S DISK WENT AWAY WITH THE OTHER'S FAULT");
+        return false;
+    };
+    let sector = &mut buf[..testdisk::SECTOR];
+    if blk.read_blocks(PROBE_LBA, sector).is_err()
+        || testdisk::first_mismatch_on(image_of(primary()), PROBE_LBA, sector).is_some()
+    {
+        c.write_str("; THE OTHER DISK STOPPED SERVING AFTER ITS NEIGHBOUR FAULTED");
+        return false;
+    }
+    c.write_str("; the volume's disk served on through it");
+    stopped && untouched
 }
 
 /// Record which bound disk carries the volumes, by reading each one's header, and set
