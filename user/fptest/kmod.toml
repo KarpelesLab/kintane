@@ -7,10 +7,13 @@
 # tested. This unit asks for `float = "hard"`, which builds it, its `user`-layer closure
 # and a `core` of its own for `targets/<target>-hf.json`; see docs/targets.md.
 #
-# **Single-threaded, and it must stay that way.** A context switch saves no floating-point
-# state on either port (`hal::HasFpu` is unimplemented), so two threads using those
-# registers would silently clobber each other. This program uses them on one thread and
-# exits; nothing here creates a second.
+# **Two threads, started by the kernel.** Both ports implement `hal::HasFpu` now, and a
+# context switch saves and restores the whole user-visible floating-point set, so two
+# threads holding different values in the same registers keep them. That is what
+# `kernel/main/src/fpu.rs` grades: it starts a graded thread and a second thread holding
+# another pattern beside it. This program still creates no thread of its own — it is given
+# no handle to its process — and only the graded thread exits, because a process carries
+# one exit code.
 #
 # `userfp` is a provider name: with USERSPACE off, `user/fptest-none` provides it as an
 # empty library, so the image depends on the name in every configuration. USERSPACE already

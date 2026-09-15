@@ -108,11 +108,14 @@ entries that can never be served for one another.
 
 **This is opt-in per program, not a blanket switch**, and the reason is the same one that
 makes the i686 note above worth reading: LLVM emits floating-point instructions to move bytes
-around whether or not the source mentions a float. If every user program were built this way,
-every user thread would be using those registers — and **no context switch on any port saves
-them**, because `hal::HasFpu` is unimplemented. Two threads would clobber each other silently.
-So exactly one program opts in today, `user/fptest`, and it is single-threaded by
-construction. Anything built for this target must be, until `HasFpu` exists.
+around whether or not the source mentions a float. Both ports implement `hal::HasFpu` now, so
+such a program's state does survive a context switch and two of its threads no longer clobber
+each other — `user/fptest` runs two on purpose, holding different values in the same registers.
+
+What the opt-in still decides is who pays. The state lives in the port's `Context`, and
+`kernel/thread` holds one of those per thread slot, so the image carries it for every thread
+whether or not that thread will ever name a floating-point register: 512 bytes a slot on
+x86_64, 528 on aarch64. So exactly one program opts in today, `user/fptest`.
 
 On x86_64 the instructions also have to be made legal: the boot path now sets
 `CR4.OSFXSR | CR4.OSXMMEXCPT` and clears `CR0.EM`, exactly as i686 already did, or a user

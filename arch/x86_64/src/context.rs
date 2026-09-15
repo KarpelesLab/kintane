@@ -69,6 +69,48 @@ use hal::{Arch, EarlyConsole, HasContextSwitch, KernAddr, ThreadEntry};
 use crate::X86_64;
 use crate::serial::{write_dec, write_hex};
 
+/// A thread's floating-point and SIMD state: the 512-byte area `FXSAVE` writes.
+///
+/// `FXSAVE`/`FXRSTOR` rather than `XSAVE`: the area is a fixed 512 bytes with no header to
+/// negotiate, it needs no `XCR0` and no feature enumeration, and it covers exactly what a
+/// program built for `targets/x86_64-kintane-hf.json` can name — x87, MMX and SSE. `XSAVE`
+/// would add AVX state this kernel cannot enable without also enabling `XCR0.YMM`, which is
+/// a larger change and buys nothing a hard-float user program currently uses.
+///
+/// Sixteen-byte aligned because `FXSAVE` faults otherwise. `Context` carries one inline, so
+/// the alignment propagates to the thread table's context array.
+#[repr(C, align(16))]
+pub struct FxSave([u8; 512]);
+
+impl FxSave {
+    /// Offsets of the two control fields in the `FXSAVE` image, from the SDM's layout.
+    const FCW: usize = 0;
+    const MXCSR: usize = 24;
+
+    /// A state `FXRSTOR` accepts, holding what a thread that has never used the unit should
+    /// see.
+    ///
+    /// **Not zero, and this is the subtle part.** An all-zero image has `MXCSR = 0`, which
+    /// leaves every SSE exception *unmasked*: the first user multiply that underflows or
+    /// divides by zero raises `#XF` instead of producing a denormal or an infinity. The
+    /// reset values are `FCW = 0x037F` (x87 precision and rounding as the ABI expects, all
+    /// exceptions masked) and `MXCSR = 0x1F80` (all six SSE exceptions masked).
+    const fn new() -> Self {
+        let mut bytes = [0u8; 512];
+        bytes[Self::FCW] = 0x7F;
+        bytes[Self::FCW + 1] = 0x03;
+        bytes[Self::MXCSR] = 0x80;
+        bytes[Self::MXCSR + 1] = 0x1F;
+        Self(bytes)
+    }
+}
+
+impl Default for FxSave {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The saved state of a suspended kernel thread: the SysV callee-saved registers.
 ///
 /// Layout is `repr(C)` because the switch reads and writes it from assembly by
@@ -95,6 +137,10 @@ pub struct Context {
     /// thread is switched away from and loaded when it is switched to, so a value a program
     /// set follows its thread to whichever CPU runs it next. See `hal::HasUserMode::set_tls`.
     pub(crate) user_tls: u64,
+    /// The floating-point and SIMD state, saved and restored by every switch. Last, and
+    /// 16-aligned, so `FXSAVE` is legal and the assembly's offsets for the registers above
+    /// are unchanged.
+    fpu: FxSave,
 }
 
 /// Size of the return address a `call` pushes, and of the slot `init` fabricates for
@@ -145,6 +191,7 @@ impl HasContextSwitch for X86_64 {
             user_kernel_stack: 0,
             user_root: 0,
             user_tls: 0,
+            fpu: FxSave::new(),
         };
     }
 
@@ -197,6 +244,14 @@ impl HasContextSwitch for X86_64 {
 #[unsafe(naked)]
 unsafe extern "C" fn switch_raw(from: *mut Context, to: *const Context) {
     core::arch::naked_asm!(
+        // The floating-point and SIMD state first, while both pointers are still in the
+        // registers the ABI put them in. The kernel names no such register, so this is
+        // entirely the user program's: without it two hard-float threads would each see
+        // the other's values. `FXSAVE`/`FXRSTOR` fault unless the area is 16-aligned,
+        // which `FxSave` is, and a context `init` built holds the reset image rather than
+        // zeros — see `FxSave::new`.
+        "fxsave64 [rdi + {fpu}]",
+        "fxrstor64 [rsi + {fpu}]",
         // Save. rsp here points at our caller's return address — that is the resume
         // point, so nothing else needs recording.
         "mov [rdi + {rsp}], rsp",
@@ -224,6 +279,7 @@ unsafe extern "C" fn switch_raw(from: *mut Context, to: *const Context) {
         r13 = const offset_of!(Context, r13),
         r14 = const offset_of!(Context, r14),
         r15 = const offset_of!(Context, r15),
+        fpu = const offset_of!(Context, fpu),
     );
 }
 
@@ -323,6 +379,7 @@ static BOOT_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     user_kernel_stack: 0,
     user_root: 0,
     user_tls: 0,
+    fpu: FxSave::new(),
 }));
 static THREAD_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     rsp: 0,
@@ -335,6 +392,7 @@ static THREAD_CONTEXT: ContextCell = ContextCell(UnsafeCell::new(Context {
     user_kernel_stack: 0,
     user_root: 0,
     user_tls: 0,
+    fpu: FxSave::new(),
 }));
 
 /// Set by the first selftest run. A second would re-`init` a stack a suspended thread

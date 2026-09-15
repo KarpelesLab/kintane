@@ -315,6 +315,10 @@ impl hal::HasUserMode for Aarch64 {
     const USER_START: usize = USER_START;
     const USER_END: usize = USER_END;
     const ELF_MACHINE: u16 = 183; // EM_AARCH64
+    // None: the stack pointer is sixteen-byte aligned at every instant here, and a call leaves
+    // its return address in x30 rather than on the stack, so an entry's frame is already where
+    // the compiler expects it; see the trait's constant.
+    const ENTRY_SP_BIAS: usize = 0;
 
     type SyscallFrame = SyscallFrame;
 

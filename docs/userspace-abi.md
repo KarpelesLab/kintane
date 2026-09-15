@@ -381,26 +381,49 @@ A program may not use floating point, with one exception, and the exception is a
 
 Every user program is built for the kernel's target specification, which disables floating
 point: `a * b` on two doubles compiles to a call to `__muldf3` in `compiler_builtins`, and no
-floating-point register is named anywhere in the image. That is deliberate — it is what lets a
-context switch save only the general-purpose registers — but it also meant nothing that uses
-those registers could be written, and so nothing could be tested.
+floating-point register is named anywhere in the image. That is deliberate — it keeps the
+kernel's own code clear of a state it would otherwise have to reason about everywhere — but it
+also meant nothing that uses those registers could be written, and so nothing could be tested.
 
 A unit may now ask for `float = "hard"`, which builds it and its `user`-layer closure for a
 hard-float target of its own; see [targets.md](targets.md#hard-float-user-programs). Exactly
 one does: `user/fptest`.
 
-**A program built this way must be single-threaded.** No context switch on any port saves
-floating-point state — `hal::HasFpu` is unimplemented, and `arch/aarch64/src/context.rs`
-asserts at compile time that the kernel itself cannot name such a register — so two threads
-using them would overwrite each other's values with no fault, no warning and no diagnostic.
-The kernel will happily schedule such a program; it simply will not preserve what it is
-computing with. Until that trait is implemented, a hard-float program may use these registers
-only on the thread the kernel started it on.
+**A program built this way may use as many threads as any other.** Both ports implement
+`hal::HasFpu`, and a context switch saves and restores the whole user-visible floating-point
+set: the 512-byte `FXSAVE` image on x86_64, the 32 V registers with FPCR and FPSR on aarch64,
+each carried inside that port's own `Context`. It is the whole set rather than the ABI's
+callee-saved subset because the kernel is not a caller preserving a few registers across a
+call — it is a different address space borrowing the hardware. The kernel still names no
+floating-point register of its own: every port builds soft-float, and
+`arch/aarch64/src/context.rs` asserts at compile time that the image cannot.
+
+`kernel/main/src/fpu.rs` holds two threads of `user/fptest` to different values in the same
+eight vector registers, on different CPUs where there are two, and requires each to read back
+what it wrote.
 
 On x86_64 the kernel makes the instructions legal (`CR4.OSFXSR`, `CR4.OSXMMEXCPT`, `CR0.EM`
 clear), which it previously had no reason to do, since its own code emits none. Without those
 bits a user program's first SSE instruction raises `#UD`, which the Linux personality reports
-as `SIGILL`.
+as `SIGILL`. Those bits were only ever reasoned about until the check above ran a
+floating-point instruction in a guest.
+
+### The stack a thread starts on
+
+A native thread's entry is an ordinary `extern "C"` function, and it is *entered*, not called.
+System V says a called function finds `RSP` eight past a sixteen-byte boundary, because the
+call pushed a return address, so the kernel leaves that same gap itself:
+`hal::HasUserMode::ENTRY_SP_BIAS`, eight on x86_64 and zero on aarch64, where the stack
+pointer is sixteen-byte aligned at every instant and the return address is in `x30` rather
+than on the stack. Without the gap every frame beneath the entry sits eight bytes from where
+the compiler believes it does, and the first aligned SSE access raises `#GP` — and the
+compiler emits one unbidden for any `align(16)` local, so a program cannot avoid this by
+choosing its own instructions. Soft-float programs never noticed; the first hard-float one
+died of it.
+
+The Linux personality does not come through here. It lays out its own start-up stack around
+argc and argv, where a sixteen-byte aligned pointer is the contract and `_start` is assembly
+that knows nothing called it; that ABI is unchanged.
 
 ## Waiting on many things at once
 

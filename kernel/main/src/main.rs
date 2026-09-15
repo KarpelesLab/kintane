@@ -77,6 +77,10 @@ mod blockdomain;
 #[cfg(not(CONFIG_BLOCK_DOMAIN))]
 #[path = "blockdomain_off.rs"]
 mod blockdomain;
+// The floating-point check needs a program to run, and the hard-float unit is built only
+// where userspace is; `model` passes the check without it elsewhere.
+#[cfg(CONFIG_USERSPACE)]
+mod fpu;
 #[cfg(CONFIG_MM_PAGED)]
 mod net;
 #[cfg(CONFIG_MM_FLAT)]

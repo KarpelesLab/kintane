@@ -139,6 +139,20 @@ pub trait HasUserMode: HasPageTables + HasContextSwitch {
     /// `e_machine` of the programs this port runs.
     const ELF_MACHINE: u16;
 
+    /// Bytes below a sixteen-byte boundary a thread's entry stack pointer sits, so that a
+    /// compiled `extern "C"` entry finds the stack its ABI promises.
+    ///
+    /// Eight on x86_64: System V says a *called* function finds `RSP` eight past a sixteen-byte
+    /// boundary, because the call pushed a return address. Nothing calls a thread's entry, so
+    /// the kernel must leave the gap the call would have left. Without it every frame beneath
+    /// the entry sits eight bytes from where the compiler believes it does, and the first
+    /// aligned SSE access raises `#GP` — which the compiler emits unbidden for any `align(16)`
+    /// local, so no program can avoid it by choosing its instructions.
+    ///
+    /// Zero on aarch64, where the stack pointer is sixteen-byte aligned at every instant and
+    /// the return address is in a register rather than on the stack.
+    const ENTRY_SP_BIAS: usize;
+
     type SyscallFrame: SyscallFrame;
 
     /// Install the kernel's hooks and turn the system call entry on. `kernel_root` is the

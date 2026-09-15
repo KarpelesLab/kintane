@@ -444,6 +444,10 @@ impl hal::HasUserMode for X86_64 {
     const USER_START: usize = USER_START;
     const USER_END: usize = USER_END;
     const ELF_MACHINE: u16 = 62; // EM_X86_64
+    // The eight bytes a `call` would have pushed. Without them a thread's entry, compiled as
+    // an ordinary System V function, aligns its frame against a boundary that is not there,
+    // and the first aligned SSE access faults; see the trait's constant.
+    const ENTRY_SP_BIAS: usize = 8;
 
     type SyscallFrame = SyscallFrame;
 

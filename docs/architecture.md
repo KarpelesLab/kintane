@@ -79,6 +79,48 @@ and TLB maintenance, atomic primitives where the ISA needs help. This is where
 assembly lives and where the `unsafe` budget is spent. One `arch` crate is linked per
 image.
 
+#### Floating-point state across a switch
+
+A port whose hardware has floating-point registers implements `hal::HasFpu` and carries that
+state inside its own `Context`. Nothing above the architecture layer names it: `kernel/thread`
+holds `[A::Context; N]` and switches through raw pointers, so the state rides along with
+everything else a switch already moves, and a port with no such state leaves `FpuState = ()`
+and pays nothing. x86_64 keeps the 512-byte `FXSAVE` image and moves it with
+`fxsave64`/`fxrstor64`; aarch64 keeps the 32 V registers with FPCR and FPSR and moves them with
+sixteen `stp q`/`ldp q` pairs, asking for the instructions with `.arch_extension fp` because
+the kernel's own target is `-neon`.
+
+It is the whole user-visible set, not the ABI's callee-saved subset. Callee-saved would be the
+right set for a *caller* preserving a few registers across a call. The kernel is not that: it
+is a different address space borrowing the hardware, and a thread resumed with only `d8`–`d15`
+restored would find the other twenty-four, and both control registers, holding whatever the
+last thread left there.
+
+The initial state is not zero. An all-zero `FXSAVE` image has `MXCSR = 0`, which unmasks every
+SSE exception, so the first user multiply that underflowed would trap; the reset values
+`FCW = 0x037F` and `MXCSR = 0x1F80` are written instead. `HasFpu`'s documentation says what
+the requirement really is: a `Default` must be a state a restore will accept.
+
+**The save is eager, and it is paid for by every thread.** Every switch moves the state
+whether or not either thread has ever named a floating-point register. What that costs was
+measured by booting the same image with the two instructions removed and comparing `processes`,
+which runs two user workers to a deadline and prints the passes each made — every pass is
+scheduler work, so a switch moving 512 more bytes each way shows up there if it shows up
+anywhere. Eight boots as built ran 1,240,128 to 1,323,520 passes; four boots with no save at
+all ran 1,349,952 to 1,384,256. The two sets do not overlap, so the cost is real: **about 2%
+at the most conservative reading, nearer 5% comparing medians.** The host was shared with other
+work and drifted quieter over the session, which is why the baseline was taken again *after*
+the mutated pair — the mutated boots beat the baselines on both sides of them in time.
+
+Lazy switching would recover most of that, and it was not chosen. It needs trap-on-first-use —
+`CR0.TS` and `#NM` on x86_64, which the XSAVE era deprecates, or `CPACR_EL1.FPEN` on aarch64 —
+and with it a record of which CPU's registers hold which thread's state, invalidated whenever a
+thread migrates. That bookkeeping fails rarely and silently, and it fails as a thread computing
+with another thread's numbers. Two percent of a context-switch microbenchmark does not buy
+that, especially while exactly one program in the image uses these registers at all. The
+door stays open: the state lives in the port's `Context` behind `HasFpu`, so a lazy scheme can
+replace this one without anything above the architecture layer noticing.
+
 #### Entries that save every register, and why some must
 
 A signal frame holds every register a thread had, because the handler it runs is the

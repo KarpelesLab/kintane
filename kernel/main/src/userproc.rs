@@ -2318,8 +2318,13 @@ pub(crate) fn user_stack_top() -> usize {
 
 /// The user stack pointer a native process starts on: the top of its stack region, with
 /// room for the ABI's alignment and the initial frame.
+///
+/// [`HasUserMode::ENTRY_SP_BIAS`] is what makes the alignment the entry's *own* ABI asks for,
+/// rather than merely a round number; see that constant. The Linux personality does not come
+/// through here — it lays out its own start-up stack, where the aligned pointer is the
+/// contract — so this is the native programs' alignment alone.
 pub(crate) fn user_stack_pointer() -> usize {
-    user_stack_top() - 16
+    user_stack_top() - 16 - <Cpu as HasUserMode>::ENTRY_SP_BIAS
 }
 
 /// Pages of stack each thread after a process's first is given.
@@ -2363,7 +2368,7 @@ fn prepare_thread(
         p.vm.reserve(anon(top - len, len))
             .map_err(|_| Error::NoMemory)?;
         p.stacks += 1;
-        (top - 16, false)
+        (top - 16 - <Cpu as HasUserMode>::ENTRY_SP_BIAS, false)
     };
     p.started = true;
     Ok(crate::spawn::Start {

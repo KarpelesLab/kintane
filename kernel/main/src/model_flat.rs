@@ -75,6 +75,11 @@ pub fn files_statfs_check(_c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// No userspace on a flat kernel: USERSPACE depends on MM_PAGED. Always `Passed`.
+pub fn fpu_check(_c: &dyn EarlyConsole) -> Check {
+    Check::Passed
+}
+
 pub fn waits_check(_c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }

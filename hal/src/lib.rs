@@ -143,6 +143,21 @@ pub trait HasCas: Arch {}
 pub trait HasCoherentDma: Arch {}
 
 /// Floating-point or SIMD state that must be saved across context switches.
+///
+/// The kernel itself never names a floating-point register — every port builds
+/// `+soft-float`, and `arch/aarch64/src/context.rs` asserts at compile time that nothing
+/// in the image can — so this state is entirely a *user* program's. That is why it is the
+/// whole user-visible set rather than the ABI's callee-saved subset: the kernel is not a
+/// caller that saved anything, it is a different address space borrowing the registers.
+///
+/// A port that implements this stores the state inside its own
+/// [`HasContextSwitch::Context`](crate::HasContextSwitch::Context) and saves it in its own
+/// switch. Nothing above the architecture layer names `FpuState`, so a port whose hardware
+/// has no such state leaves it `()` and costs nothing.
+///
+/// `Default` must produce a state a restore will accept. That is not the same as zero: an
+/// all-zero x86 `FXSAVE` image has `MXCSR = 0`, which unmasks every floating-point
+/// exception, so the first user multiply that underflows traps. See `X86_64::FpuState`.
 pub trait HasFpu: Arch {
     type FpuState: Default;
 }
