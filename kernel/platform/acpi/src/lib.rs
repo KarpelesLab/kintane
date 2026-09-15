@@ -142,6 +142,17 @@ static NET_LINE: BootCell<IrqNumber> = BootCell::new();
 static BLOCK_MSIX: [BootCell<bool>; virtio_blk::MAX_DISKS] =
     [const { BootCell::new() }; virtio_blk::MAX_DISKS];
 
+/// Each block device's PCI source id (`bus << 8 | dev << 3 | fn`), the name an IOMMU knows it
+/// by, recorded per slot as its interrupt facts are.
+///
+/// Per slot, and taken from the function the slot was actually bound from, rather than from the
+/// first block function enumeration happens to list. With two disks those differ, and a source
+/// id paired with the wrong slot would confine one device to the other's grant — which is
+/// exactly what a fault attributed by source id is meant to catch, so it cannot be left to the
+/// order the devices came out in.
+static BLOCK_SOURCES: [BootCell<u16>; virtio_blk::MAX_DISKS] =
+    [const { BootCell::new() }; virtio_blk::MAX_DISKS];
+
 /// Lines past the ISA ones there can be; `controller::MSI_LINES` is at most this long.
 const MAX_MSI_ROUTES: usize = 16;
 /// CPUs whose interrupts on a message-signalled line are counted apart.
@@ -1021,6 +1032,20 @@ unsafe fn wire_all(
             // SAFETY: once per slot, on the single-threaded boot path.
             let _ = unsafe { cell.set(msix) };
         }
+        // The same slot's source id, from the very function this slot was bound from, so the
+        // name the IOMMU knows a device by and the slot the kernel drives it through cannot
+        // come apart.
+        if drv.name() == virtio_blk::DRIVER.name()
+            && let Some(i) = virtio_blk::slot(s.bound().node())
+            && let Some(cell) = BLOCK_SOURCES.get(i)
+            && let Some(f) = function
+        {
+            let a = f.address;
+            let source =
+                (u16::from(a.bus) << 8) | (u16::from(a.device) << 3) | u16::from(a.function);
+            // SAFETY: once per slot, on the single-threaded boot path.
+            let _ = unsafe { cell.set(source) };
+        }
         match wire(c, chip, drv, s, function, Some(messages)) {
             Wired::Nothing => {}
             Wired::Failed => ok = false,
@@ -1487,6 +1512,12 @@ pub fn block_has_msix(i: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Block device `i`'s PCI source id, the name an IOMMU knows it by. `None` for a slot no disk
+/// claimed, or one bound from something that is not a PCI function.
+pub fn block_source_id(i: usize) -> Option<u16> {
+    BLOCK_SOURCES.get(i)?.get().copied()
+}
+
 /// The console UART's receive line, once its handler is wired.
 pub fn console_line() -> Option<u32> {
     CONSOLE_LINE.get().map(|n| n.0)
@@ -1728,14 +1759,16 @@ pub fn isolation_window() -> Option<(u64, u64)> {
     None
 }
 
-/// What the IOMMU check needs: the DMA remapping unit's register base, the address width the
-/// hardware translates, and the source id (`bus << 8 | dev << 3 | fn`) of the virtio-blk
-/// device that will be put behind it.
+/// What the IOMMU check needs about the unit itself: the DMA remapping unit's register base
+/// and the address width the hardware translates.
+///
+/// Which devices go behind it is not here: a device's source id is recorded per slot as its
+/// interrupt facts are, and read with [`block_source_id`], so a machine with two disks names
+/// each of them by the slot the kernel drives it through.
 #[derive(Clone, Copy)]
 pub struct IommuFacts {
     pub register_base: u64,
     pub host_address_width: u8,
-    pub block_source_id: u16,
 }
 
 static IOMMU: BootCell<IommuFacts> = BootCell::new();
@@ -1766,15 +1799,15 @@ fn iommu_discover(
         }
     };
     let unit = dmar.units().flatten().next()?;
-    let block = functions
+    // A machine with no block device has nothing here to confine. The devices' own source ids
+    // are recorded per slot in `wire_all`, not taken from this list, which is in enumeration
+    // order and cannot say which slot drives which function.
+    functions
         .iter()
         .find(|f| virtio_blk::pci::is_block_device(f))?;
-    let a = block.address;
-    let source = (u16::from(a.bus) << 8) | (u16::from(a.device) << 3) | u16::from(a.function);
     Some(IommuFacts {
         register_base: unit.register_base,
         host_address_width: dmar.host_address_width(),
-        block_source_id: source,
     })
 }
 

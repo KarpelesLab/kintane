@@ -365,6 +365,29 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
         "-device".to_string(),
         format!("{device},drive=kt_disk"),
     ];
+    // A second disk, on its own function: what the checks that one device cannot reach
+    // another's data, and that a fault in one driver leaves the other serving, are true of.
+    // It carries its own file — two `-drive`s on one image make QEMU refuse the run with
+    // `Failed to get shared "write" lock` — holding its own pattern, so a read served by the
+    // wrong device's binding comes back as bytes that match nothing.
+    //
+    // On the memory-mapped transport this works only because the kernel no longer trusts a
+    // slot's number: QEMU fills `virt`'s virtio-mmio slots downwards as devices are created
+    // while enumeration walks the tree upwards, so the slots arrive in the reverse of the
+    // order the drives are given here. The kernel picks the disk carrying the volume by
+    // reading each disk's header instead (`block::choose_primary`).
+    //
+    // Behind an IOMMU it works because each device now has a domain of its own and faults are
+    // attributed by source id. While one unit's translation covered a single domain, a second
+    // function there was unconfined and its faults landed in the same log the confinement check
+    // reads, which then took a fault that was not the rogue one.
+    let disk2 = crate::diskcheck::run_copy2(image);
+    args.extend([
+        "-drive".to_string(),
+        format!("file={},if=none,id=kt_disk2,format=raw", disk2.display()),
+        "-device".to_string(),
+        format!("{device},drive=kt_disk2"),
+    ]);
     // QEMU's memory-mapped virtio transport presents the legacy (version 1) register
     // layout unless told otherwise, and the driver speaks only virtio 1.x. Found when the
     // first boot with a disk attached reported the slot as legacy and bound nothing.

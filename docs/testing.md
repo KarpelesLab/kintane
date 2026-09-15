@@ -480,9 +480,10 @@ is not exercised under load yet.
 ### 2b. Block storage
 
 With `QEMU_BLOCK_TEST`, on by default on aarch64, x86_64 and i686 test builds, kbuild
-writes `testdisk.img` beside the image. It is 6 MiB in three regions: 4096 sectors in which every
-byte is a function of its sector and offset, with a header in sector 0; a scratch area the
-write checks use; and a FAT16 volume for the [files check](#2e-files). Each run attaches a fresh
+writes `testdisk.img` beside the image. It is 79,144 sectors — about 39 MiB — in four regions:
+4096 sectors in which every byte is a function of its sector and offset, with a header in
+sector 0; a scratch area the write checks use; a FAT16 volume for the
+[files check](#2e-files); and the FAT32 volume that follows it. Each run attaches a fresh
 copy of it, written for real, which kbuild reads back after a passing run
 ([2e](#the-disk-image-after-a-run)), so the image kbuild built never changes: to a
 `virtio-blk-device` in a memory-mapped
@@ -490,6 +491,31 @@ slot on aarch64, and to a modern-only `virtio-blk-pci` function on the PCs, thro
 path they have (`-kernel`, BIOS and UEFI). The format is written twice, in
 `kernel/block/src/testdisk.rs` and `kbuild/src/testdisk.rs`, and a pinned set of bytes
 that both sides' tests assert keeps the two in step.
+
+A run attaches a **second disk** as well, `testdisk2.img`, on its own
+virtio-blk function and its own file — two `-drive`s on one image make QEMU refuse the run with
+`Failed to get shared "write" lock`. It carries no volume: both volumes stay on the first disk,
+so `FS_START` and `FS32_START` are unchanged. Its bytes are the same pattern with the disk's
+index folded into the hash, so disk 0's image is untouched and a sector read from the wrong disk
+matches nothing. The `block` line reports how many disks the boot bound, so a run that attached
+two and bound one is visible there rather than only as a later check quietly skipping, and every
+disk's geometry is reported:
+
+```
+  block      2 disks bound; 4352 sectors of 512 bytes, 15 per request, 79144 sectors of 512
+             bytes, 15 per request; the volume is on disk 1; 32 sectors read back the pattern
+```
+
+That line is from `aarch64-virt`, and it shows why the slot's number is not trusted: QEMU fills
+`virt`'s virtio-mmio slots downwards as devices are created while enumeration walks the tree
+upwards, so slot 0 is the second drive there. The kernel brings up every bound disk and then
+reads each one's header to find the one carrying the volume, saying so when it is not slot 0.
+The interrupt checks follow that disk too, so `block irq` measures the disk the kernel drives.
+
+Behind an IOMMU both disks are attached and each is confined to a domain of its own, reported as
+two source ids on the `block` line — `disk 00:02.0 mapped to its grant only` and
+`disk 00:03.0 mapped to its grant only`. See "Each device is confined to its own grant" in
+[architecture.md](architecture.md).
 
 The boot gates on the `block` line ([architecture.md](architecture.md#block--the-block-layer-and-the-first-driver-with-dma)):
 
@@ -701,16 +727,18 @@ the code.
 
 ### 2c-bis. DMA confinement with the IOMMU
 
-On x86_64 with `IOMMU` (the `x86_64-iommu` preset), the disk runs behind an Intel VT-d IOMMU:
-a translation domain that maps *exactly* its DMA grant. The `iommu` line gates the boot:
+On x86_64 with `IOMMU` (the `x86_64-iommu` preset), both disks run behind an Intel VT-d IOMMU,
+each attached to a translation domain of its own that maps *exactly* that disk's DMA grant. The
+`iommu` line gates the boot:
 
 ```
   iommu      in-grant DMA served behind VT-d; a page the device used was unmapped and flushed; out-of-grant DMA stopped at 0x00000000002a9000 from 0x0000000000000010; restarted and served a read ok
 ```
 
-The `block` line first shows the device brought up behind the IOMMU (`VT-d on, 48-bit; disk
-00:03.0 mapped to its grant only`) and passes every functional check with its DMA translated —
-that is the in-grant DMA working. Then the `iommu` line requires all of:
+The `block` line first shows each device brought up behind the IOMMU — `VT-d on, 48-bit; disk
+00:02.0 mapped to its grant only, invalidation queued` for the volume's disk, and
+`disk 00:03.0 mapped to its grant only` for the second — and passes every functional check with
+its DMA translated, which is the in-grant DMA working. Then the `iommu` line requires all of:
 
 - a translation the device used is taken away: the canary is mapped into the domain, the device
   reads a sector into it and the sector arrives, and the canary is unmapped with a page-selective
@@ -718,7 +746,10 @@ that is the in-grant DMA working. Then the `iommu` line requires all of:
   rogue DMA below would reach the canary;
 - the domain maps the grant and does **not** map the canary frame beside it (map exactly the grant);
 - a deliberate out-of-grant DMA (a read into the canary) is stopped, and the unit's fault log names
-  the canary's address and the disk's own source id `00:03.0`;
+  the canary's address and that disk's own source id `00:02.0` — the check compares the fault's
+  source id against the one *that disk* was attached with, so another device's fault at the same
+  page is not taken for this one, and it drains the log first so the fault it reads is the one it
+  caused;
 - the canary still holds its sentinel — the blocked write never landed;
 - the faulted device is reset, brought up again over the same grant, and serves a read.
 

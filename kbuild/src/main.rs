@@ -1250,6 +1250,9 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
             program.as_deref(),
             linux.as_deref(),
         )?;
+        // The second disk, beside the first. It carries no volume and no program: it exists so
+        // the machine has two block devices to tell apart.
+        testdisk::write2(image.parent().unwrap_or(Path::new(".")))?;
     }
     // A module asking for another configuration gets this one with its overrides on top.
     // A `--set` the overridden configuration cannot honour is dropped for that build only:

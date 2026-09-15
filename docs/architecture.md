@@ -1670,6 +1670,56 @@ tests. kbuild writes files into it as it does the first, and both the file serve
 workload mount it at `/FAT32`, each through a constant of its own, since the crash workload is
 built on configurations that have no file server.
 
+**A second disk.** A test run attaches two virtio-blk functions, each with its
+own file: two `-drive`s on one image make QEMU refuse the run with `Failed to get shared "write"
+lock`. The second disk, `testdisk2.img` of `SECTORS2` sectors, carries **no volume at all** —
+both volumes stay on the first disk, where the filesystem checks and the crash campaign already
+expect them, so `FS_START` and `FS32_START` are exactly where they were and nothing moved. It is
+pattern all the way down, and the pattern is its own: `pattern_on` folds the disk's index into
+the same hash before its shift, so disk 0 adds zero and is byte for byte the image it always was,
+while disk 1 shares almost no byte of any sector with it. Each disk's header names its own
+length. That is what lets a read served through the wrong device's binding be caught by content,
+rather than by trusting the binding that served it.
+
+**Which disk carries the volume is read, not assumed.** A slot's number is the order the
+platform enumerated the devices in, which need not be the order the run gave the drives: QEMU
+fills `virt`'s virtio-mmio slots downwards as devices are created while enumeration walks the
+tree upwards, so on `virt` the slots arrive in the reverse of the order the drives were given
+and slot 0 is the *second* drive. Trusting the number there mounted the wrong disk — observed
+as a `block` line reporting `4352 sectors`, which is `SECTORS2`. So `block::check` brings up
+every bound disk, each over a grant and an interrupt trampoline of its own, then reads each
+one's sector 0 and records as `PRIMARY` the slot whose header names the volume-carrying image's
+length. `block::disk()` — what the filesystem, the stress workload and the driver domain all
+mean by "the disk" — is that slot, and the boot says so when it is not slot 0:
+
+```
+  block      2 disks bound; 4352 sectors of 512 bytes, 15 per request, 79144 sectors of 512
+             bytes, 15 per request; the volume is on disk 1; 32 sectors read back the pattern
+```
+
+**Each device is confined to its own grant.** Behind an IOMMU both disks are attached, each to a
+domain of its own mapping exactly that disk's DMA grant and nothing else. One `Unit`, though:
+translation, the root table and the invalidation queue belong to the hardware unit rather than
+to a device, so the unit is brought up once and each device gets a domain under it (id
+`1 + slot`, zero meaning "no domain" to the hardware). The interrupt remapping table is shared
+the same way — made and latched once, one entry per slot — so a message naming another slot's
+entry is a message for another device:
+
+```
+  block      2 disks bound; VT-d on, 48-bit; disk 00:02.0 mapped to its grant only,
+             invalidation queued; interrupts remapped, 32-bit destinations; 79144 sectors ...;
+             disk 00:03.0 mapped to its grant only; a second interrupt remapped; 4352 sectors ...
+```
+
+The unit's **fault log is shared** by every device behind it, and that changes what a
+confinement check must prove. A fault matched only by its address and direction would be
+satisfied by another device's fault at the same page, so the checks compare the fault's
+`source_id` against the source id *that disk* was attached with, and say
+`STOPPED BUT THE FAULT NAMES ANOTHER DEVICE` when they differ. For the same reason each check
+drains the log before causing the fault it intends to read: a second disk faults once as it is
+brought up behind its own domain — stopped, as it should be — and that record would otherwise
+be the one the check reads.
+
 **Loading a program from a disk.** The boot `fs` check reads `/KINTANE/INIT.ELF` from the volume
 into frames it keeps, runs it once, and only after it exits with the success code makes it the
 program `userproc::program()` returns. So on a machine with the disk — aarch64 today — the

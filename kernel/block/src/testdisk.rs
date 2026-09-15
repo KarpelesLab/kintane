@@ -47,6 +47,15 @@ pub const FS32_SECTORS: u64 = 66_600;
 /// Sectors in the image.
 pub const SECTORS: u64 = FS32_START + FS32_SECTORS;
 
+/// Sectors in the second disk's image.
+///
+/// The second disk carries no volume — both volumes stay on the first, where the filesystem
+/// checks and the crash campaign already expect them — so it is pattern all the way down and
+/// ends where the first disk's volume would begin. Its bytes are [`pattern_on`]'s for disk 1,
+/// which share no byte with disk 0's, so a read served by the wrong device's binding is caught
+/// by content.
+pub const SECTORS2: u64 = FS_START;
+
 /// `/HELLO.TXT`'s content.
 pub const HELLO: &[u8] = b"hello from the KinTane test disk\n";
 /// `/SUB/NESTED.TXT`'s content.
@@ -85,6 +94,23 @@ pub const fn pattern(sector: u64, offset: usize) -> u8 {
     let s = (sector as u32).wrapping_mul(2_654_435_761);
     let o = (offset as u32).wrapping_mul(40_503);
     (s.wrapping_add(o).wrapping_add(sector as u32 >> 3) >> 13) as u8
+}
+
+/// The byte at `offset` of sector `sector` on disk `disk`.
+///
+/// The disk's index is folded into the same hash before its shift, so each disk's pattern is
+/// its own: a sector read from the wrong disk matches nothing, which is what makes a read
+/// served through the wrong device's binding detectable by content rather than by trusting
+/// the binding. Disk 0 adds zero and so is [`pattern`] exactly — the first disk's image is
+/// byte for byte what it was before there was a second.
+pub const fn pattern_on(disk: usize, sector: u64, offset: usize) -> u8 {
+    let s = (sector as u32).wrapping_mul(2_654_435_761);
+    let o = (offset as u32).wrapping_mul(40_503);
+    let d = (disk as u32).wrapping_mul(0x9E37_79B9);
+    (s.wrapping_add(o)
+        .wrapping_add(sector as u32 >> 3)
+        .wrapping_add(d)
+        >> 13) as u8
 }
 
 /// The byte at offset `i` of `/BIG.BIN`.
@@ -139,21 +165,35 @@ pub const PINNED_BIG: [(usize, u8); 6] = [
 /// Fill `sector` of the image into `into`, header included for sector 0. Meaningful only
 /// below [`FS_START`]: the volume's sectors are FAT's, not the pattern's.
 pub fn fill_sector(sector: u64, into: &mut [u8]) {
+    fill_sector_on(0, sector, into);
+}
+
+/// Fill `sector` of disk `disk`'s image into `into`, header included for sector 0.
+///
+/// Each disk's header records its own length, so a device that answered with another disk's
+/// sector 0 is caught by the geometry the header names as well as by the pattern around it.
+pub fn fill_sector_on(disk: usize, sector: u64, into: &mut [u8]) {
     for (i, b) in into.iter_mut().enumerate() {
-        *b = pattern(sector, i);
+        *b = pattern_on(disk, sector, i);
     }
     if sector == 0 && into.len() >= HEADER_BYTES {
         into[..8].copy_from_slice(MAGIC);
         into[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        into[12..16].copy_from_slice(&(SECTORS as u32).to_le_bytes());
+        let sectors = if disk == 0 { SECTORS } else { SECTORS2 };
+        into[12..16].copy_from_slice(&(sectors as u32).to_le_bytes());
     }
 }
 
 /// Where a sector read from the image first differs from what it should hold.
 pub fn first_mismatch(sector: u64, bytes: &[u8]) -> Option<usize> {
+    first_mismatch_on(0, sector, bytes)
+}
+
+/// Where a sector read from disk `disk` first differs from what that disk should hold.
+pub fn first_mismatch_on(disk: usize, sector: u64, bytes: &[u8]) -> Option<usize> {
     let mut want = [0u8; SECTOR];
     let want = &mut want[..bytes.len().min(SECTOR)];
-    fill_sector(sector, want);
+    fill_sector_on(disk, sector, want);
     bytes.iter().zip(want.iter()).position(|(a, b)| a != b)
 }
 
@@ -217,6 +257,46 @@ mod tests {
             .filter(|&i| big_byte(i) == pattern(FS_START - 1, i))
             .count();
         assert!(same < SECTOR / 16, "{same} of {SECTOR} bytes equal");
+    }
+
+    #[test]
+    fn the_first_disks_pattern_is_unchanged_by_there_being_a_second() {
+        // Disk 0 folds in zero, so the image kbuild has always written is untouched.
+        for (sector, offset, byte) in PINNED {
+            assert_eq!(pattern_on(0, sector, offset), byte, "sector {sector} offset {offset}");
+        }
+        for sector in [0, 1, 7, 1000, FS_START - 1] {
+            for offset in [0, 1, 255, 511] {
+                assert_eq!(pattern_on(0, sector, offset), pattern(sector, offset));
+            }
+        }
+    }
+
+    #[test]
+    fn a_sector_from_the_wrong_disk_matches_nothing() {
+        // What the wrong-binding check rests on: the same sector on the two disks shares
+        // almost no byte, so a read served by the other device is caught by content.
+        let mut a = [0u8; SECTOR];
+        let mut b = [0u8; SECTOR];
+        for sector in [1, 7, 1000, FS_START - 1] {
+            fill_sector_on(0, sector, &mut a);
+            fill_sector_on(1, sector, &mut b);
+            let same = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+            assert!(same < SECTOR / 16, "sector {sector}: {same} of {SECTOR} bytes equal");
+            assert_eq!(first_mismatch_on(1, sector, &a), Some(0), "disk 0 passes as disk 1");
+            assert_eq!(first_mismatch_on(0, sector, &b), Some(0), "disk 1 passes as disk 0");
+        }
+    }
+
+    #[test]
+    fn each_disks_header_names_its_own_length() {
+        let mut s0 = [0u8; SECTOR];
+        fill_sector_on(0, 0, &mut s0);
+        assert_eq!(header(&s0), Some(SECTORS));
+        fill_sector_on(1, 0, &mut s0);
+        assert_eq!(header(&s0), Some(SECTORS2), "the second disk names its own length");
+        assert_ne!(SECTORS, SECTORS2, "the two lengths must differ to tell them apart");
+        assert_eq!(SECTORS2, FS_START, "the second disk is pattern only");
     }
 
     #[test]

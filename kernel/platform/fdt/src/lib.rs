@@ -201,12 +201,15 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     // Probe everything first and start nothing until every claim is in: a start that ran
     // before a later probe's claim was refused would be driving hardware the ledger never
     // agreed was its.
-    // Which memory-mapped virtio slot holds a block device, and which a network card. The
+    // Which memory-mapped virtio slots hold block devices, and which a network card. The
     // tree lists every slot the machine has, occupied or not, and only the slot's own
     // registers say which is which: this is enumeration, done here as `pci::enumerate` is,
     // so that the drivers' probes keep their rule of touching no hardware. See
     // `virtio::mmio`.
-    let mut block_slot = None;
+    //
+    // Block slots are plural because a machine with a second drive presents a second slot;
+    // one slot's worth would bind the first and leave the other drive undriven.
+    let mut block_slots = [const { None }; virtio_blk::MAX_DISKS];
     let mut net_slot = None;
     let (mut slots, mut legacy) = (0usize, 0usize);
     for id in tree
@@ -226,7 +229,11 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         // the slot's identification registers only, which no driver owns yet.
         match unsafe { virtio_blk::mmio::identify(base, len) } {
             Slot::Device { device_id } if device_id == virtio_blk::transport::DEVICE_ID_BLOCK => {
-                block_slot = block_slot.or(Some(id));
+                // Into the first free slot, so the numbering here is the order the tree lists
+                // them; a slot beyond what this kernel binds is left for the report below.
+                if let Some(free) = block_slots.iter_mut().find(|s| s.is_none()) {
+                    *free = Some(id);
+                }
             }
             Slot::Device { device_id } if device_id == virtio::transport::DEVICE_ID_NET => {
                 net_slot = net_slot.or(Some(id));
@@ -247,7 +254,7 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
             _ => {}
         }
     }
-    if slots > 0 && block_slot.is_none() && legacy > 0 {
+    if slots > 0 && block_slots[0].is_none() && legacy > 0 {
         // Not a failure of discovery: the machine has a disk this driver will not drive.
         // Said here, because the block check can only report that no device was bound.
         c.write_str(" (a legacy virtio-blk slot, which the driver does not drive)");
@@ -264,7 +271,7 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         // its driver is the one for what the slot's registers said above. An empty slot, or
         // one holding a device this image has no driver for, binds nothing.
         if tree.node(id).is_compatible("virtio,mmio") {
-            let wanted = if Some(id) == block_slot {
+            let wanted = if block_slots.contains(&Some(id)) {
                 virtio_blk::DRIVER.name()
             } else if Some(id) == net_slot {
                 virtio_net::DRIVER.name()
@@ -480,6 +487,12 @@ pub fn console_line() -> Option<u32> {
 /// is polled, and for a slot no disk claimed.
 pub fn block_line(i: usize) -> Option<u32> {
     BLOCK_LINES.get(i)?.get().map(|n| n.0)
+}
+
+/// A memory-mapped virtio slot is not a PCI function and has no source id, and no port using
+/// this platform has an IOMMU to want one.
+pub fn block_source_id(_i: usize) -> Option<u16> {
+    None
 }
 
 /// The network card's interrupt line, once its handler is wired. `None` when the card is
