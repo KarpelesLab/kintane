@@ -718,6 +718,38 @@ impl<'fs, const MOUNTS: usize, const OPEN: usize> Vfs<'fs, MOUNTS, OPEN> {
         self.fs_of(mount)?.statfs()
     }
 
+    /// The `index`th entry of the directory an open handle names.
+    ///
+    /// By index rather than by a cursor, exactly as [`FileSystem::readdir`] is, so the handle
+    /// holds no listing state and a caller may ask for the same entry twice. A caller that
+    /// wants a cursor has one already: the handle's position, moved with [`seek`](Self::seek)
+    /// and read with [`tell`](Self::tell), which nothing else uses on a directory.
+    ///
+    /// # What an index promises, and what it costs
+    ///
+    /// An index names a position in the directory as it is **now**, not a name. Nothing here
+    /// can promise more: a filesystem this kernel mounts has no stable cookie per entry — FAT
+    /// numbers its entries by where they sit, so removing one moves every entry after it down.
+    /// A caller that lists a directory while something removes from it may therefore see a
+    /// name twice or not at all, and only a caller that does not remove while listing is
+    /// promised each name once. The same is true of every `readdir` by index, and saying so is
+    /// cheaper than a cookie no filesystem below could honour.
+    ///
+    /// The cost is that a filesystem finds its `index`th entry by counting from the first, so
+    /// listing a directory of *n* entries reads *n²/2* of them. Directories here hold tens of
+    /// names, not thousands.
+    pub fn readdir_fd(&mut self, fd: Fd, index: usize) -> Result<Option<Entry>, Error> {
+        let slot = self.slot_of(fd)?;
+        let (mount, node, kind) = {
+            let o = &self.open[slot];
+            (o.mount, o.node, o.kind)
+        };
+        if kind != Kind::Dir {
+            return Err(Error::NotADirectory);
+        }
+        self.fs_of(mount)?.readdir(node, index)
+    }
+
     /// The `index`th entry of the directory at `path`.
     pub fn readdir(&mut self, path: &str, index: usize) -> Result<Option<Entry>, Error> {
         let (mount, node, stat) = self.resolve(path)?;

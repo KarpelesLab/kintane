@@ -1537,7 +1537,12 @@ compiled by `kbuild portability` for the machines with no atomics:
   writes. `mkdir`, `unlink` and `rename` work by path; a rename moves a name between two directories of one
   filesystem, and across two filesystems it is `Error::CrossDevice` — Linux's `EXDEV`, which a
   program handles by copying. `statfs` is read-side like `stat`, so every filesystem answers what it
-  allocates in, how many units it has, how many are free and the longest name it holds. `.` and
+  allocates in, how many units it has, how many are free and the longest name it holds.
+  `readdir_fd` lists through an open handle rather than a path, and the handle's own position is
+  the cursor, so the namespace keeps no listing state and a caller starts again by seeking to
+  zero. An index names a place in the directory *as it is now*, not a name: no filesystem here
+  has a stable per-entry cookie, so a caller that removes while listing may see a name twice or
+  miss one. `.` and
   empty components resolve; `..` does not yet. `vfs::memfs` is the in-memory reference filesystem the namespace's own tests run against.
 - **`bcache`** caches whole blocks between a filesystem and a device: fixed slots from the caller,
   least-recently-used replacement, and two ways to write. `write_block` writes **through**: the
@@ -1617,7 +1622,11 @@ every process the kernel has connected, holding the volume one request at a time
 `fs::lease`. Whether a connection may write is decided when the kernel makes it: a request that would
 change the volume on a read-only connection is refused before the volume is touched, and a file opened
 without the write flag is read-only on any connection. The server syncs when a file opened for writing
-is closed and when a client asks. Nothing in `vfs` knows about channels, processes or rights. The
+is closed and when a client asks. `Getdents` asks for one entry of an open directory by index and is
+answered with its name and whether it is a directory; listing changes nothing, so a read-only
+connection may do it, and because the server reopens the path it was given rather than holding a live
+handle, the operation follows the path's own volume and a directory of the second volume lists like
+any other. Nothing in `vfs` knows about channels, processes or rights. The
 Linux personality reaches the same namespace through its descriptors.
 
 **Where a volume lives.** The test disk (`kernel/block/src/testdisk.rs`, version 2) has three

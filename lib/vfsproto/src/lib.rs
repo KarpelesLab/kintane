@@ -33,6 +33,9 @@
 //! * `statfs`: the payload is a path; the reply's payload is the filesystem covering it — its
 //!   allocation unit, how many units it has, how many are free and the longest name it holds, as
 //!   [`statfs_answer`] encodes them. A read-side request, so a read-only connection may ask.
+//! * `getdents`: `a` is the file number of an open directory and the payload an eight-byte
+//!   little-endian index; the reply's payload is that entry as [`dirent_answer`] encodes it, and
+//!   empty once the directory has no more. A read-side request, so a read-only connection may list.
 //! * `sync`: nothing; every write so far reaches the disk before the reply.
 //! * `close`: `a` is the file number.
 //!
@@ -88,6 +91,7 @@ pub enum Op {
     Rename = 9,
     Sync = 10,
     Statfs = 11,
+    Getdents = 12,
 }
 
 /// How a request went.
@@ -294,6 +298,31 @@ pub fn parse_statfs(data: &[u8]) -> Option<(u64, u64, u64, u32)> {
     Some((eight(0)?, eight(8)?, eight(16)?, u32::from_le_bytes(four)))
 }
 
+/// A request for the `index`th entry of the open directory `file`.
+pub fn getdents(file: u8, index: u64) -> Message {
+    Message::new(Op::Getdents as u8, file, 0, &index.to_le_bytes())
+        .unwrap_or(Message::bare(0, 0, 0))
+}
+
+/// A reply carrying one directory entry: what it is, then its name.
+pub fn dirent_answer(is_dir: bool, name: &[u8]) -> Option<Message> {
+    let mut head = [0u8; 1];
+    head[0] = u8::from(is_dir);
+    Message::joined(Status::Ok as u8, 0, 0, &head, name)
+}
+
+/// What a [`dirent_answer`] carries: whether the entry is a directory, and its name. `None`
+/// for a payload that is not one; an empty payload is the end of the directory rather than an
+/// entry, and is not one of these.
+pub fn parse_dirent(data: &[u8]) -> Option<(bool, &[u8])> {
+    let kind = *data.first()?;
+    let name = data.get(1..)?;
+    if kind > 1 || name.is_empty() {
+        return None;
+    }
+    Some((kind == 1, name))
+}
+
 /// A request to close file `file`.
 pub fn close(file: u8) -> Message {
     Message::bare(Op::Close as u8, file, 0)
@@ -328,6 +357,7 @@ pub enum Request<'a> {
     Rename { from: &'a [u8], to: &'a [u8] },
     Sync,
     Statfs { path: &'a [u8] },
+    Getdents { file: u8, index: u64 },
 }
 
 impl Request<'_> {
@@ -338,8 +368,9 @@ impl Request<'_> {
                 flags & (flags::WRITE | flags::CREATE | flags::TRUNCATE) != 0
             }
             Request::Read { .. } | Request::Close { .. } | Request::Seek { .. } => false,
-            // Asking what a filesystem is changes nothing, so a read-only connection may.
-            Request::Sync | Request::Statfs { .. } => false,
+            // Asking what a filesystem is, or what a directory holds, changes nothing, so a
+            // read-only connection may.
+            Request::Sync | Request::Statfs { .. } | Request::Getdents { .. } => false,
             Request::Write { .. }
             | Request::Truncate { .. }
             | Request::Unlink { .. }
@@ -412,6 +443,10 @@ pub fn parse_request(bytes: &[u8]) -> Option<Request<'_>> {
         }
         10 if bare => Some(Request::Sync),
         11 if !payload.is_empty() && b == 0 => Some(Request::Statfs { path: payload }),
+        12 if b == 0 => Some(Request::Getdents {
+            file: a,
+            index: u64_of(payload)?,
+        }),
         _ => None,
     }
 }

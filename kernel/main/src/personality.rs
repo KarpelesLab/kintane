@@ -330,6 +330,7 @@ fn dispatch(
         Call::Rename => renameat(slot, linux::AT_FDCWD as u64, a0, linux::AT_FDCWD as u64, a1),
         Call::Renameat => renameat(slot, a0, a1, a2, a3),
         Call::Statfs => statfs(slot, a0, a1),
+        Call::Getdents64 => getdents64(slot, a0, a1, a2),
         Call::Fstatfs => fstatfs(slot, a0, a1),
         Call::Poll => poll::poll_call(slot, a0, a1, a2, false, 0),
         Call::Ppoll => poll::poll_call(slot, a0, a1, a2, true, a3),
@@ -598,6 +599,74 @@ fn fstatfs(slot: usize, fd: u64, out: u64) -> Result<u64, Failure> {
     let (fd, _) = file_of(slot, fd, Failure::BadDescriptor)?;
     let s = with_ns(|ns| ns.statfs_fd(fd).map_err(failure))?;
     write_statfs(out, s)
+}
+
+/// The open directory a descriptor names. Anything else is `ENOTDIR`, which is what Linux
+/// answers a `getdents64` on a file.
+fn directory_of(slot: usize, fd: u64) -> Result<vfs::Fd, Failure> {
+    match descriptor_of(slot, fd)?.0 {
+        Descriptor::File {
+            fd,
+            kind: FileKind::Directory,
+            ..
+        } => Ok(fd),
+        _ => Err(Failure::NotADirectory),
+    }
+}
+
+/// `getdents64`: as many of an open directory's entries as fit in `count` bytes at `buf`,
+/// packed as Linux's records, and zero once there are no more.
+///
+/// **The handle's position is the cursor**, holding the index of the entry to report next, so
+/// a program starts again by seeking to zero and nothing else has to be remembered. What an
+/// index promises is [`vfs::Vfs::readdir_fd`]'s business: it names a place in the directory as
+/// it is now, so a program that removes entries while listing may see a name twice or not at
+/// all.
+///
+/// An entry that does not fit is **not** consumed — the cursor moves only after its record
+/// reaches the buffer — so the call after it reports that same entry. A buffer too small for
+/// even one record is `EINVAL`, as Linux answers, rather than a silent zero that a caller
+/// would read as the end of the directory.
+fn getdents64(slot: usize, fd: u64, buf: u64, count: u64) -> Result<u64, Failure> {
+    let dir = directory_of(slot, fd)?;
+    let count = usize::try_from(count).map_err(|_| Failure::InvalidArgument)?;
+    // One record at a time: a name is bounded by `vfs::MAX_NAME`, so this holds the largest
+    // record the namespace can produce, and nothing here allocates.
+    let mut record = [0u8; linux::DIRENT_HEADER + vfs::MAX_NAME + 8];
+    let mut written = 0usize;
+    loop {
+        let index = with_ns(|ns| ns.tell(dir).map_err(failure))?;
+        let at = usize::try_from(index).map_err(|_| Failure::InvalidArgument)?;
+        let Some(entry) = with_ns(|ns| ns.readdir_fd(dir, at).map_err(failure))? else {
+            break;
+        };
+        let kind = match entry.kind {
+            Kind::Dir => FileKind::Directory,
+            Kind::File => FileKind::Regular,
+        };
+        let next = index.checked_add(1).ok_or(Failure::InvalidArgument)?;
+        let len = linux::dirent64_bytes(&mut record, entry.node, next, kind, entry.name())
+            .ok_or(Failure::Io)?;
+        let end = written.checked_add(len).ok_or(Failure::InvalidArgument)?;
+        if end > count {
+            if written == 0 {
+                return Err(Failure::InvalidArgument);
+            }
+            break;
+        }
+        let at_user = buf
+            .checked_add(written as u64)
+            .ok_or(Failure::InvalidArgument)?;
+        to_user(at_user, record.get(..len).ok_or(Failure::Io)?)?;
+        // Consumed only now that its record is the program's.
+        with_ns(|ns| {
+            ns.seek(dir, vfs::Whence::Start, next as i64)
+                .map(|_| ())
+                .map_err(failure)
+        })?;
+        written = end;
+    }
+    Ok(written as u64)
 }
 
 fn write_statfs(out: u64, s: vfs::StatFs) -> Result<u64, Failure> {
@@ -1884,6 +1953,11 @@ const FILES_SUCCESS: u64 = 50;
 /// SAFETY INVARIANT: borrowed only by [`run_hello`], once, on the boot path.
 static OUT_BUF: SyncUnsafeCell<[u8; testdisk::LINUX_OUT_LEN + 1]> =
     SyncUnsafeCell::new([0; testdisk::LINUX_OUT_LEN + 1]);
+
+/// What the files mode left for [`answers_agree`] to hold against the volumes.
+///
+/// SAFETY INVARIANT: borrowed once, by `answers_agree`, on the boot thread.
+static ANSWERS_BUF: SyncUnsafeCell<[u8; 1024]> = SyncUnsafeCell::new([0; 1024]);
 /// What it writes to standard output.
 const HELLO_OUTPUT: &[u8] = b"hello from linux\n";
 /// The call it makes that the personality does not implement.
@@ -2104,7 +2178,10 @@ fn run_hello(
                 .enumerate()
                 .all(|(i, &b)| b == testdisk::out_byte(testdisk::LINUX_OUT_SEED, i))
     );
-    let files_ok = files == Some(FILES_SUCCESS) && written;
+    // Its own steps prove only that it is consistent with itself; this holds what it was told
+    // and what it listed against the volumes themselves.
+    let answers_ok = files == Some(FILES_SUCCESS) && answers_agree(c, ns);
+    let files_ok = files == Some(FILES_SUCCESS) && written && answers_ok;
     c.write_str(match (files == Some(FILES_SUCCESS), written) {
         (true, true) => " ok, /KINTANE/LINUX.OUT read back",
         (true, false) => ", /KINTANE/LINUX.OUT IS NOT WHAT IT WROTE",
@@ -2118,6 +2195,120 @@ fn run_hello(
         KEPT.store(buf.as_ptr().cast_mut(), Ordering::Release);
     }
     (pass, pass)
+}
+
+/// Where the files mode leaves what it was told and what it listed.
+const ANSWERS_PATH: &str = "/KINTANE/LINUX.DIR";
+/// The directory the program lists and this check walks.
+const LISTED_DIR: &str = "/KINTANE";
+/// How far ahead of the volume the program's free count may be: it was told before it wrote
+/// the answers file, so that file's own clusters are the whole of the difference.
+const FREE_SLACK: u64 = 8;
+
+/// Hold what the program was told, and what it listed, against the kernel's own view of the
+/// same volumes.
+///
+/// Everything the program checks in its own steps is self-coherence: that an answer has a unit
+/// size, that two volumes differ, that a name it made comes back by the name it made it with.
+/// None of that is falsified by a driver reporting the same wrong numbers to every asker, or by
+/// a listing that agrees with itself. This reads the answers back and compares them with what
+/// the namespace says — the comparison `files size` makes for the native program, which the
+/// Linux path did not have.
+fn answers_agree(c: &dyn EarlyConsole, ns: &mut Namespace) -> bool {
+    // SAFETY: the one borrow of `ANSWERS_BUF`; see its invariant.
+    let buf = unsafe { &mut *ANSWERS_BUF.get() };
+    let Ok(n) = ns.read_all(ANSWERS_PATH, buf) else {
+        c.write_str(", THE PROGRAM LEFT NO ANSWERS");
+        return false;
+    };
+    let width = ABI.statfs_len();
+    let (told, listing) = match (buf.get(..2 * width), buf.get(2 * width..n)) {
+        (Some(told), Some(listing)) => (told, listing),
+        _ => {
+            c.write_str(", THE ANSWERS ARE TOO SHORT");
+            return false;
+        }
+    };
+    for (i, at) in ["/", crate::fileserver::FAT32_AT].iter().enumerate() {
+        let Some(one) = told.get(i * width..(i + 1) * width) else {
+            return false;
+        };
+        let Ok(now) = ns.statfs(at) else {
+            c.write_str(", A VOLUME WOULD NOT SAY WHAT IT IS");
+            return false;
+        };
+        if !statfs_matches(one, now) {
+            c.write_str(", THE PROGRAM WAS TOLD SOMETHING ELSE ABOUT ");
+            c.write_str(at);
+            return false;
+        }
+    }
+    // Every name the kernel sees must be one the program listed, and the program must have
+    // listed no more than the kernel sees: a listing that drops a name and one that invents a
+    // name are different faults, and neither is caught by the program checking itself.
+    let mut index = 0usize;
+    loop {
+        let entry = match ns.readdir(LISTED_DIR, index) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => {
+                c.write_str(", THE DIRECTORY WOULD NOT BE WALKED");
+                return false;
+            }
+        };
+        let kind = match entry.kind {
+            Kind::Dir => 4u8,
+            Kind::File => 8,
+        };
+        if !listing_holds(listing, entry.name(), kind) {
+            c.write_str(", THE PROGRAM DID NOT LIST A NAME THE DIRECTORY HOLDS");
+            return false;
+        }
+        index += 1;
+    }
+    if listing.iter().filter(|&&b| b == b'\n').count() != index {
+        c.write_str(", THE PROGRAM LISTED NAMES THE DIRECTORY DOES NOT HOLD");
+        return false;
+    }
+    true
+}
+
+/// Whether a `struct statfs` the program was given says what `now` says.
+///
+/// The allocation unit, the units there are and the longest name cannot change while the
+/// program runs, so those must match exactly. The free count can: the program was told before
+/// it wrote the file carrying the answer, so it may be ahead by what that file took and no
+/// more.
+fn statfs_matches(said: &[u8], now: vfs::StatFs) -> bool {
+    let word = |at: usize, width: usize| -> u64 {
+        let mut v = 0u64;
+        for i in 0..width {
+            match said.get(at + i) {
+                Some(&b) => v |= u64::from(b) << (8 * i),
+                None => return u64::MAX,
+            }
+        }
+        v
+    };
+    // The counts are 64-bit in both layouts; the unit and the longest name are 32-bit in the
+    // generic one aarch64 uses.
+    let narrow = matches!(ABI, linux::Abi::Aarch64);
+    let width = if narrow { 4 } else { 8 };
+    let told_free = word(24, 8);
+    word(8, width) == now.block_size
+        && word(16, 8) == now.blocks
+        && word(56, width) == u64::from(now.name_max)
+        && told_free >= now.free
+        && told_free - now.free <= FREE_SLACK
+}
+
+/// Whether `listing` — a kind byte, a name and a newline for each entry — holds `name` as
+/// something of `kind`.
+fn listing_holds(listing: &[u8], name: &[u8], kind: u8) -> bool {
+    listing.split(|&b| b == b'\n').any(|line| {
+        line.split_first()
+            .is_some_and(|(&k, rest)| k == kind && rest == name)
+    })
 }
 
 // ---- the scheduled check --------------------------------------------------------------

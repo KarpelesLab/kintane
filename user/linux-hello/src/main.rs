@@ -2047,10 +2047,116 @@ const OUT: &[u8] = b"/KINTANE/LINUX.OUT\0";
 /// A long name renamed to another long name, so a rename carries one end to end rather than
 /// only a create and an unlink.
 const LONG_RENAMED: &[u8] = b"/KINTANE/ALSO.NOT.83\0";
+/// A long name and a directory the listing steps make, list, and remove again. Their own,
+/// rather than anything earlier steps leave: steps 93 and 94 remove the directory and the
+/// long name they make, so a listing that looked for those would be looking for nothing.
+const LISTED_LONG: &[u8] = b"/KINTANE/LISTED.LONG.NAME\0";
+const LISTED_DIR: &[u8] = b"/KINTANE/LSDIR\0";
+/// What the program leaves for the kernel to hold against its own walk: the two `statfs`
+/// answers it was given, then every name it listed. Checking a program against itself only
+/// proves it is consistent; this is what makes the answers true rather than coherent.
+const ANSWERS: &[u8] = b"/KINTANE/LINUX.DIR\0";
 /// The second volume's mount point, and a name on it: `statfs` about this must answer for that
 /// volume and not for the root.
 const ON_FAT32: &[u8] = b"/FAT32/HELLO32.TXT\0";
 const AT_ROOT: &[u8] = b"/\0";
+/// The directory the steps above fill and the listing steps read back.
+const KINTANE_DIR: &[u8] = b"/KINTANE\0";
+/// What `d_type` calls a file and a directory.
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+
+/// What a listing saw: the names, what each was, and whether any name came twice.
+///
+/// Fixed storage, because this program has no allocator: a directory with more names than
+/// this holds is a listing the steps below do not claim to have read whole, and `full` says
+/// so rather than the names quietly ending.
+struct Listing {
+    names: [[u8; 32]; 16],
+    lens: [usize; 16],
+    kinds: [u8; 16],
+    count: usize,
+    full: bool,
+    repeated: bool,
+}
+
+impl Listing {
+    fn new() -> Listing {
+        Listing {
+            names: [[0; 32]; 16],
+            lens: [0; 16],
+            kinds: [0; 16],
+            count: 0,
+            full: false,
+            repeated: false,
+        }
+    }
+
+    /// Take the `n` bytes of `dirent64` records one call left, remembering each name. False
+    /// if the records are not walkable: a length that does not advance, or one that runs past
+    /// what the call said it wrote, means the kernel packed them wrongly.
+    fn take(&mut self, buf: &[u8], n: usize) -> bool {
+        let mut at = 0usize;
+        while at < n {
+            // d_reclen sits at byte 16 of the record, after the inode and the offset.
+            let Some(hi) = buf.get(at + 17) else {
+                return false;
+            };
+            let Some(lo) = buf.get(at + 16) else {
+                return false;
+            };
+            let reclen = usize::from(u16::from_le_bytes([*lo, *hi]));
+            // A record must advance, must fit what the call reported, and must have room for
+            // its header and at least one byte of name.
+            if reclen < 20 || at + reclen > n {
+                return false;
+            }
+            let Some(&kind) = buf.get(at + 18) else {
+                return false;
+            };
+            let name_at = at + 19;
+            let mut len = 0usize;
+            while name_at + len < at + reclen {
+                match buf.get(name_at + len) {
+                    Some(0) | None => break,
+                    Some(_) => len += 1,
+                }
+            }
+            if len == 0 || len > 32 {
+                return false;
+            }
+            if self.count < self.names.len() {
+                let i = self.count;
+                for (dst, src) in self.names[i].iter_mut().zip(&buf[name_at..name_at + len]) {
+                    *dst = *src;
+                }
+                self.lens[i] = len;
+                self.kinds[i] = kind;
+                // A name reported twice is what a partial fill that re-sent its last record
+                // would produce, and nothing else here would catch it.
+                if self.saw_before(i) {
+                    self.repeated = true;
+                }
+                self.count += 1;
+            } else {
+                self.full = true;
+            }
+            at += reclen;
+        }
+        at == n
+    }
+
+    /// Whether the name at `i` is one an earlier entry already had.
+    fn saw_before(&self, i: usize) -> bool {
+        let name = &self.names[i][..self.lens[i]];
+        (0..i).any(|j| &self.names[j][..self.lens[j]] == name)
+    }
+
+    /// Whether the listing holds `name`, and calls it `kind`.
+    fn holds(&self, name: &[u8], kind: u8) -> bool {
+        (0..self.count).any(|i| &self.names[i][..self.lens[i]] == name && self.kinds[i] == kind)
+    }
+}
 const OUT_LEN: usize = 2000;
 const OUT_SEED: u8 = 0x4c;
 
@@ -2256,6 +2362,80 @@ fn files() -> ! {
     expect(call1(sys::CLOSE, again as u64) == 0, 94);
     expect(unlink(LONG_NAME, 0) == 0, 94);
 
+    // 230-239: listing a directory. These make a long name of their own and remove it, so
+    // they write, and like steps 94 and 190-192 they come before step 95's `fsync` — which
+    // is what makes them durable and leaves nothing in the cache for the check that follows.
+    let listed = openat(LISTED_LONG, O_WRONLY | O_CREAT);
+    expect(listed >= 0, 230);
+    expect(call1(sys::CLOSE, listed as u64) == 0, 230);
+    expect(mkdir(LISTED_DIR) == 0, 230);
+    let dir = openat(KINTANE_DIR, 0);
+    expect(dir >= 0, 230);
+    let dir = dir as u64;
+    let mut seen = Listing::new();
+    // A buffer too small for even one record is refused, not answered zero, which a caller
+    // would read as the end of the directory.
+    let mut cramped = [0u8; 8];
+    expect(
+        sys::call(sys::GETDENTS64, [dir, cramped.as_mut_ptr() as u64, 8, 0, 0, 0]) == -EINVAL,
+        231,
+    );
+    // Read it in pieces small enough that the listing spans several calls, so a record that
+    // does not fit must be carried to the next one rather than dropped or repeated.
+    let mut buf = [0u8; 128];
+    loop {
+        let n =
+            sys::call(sys::GETDENTS64, [dir, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]);
+        expect(n >= 0, 232);
+        if n == 0 {
+            break;
+        }
+        expect(seen.take(&buf, n as usize), 233);
+    }
+    expect(call1(sys::CLOSE, dir) == 0, 234);
+    // The long name step 94 made is listed, and listed as itself: a driver that reported the
+    // short alias it also answers to would pass every other check here.
+    expect(seen.holds(b"LISTED.LONG.NAME", DT_REG), 235);
+    // And the directory is listed as a directory where the file is listed as a file, so
+    // `d_type` says what each one is rather than one value for everything.
+    expect(seen.holds(b"LSDIR", DT_DIR), 236);
+    // Nothing is listed twice, which a partial fill that re-reported its last record would do.
+    expect(!seen.repeated, 237);
+    // Seeking back to zero lists the same directory again, which is how a program starts over.
+    let again = openat(KINTANE_DIR, 0);
+    expect(again >= 0, 238);
+    let again = again as u64;
+    let mut first = [0u8; 128];
+    let one = sys::call(
+        sys::GETDENTS64,
+        [
+            again,
+            first.as_mut_ptr() as u64,
+            first.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    expect(one > 0, 238);
+    expect(sys::call(sys::LSEEK, [again, 0, SEEK_SET, 0, 0, 0]) == 0, 239);
+    let mut twice = [0u8; 128];
+    let two = sys::call(
+        sys::GETDENTS64,
+        [
+            again,
+            twice.as_mut_ptr() as u64,
+            twice.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    expect(two == one && twice[..two as usize] == first[..one as usize], 239);
+    expect(call1(sys::CLOSE, again) == 0, 239);
+    expect(unlink(LISTED_LONG, 0) == 0, 239);
+    expect(unlink(LISTED_DIR, AT_REMOVEDIR) == 0, 239);
+
     // 190-192: a long name survives a rename to another long name, which `openat` and
     // `unlinkat` already showed for a create and a removal. Both entry sets are freed. Before
     // step 95, like step 94 and for the same reason: this writes, so step 95's `fsync` is what
@@ -2315,5 +2495,56 @@ fn files() -> ! {
             && field(&by_fd, NAMELEN) == field(&second, NAMELEN),
         198,
     );
+    // Everything above checked the program against itself. This leaves what it was told and
+    // what it listed where the kernel can hold both against the volume, and syncs it, so the
+    // check that follows still finds nothing waiting in the cache.
+    // The answers file is created *before* the listing that goes into it, and the listing is
+    // taken after every create and removal above, so what the program lists and what the kernel
+    // walks afterwards are the same set of names. A listing taken earlier would be missing this
+    // file, and one taken before the removals would hold names the volume no longer has.
+    let out = openat(ANSWERS, O_WRONLY | O_CREAT | O_TRUNC);
+    expect(out >= 0, 241);
+    let out = out as u64;
+    let now = openat(KINTANE_DIR, 0);
+    expect(now >= 0, 240);
+    let now = now as u64;
+    let mut final_seen = Listing::new();
+    let mut into = [0u8; 128];
+    loop {
+        let n =
+            sys::call(sys::GETDENTS64, [now, into.as_mut_ptr() as u64, into.len() as u64, 0, 0, 0]);
+        expect(n >= 0, 240);
+        if n == 0 {
+            break;
+        }
+        expect(final_seen.take(&into, n as usize), 240);
+    }
+    expect(call1(sys::CLOSE, now) == 0, 240);
+    let seen = final_seen;
+    let mut answers = [0u8; 1024];
+    let mut at = 0usize;
+    for byte in root.iter().chain(second.iter()) {
+        expect(at < answers.len(), 240);
+        answers[at] = *byte;
+        at += 1;
+    }
+    for i in 0..seen.count {
+        let name = &seen.names[i][..seen.lens[i]];
+        expect(at + name.len() + 2 <= answers.len(), 240);
+        answers[at] = seen.kinds[i];
+        at += 1;
+        for b in name {
+            answers[at] = *b;
+            at += 1;
+        }
+        answers[at] = b'\n';
+        at += 1;
+    }
+    // A listing this program could not hold whole would make the kernel's comparison a
+    // comparison against part of a directory, which would pass while missing a name.
+    expect(!seen.full, 240);
+    expect(write_pieces(out, &answers[..at]), 241);
+    expect(call1(sys::FSYNC, out) == 0, 241);
+    expect(call1(sys::CLOSE, out) == 0, 241);
     exit(FILES_SUCCESS)
 }
