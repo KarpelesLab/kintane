@@ -1720,6 +1720,29 @@ drains the log before causing the fault it intends to read: a second disk faults
 brought up behind its own domain — stopped, as it should be — and that record would otherwise
 be the one the check reads.
 
+**What two devices make checkable.** The `two disks` line runs wherever a boot bound more than
+one, and proves three things a single device could not:
+
+```
+  two disks  each device read its own disk's sector; the second disk's out-of-grant DMA
+             stopped, fault from 0x0000000000000018; the volume's disk served on through it ok
+```
+
+- **Each binding reaches its own disk.** The same sector is read through each device and must
+  hold *that* disk's pattern, and must *not* match the other's. Without both halves, a driver
+  that bound one device and read through another would pass every other check here.
+- **A fault names the device that caused it.** The second disk is pointed at a page outside its
+  own grant; the fault must carry that disk's source id — `0x18`, which is `00:03.0` — and not
+  the volume disk's `0x10`. Proving something was stopped is not enough when the log is shared.
+- **A fault in one device leaves the other serving.** After the second disk's DMA is stopped,
+  the volume's disk still reads its own data: the devices fail apart.
+
+Only the first runs without an IOMMU, and the other two are not built there. The distinction
+matters for size: `kconfig::IOMMU` is a runtime constant, so branching on it inside one function
+still links the canary frame, the deliberate DMA and their reporting into every image — which
+cost the i686 presets the last of their 4,096 spare bytes. The two halves are separate items
+under `#[cfg(CONFIG_IOMMU)]` instead.
+
 **Loading a program from a disk.** The boot `fs` check reads `/KINTANE/INIT.ELF` from the volume
 into frames it keeps, runs it once, and only after it exits with the success code makes it the
 program `userproc::program()` returns. So on a machine with the disk — aarch64 today — the

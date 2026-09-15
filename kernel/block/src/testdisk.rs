@@ -56,6 +56,15 @@ pub const SECTORS: u64 = FS32_START + FS32_SECTORS;
 /// by content.
 pub const SECTORS2: u64 = FS_START;
 
+/// The second disk's index in [`pattern_on`]'s hash; mirrors `kbuild/src/testdisk.rs`'s `DISK2`.
+///
+/// This is which *image* a disk carries, not which slot it was bound in. The two are the same on
+/// PCI, where enumeration follows the order the drives were attached, and different on
+/// virtio-mmio, where QEMU fills the slots downwards and the volume's disk lands in the higher
+/// one. Keying expected contents by slot therefore reads the right bytes on one port and the
+/// wrong ones on the other.
+pub const DISK2: usize = 1;
+
 /// `/HELLO.TXT`'s content.
 pub const HELLO: &[u8] = b"hello from the KinTane test disk\n";
 /// `/SUB/NESTED.TXT`'s content.
