@@ -185,10 +185,11 @@ impl HasCas for Aarch64 {}
 // the first real board — see `docs/testing.md#what-qemu-will-not-catch`.
 
 impl HasFpu for Aarch64 {
-    // Real save/restore arrives with the context switch in Phase 2. It is the 32
-    // Q registers plus FPCR and FPSR; the boot code has already cleared
-    // CPACR_EL1.FPEN so that reaching them does not trap.
-    type FpuState = ();
+    // The 32 Q registers plus FPCR and FPSR, carried inside `Context` and saved by every
+    // switch; see `context::FpSimd`. Boot sets CPACR_EL1.FPEN so reaching them does not
+    // trap, and the kernel's own target keeps `-neon`, so this state is a user program's
+    // alone.
+    type FpuState = context::FpSimd;
 }
 
 /// Terminate QEMU through an ARM semihosting `SYS_EXIT` call.

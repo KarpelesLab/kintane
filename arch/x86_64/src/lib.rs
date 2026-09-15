@@ -160,8 +160,10 @@ impl HasCas for X86_64 {}
 impl HasCoherentDma for X86_64 {}
 
 impl HasFpu for X86_64 {
-    // Real save/restore arrives with the context switch in Phase 2.
-    type FpuState = ();
+    // The 512-byte `FXSAVE` image, carried inside `Context` and saved by every switch; see
+    // `context::FxSave`. The kernel emits no floating-point instruction of its own, so this
+    // state belongs entirely to user programs built for the hard-float target.
+    type FpuState = context::FxSave;
 }
 
 /// Terminate QEMU through the `isa-debug-exit` device.

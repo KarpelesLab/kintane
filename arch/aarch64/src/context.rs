@@ -76,6 +76,41 @@ const _: () = assert!(
      now save them (see arch/aarch64/src/context.rs)"
 );
 
+/// A thread's floating-point and SIMD state: the 32 V registers, then FPCR and FPSR.
+///
+/// The whole user-visible set, not AAPCS64's callee-saved `d8`–`d15`. The distinction
+/// matters and is easy to get backwards: callee-saved would be the right set if the kernel
+/// were a *caller* that had to preserve a few registers across a call. It is not — it is a
+/// different address space borrowing the hardware, it names no floating-point register at
+/// all (the assertion above holds), and a program resumed with only `d8`–`d15` restored
+/// would find the other twenty-four, and both control registers, holding whatever the last
+/// thread left there.
+///
+/// Sixteen-byte aligned so the `stp q`/`ldp q` pairs that move it are legal, and `repr(C)`
+/// so the assembly can address it by a fixed offset like everything else here.
+#[repr(C, align(16))]
+pub struct FpSimd {
+    /// v0-v31, sixteen bytes each.
+    v: [u8; 512],
+    /// FPCR then FPSR, one word each, padded to keep the whole thing 16-aligned.
+    control: [u64; 2],
+}
+
+impl FpSimd {
+    const fn empty() -> Self {
+        // Zero is the reset value of both FPCR and FPSR: rounding to nearest, no exception
+        // trapped, no status bit set. Unlike x86, there is nothing here that must be
+        // non-zero for a restore to be accepted.
+        Self { v: [0; 512], control: [0; 2] }
+    }
+}
+
+impl Default for FpSimd {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 /// The callee-saved state of a suspended thread.
 ///
 /// `repr(C)` because `aarch64_context_switch` addresses the fields by offset. The offsets
@@ -108,6 +143,10 @@ pub struct Context {
     /// writes that register itself, at EL0, so it is read back when the thread is switched
     /// away from and loaded when it is switched to. See `hal::HasUserMode::set_tls`.
     pub(crate) user_tls: u64,
+    /// The floating-point and SIMD state, saved and restored by every switch. After
+    /// `user_tls`, so the register offsets the assembly hardcodes (which stop at `sp`,
+    /// 0x60) are unchanged, and 16-aligned so the `stp q` pairs that move it are legal.
+    fpu: FpSimd,
 }
 
 impl Context {
@@ -130,6 +169,7 @@ impl Context {
             user_kernel_stack: 0,
             user_root: 0,
             user_tls: 0,
+            fpu: FpSimd::empty(),
         }
     }
 }
@@ -143,6 +183,9 @@ const _: () = {
     assert!(offset_of!(Context, fp) == 0x50);
     assert!(offset_of!(Context, lr) == 0x58);
     assert!(offset_of!(Context, sp) == 0x60);
+    // The floating-point area's offset is passed to the assembly below rather than
+    // hardcoded, but alignment is not negotiable: `stp q` faults on a misaligned address.
+    assert!(offset_of!(Context, fpu) % 16 == 0);
 };
 
 /// Size of an AArch64 frame record: the saved x29 and x30 of the frame above.
@@ -158,8 +201,62 @@ core::arch::global_asm!(
 // the loaded x30. The offsets are `Context`'s, asserted in Rust. x9 is a caller-saved
 // scratch register, which the caller has already given up by making a call; SP cannot be
 // the operand of an stp/ldp transfer, hence the detour through it.
+//
+// The floating-point state goes first, while both pointers are untouched. `.arch_extension
+// fp` is required because the kernel's own target is `-neon`: without it the integrated
+// assembler rejects every instruction below outright, which is the same guard the module
+// comment describes for compiled code. Enabling it for these instructions does not let
+// compiled kernel code name a floating-point register — that is still refused by the
+// target, and asserted above.
 .globl aarch64_context_switch
 aarch64_context_switch:
+    .arch_extension fp
+    add     x9, x0, {fpu}
+    stp     q0,  q1,  [x9, #0x000]
+    stp     q2,  q3,  [x9, #0x020]
+    stp     q4,  q5,  [x9, #0x040]
+    stp     q6,  q7,  [x9, #0x060]
+    stp     q8,  q9,  [x9, #0x080]
+    stp     q10, q11, [x9, #0x0a0]
+    stp     q12, q13, [x9, #0x0c0]
+    stp     q14, q15, [x9, #0x0e0]
+    stp     q16, q17, [x9, #0x100]
+    stp     q18, q19, [x9, #0x120]
+    stp     q20, q21, [x9, #0x140]
+    stp     q22, q23, [x9, #0x160]
+    stp     q24, q25, [x9, #0x180]
+    stp     q26, q27, [x9, #0x1a0]
+    stp     q28, q29, [x9, #0x1c0]
+    stp     q30, q31, [x9, #0x1e0]
+    mrs     x10, fpcr
+    mrs     x11, fpsr
+    // Two `str`, not one `stp`: a paired transfer of 64-bit registers takes a scaled
+    // 7-bit offset that stops at 504, and the control words sit at 512.
+    str     x10, [x9, #0x200]
+    str     x11, [x9, #0x208]
+
+    add     x9, x1, {fpu}
+    ldp     q0,  q1,  [x9, #0x000]
+    ldp     q2,  q3,  [x9, #0x020]
+    ldp     q4,  q5,  [x9, #0x040]
+    ldp     q6,  q7,  [x9, #0x060]
+    ldp     q8,  q9,  [x9, #0x080]
+    ldp     q10, q11, [x9, #0x0a0]
+    ldp     q12, q13, [x9, #0x0c0]
+    ldp     q14, q15, [x9, #0x0e0]
+    ldp     q16, q17, [x9, #0x100]
+    ldp     q18, q19, [x9, #0x120]
+    ldp     q20, q21, [x9, #0x140]
+    ldp     q22, q23, [x9, #0x160]
+    ldp     q24, q25, [x9, #0x180]
+    ldp     q26, q27, [x9, #0x1a0]
+    ldp     q28, q29, [x9, #0x1c0]
+    ldp     q30, q31, [x9, #0x1e0]
+    ldr     x10, [x9, #0x200]
+    ldr     x11, [x9, #0x208]
+    msr     fpcr, x10
+    msr     fpsr, x11
+
     stp     x19, x20, [x0, #0x00]
     stp     x21, x22, [x0, #0x10]
     stp     x23, x24, [x0, #0x20]
@@ -190,7 +287,8 @@ aarch64_thread_trampoline:
     // so it still names the entry point that returned.
     mov     x0, x19
     b       aarch64_thread_returned
-"#
+"#,
+    fpu = const core::mem::offset_of!(Context, fpu),
 );
 
 unsafe extern "C" {
