@@ -1635,8 +1635,22 @@ is closed and when a client asks. `Getdents` asks for one entry of an open direc
 answered with its name and whether it is a directory; listing changes nothing, so a read-only
 connection may do it, and because the server reopens the path it was given rather than holding a live
 handle, the operation follows the path's own volume and a directory of the second volume lists like
-any other. Nothing in `vfs` knows about channels, processes or rights. The
-Linux personality reaches the same namespace through its descriptors.
+any other. The `files list` check exercises that arm in a boot: a program lists a directory of each
+volume over a **read-only** connection, and the kernel then walks the same two directories itself
+and requires the program's listing to be what it finds. Nothing in `vfs` knows about channels,
+processes or rights. The Linux personality reaches the same namespace through its descriptors.
+
+**`..` resolves nowhere, on either volume.** The namespace passes every component but `.` and an
+empty one to the filesystem, and FAT's own enumeration — the single scan both `readdir` and
+`lookup` go through — skips the `.` and `..` entries a directory physically carries, so nothing
+answers to them and the refusal is `NotFound`. That is deliberate rather than pending. A `..` that
+resolved would have to cross out of the filesystem it is asked of: `/FAT32/..` names the *first*
+volume's root, a node belonging to another `FileSystem`, and `lookup` returns a `NodeId` within one
+filesystem with no way to say otherwise — the mount table resolves prefixes downward only. FAT's
+on-disk `..` could not supply it either: the entry records cluster 0 as a sentinel meaning "the
+root", which is not a cluster id at all, and the root is a fixed-size region on FAT16 and a cluster
+chain on FAT32. Ascending would also give a read-only connection a way out of the subtree a path
+confines it to. Paths here are absolute and already normalized by the caller, so nothing needs it.
 
 **Where a volume lives.** The test disk (`kernel/block/src/testdisk.rs`, version 2) has three
 regions: the pattern sectors the block check verifies, the scratch area tests may overwrite, and a

@@ -74,6 +74,8 @@ const MODE_WRITE: usize = 11;
 const MODE_POLL: usize = 12;
 /// Ask the file service what the volumes are; see [`statfs_mode`].
 const MODE_STATFS: usize = 13;
+/// List both volumes through the file service; see [`list_mode`].
+const MODE_LIST: usize = 16;
 
 /// [`MODE_MAIN`]'s exit code when every step behaved.
 pub const SUCCESS: u64 = 0x2a;
@@ -121,6 +123,7 @@ pub extern "C" fn _start(mode: usize, a: usize, b: usize, c: usize) -> ! {
         MODE_WRITE => write_files(handle(a), handle(b), handle(c)),
         MODE_POLL => poll_wait(handle(a), handle(b), handle(c)),
         MODE_STATFS => statfs_mode(handle(a), handle(b)),
+        MODE_LIST => list_mode(handle(a), handle(b), handle(c)),
         _ => 0xbad0,
     };
     exit(code)
@@ -860,6 +863,258 @@ fn one_statfs(
         *dst = *src;
     }
     Ok(said)
+}
+
+/// [`MODE_LIST`]'s exit code when every step behaved.
+const LIST_SUCCESS: u64 = 0x74;
+/// Where [`MODE_LIST`] leaves what it listed, for the kernel to hold against its own walk of
+/// the same directories. Mirrored in `kernel/main/src/fileserver.rs`.
+const LIST_OUT: &[u8] = b"/KINTANE/LISTDIR.BIN";
+/// The directory of the first volume [`MODE_LIST`] lists, and the second volume's root. The
+/// second is named by where the namespace mounts it, not by anything about the volume's own
+/// place on a disk, so moving it leaves this asking the same question.
+const LIST_DIR: &[u8] = b"/KINTANE";
+const LIST_DIR32: &[u8] = b"/FAT32";
+/// A name no short entry can hold — mixed case, spaces, an extension longer than three — made
+/// so that a listing has a long name to report. The volume holds an eight-and-three alias for
+/// it as well, which the file also answers to, and reporting *that* is the way a listing goes
+/// wrong without failing anything else.
+const LONG_NAME: &[u8] = b"/KINTANE/A Listed Long Name.text";
+/// Its last component, which is what a listing reports.
+const LONG_LEAF: &[u8] = b"A Listed Long Name.text";
+/// A directory made beside it, so a listing has both kinds of entry to tell apart.
+///
+/// Not `LSDIR`: that name belongs to `linux-hello`'s own listing steps, which make it and
+/// remove it again. This check leaves what it makes in place, so sharing the name left the
+/// directory there for the Linux mode to trip over on the next boot against the same volume —
+/// which one boot never shows and the boot counter, booting one disk four times, does.
+const LIST_SUBDIR: &[u8] = b"/KINTANE/NLSDIR";
+const LIST_SUBLEAF: &[u8] = b"NLSDIR";
+/// The leaf of [`LIST_OUT`], which is in the directory by the time it is listed.
+const LIST_OUT_LEAF: &[u8] = b"LISTDIR.BIN";
+/// Room for both listings. A name is at most 64 bytes and a record adds two; these
+/// directories hold tens of names, not thousands.
+const LISTING_BYTES: usize = 512;
+/// More indices than any directory here holds: a listing that never ends is a fault, not a
+/// long directory, and this is what stops the loop rather than trusting the service to.
+const MAX_ENTRIES: usize = 64;
+
+/// List both volumes through the file service and leave what was listed where the kernel can
+/// hold it against its own walk.
+///
+/// `rw` may write and `ro` may not. **The listing itself is done on `ro`**: asking what a
+/// directory holds changes nothing, so a read-only connection may do it, and doing it there
+/// proves that right is real rather than merely declared — the same connection is refused
+/// every write it tries.
+///
+/// The names this makes are made first, on `rw`, and **left in place**. The kernel walks the
+/// directory after this program has exited, so a name removed before then would be a name
+/// this listed and the walk cannot find.
+fn list_through_the_service(rw: Handle, ro: Handle) -> Result<(), u64> {
+    use vfsproto::{Status, flags};
+    let mut buf = [0u8; vfsproto::MESSAGE];
+    let b = &mut buf;
+    let mut listing = [0u8; LISTING_BYTES];
+    let mut len = 0usize;
+
+    // 1: a long name, a directory beside it, and the file this listing is left in — all made
+    // before anything is listed, so what the listing says is what the directory still holds
+    // when the kernel walks it.
+    //
+    // Made whether or not they are already there, rather than exclusively. These names are
+    // left on the volume on purpose, and a boot may run against a volume an earlier boot has
+    // already listed — the boot counter boots one disk four times — so a creation that
+    // insisted on being the first would pass once and fail every time after.
+    let create = flags::WRITE | flags::CREATE;
+    let (long, _) =
+        expect_status(rw, vfsproto::open_with(LONG_NAME, create), Status::Ok, 0xc01, b)?;
+    expect_status(rw, Some(vfsproto::close(long)), Status::Ok, 0xc01, b)?;
+    let made = vfsproto::mkdir(LIST_SUBDIR).ok_or(0xc01u64)?;
+    match ask(rw, made.as_bytes(), b) {
+        Some(r) if r.status == Status::Ok || r.status == Status::Exists => {}
+        _ => return Err(0xc01),
+    }
+    let replace = flags::WRITE | flags::CREATE | flags::TRUNCATE;
+    let (out, _) = expect_status(rw, vfsproto::open_with(LIST_OUT, replace), Status::Ok, 0xc02, b)?;
+
+    // 2: the first volume's directory, opened and listed on the connection that may not write.
+    let (dir, _) = expect_status(ro, vfsproto::open(LIST_DIR), Status::Ok, 0xc03, b)?;
+    let counted = list_into(ro, dir, &mut listing, &mut len, 0xc03, b)?;
+    let first = listing.get(..len).ok_or(0xc03u64)?;
+
+    // 3: what a long name is listed as. Its alias is a name of its own that the file also
+    // answers to, so a listing reporting the alias would be reporting a name nothing wrote.
+    // Every name in this directory was written either as an eight-and-three name or with long
+    // entries of its own, so none of them is an alias — and a `~` is what an alias would carry.
+    if !lists(first, false, LONG_LEAF)
+        || !lists(first, true, LIST_SUBLEAF)
+        || !lists(first, false, LIST_OUT_LEAF)
+        || first.contains(&b'~')
+    {
+        return Err(0xc04);
+    }
+
+    // 4: by index, not by a cursor. The service holds no listing state, so the same index is
+    // the same entry however often it is asked, and asking never moves anything on. This is
+    // the duplicating direction of a miscounted listing: an entry reported at two indices
+    // leaves the directory looking longer than it is, which the kernel's walk then contradicts.
+    for index in 0..counted {
+        let reply = ask(ro, vfsproto::getdents(dir, index as u64).as_bytes(), b).ok_or(0xc05u64)?;
+        if reply.status != Status::Ok {
+            return Err(0xc05);
+        }
+        let (kind, name) = vfsproto::parse_dirent(reply.data).ok_or(0xc05u64)?;
+        match record_at(first, index) {
+            Some((was, then)) if was == kind && then == name => {}
+            _ => return Err(0xc05),
+        }
+    }
+
+    // 5: the connection that just listed writes nothing, whatever it asks, and the name it
+    // was refused is not there afterwards.
+    expect_status(ro, vfsproto::mkdir(b"/KINTANE/LSNOPE"), Status::ReadOnly, 0xc06, b)?;
+    let make = flags::WRITE | flags::CREATE;
+    let nope = vfsproto::open_with(b"/KINTANE/LSNOPE.TXT", make);
+    expect_status(ro, nope, Status::ReadOnly, 0xc06, b)?;
+    expect_status(ro, vfsproto::open(b"/KINTANE/LSNOPE"), Status::NotFound, 0xc06, b)?;
+
+    // 6: `..` is not a name this filesystem holds. The namespace passes every component but
+    // `.` and an empty one to the filesystem, and FAT's own enumeration skips the `.` and `..`
+    // entries a directory carries, so nothing answers to them. `.` does resolve, which is what
+    // makes this a statement about `..` rather than about a dot in a path.
+    expect_status(ro, vfsproto::open(b"/KINTANE/.."), Status::NotFound, 0xc07, b)?;
+    expect_status(ro, vfsproto::open(b"/FAT32/.."), Status::NotFound, 0xc07, b)?;
+    let (dot, _) = expect_status(ro, vfsproto::open(b"/KINTANE/."), Status::Ok, 0xc07, b)?;
+    expect_status(ro, Some(vfsproto::close(dot)), Status::Ok, 0xc07, b)?;
+
+    // 7: listing is a question only a directory answers.
+    let (file, _) = expect_status(ro, vfsproto::open(b"/HELLO.TXT"), Status::Ok, 0xc08, b)?;
+    match ask(ro, vfsproto::getdents(file, 0).as_bytes(), b) {
+        Some(r) if r.status == Status::WrongKind => {}
+        _ => return Err(0xc08),
+    }
+    expect_status(ro, Some(vfsproto::close(file)), Status::Ok, 0xc08, b)?;
+
+    // 8: the second volume, reached through the mount point, on the same read-only connection.
+    // A zero byte separates the two listings: no name can hold one.
+    let sep = listing.get_mut(len).ok_or(0xc09u64)?;
+    *sep = 0;
+    len += 1;
+    let at32 = len;
+    let (dir32, _) = expect_status(ro, vfsproto::open(LIST_DIR32), Status::Ok, 0xc09, b)?;
+    list_into(ro, dir32, &mut listing, &mut len, 0xc09, b)?;
+    let second = listing.get(at32..len).ok_or(0xc09u64)?;
+    if !lists(second, false, b"HELLO32.TXT")
+        || !lists(second, false, b"BIG32.BIN")
+        || !lists(second, true, b"SUB32")
+    {
+        return Err(0xc0a);
+    }
+    // The volumes are two, not one listed twice, and a path is answered by the volume it
+    // names rather than by the one at the root.
+    if lists(second, false, b"HELLO.TXT") {
+        return Err(0xc0a);
+    }
+    expect_status(ro, vfsproto::open(b"/FAT32/HELLO.TXT"), Status::NotFound, 0xc0a, b)?;
+    expect_status(ro, Some(vfsproto::close(dir32)), Status::Ok, 0xc0a, b)?;
+    expect_status(ro, Some(vfsproto::close(dir)), Status::Ok, 0xc0a, b)?;
+
+    // 9: what was listed, left for the kernel to walk the same directories and compare.
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(vfsproto::PAYLOAD);
+        let chunk = listing.get(done..done + n).ok_or(0xc0bu64)?;
+        expect_status(rw, vfsproto::write(out, chunk), Status::Ok, 0xc0b, b)?;
+        done += n;
+    }
+    expect_status(rw, Some(vfsproto::sync()), Status::Ok, 0xc0b, b)?;
+    expect_status(rw, Some(vfsproto::close(out)), Status::Ok, 0xc0b, b)?;
+    Ok(())
+}
+
+/// List the open directory `dir` over `service`, appending one record per entry to `into` at
+/// `len`: what the entry is as [`kind_byte`] writes it, the name, then a newline. Returns how
+/// many entries were listed.
+///
+/// The index is the program's own — the service keeps no cursor — so a listing is this loop
+/// and nothing else. A name already in this listing is a fault rather than an entry: the same
+/// entry reported at two indices is how a listing duplicates instead of dropping.
+fn list_into(
+    service: Handle,
+    dir: u8,
+    into: &mut [u8; LISTING_BYTES],
+    len: &mut usize,
+    step: u64,
+    buf: &mut [u8; vfsproto::MESSAGE],
+) -> Result<usize, u64> {
+    let start = *len;
+    let mut count = 0usize;
+    for index in 0..MAX_ENTRIES {
+        let reply =
+            ask(service, vfsproto::getdents(dir, index as u64).as_bytes(), buf).ok_or(step)?;
+        if reply.status != vfsproto::Status::Ok {
+            return Err(step);
+        }
+        // No payload is the end of the directory rather than an entry, which is why an entry
+        // with no name is not one this protocol can carry.
+        if reply.data.is_empty() {
+            return Ok(count);
+        }
+        let (is_dir, name) = vfsproto::parse_dirent(reply.data).ok_or(step)?;
+        if holds_name(into.get(start..*len).ok_or(step)?, name) {
+            return Err(step);
+        }
+        let end = *len + name.len() + 2;
+        let record = into.get_mut(*len..end).ok_or(step)?;
+        let mut into_record = record.iter_mut();
+        *into_record.next().ok_or(step)? = kind_byte(is_dir);
+        for byte in name {
+            *into_record.next().ok_or(step)? = *byte;
+        }
+        *into_record.next().ok_or(step)? = b'\n';
+        *len = end;
+        count += 1;
+    }
+    Err(step)
+}
+
+/// Whether `listing` holds a record for `name`, whatever kind it is.
+fn holds_name(listing: &[u8], name: &[u8]) -> bool {
+    listing
+        .split(|&b| b == b'\n')
+        .any(|line| line.split_first().is_some_and(|(_, rest)| rest == name))
+}
+
+/// What a record says an entry is. Printable, and never zero: a zero byte separates the two
+/// listings, so no byte of a record may be one. Mirrored in `kernel/main/src/fileserver.rs`.
+fn kind_byte(is_dir: bool) -> u8 {
+    if is_dir { b'd' } else { b'f' }
+}
+
+/// Whether `listing` holds a record naming `name` as a directory or not, as `is_dir` says.
+fn lists(listing: &[u8], is_dir: bool, name: &[u8]) -> bool {
+    listing.split(|&b| b == b'\n').any(|line| {
+        line.split_first()
+            .is_some_and(|(&kind, rest)| kind == kind_byte(is_dir) && rest == name)
+    })
+}
+
+/// The `n`th record of `listing`: what it is, and its name.
+fn record_at(listing: &[u8], n: usize) -> Option<(bool, &[u8])> {
+    let line = listing.split(|&b| b == b'\n').nth(n)?;
+    let (&kind, name) = line.split_first()?;
+    (!name.is_empty()).then_some((kind == b'd', name))
+}
+
+fn list_mode(console: Handle, rw: Handle, ro: Handle) -> u64 {
+    match list_through_the_service(rw, ro) {
+        Ok(()) => {
+            // The kernel's check goes on with the same line.
+            let _ = rt::print(console, b"init: listed both volumes through the file service; ");
+            LIST_SUCCESS
+        }
+        Err(code) => code,
+    }
 }
 
 fn write_files(console: Handle, rw: Handle, ro: Handle) -> u64 {
