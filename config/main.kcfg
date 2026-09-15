@@ -848,6 +848,25 @@ config IOMMU
         `-device intel-iommu` and the disk with `iommu_platform=on`, which the
         `x86_64-iommu` preset does. See docs/isolation.md.
 
+config PCIE
+    bool "Find the PCI Express host bridge the device tree describes"
+    depends on ARCH_AARCH64
+    help
+        Read the machine's `pci-host-ecam-generic` node and report where
+        configuration space is, which buses live behind the bridge, the windows
+        it forwards, and the controller its messages are mapped to.
+
+        Reading only. Nothing is claimed, no register is touched, and no bus is
+        enumerated -- because on this port configuration space is not addressable
+        when discovery runs. The boot tables map two gigabytes and QEMU's `virt`
+        puts the ECAM window a quarter of a terabyte up, which is why the PCs
+        enumerate during discovery and aarch64 cannot.
+
+        This is the first step toward a disk on PCIe, which would be the first
+        device on this port whose DMA an SMMUv3 could translate: the unit is
+        wired to the PCIe root complex alone, and every device here today is a
+        memory-mapped virtio slot outside it. See docs/isolation.md.
+
 config SMMUV3
     bool "Discover an Arm SMMUv3 and report what it covers"
     depends on ARCH_AARCH64

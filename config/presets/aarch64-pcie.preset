@@ -1,0 +1,25 @@
+# aarch64 under QEMU `virt`, reading the PCI Express host bridge the device tree describes.
+#
+# The same kernel as aarch64-virt, with PCIE on. `virt` always has a
+# `pci-host-ecam-generic` node; nothing binds it today, so the kernel walks past it. With
+# this on, the kernel reads what the tree says about it -- where configuration space is,
+# which buses are behind the bridge, the windows it forwards, and the controller its
+# messages are mapped to -- and checks that description for the coherence an enumerator
+# would depend on.
+#
+# Reading only. No window is claimed, no register is touched, and no bus is enumerated,
+# because on this port configuration space is not addressable when discovery runs: the boot
+# tables map two gigabytes and the window sits a quarter of a terabyte up. The PCs do not
+# have that problem, which is why they enumerate during discovery and this does not.
+#
+# This is the first step toward a disk on PCIe, which would be the first device on this port
+# whose DMA an SMMUv3 could translate -- the unit is wired to the PCIe root complex alone,
+# and every device here today is a memory-mapped virtio slot outside it. See
+# docs/isolation.md.
+ARCH_AARCH64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+PCIE=y
+SIZE_BUDGET_KIB=2048

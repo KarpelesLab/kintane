@@ -59,6 +59,11 @@ mod iommu;
 #[path = "iommu_off.rs"]
 mod iommu;
 // Discovering an Arm SMMUv3 and reporting what it covers; without one, a skipped check.
+#[cfg(CONFIG_PCIE)]
+mod pcie;
+#[cfg(not(CONFIG_PCIE))]
+#[path = "pcie_off.rs"]
+mod pcie;
 #[cfg(CONFIG_SMMUV3)]
 mod smmu;
 #[cfg(not(CONFIG_SMMUV3))]
@@ -658,6 +663,7 @@ fn memory(c: &dyn EarlyConsole, boot_arg: u64) -> (Check, Live) {
         .and(kheap::install(c, &mut frames, &regions[..n]))
         .and(block::check(c, &mut frames, live))
         .and(smmu::check(c))
+        .and(pcie::check(c))
         .and(net::bring_up(c, &mut frames, live))
         .and(fs::check(c, &mut frames, live))
         .and(personality::check(c, &mut frames, live))
