@@ -533,6 +533,9 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
     // After `files write`, which left the volume written: a program asks the server what each
     // volume is, and the kernel holds what it was told against its own walk.
     let files_statfs = crate::model::files_statfs_check(c);
+    // After `files size`, whose process slot and stack slots it reuses: a program lists both
+    // volumes over a read-only connection, and the kernel walks the same directories itself.
+    let files_list = crate::model::files_list_check(c);
     // After `files`, which has torn its process down by now, and reusing its process slot:
     // the Linux program with the scheduler, forking and starting a thread.
     let linux = crate::model::linux_check(c);
@@ -577,6 +580,7 @@ pub fn run(c: &dyn EarlyConsole) -> Check {
         .and(files)
         .and(files_write)
         .and(files_statfs)
+        .and(files_list)
         .and(linux)
         .and(readiness)
         .and(waitrace)

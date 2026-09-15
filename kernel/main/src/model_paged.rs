@@ -302,6 +302,20 @@ pub fn files_statfs_check(c: &dyn EarlyConsole) -> Check {
     Check::Passed
 }
 
+/// A program lists both volumes through the file server over a read-only connection, and what
+/// it listed is what the kernel's own walk of the same directories finds. Passed when
+/// USERSPACE is off.
+#[cfg(CONFIG_USERSPACE)]
+pub fn files_list_check(c: &dyn EarlyConsole) -> Check {
+    crate::fileserver::list_check(c)
+}
+
+#[cfg(not(CONFIG_USERSPACE))]
+pub fn files_list_check(c: &dyn EarlyConsole) -> Check {
+    let _ = c;
+    Check::Passed
+}
+
 /// Arithmetic in a hard-float program, and two threads holding vector registers across a
 /// context switch. Passed when USERSPACE is off, where no such program is built.
 #[cfg(CONFIG_USERSPACE)]

@@ -100,6 +100,13 @@ const STATFS_OUT: &str = "/KINTANE/STATFS.BIN";
 /// the file that carries the answer, which took a cluster, and the directory holding it may
 /// have grown by one more.
 const STATFS_SLACK: u64 = 8;
+/// `init`'s listing mode, its code, and where it leaves what it listed.
+const MODE_LIST: usize = 16;
+const LIST_SUCCESS: u64 = 0x74;
+const LIST_OUT: &str = "/KINTANE/LISTDIR.BIN";
+/// The directory of the first volume the program lists. The second is its volume's root, named
+/// by [`FAT32_AT`] — where the namespace mounts it, not where the volume sits on a disk.
+const LISTED_DIR: &str = "/KINTANE";
 /// The names `init`'s write mode makes and removes again.
 const REMOVED: [&str; 3] = ["/KINTANE/NWTMP.TXT", "/KINTANE/NWREN.TXT", "/KINTANE/NWDIR"];
 
@@ -949,6 +956,164 @@ fn volume_after(c: &dyn EarlyConsole) -> bool {
         }
     }
     ok
+}
+
+/// Run the `files list` check. On the boot thread, after `files size`.
+///
+/// What it proves. A program opened a directory on each volume through the service and listed
+/// it **over the read-only connection**: asking what a directory holds changes nothing, so a
+/// connection that may not write may still list, and the same connection is refused every
+/// write it tries. A long name is listed as itself rather than as the eight-and-three alias
+/// the file also answers to. An entry asked for twice is the same entry, since the service
+/// keeps no cursor — which is the direction in which a listing duplicates rather than drops.
+/// And `..` resolves nowhere, on either volume.
+///
+/// Then the kernel walks the same two directories itself and holds the program's listing
+/// against them. That half is what makes the rest worth anything: a program checking its own
+/// listing proves only that the listing agrees with itself, and a driver reporting the same
+/// wrong names to every asker would satisfy it.
+pub fn list_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  files list ");
+    let server = match ready(c) {
+        Ok(server) => server,
+        Err(check) => return check,
+    };
+    let Some(program) = userproc::program() else {
+        c.write_str("the init program does not load");
+        return Check::Failed;
+    };
+    let connected_before = connections();
+    let (code, after) = run_checked(&program, server, MODE_LIST, || {
+        Some([connect_writable(SLOT)?, connect(SLOT)?])
+    });
+    let connected = connections() - connected_before;
+    let code_ok = code == Some(LIST_SUCCESS);
+    match code {
+        Some(LIST_SUCCESS) => c.write_str(
+            "listed both volumes over a read-only connection, a long name as itself, an entry \
+             the same however often it was asked for, and `..` nowhere",
+        ),
+        Some(other) => {
+            c.write_str("init exited ");
+            write_hex(c, other);
+            c.write_str(", WRONG");
+        }
+        None => c.write_str("init NEVER EXITED"),
+    }
+    c.write_str("; ");
+    let listed_ok = code_ok && listed_truly(c);
+    c.write_str("; ");
+    let clean = report(c, &after);
+    if listed_ok && clean && connected == 2 {
+        c.write_str(" ok");
+    }
+    Check::from_ok(code_ok && listed_ok && clean && connected == 2)
+}
+
+/// What the program listed, read back off the boot stack.
+///
+/// SAFETY INVARIANT: borrowed only by [`listed_truly`], on the boot thread.
+static LISTED: SyncUnsafeCell<[u8; 512]> = SyncUnsafeCell::new([0; 512]);
+
+/// Read back what the program listed, and hold it against the kernel's own walk of the same
+/// two directories.
+fn listed_truly(c: &dyn EarlyConsole) -> bool {
+    let Some(mut volume) = crate::fs::lease(Some(timekeeping::now().saturating_add(PATIENCE)))
+    else {
+        c.write_str("THE VOLUME COULD NOT BE LEASED");
+        return false;
+    };
+    // SAFETY: the one borrow of `LISTED`; see its invariant.
+    let buf = unsafe { &mut *LISTED.get() };
+    let mut ns = Vfs::<2, 1>::new();
+    let (first, second) = volume.both();
+    if ns.mount("/", first).is_err() {
+        c.write_str("THE VOLUME COULD NOT BE MOUNTED");
+        return false;
+    }
+    let both = match second {
+        Some(second) => ns.mount(FAT32_AT, second).is_ok(),
+        None => false,
+    };
+    let read = ns.read_all(LIST_OUT, buf);
+    let ok = if !both {
+        c.write_str("THERE IS NO SECOND VOLUME TO LIST");
+        false
+    } else {
+        match read {
+            Ok(n) => {
+                // The two listings are separated by a zero byte, which no name can hold.
+                let said = buf.get(..n).unwrap_or(&[]);
+                let mut halves = said.split(|&b| b == 0);
+                match (halves.next(), halves.next(), halves.next()) {
+                    (Some(one), Some(two), None) => {
+                        let first_ok = walk_agrees(c, &mut ns, LISTED_DIR, one);
+                        first_ok && walk_agrees(c, &mut ns, FAT32_AT, two)
+                    }
+                    _ => {
+                        c.write_str("WHAT THE PROGRAM LISTED IS NOT TWO LISTINGS");
+                        false
+                    }
+                }
+            }
+            Err(_) => {
+                c.write_str("THE PROGRAM LEFT NO LISTING");
+                false
+            }
+        }
+    };
+    let _ = ns.unmount(FAT32_AT);
+    let _ = ns.unmount("/");
+    if ok {
+        c.write_str("both directories listed as the kernel walks them");
+    }
+    ok
+}
+
+/// Whether `listing` is what walking `at` finds.
+///
+/// The two directions are different faults, and both are checked. A name the walk finds that
+/// the listing does not hold is an entry dropped; a listing holding more records than the walk
+/// found is an entry invented or reported twice. Only counting the records catches the second,
+/// which no comparison name by name can.
+fn walk_agrees(c: &dyn EarlyConsole, ns: &mut Vfs<'_, 2, 1>, at: &str, listing: &[u8]) -> bool {
+    let mut index = 0usize;
+    loop {
+        let entry = match ns.readdir(at, index) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => {
+                c.write_str("A DIRECTORY WOULD NOT BE WALKED: ");
+                c.write_str(at);
+                return false;
+            }
+        };
+        if !listed_as(listing, entry.kind == vfs::Kind::Dir, entry.name()) {
+            c.write_str("A NAME THE DIRECTORY HOLDS WAS NOT LISTED: ");
+            c.write_str(at);
+            return false;
+        }
+        index += 1;
+    }
+    // One record per newline: the program writes a record a line, and no name holds one.
+    if listing.iter().filter(|&&b| b == b'\n').count() != index {
+        c.write_str("NAMES WERE LISTED THE DIRECTORY DOES NOT HOLD: ");
+        c.write_str(at);
+        return false;
+    }
+    true
+}
+
+/// Whether `listing` holds a record naming `name` as `is_dir` says it is.
+///
+/// A record says what an entry is with a printable byte that is never zero, since a zero byte
+/// is what separates the two listings. Mirrors `kind_byte` in `user/init/src/main.rs`.
+fn listed_as(listing: &[u8], is_dir: bool, name: &[u8]) -> bool {
+    let want = if is_dir { b'd' } else { b'f' };
+    listing.split(|&b| b == b'\n').any(|line| {
+        line.split_first()
+            .is_some_and(|(&kind, rest)| kind == want && rest == name)
+    })
 }
 
 /// Build `init` in `mode` with a console and the connections `connections` makes, and wait for

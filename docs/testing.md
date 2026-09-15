@@ -1093,6 +1093,56 @@ stop early in.
 | A directory carrying a regular file's `d_type` | files mode exited **`0xec`**, step 236, and the guest exited 35 |
 | A Linux `statfs` answer overstating the free count by 64 clusters | **the program still exited `0x32`** — its own steps cannot catch a fabricated number — and the kernel's walk failed the boot with `THE PROGRAM WAS TOLD SOMETHING ELSE ABOUT /`, the guest exiting 35 |
 
+#### What a directory holds, over a channel
+
+- **`files list`**, right after `files size`. This is the file server's listing arm exercised in a
+  boot rather than only under host tests. `init` in its listing mode (mode 16, success `0x74`) is
+  given two connections, one writable and one not. On the writable one it first makes the names it
+  will look for — a long name, `A Listed Long Name.text`, which no short entry can hold; a
+  directory, `LSDIR`, beside it; and the file the listing is left in — so that what it lists is
+  what the directory still holds when the kernel walks it afterwards.
+
+  **Then it lists on the read-only connection**, which is the point of a read-side operation:
+  `/KINTANE` on the first volume and `/FAT32` on the second, each opened as a directory and walked
+  by index until the reply with no payload that means the end. It requires the long name to be
+  listed **as itself and never as the alias** the file also answers to, and no listed name to carry
+  a `~`, since every name there was written either as an eight-and-three name or with long entries
+  of its own. It requires `LSDIR` to come back as a directory where the long name comes back as a
+  file; the same index asked twice to give the same entry, since the server keeps no cursor; and no
+  name to appear twice within one listing. The same connection is then refused a `mkdir` and a
+  creating `open` with `ReadOnly`, and the name it was refused is not there afterwards. `..` is
+  required to resolve nowhere on either volume, while `.` resolves, so the refusal is about `..`
+  and not about a dot in a path. `getdents` on a file rather than a directory is `WrongKind`. The
+  second volume is named through its mount point, never a sector, so it is unaffected by which
+  drive the volume lives on.
+
+  **Then the kernel walks both directories itself** and holds the program's listing against them,
+  which is the half that makes the rest worth anything — a program checking its own listing proves
+  only that the listing agrees with itself. Every name the walk finds must be listed with the same
+  kind, *and* the listing must hold no more records than the walk found. The two directions are
+  different faults: a name the walk finds and the listing lacks is an entry dropped, and a listing
+  longer than the walk is one invented or reported twice. Only counting the records catches the
+  second.
+
+| Mutation | What catches it |
+|---|---|
+| A long name listed as the short alias it also answers to (`fat`'s `named_at` never matching a collected long set) | `files list`: init exited **`0xc04`** and the boot failed `rc=1` |
+| A write accepted on a read-only connection (the rights gate in `answer` disabled) | `files list`: init exited **`0xc06`** |
+| An entry reported at two indices, so a listing duplicates rather than drops (the server's own index moved back by one) | `files list`: init exited **`0xc03`**, the duplicate caught as it was listed |
+| Listing a path on the wrong volume (`readdir_fd` taking the root mount instead of the handle's) | `files list`: init exited **`0xc0a`**; `files write` and `files size` passed, neither of them listing |
+
+  A duplicate cannot arise from `named_at` alone, which is why the third mutation above is made in
+  the server's index arithmetic: within one call `seen` only ever rises and the scan returns at the
+  first match, so the map from index to entry is injective. Duplication on this path comes from the
+  index, and that is where it is falsified.
+
+  **What is not covered.** The duplicating direction of `getdents64`'s own cursor — round 13
+  falsified the losing direction — could not be turned into a failing check. Putting the cursor
+  back where it was after a record reaches the program makes a *correct* client loop for ever, so
+  the guest hung with no exit signal rather than the `linux` check reporting a duplicate. The
+  duplicating direction is covered on the channel side, by the `0xc03` row above, where the caller
+  owns the index and a listing that repeats itself terminates.
+
 #### What the volumes say they are
 
 - **`files size`**, right after `files write`. `init` asks the file server what the filesystem

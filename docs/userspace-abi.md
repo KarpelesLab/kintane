@@ -333,11 +333,28 @@ hierarchical name lookups.
 That service is the file server (`lib/vfsproto`, answered by `kernel/main/src/fileserver.rs`), and a
 native program writes files through it: there is no native system call for a file. One message is
 one operation — `open` with flags (write, create, exclusive, truncate, append), `read`, `write`,
-`seek`, `truncate`, `unlink`, `mkdir`, `rename` within a directory, `sync` and `close` — and the
+`seek`, `truncate`, `unlink`, `mkdir`, `rename` within a directory, `getdents`, `statfs`, `sync`
+and `close` — and the
 right to change the volume belongs to the connection. The kernel makes each connection writable or
 not when it hands the program its end, and a read-only connection is answered `ReadOnly` for every
 request that would write, whatever it asks for. A file opened without the write flag is read-only on
 either kind.
+
+**Listing a directory over the protocol.** A directory is opened like a file, with no flags — an
+open asking to write one is refused `WrongKind` — and `getdents` then asks for its *n*th entry,
+answered with whether that entry is a directory and its name. **The name is the long one** where a
+file has one, never the short alias it also answers to. The end of a directory is a reply with no
+payload at all, which is why an entry with an empty name is not something this protocol can carry.
+Listing changes nothing, so a read-only connection may do it.
+
+**The index is the caller's, not a cursor.** The server keeps no listing state — it holds a path
+and an offset, and reopens the path for each request — so asking for entry *n* twice gives the same
+entry both times, and a program starts again simply by asking for entry 0. What an index promises
+is bounded by the same thing that bounds `getdents64`: it names a position in the directory as it
+is *now*, not a name, and FAT numbers entries by where they sit, so a program that lists while
+something removes may see a name twice or miss one. An index past the end reads as the end of the
+directory rather than as an error. The cost is the same *n²/2* as well, plus a directory walk per
+request, since each one reopens the path.
 
 ### Asynchronous by default, with synchronous convenience
 
