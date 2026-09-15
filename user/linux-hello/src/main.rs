@@ -28,6 +28,9 @@
 //!   a program raises itself.
 //! * `rtsig`: [`rtsig`], real-time signals queued three deep and delivered in order, and a full
 //!   queue refused.
+//! * `fp`: [`fp_mode`], floating-point state across a signal handler — the interrupted code's
+//!   registers kept, a handler's edit of the saved state honoured, and a malformed record refused.
+//!   The only mode that needs this program to be built hard-float.
 //!
 //! No step decides whether the kernel is right: the program reports what it saw.
 
@@ -185,6 +188,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"files" => files(),
         b"faults" => faults(),
         b"rtsig" => rtsig(),
+        b"fp" => fp_mode(),
         b"poll" => poll_mode(),
         b"peek" => peek_mode(s.arg),
         _ => hello(&s),
@@ -1014,6 +1018,104 @@ fn faults() -> ! {
     expect(sigaction(SIGSEGV, SIG_DFL, 0) == 0, 219);
     expect(sigaction(sys::ARITH_SIG, SIG_DFL, 0) == 0, 219);
     exit(FAULTS_SUCCESS)
+}
+
+// ---- fp: floating-point state across a signal handler --------------------------------------
+
+/// Exits with this when every step behaved; `kernel/main/src/personality/signals.rs` mirrors it.
+const FP_SUCCESS: u64 = 60;
+
+/// Bits of two doubles with exact binary representations, so a value that survives a save and a
+/// restore compares bit for bit: 9.5, which the interrupted code holds, and 12.5, which a
+/// handler writes over it.
+const FP_BEFORE: u64 = 0x4023_0000_0000_0000;
+const FP_EDIT: u64 = 0x4029_0000_0000_0000;
+
+static FP_HITS: AtomicU64 = AtomicU64::new(0);
+static FP_WORK: AtomicU64 = AtomicU64::new(0);
+
+/// Floating-point arithmetic the compiler cannot fold away, because its input comes from memory
+/// it cannot see through.
+///
+/// This is what makes the program hard-float **in fact** and not merely in the unit's
+/// configuration: kbuild disassembles the image and requires arithmetic instructions in it, and
+/// moving values between general-purpose and vector registers does not count — a soft-float
+/// build does that too. See `kbuild/src/fpregs.rs`.
+fn scramble(bits: u64) -> u64 {
+    let x = f64::from_bits(bits);
+    let y = x * 3.25 + 1.5;
+    (y / 2.0 - 0.75).to_bits()
+}
+
+/// A handler that uses floating-point registers, as any handler may: it does arithmetic of its
+/// own, which clobbers the caller-saved vector registers the interrupted code was using.
+extern "C" fn on_fp(_sig: i32) {
+    FP_HITS.fetch_add(1, Ordering::Relaxed);
+    let v = FP_WORK.load(Ordering::Relaxed);
+    FP_WORK.store(scramble(v), Ordering::Relaxed);
+}
+
+/// A handler that writes the saved state in its own frame, so the interrupted code resumes with
+/// what the handler chose. The frame is the program's memory and this is a program editing it —
+/// the same thing a handler does when it changes a saved general-purpose register.
+extern "C" fn on_fp_edit(_sig: i32, _info: *const u64, uc: *mut u8) {
+    FP_HITS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the `ucontext` the kernel pushed, whose saved floating-point state sits where this
+    // architecture's module says it does.
+    unsafe { sys::set_saved_fp_first(uc, FP_EDIT) };
+}
+
+/// A handler that makes its frame's floating-point record malformed and returns into it, which
+/// `rt_sigreturn` must refuse. The process does not come back from this.
+extern "C" fn on_fp_corrupt(_sig: i32, _info: *const u64, uc: *mut u8) {
+    FP_HITS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: as in `on_fp_edit`.
+    unsafe { sys::corrupt_saved_fp(uc) };
+}
+
+fn fp_mode() -> ! {
+    let pid = sys::call(sys::GETPID, [0; 6]) as u64;
+
+    // 120: the arithmetic runs at all. On x86_64 an SSE instruction raises #UD unless boot set
+    // CR4.OSFXSR and cleared CR0.EM, so this is the enable bits as much as the arithmetic.
+    FP_WORK.store(FP_BEFORE, Ordering::Relaxed);
+    let once = scramble(FP_WORK.load(Ordering::Relaxed));
+    expect(once != FP_BEFORE && once != 0, 120);
+
+    // 121–123: a handler that uses floating-point registers leaves the interrupted code's values
+    // alone. Eight registers are marked before the signal and compared after it, and the handler
+    // in between does arithmetic of its own — so a kernel that saved none of this would be
+    // caught by the compare rather than by luck.
+    expect(sigaction(SIGUSR1, on_fp as *const () as u64, 0) == 0, 121);
+    expect(sys::fp_marked(pid, SIGUSR1), 122);
+    expect(FP_HITS.load(Ordering::Relaxed) == 1, 123);
+    expect(FP_WORK.load(Ordering::Relaxed) == once, 123);
+
+    // 124–126: a handler that edits the saved state changes what the interrupted code sees. This
+    // is what says the frame is the source of truth and not a copy the kernel kept elsewhere: a
+    // kernel restoring from its own copy would hand back `FP_BEFORE` and pass every other step
+    // here.
+    expect(sigaction(SIGUSR2, on_fp_edit as *const () as u64, SA_SIGINFO) == 0, 124);
+    let back = sys::fp_across_signal(pid, SIGUSR2, FP_BEFORE);
+    expect(FP_HITS.load(Ordering::Relaxed) == 2, 125);
+    expect(back == FP_EDIT, 126);
+
+    // 127–129: a malformed record is refused. The child's handler corrupts its own frame — a
+    // pointer of its choosing on x86_64, a record of the wrong size on aarch64 — and returns
+    // into it, so `rt_sigreturn` must end the process with SIGSEGV rather than follow it.
+    let child = sys::fork();
+    expect(child >= 0, 127);
+    if child == 0 {
+        let me = sys::call(sys::GETPID, [0; 6]) as u64;
+        expect(sigaction(SIGUSR1, on_fp_corrupt as *const () as u64, SA_SIGINFO) == 0, 127);
+        sys::call(sys::KILL, [me, SIGUSR1, 0, 0, 0, 0]);
+        // Reached only if the kernel accepted the frame, which is the failure this step is for.
+        exit(128)
+    }
+    let status = wait_child(child, 129);
+    expect(status == SIGSEGV as u32, if status == 128 << 8 { 128 } else { 129 });
+
+    exit(FP_SUCCESS)
 }
 
 // ---- tcp and serve: sockets ---------------------------------------------------------------

@@ -164,6 +164,16 @@ impl HasFpu for X86_64 {
     // `context::FxSave`. The kernel emits no floating-point instruction of its own, so this
     // state belongs entirely to user programs built for the hard-float target.
     type FpuState = context::FxSave;
+
+    const FPU_BYTES: usize = context::FXSAVE_BYTES;
+
+    fn save_live(out: &mut [u8]) {
+        context::save_live(out);
+    }
+
+    fn load_live(bytes: &[u8]) {
+        context::load_live(bytes);
+    }
 }
 
 /// Terminate QEMU through the `isa-debug-exit` device.

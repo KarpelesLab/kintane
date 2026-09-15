@@ -108,8 +108,14 @@ fn an_x86_64_frame_is_laid_out_as_linux_lays_it_and_reads_back() {
     // Below the red zone, and aligned as a call leaves the stack.
     assert!(b.at + x86::FRAME as u64 <= ctx[x86::RSP] - x86::RED_ZONE);
     assert_eq!((b.at + 8) % 16, 0);
-    assert_eq!(b.head_len, 440);
+    // The frame ends in the `FXSAVE` area the `fpstate` pointer names.
+    assert_eq!(b.head_len, 952);
     assert_eq!(b.zeros, 0);
+    assert_eq!(
+        u64::from_le_bytes(array8(&b.head, x86::FPSTATE)),
+        b.at + 440,
+        "the fpstate pointer names the area in this frame"
+    );
     assert!(b.record.is_none());
     // The return address is the restorer; siginfo names the signal and its sender.
     assert_eq!(u64::from_le_bytes(array8(&b.head, 0)), d.action.restorer);
@@ -129,7 +135,7 @@ fn an_x86_64_frame_is_laid_out_as_linux_lays_it_and_reads_back() {
 
     let (bytes, len, sp) = frame_bytes(abi, &b);
     assert_eq!(abi.frame_at(sp), Ok(b.at));
-    let r = restore(abi, &bytes[..len], START, END).expect("a frame this built");
+    let r = restore(abi, &bytes[..len], b.at, START, END).expect("a frame this built");
     assert_eq!(r.regs, ctx);
     assert_eq!(r.mask, d.old_mask);
 }
@@ -160,7 +166,7 @@ fn an_aarch64_frame_is_laid_out_as_linux_lays_it_and_reads_back() {
 
     let (bytes, len, sp) = frame_bytes(abi, &b);
     assert_eq!(abi.frame_at(sp), Ok(b.at));
-    let r = restore(abi, &bytes[..len], START, END).expect("a frame this built");
+    let r = restore(abi, &bytes[..len], b.at, START, END).expect("a frame this built");
     assert_eq!(r.regs, ctx);
     assert_eq!(r.mask, d.old_mask);
 }
@@ -199,12 +205,12 @@ fn a_frame_the_program_changed_cannot_return_anywhere_a_program_may_not() {
             let mut bytes = b.head;
             bytes[pc_at..pc_at + 8].copy_from_slice(&bad.to_le_bytes());
             assert_eq!(
-                restore(abi, &bytes[..len], START, END),
+                restore(abi, &bytes[..len], b.at, START, END),
                 Err(BadFrame::BadReturn),
                 "{abi:?} {bad:#x}"
             );
         }
-        assert_eq!(restore(abi, &b.head[..len - 1], START, END), Err(BadFrame::Short));
+        assert_eq!(restore(abi, &b.head[..len - 1], b.at, START, END), Err(BadFrame::Short));
         // A mask that blocks the unblockable is given back without them.
         let mask_at = match abi {
             Abi::X86_64 => 304,
@@ -212,7 +218,7 @@ fn a_frame_the_program_changed_cannot_return_anywhere_a_program_may_not() {
         };
         let mut bytes = b.head;
         bytes[mask_at..mask_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(restore(abi, &bytes[..len], START, END).unwrap().mask, !UNBLOCKABLE);
+        assert_eq!(restore(abi, &bytes[..len], b.at, START, END).unwrap().mask, !UNBLOCKABLE);
     }
     // x86_64: flags beyond a program's own are dropped, and interrupts stay on.
     let abi = Abi::X86_64;
@@ -220,7 +226,7 @@ fn a_frame_the_program_changed_cannot_return_anywhere_a_program_may_not() {
     let mut bytes = b.head;
     let flags_at = 48 + 17 * 8;
     bytes[flags_at..flags_at + 8].copy_from_slice(&0x3000u64.to_le_bytes());
-    let r = restore(abi, &bytes[..abi.restore_len()], START, END).unwrap();
+    let r = restore(abi, &bytes[..abi.restore_len()], b.at, START, END).unwrap();
     assert_eq!(r.regs[16], 0x202);
     assert!(is_user_context(abi, &r.regs, START, END));
     // aarch64: a state that is not EL0 is refused outright, and so is a misaligned frame.
@@ -230,7 +236,11 @@ fn a_frame_the_program_changed_cannot_return_anywhere_a_program_may_not() {
         let mut bytes = b.head;
         bytes[576..584].copy_from_slice(&state.to_le_bytes());
         let len = abi.restore_len();
-        assert_eq!(restore(abi, &bytes[..len], START, END), Err(BadFrame::BadState), "{state:#x}");
+        assert_eq!(
+            restore(abi, &bytes[..len], b.at, START, END),
+            Err(BadFrame::BadState),
+            "{state:#x}"
+        );
     }
     assert_eq!(abi.frame_at(START + 7), Err(BadFrame::Misaligned));
 }
@@ -255,25 +265,66 @@ fn a_stack_with_no_room_below_it_takes_no_frame() {
 }
 
 #[test]
-fn a_frame_that_asks_for_floating_point_state_back_is_refused() {
-    // Nothing here can restore those registers, so a frame naming some is refused rather than
-    // accepted with the request ignored: a program must not be told its state came back.
+fn a_frame_carries_floating_point_state_and_only_the_one_this_kernel_wrote() {
+    // The frame now carries those registers, so a well-formed one is accepted — and every
+    // other shape of the same field is refused. The frame is the program's to write, so this
+    // is the field a program would use to point the kernel somewhere of its choosing.
     for (abi, at) in [(Abi::X86_64, x86::FPSTATE), (Abi::Aarch64, a64::RECORD)] {
         let ctx = context(abi);
         let b = build(abi, &ctx, &delivery(SIGUSR1), START, END).expect("room");
         let len = abi.restore_len();
-        // What `build` writes is none: the pointer is null, the record terminates.
-        assert_eq!(u64::from_le_bytes(array8(&b.head, at)), 0, "{abi:?}");
-        restore(abi, &b.head[..len], START, END).expect("a frame this built");
-        for claimed in [1u64, START + 0x1000, u64::MAX, 0x4650_5342] {
+        // What `build` writes: x86_64's pointer names the area in this frame, and aarch64's
+        // record is a `fpsimd_context` header — Linux's magic and Linux's size.
+        let written = u64::from_le_bytes(array8(&b.head, at));
+        let good = match abi {
+            Abi::X86_64 => b.at + x86::FPSTATE_AREA as u64,
+            Abi::Aarch64 => u64::from(a64::FPSIMD_MAGIC) | ((a64::FPSIMD_SIZE as u64) << 32),
+        };
+        assert_eq!(written, good, "{abi:?}");
+        restore(abi, &b.head[..len], b.at, START, END).expect("a frame this built");
+
+        // Null is no longer "no state claimed" — it is a malformed frame, because every frame
+        // this kernel writes carries the state. The old refusal accepted null; this must not.
+        // 0x4650_5342 is the bare magic with a zero size: the right name, the wrong shape.
+        for claimed in [0u64, 1, START + 0x1000, u64::MAX, 0x4650_5342] {
+            if claimed == good {
+                continue;
+            }
             let mut bytes = b.head;
             bytes[at..at + 8].copy_from_slice(&claimed.to_le_bytes());
             assert_eq!(
-                restore(abi, &bytes[..len], START, END),
+                restore(abi, &bytes[..len], b.at, START, END),
                 Err(BadFrame::FpState),
                 "{abi:?} {claimed:#x}"
             );
         }
+    }
+
+    // x86_64's pointer is checked against the address the frame was read from, so the same
+    // bytes restored as if they came from elsewhere are refused: a program cannot move the
+    // area by lying about where its frame is.
+    let abi = Abi::X86_64;
+    let b = build(abi, &context(abi), &delivery(SIGUSR1), START, END).expect("room");
+    let len = abi.restore_len();
+    assert_eq!(
+        restore(abi, &b.head[..len], b.at + 16, START, END),
+        Err(BadFrame::FpState),
+        "a pointer is only good for the frame it was built for"
+    );
+
+    // aarch64: a record naming a size other than `fpsimd_context`'s is refused, magic or no.
+    let abi = Abi::Aarch64;
+    let b = build(abi, &context(abi), &delivery(SIGUSR1), START, END).expect("room");
+    let len = abi.restore_len();
+    for size in [0u32, 0x10, a64::FPSIMD_SIZE as u32 - 1, u32::MAX] {
+        let mut bytes = b.head;
+        bytes[a64::RECORD..a64::RECORD + 4].copy_from_slice(&a64::FPSIMD_MAGIC.to_le_bytes());
+        bytes[a64::RECORD + 4..a64::RECORD + 8].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(
+            restore(abi, &bytes[..len], b.at, START, END),
+            Err(BadFrame::FpState),
+            "size {size:#x}"
+        );
     }
 }
 

@@ -38,11 +38,6 @@
 //! action does nothing. Alternate signal stacks: `sigaltstack` reports none and refuses to set
 //! one. `rt_sigsuspend`, `rt_sigtimedwait` and `signalfd`.
 //!
-//! Floating-point state is not saved in the frame, and cannot honestly be until `hal::HasFpu`
-//! exists: no context switch on either port saves those registers either, so a handler is not
-//! the only thing that changes them under the code it interrupted.
-//! `linux::signal::restore` refuses a frame that carries such state rather than reading past it.
-//!
 //! # Queued signals
 //!
 //! A signal from [`RT_FIRST`] up queues: three sent are three delivered, oldest first, each with
@@ -55,7 +50,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use arch::Cpu;
 use hal::user::UserRegisters;
-use hal::{EarlyConsole, HasUserMode};
+use hal::{EarlyConsole, HasFpu, HasUserMode};
 use linux::Failure;
 use linux::signal::{self as sig, Action, Delivery, Effect};
 use sched::ThreadId;
@@ -75,6 +70,21 @@ type Words = [u64; sig::REGISTER_WORDS];
 
 const USER_START: u64 = <Cpu as HasUserMode>::USER_START as u64;
 const USER_END: u64 = <Cpu as HasUserMode>::USER_END as u64;
+
+/// Where this port's frame keeps the saved floating-point state, and how much of it there is.
+const FPU_AT: usize = ABI.fpu_at();
+const FPU_BYTES: usize = ABI.fpu_bytes();
+
+const _: () = {
+    // The frame's idea of the image and the port's must be one number. `kernel/linux` depends
+    // on nothing and cannot ask the architecture, so it writes the size down; this is where the
+    // two meet. A port whose image changed without the layout following would otherwise write
+    // a short record and read back a long one.
+    assert!(FPU_BYTES == <Cpu as HasFpu>::FPU_BYTES);
+    // Both lie inside the bytes `rt_sigreturn` reads back, which is what makes it safe to take
+    // the state from the same buffer `restore` validated.
+    assert!(FPU_AT + FPU_BYTES <= ABI.restore_len());
+};
 const SIGNALS: usize = sig::NSIG as usize;
 
 // ---- state -------------------------------------------------------------------------------
@@ -611,9 +621,15 @@ fn enter_handler(
         addr: fault_addr(slot, signo),
         value,
     };
-    let built = sig::build(ABI, ctx, &d, USER_START, USER_END)
-        .ok()
-        .filter(write_frame)?;
+    let mut built = sig::build(ABI, ctx, &d, USER_START, USER_END).ok()?;
+    // The interrupted thread's floating-point registers, into the frame before it is written.
+    // They are live at this moment — the thread is in a system call, a fault or an interrupt,
+    // and nothing has reloaded them — so this is the one place they can be taken from. A switch
+    // after this point carries them as it always did; see `hal::HasFpu`.
+    Cpu::save_live(&mut built.head[FPU_AT..FPU_AT + FPU_BYTES]);
+    if !write_frame(&built) {
+        return None;
+    }
     let mut blocked = mask | action.mask;
     if action.flags & SA_NODEFER == 0 {
         blocked |= sig::bit(signo);
@@ -991,7 +1007,7 @@ pub(super) fn sigreturn(
         .frame_at(ctx[ABI.sp_word()])
         .ok()
         .filter(|&at| super::from_user(at, &mut bytes[..len]).is_ok())
-        .and_then(|_| sig::restore(ABI, &bytes[..len], USER_START, USER_END).ok());
+        .and_then(|at| sig::restore(ABI, &bytes[..len], at, USER_START, USER_END).ok());
     let Some(r) = restored else {
         SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
         super::exit_group(slot, sig::exit_code(sig::SIGSEGV))
@@ -999,6 +1015,12 @@ pub(super) fn sigreturn(
     if let Some(me) = mine(slot) {
         me.mask.store(r.mask, Ordering::Release);
     }
+    // The frame's floating-point state, back into the registers. These are the program's own
+    // bytes and it may have changed them, deliberately or by accident — which is the point: a
+    // handler that edits the saved state changes what the interrupted code sees, exactly as it
+    // can with any other register in the frame. `restore` has already accepted the frame, so
+    // the record is the one this kernel wrote and these bytes are inside what it validated.
+    Cpu::load_live(&bytes[FPU_AT..FPU_AT + FPU_BYTES]);
     Cpu::set_registers(frame, &UserRegisters::from_words(&r.regs));
     RETURNED.fetch_add(1, Ordering::Relaxed);
     // The return register, which the table sets last, is the one the frame holds.
@@ -1006,6 +1028,14 @@ pub(super) fn sigreturn(
 }
 
 // ---- the check ----------------------------------------------------------------------------
+
+/// `argv` for the program's floating-point mode, and its exit code when every step behaved;
+/// mirror `user/linux-hello/src/main.rs`.
+const FP_ARGV: [&[u8]; 2] = [b"hello", b"fp"];
+const FP_SUCCESS: u64 = 60;
+/// What that mode does at least: two handlers that return, and one child ended by a signal —
+/// the one whose `rt_sigreturn` handed back a frame this kernel refused.
+const FP_HANDLERS: u64 = 2;
 
 /// `argv` for the program's signals mode, and its exit code when every step behaved; mirror
 /// `user/linux-hello/src/main.rs`.
@@ -1076,6 +1106,56 @@ pub(super) fn rtsig_check(c: &dyn EarlyConsole) -> Check {
     }
     let clean = super::report_run(c, &run);
     Check::from_ok(run.code == Some(RTSIG_SUCCESS) && counted && clean)
+}
+
+/// Run the program in its floating-point mode and grade it. On the boot thread, after the
+/// real-time run, whose slot and stacks it reuses.
+///
+/// This is the check that says the frame's floating-point state is *carried* rather than merely
+/// shaped. Every other Linux check passes with `save_live` and `load_live` as no-ops, because no
+/// other mode puts a value in a vector register and looks at it again: the frame would still be
+/// the right size, the record would still be well-formed, and the bytes would still be zero.
+/// The three things graded here are the three that a no-op fails.
+pub(super) fn fp_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux fp   ");
+    let before = [&HANDLED, &RETURNED, &SIGNAL_ENDS].map(|n| n.load(Ordering::Relaxed));
+    let run = match super::run_mode(&FP_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
+    let after = [&HANDLED, &RETURNED, &SIGNAL_ENDS].map(|n| n.load(Ordering::Relaxed));
+    let [handled, returned, ends] = [0, 1, 2].map(|i| after[i] - before[i]);
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(FP_SUCCESS)) => c.write_str(
+            "registers held across a handler that used them, a handler's edit of the saved state honoured, a malformed record refused",
+        ),
+        (true, Some(code)) => {
+            c.write_str("the program exited ");
+            write_hex(c, code);
+            c.write_str(", WRONG");
+        }
+    }
+    c.write_str("; ");
+    write_usize(c, handled as usize);
+    c.write_str(" handlers run, ");
+    write_usize(c, returned as usize);
+    c.write_str(" returned, ");
+    write_usize(c, ends as usize);
+    c.write_str(" ended by a refused frame");
+    // The corrupting child's handler runs and never returns, so a run that behaved has one more
+    // handler than it has returns, and exactly one process ended by the signal that refusal
+    // raises. A kernel that accepted the malformed frame would return three times and end none.
+    let counted = handled >= FP_HANDLERS + 1 && returned >= FP_HANDLERS && ends >= 1;
+    if !counted {
+        c.write_str("; NOT WHAT THE MODE DOES");
+    }
+    let clean = super::report_run(c, &run);
+    Check::from_ok(run.code == Some(FP_SUCCESS) && counted && clean)
 }
 
 /// Run the program in its faults mode and grade it: a handler entered for a thread that makes

@@ -93,6 +93,19 @@ std::thread_local! {
     /// what a CPU is to the tests, so this is per thread rather than a shared static, and
     /// tests running in parallel cannot see each other's choice.
     static MOCK_CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+
+    /// `MockFull`'s floating-point registers: one set per CPU, per host thread.
+    ///
+    /// Per CPU because that is the property the real ports' switches provide, and a test
+    /// that plays two CPUs in turn on one thread must see two register sets or it would pass
+    /// against a kernel that lost them. Per thread for the reason [`FULL_IRQ`] is: tests run
+    /// in parallel and must not see each other's registers.
+    ///
+    /// One slot past [`MOCK_CPUS`] for the CPU indices [`set_cpu`] deliberately accepts
+    /// without storage, which share it: an out-of-range CPU still has somewhere to put its
+    /// registers rather than panicking inside a save.
+    static MOCK_FPU: core::cell::Cell<[[u8; 16]; MOCK_CPUS + 1]> =
+        const { core::cell::Cell::new([[0; 16]; MOCK_CPUS + 1]) };
 }
 
 /// Make the current host thread run as `MockFull` CPU `cpu`. Indices at or above
@@ -107,6 +120,28 @@ impl HasCoherentDma for MockFull {}
 
 impl HasFpu for MockFull {
     type FpuState = ();
+
+    /// Enough to be a state and small enough to read in a failure message. No relation to
+    /// any real image: as with the page tables below, a mock that copied a real format would
+    /// make a bug in the code under test and a bug in the encoding look the same.
+    const FPU_BYTES: usize = 16;
+
+    /// The registers of the CPU this host thread is playing; see [`MOCK_FPU`].
+    fn save_live(out: &mut [u8]) {
+        let cpu = Self::cpu_index().min(MOCK_CPUS);
+        MOCK_FPU.with(|f| out[..Self::FPU_BYTES].copy_from_slice(&f.get()[cpu]));
+    }
+
+    fn load_live(bytes: &[u8]) {
+        let cpu = Self::cpu_index().min(MOCK_CPUS);
+        let mut v = [0u8; 16];
+        v.copy_from_slice(&bytes[..Self::FPU_BYTES]);
+        MOCK_FPU.with(|f| {
+            let mut all = f.get();
+            all[cpu] = v;
+            f.set(all);
+        });
+    }
 }
 
 impl Arch for MockTiny {
@@ -451,6 +486,48 @@ mod tests {
         assert_ne!(MockFull::PAGE_SIZE, MockTiny::PAGE_SIZE);
         assert!(MockFull::UNALIGNED_ACCESS);
         assert!(!MockTiny::UNALIGNED_ACCESS);
+    }
+
+    /// The live floating-point registers come back as they were put in, and are the CPU's
+    /// own.
+    ///
+    /// Worth a test even though the state is a mock's: a `save_live` that wrote nothing and a
+    /// `load_live` that discarded its argument would satisfy every type in the trait and leave
+    /// every caller looking correct, because a frame full of zeros is still a frame. The real
+    /// ports are proved by a boot instead — nothing on the host has floating-point registers
+    /// to check against.
+    #[test]
+    fn live_floating_point_state_round_trips_and_is_per_cpu() {
+        let pattern = [0x5a; MockFull::FPU_BYTES];
+        MockFull::load_live(&pattern);
+        let mut back = [0u8; MockFull::FPU_BYTES];
+        MockFull::save_live(&mut back);
+        assert_eq!(back, pattern, "what was loaded is not what came back");
+
+        // A buffer longer than the state is written up to `FPU_BYTES` and no further, so a
+        // caller laying this into a larger frame keeps whatever surrounds it.
+        let mut wide = [0xffu8; MockFull::FPU_BYTES + 8];
+        MockFull::save_live(&mut wide);
+        assert_eq!(&wide[..MockFull::FPU_BYTES], &pattern);
+        assert_eq!(&wide[MockFull::FPU_BYTES..], &[0xff; 8], "wrote past the state");
+
+        // Another CPU's registers are not this one's. This is the property a real port's
+        // switch provides, and it is why the mock's state is indexed by CPU: a mock holding
+        // one buffer per thread would let a test pass that a two-CPU machine would fail —
+        // which is what this very test caught when it did.
+        set_cpu(1);
+        let mut other = [0u8; MockFull::FPU_BYTES];
+        MockFull::save_live(&mut other);
+        assert_ne!(other, pattern, "CPU 1 sees the state CPU 0 loaded");
+        let theirs = [0x3c; MockFull::FPU_BYTES];
+        MockFull::load_live(&theirs);
+        set_cpu(0);
+        MockFull::save_live(&mut back);
+        assert_eq!(back, pattern, "CPU 0's state followed CPU 1's load");
+        set_cpu(1);
+        MockFull::save_live(&mut other);
+        assert_eq!(other, theirs);
+        set_cpu(0);
     }
 
     #[test]

@@ -294,6 +294,146 @@ pub const ARITH_SIG: u64 = 8; // SIGFPE
 /// `rip` is the sixteenth of the registers there. Mirrors `kernel/linux`'s `x86` layout.
 pub const UC_PC: usize = 40 + 16 * 8;
 
+/// Where `sigcontext` keeps the pointer to the saved floating-point state: after `cr2`, the
+/// twenty-fourth word. Mirrors `kernel/linux`'s `x86::FPSTATE`.
+pub const UC_FPSTATE_PTR: usize = 40 + 23 * 8;
+
+/// Where the first XMM register sits in the `FXSAVE` image the pointer names, from the SDM's
+/// layout.
+const FX_XMM0: usize = 160;
+
+// Floating point across a handler. `linux_fp_marked` puts a known double in xmm0-xmm7, sends
+// the signal to its own process (rdi pid, rsi signal), and answers 1 in rax if every one came
+// back. The handler in between does floating-point work of its own, so a kernel that did not
+// save and restore this state would be caught by the compare rather than by luck.
+//
+// The marks are doubles with exact binary representations — small integers scaled by powers of
+// two — so a value that survives a save and restore compares bit-for-bit, and the comparison is
+// integer, on the bits, not a floating-point compare that a NaN could pass or fail oddly.
+global_asm!(
+    ".pushsection .text.linux_fp, \"ax\"",
+    ".globl linux_fp_marked",
+    "linux_fp_marked:",
+    "    sub rsp, 128",
+    // The eight marks: 1.5, 2.5, ... 8.5, built as integers and moved in.
+    "    mov rax, 0x3ff8000000000000", // 1.5
+    "    movq xmm0, rax",
+    "    mov rax, 0x4004000000000000", // 2.5
+    "    movq xmm1, rax",
+    "    mov rax, 0x400c000000000000", // 3.5
+    "    movq xmm2, rax",
+    "    mov rax, 0x4012000000000000", // 4.5
+    "    movq xmm3, rax",
+    "    mov rax, 0x4016000000000000", // 5.5
+    "    movq xmm4, rax",
+    "    mov rax, 0x401a000000000000", // 6.5
+    "    movq xmm5, rax",
+    "    mov rax, 0x401e000000000000", // 7.5
+    "    movq xmm6, rax",
+    "    mov rax, 0x4021000000000000", // 8.5
+    "    movq xmm7, rax",
+    // kill(pid, sig). rdi and rsi already hold them.
+    "    mov eax, 62",
+    "    syscall",
+    // Every register back, or zero.
+    "    xor eax, eax",
+    "    mov rcx, 0x3ff8000000000000",
+    "    movq rdx, xmm0",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov rcx, 0x4004000000000000",
+    "    movq rdx, xmm1",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov rcx, 0x400c000000000000",
+    "    movq rdx, xmm2",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov rcx, 0x4012000000000000",
+    "    movq rdx, xmm3",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov rcx, 0x4016000000000000",
+    "    movq rdx, xmm4",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov rcx, 0x401a000000000000",
+    "    movq rdx, xmm5",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov rcx, 0x401e000000000000",
+    "    movq rdx, xmm6",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov rcx, 0x4021000000000000",
+    "    movq rdx, xmm7",
+    "    cmp rdx, rcx",
+    "    jne 2f",
+    "    mov eax, 1",
+    "2:",
+    "    add rsp, 128",
+    "    ret",
+    // Put `bits` in xmm0, send the signal, and answer what xmm0 holds afterwards. One routine
+    // rather than a set and a separate read: xmm0 is caller-saved, so between two calls the
+    // compiler may use it for anything it likes, and the check would be of the compiler rather
+    // than of the kernel.
+    ".globl linux_fp_across",
+    "linux_fp_across:",
+    "    movq xmm0, rdx",
+    "    mov eax, 62",
+    "    syscall",
+    "    movq rax, xmm0",
+    "    ret",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn linux_fp_marked(pid: u64, sig: u64) -> u64;
+    fn linux_fp_across(pid: u64, sig: u64, bits: u64) -> u64;
+}
+
+/// Send `sig` to `pid` with eight floating-point registers marked, and say whether every mark
+/// survived the handler.
+pub fn fp_marked(pid: u64, sig: u64) -> bool {
+    // SAFETY: the routine touches only volatile registers and its own red-zone allocation, and
+    // makes one system call.
+    unsafe { linux_fp_marked(pid, sig) == 1 }
+}
+
+/// Put `bits` in the first floating-point argument register, send `sig` to `pid`, and answer
+/// what that register holds once the handler has returned.
+pub fn fp_across_signal(pid: u64, sig: u64, bits: u64) -> u64 {
+    // SAFETY: the routine writes one volatile register and makes one system call.
+    unsafe { linux_fp_across(pid, sig, bits) }
+}
+
+/// The saved floating-point state in a `ucontext`, which `sigcontext`'s pointer names.
+///
+/// # Safety
+/// `uc` is the `ucontext` the kernel pushed for a handler of this process, whose pointer the
+/// kernel wrote and nothing has changed yet.
+unsafe fn saved_fp(uc: *mut u8) -> *mut u8 {
+    unsafe { uc.add(UC_FPSTATE_PTR).cast::<u64>().read() as *mut u8 }
+}
+
+/// Write `bits` over the saved first floating-point register, so the interrupted code resumes
+/// with what the handler chose rather than with what it had.
+///
+/// # Safety
+/// As [`saved_fp`].
+pub unsafe fn set_saved_fp_first(uc: *mut u8, bits: u64) {
+    unsafe { saved_fp(uc).add(FX_XMM0).cast::<u64>().write(bits) }
+}
+
+/// Make the frame's floating-point state malformed: a pointer of the program's own choosing,
+/// which `rt_sigreturn` must refuse rather than follow.
+///
+/// # Safety
+/// `uc` is the `ucontext` the kernel pushed for a handler of this process.
+pub unsafe fn corrupt_saved_fp(uc: *mut u8) {
+    unsafe { uc.add(UC_FPSTATE_PTR).cast::<u64>().write(0x4000_0000) }
+}
+
 /// Divide by zero, and come back through the handler's redirect.
 pub fn raise_arith() {
     // SAFETY: the instruction traps, and the handler this mode installs points the saved

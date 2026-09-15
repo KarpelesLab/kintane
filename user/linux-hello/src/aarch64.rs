@@ -337,6 +337,141 @@ pub const ARITH_SIG: u64 = 4; // SIGILL
 /// layout, where the frame puts `pc` at 568 with the `ucontext` at 128.
 pub const UC_PC: usize = 176 + 8 + 31 * 8 + 8;
 
+/// Where the `fpsimd_context` record sits in a `ucontext`: the reserved space, which begins
+/// 288 bytes into the `sigcontext`. Mirrors `kernel/linux`'s `a64::RESERVED`.
+pub const UC_FPSIMD: usize = 176 + 288;
+
+/// Inside that record: `struct _aarch64_ctx` is a magic and a size, then `fpsr` and `fpcr` as
+/// 32-bit fields, then the 32 V registers.
+const FPSIMD_SIZE_AT: usize = 4;
+const FPSIMD_V0: usize = 16;
+/// The size a well-formed record declares, which the kernel writes and checks.
+const FPSIMD_SIZE: u32 = 0x210;
+
+// Floating point across a handler, as on x86_64: `linux_fp_marked` puts a known double in
+// d0-d7, sends the signal to its own process, and answers 1 if every one came back. The marks
+// are doubles with exact representations, compared on their bits rather than by a floating-point
+// compare. `.arch_extension fp` because this program's own target permits these instructions
+// but the assembler still wants them enabled in the block, as the kernel's switch does.
+global_asm!(
+    ".pushsection .text.linux_fp, \"ax\"",
+    ".arch_extension fp",
+    ".globl linux_fp_marked",
+    "linux_fp_marked:",
+    "    stp x29, x30, [sp, #-16]!",
+    "    ldr x9, =0x3ff8000000000000", // 1.5
+    "    fmov d0, x9",
+    "    ldr x9, =0x4004000000000000", // 2.5
+    "    fmov d1, x9",
+    "    ldr x9, =0x400c000000000000", // 3.5
+    "    fmov d2, x9",
+    "    ldr x9, =0x4012000000000000", // 4.5
+    "    fmov d3, x9",
+    "    ldr x9, =0x4016000000000000", // 5.5
+    "    fmov d4, x9",
+    "    ldr x9, =0x401a000000000000", // 6.5
+    "    fmov d5, x9",
+    "    ldr x9, =0x401e000000000000", // 7.5
+    "    fmov d6, x9",
+    "    ldr x9, =0x4021000000000000", // 8.5
+    "    fmov d7, x9",
+    // kill(pid, sig): x0 and x1 already hold them.
+    "    mov x8, #129",
+    "    svc #0",
+    "    mov x0, xzr",
+    "    ldr x9, =0x3ff8000000000000",
+    "    fmov x10, d0",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x4004000000000000",
+    "    fmov x10, d1",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x400c000000000000",
+    "    fmov x10, d2",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x4012000000000000",
+    "    fmov x10, d3",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x4016000000000000",
+    "    fmov x10, d4",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x401a000000000000",
+    "    fmov x10, d5",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x401e000000000000",
+    "    fmov x10, d6",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    ldr x9, =0x4021000000000000",
+    "    fmov x10, d7",
+    "    cmp x10, x9",
+    "    b.ne 2f",
+    "    mov x0, #1",
+    "2:",
+    "    ldp x29, x30, [sp], #16",
+    "    ret",
+    // Put `bits` in d0, send the signal, and answer what d0 holds afterwards. One routine
+    // rather than a set and a separate read: d0 is caller-saved, so between two calls the
+    // compiler may use it for anything, and the check would be of the compiler rather than of
+    // the kernel.
+    ".globl linux_fp_across",
+    "linux_fp_across:",
+    "    fmov d0, x2",
+    "    mov x8, #129",
+    "    svc #0",
+    "    fmov x0, d0",
+    "    ret",
+    "    .ltorg",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn linux_fp_marked(pid: u64, sig: u64) -> u64;
+    fn linux_fp_across(pid: u64, sig: u64, bits: u64) -> u64;
+}
+
+/// Send `sig` to `pid` with eight floating-point registers marked, and say whether every mark
+/// survived the handler.
+pub fn fp_marked(pid: u64, sig: u64) -> bool {
+    // SAFETY: the routine touches only volatile registers and its own frame, and makes one
+    // system call.
+    unsafe { linux_fp_marked(pid, sig) == 1 }
+}
+
+/// Put `bits` in the first floating-point argument register, send `sig` to `pid`, and answer
+/// what that register holds once the handler has returned.
+pub fn fp_across_signal(pid: u64, sig: u64, bits: u64) -> u64 {
+    // SAFETY: the routine writes one volatile register and makes one system call.
+    unsafe { linux_fp_across(pid, sig, bits) }
+}
+
+/// Write `bits` over the saved first floating-point register, so the interrupted code resumes
+/// with what the handler chose rather than with what it had.
+///
+/// # Safety
+/// `uc` is the `ucontext` the kernel pushed for a handler of this process.
+pub unsafe fn set_saved_fp_first(uc: *mut u8, bits: u64) {
+    unsafe { uc.add(UC_FPSIMD + FPSIMD_V0).cast::<u64>().write(bits) }
+}
+
+/// Make the frame's floating-point state malformed: a record naming a size other than
+/// `fpsimd_context`'s, which `rt_sigreturn` must refuse rather than walk.
+///
+/// # Safety
+/// As [`set_saved_fp_first`].
+pub unsafe fn corrupt_saved_fp(uc: *mut u8) {
+    unsafe {
+        uc.add(UC_FPSIMD + FPSIMD_SIZE_AT)
+            .cast::<u32>()
+            .write(FPSIMD_SIZE - 1)
+    }
+}
+
 /// Raise the trap, and come back through the handler's redirect.
 pub fn raise_arith() {
     // SAFETY: the instruction traps, and the handler this mode installs points the saved

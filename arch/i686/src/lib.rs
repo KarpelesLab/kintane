@@ -158,6 +158,15 @@ impl HasFpu for I686 {
     // so the x86_64 trick of building the kernel without an FPU is not available and
     // the state is x87 plus SSE rather than SSE alone. See docs/targets.md#i686.
     type FpuState = ();
+
+    // Nothing is carried, so nothing is moved. `ABI_LINUX` depends on x86_64 or aarch64, so
+    // no signal frame is ever built here and neither call below has a caller; they are the
+    // honest answer for a port with no saved state rather than a stub that pretends to save.
+    const FPU_BYTES: usize = 0;
+
+    fn save_live(_out: &mut [u8]) {}
+
+    fn load_live(_bytes: &[u8]) {}
 }
 
 /// Terminate QEMU through the `isa-debug-exit` device.

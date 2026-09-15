@@ -125,7 +125,10 @@ replace this one without anything above the architecture layer noticing.
 
 A signal frame holds every register a thread had, because the handler it runs is the
 program's own code and may clobber the caller-saved registers the interrupted code was
-using. So any vector that can deliver a signal has to reach those registers.
+using. So any vector that can deliver a signal has to reach those registers. That includes the
+floating-point ones: the frame carries an `FXSAVE` area on x86_64 and a `fpsimd_context` record
+on aarch64, filled from `HasFpu::save_live` at delivery and handed back to `load_live` when
+`rt_sigreturn` has accepted the frame.
 
 aarch64 always could: its exception entry saves `x0`–`x30`, `SP_EL0`, `ELR_EL1` and
 `SPSR_EL1` into a `TrapFrame` that the Rust handler is handed. x86_64 could not. Its

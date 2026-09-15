@@ -9,11 +9,22 @@
 # Linked in the user half at 512 GiB like every program here, not at Linux's customary
 # 4 MiB: the kernel still maps itself in the lower half. A program linked at 0x400000 is
 # refused by the loader until it does not.
+#
+# **Hard float.** Its `fp` mode puts known values in floating-point registers across a signal
+# handler, which needs a program that can name those registers: every other unit here builds for
+# the kernel's soft-float specification, where `a * b` is a call to `__muldf3` and no register is
+# named at all. `float = "hard"` builds this unit, its `user`-layer closure and a `core` of its
+# own for `targets/<target>-hf.json`; see docs/targets.md. `ABI_LINUX` depends on x86_64 or
+# aarch64, which are exactly the two architectures that have such a specification.
+#
+# kbuild disassembles the result and requires real floating-point arithmetic in it, so asking for
+# hard float is not the same as getting it — see `kbuild/src/fpregs.rs`.
 [unit]
 name = "linux-hello"
 kind = "user"
 root = "src/main.rs"
 layer = "user"
+float = "hard"
 rustflags = [
     "-C", "relocation-model=pic",
     "-C", "link-arg=-T$ROOT/user/linux-hello/link.ld",

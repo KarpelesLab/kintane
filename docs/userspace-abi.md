@@ -722,11 +722,18 @@ handler to the default while an ignored signal stays ignored.
   `siginfo`, below the 128-byte red zone and aligned as a call leaves the stack; on aarch64 a
   `siginfo` and a `ucontext` whose `sigcontext` ends in 4 KiB of reserved space, with a frame
   record above it that the handler's `x29` points at. The handler starts with the signal, the
-  `siginfo` and the `ucontext` in its first three argument registers. Neither frame holds
-  floating-point or SIMD state: a handler that uses those registers changes them under the code
-  it interrupted. A frame that comes back *claiming* such state — a non-null `fpstate` pointer on
-  x86_64, any record in aarch64's reserved space — is refused rather than read past, so no
-  program is told its registers were restored when they were not.
+  `siginfo` and the `ucontext` in its first three argument registers. Both frames carry
+  floating-point and SIMD state, because a handler is the program's own code and may use those
+  registers: x86_64 keeps a 512-byte `FXSAVE` area at the end of the frame, named by
+  `sigcontext`'s `fpstate` pointer, and aarch64 a `fpsimd_context` record at the head of the
+  reserved space — Linux's magic, Linux's `0x210` size, `fpsr` and `fpcr` then the 32 V
+  registers — with the terminating null record above it.
+- **What `rt_sigreturn` will accept of that state.** The field is the program's to write, and it
+  is the one a program would use to aim the kernel at memory of its choosing, so it is checked
+  rather than followed. On x86_64 the only pointer accepted is the one naming the area inside
+  that very frame; on aarch64 the record must carry exactly Linux's magic and size. Null is not
+  "no state claimed" but a malformed frame, since every frame this kernel writes carries the
+  state. A frame that fails either check ends the process with `SIGSEGV`, as a bad frame does.
 - **`rt_sigreturn`** reads the frame back with `signal::restore`. The frame is the program's to
   write, so a return address outside the user half, or on aarch64 a processor state that is not
   EL0 with only the condition flags, is refused, and on x86_64 only the flags a program may hold
@@ -794,18 +801,12 @@ no corpus yet for a gap to fail.
   delivered is the same signal arriving once, keeping the first sender's value. Delivery takes
   the lowest number first, as Linux does.
 - **The frame still holds no floating-point or SIMD state,** and the fix is larger than the
-  frame. A handler is the program's own code, and one that uses those registers changes them
-  under the code it interrupted — but so does *any other thread that runs*, because no context
-  switch on either port saves them either: `hal::HasFpu` is the unbuilt work that would, and
-  aarch64's context switch asserts at compile time that nothing in the image can name an FP
-  register. On x86_64 the question does not even arise yet: `CR4.OSFXSR` is never set, so a user
-  SSE instruction raises #UD, which the personality reports as `SIGILL`, and `fxsave` would save
-  no XMM state at all. Saving state in the frame while a context switch drops it would be a
-  guarantee that is false the moment another thread runs, so the frame instead **refuses** a
-  frame that claims such state. Doing it properly means `HasFpu`: a save area in the thread
-  context, saved and restored by the context switch, `CR4.OSFXSR` and `OSXMMEXCPT` set on every
-  CPU, and then an `fxsave` area behind `sigcontext`'s `fpstate` pointer on x86_64 and an
-  `fpsimd_context` record in aarch64's reserved space.
+  frame — and it is carried now. This was refused for two rounds, and the reason it was refused
+  is worth keeping: a frame promising those registers back while no context switch saved them
+  would have been false the moment another thread ran. `hal::HasFpu` closed that, and the trait
+  grew `save_live`/`load_live` for the frame's sake, since the switch moves state between two
+  stored contexts and a frame's bytes belong to nobody. A switch landing between the save and
+  the load is harmless either way, which is what makes it sound.
 - **A handler cannot run from every trap.** Delivery from an interrupt covers the scheduler's
   vectors, so a thread spinning in user mode is reached; a device interrupt that arrives while a
   process runs still returns without delivering, and the signal waits for the next scheduler
