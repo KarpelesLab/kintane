@@ -26,19 +26,18 @@
 //! # What must hold
 //!
 //! * The arithmetic thread exits with [`ARITH_SUCCESS`].
-//! * Both graded threads exit with [`PATTERN_SUCCESS`]. A thread whose registers were
-//!   clobbered exits [`LOST`]` + n`, naming the first register that came back wrong, and this
-//!   check prints which.
-//! * Every thread ends within [`PATIENCE`], so a kernel that cannot run them fails by the
-//!   clock rather than hanging.
+//! * Both graded threads exit with [`PATTERN_SUCCESS`]. A thread whose registers were clobbered
+//!   exits [`LOST`]` + n`, naming the first register that came back wrong, and this check prints
+//!   which.
+//! * Every thread ends within [`PATIENCE`], so a kernel that cannot run them fails by the clock
+//!   rather than hanging.
 //! * Every object and frame is back once the processes are torn down.
 
 use hal::EarlyConsole;
 use time::Duration;
 
-use crate::objects;
 use crate::preempt::{self, sleep_until};
-use crate::{Check, spawn, timekeeping, userproc, write_hex, write_usize};
+use crate::{Check, objects, spawn, timekeeping, userproc, write_hex, write_usize};
 
 /// The program's modes and codes. Mirrors `user/fptest/src/main.rs`; the two are one contract.
 const MODE_ARITH: usize = 0;

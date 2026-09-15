@@ -2020,12 +2020,41 @@ program, eight in each hard-float one.
 | Mutation | Result |
 |---|---|
 | `rustc-abi: softfloat` restored in the hard-float specification | the build fails: `userfp` holds no floating-point arithmetic |
+| x86_64 `fxrstor64` restores from the context being switched *away* from | `fpu` fails: REGISTERS DID NOT SURVIVE THE SWITCH, first lost register 0, second lost register 0 |
+| aarch64 FPSIMD restore reads its base from `x0` rather than `x1` | the same, on that port |
+| `-neon` removed from the kernel's own aarch64 target | the build fails on the assertion in `arch/aarch64/src/context.rs`: *NEON/FP is enabled for aarch64: d8-d15 are callee-saved and the context switch must now save them* |
+| a kernel function given `asm!("fmul d0, d0, d0")` | the build fails: *instruction requires: fp-armv8*. The assertion above catches the target being changed; this catches a single file reaching for the registers anyway |
 
-**What this does not prove.** Nothing here runs the program. The kernel enables the
-instructions on x86_64 (`CR4.OSFXSR`, `CR4.OSXMMEXCPT`, `CR0.EM` clear), but no boot check
-executes `fptest` and grades its exit code, so a fault on the first SSE instruction would not
-be caught by this round's work. That check, and `hal::HasFpu` beneath it, are the next piece —
-and they are writable now only because a program that uses these registers can be built at all.
+Both of those keep the save, so the `{fpu}` operand is still used and the build is still
+honest; only the restore is wrong. A mutation that removed the instructions outright would
+leave the operand unused, which is a compile error rather than a check that fails.
+
+**Running it.** `kernel/main/src/fpu.rs` runs the program in a guest and grades its exit. That
+is what turns the x86_64 enable bits from a reasoned claim into a tested one: until it existed
+nothing had executed a floating-point instruction in a guest, and a fault on the first SSE
+instruction would have gone unnoticed. It now fails the boot.
+
+It then runs what the arithmetic cannot reach. Eight vector registers are loaded with values
+derived from a seed, yielded across sixty-four times and read back, while a second thread of
+the same process holds a *different* pattern in the same registers, pinned to another CPU
+where there is one. The phase runs twice with the seeds swapped, so each pattern is the graded
+one in turn. A thread whose registers were clobbered exits `210 + n` and the check names which
+register came back wrong.
+
+```
+  fpu        arithmetic ran in a hard-float program; eight vector registers held across
+             64 yields beside a thread holding others, both ways round; 0 objects left,
+             0 frames left ok
+```
+
+The load, the system call and the read-back are **one `asm!` block**, and the call is issued
+directly rather than through `abi`. In plain Rust the check would prove nothing: nothing
+obliges the compiler to keep those values in vector registers across a call, and values spilled
+to the stack and reloaded compare equal whether or not the kernel saved a single register.
+
+Only the graded thread exits. A process carries one exit code and `record_exit` keeps the first
+one recorded, so two threads racing for it would grade whichever won — which is how the first
+run of this check reported a lost register that was really a killed process.
 
 ### 3. Boot and integration tests
 

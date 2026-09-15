@@ -101,7 +101,10 @@ impl FpSimd {
         // Zero is the reset value of both FPCR and FPSR: rounding to nearest, no exception
         // trapped, no status bit set. Unlike x86, there is nothing here that must be
         // non-zero for a restore to be accepted.
-        Self { v: [0; 512], control: [0; 2] }
+        Self {
+            v: [0; 512],
+            control: [0; 2],
+        }
     }
 }
 
