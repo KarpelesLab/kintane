@@ -23,9 +23,15 @@
 //! - **Stage three** was TCP accepting: the two close orders, and a bulk round whose dropped
 //!   first segment leaves the three behind it drawing the duplicate acknowledgements the
 //!   guest's fast retransmit needs.
-//! - **Stage four**, here, is the other direction: this end opens a connection into the guest's
+//! - **Stage four** was the other direction: this end opens a connection into the guest's
 //!   listener, sends the request that server waits for, judges its reply and closes. It is the
 //!   last thing the `net` and `linux net` checks wait on.
+//! - **Stage five**, here, is the pair of things the user-mode network cannot do at all:
+//!   `SACK-permitted` on the SYN with selective acknowledgements behind it, so the guest's
+//!   sending half resends the hole and steps over what this end says it holds; and an ICMP
+//!   destination-unreachable for the quiet port, so a connected datagram socket is refused
+//!   rather than left to time out. Both halves of the guest's selective acknowledgement were
+//!   written against host tests and had never met a peer that asked for blocks or sent one.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +69,17 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
+/// TCP option kinds, as `kernel/net/src/wire.rs` spells them.
+const TCP_OPT_END: u8 = 0;
+const TCP_OPT_NOP: u8 = 1;
+const TCP_OPT_MSS: u8 = 2;
+const TCP_OPT_SACK_PERMITTED: u8 = 4;
+const TCP_OPT_SACK: u8 = 5;
+
+/// Runs one selective acknowledgement names. Three, because that is what the guest's receiver
+/// writes and reads (`wire::SACK_BLOCKS`), and a fourth would be ignored at the other end.
+const SACK_BLOCKS: usize = 3;
+
 /// The segment size this peer offers, which is the guest's own: both sit behind one
 /// 1500-byte Ethernet, so neither has reason to offer less.
 const PEER_MSS: u16 = 1460;
@@ -72,6 +89,11 @@ const PEER_MSS: u16 = 1460;
 const PEER_WINDOW: u16 = 0xffff;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
+/// Destination unreachable, and the code that says the port has nobody on it (RFC 792). The
+/// message quotes the offending IPv4 header and the eight bytes behind it, which for UDP is
+/// the ports — and those are what name the socket the refusal belongs to.
+const ICMP_UNREACHABLE: u8 = 3;
+const ICMP_PORT_UNREACHABLE: u8 = 3;
 
 /// How often the announcements go out, matching the slirp path's probe: a guest that is not
 /// listening yet has missed nothing that will not come again.
@@ -97,6 +119,19 @@ struct Seen {
     replies_reversed: u64,
     opened: u64,
     verdicts: u64,
+    /// Acknowledgements this end sent carrying selective blocks, and the runs named in them.
+    selective_acks: u64,
+    blocks_sent: u64,
+    /// Acknowledgements the guest sent carrying blocks of its own: its *receiving* half, which
+    /// stays silent for a peer that never offered `SACK-permitted` — so nothing before this
+    /// peer could draw one out.
+    guest_blocks: u64,
+    /// Data segments the guest sent a second time, and the bytes in them. What go-back-N costs
+    /// over selective recovery is the difference between this and the holes actually missing.
+    guest_retransmits: u64,
+    guest_retransmit_bytes: u64,
+    /// Datagrams to the quiet port answered with a destination-unreachable message.
+    refusals: u64,
 }
 
 /// One connection the guest opened to the service, and what this end owes it.
@@ -131,6 +166,19 @@ struct Conn {
     /// once both ends have finished: the guest acknowledges this end's FIN before sending its
     /// own, and forgetting it in between leaves that FIN unanswered and the guest in LAST-ACK.
     fin_seen: bool,
+    /// The guest offered `SACK-permitted` on its SYN, so blocks may be sent to it. Nothing is
+    /// sent to an end that did not ask — the rule the guest's own receiver keeps, and the one
+    /// a falsification turns off to watch the blocks stop.
+    sack_ok: bool,
+    /// Frames the last reply held back, sent when the guest next says anything. Holding the
+    /// front half of a reply for a round trip is what leaves the half behind it out of order
+    /// long enough for the guest's *receiver* to report it: sent in one batch, as they were
+    /// before, the hole closed in the same poll and there was never a block to send.
+    pending: Vec<Vec<u8>>,
+    /// One past the highest byte of the guest's this end has seen, dropped segments included.
+    /// A segment starting below it is one the guest is sending again, which is how a
+    /// retransmission is told from new data without keeping every segment.
+    seen_through: u32,
     /// Set when this end opened the connection into the guest's listener, which reverses who
     /// speaks first and who closes: this end sends the request, judges the reply, and finishes.
     opened: Option<Opened>,
@@ -216,7 +264,9 @@ pub fn serve(ports: NetPorts, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<
             "  net peer: {} frames in, {} ARP requests, {} answered, {} echoes answered, \
              {} acknowledgements, {} service replies, {} rounds of announcements, \
              {} connections, {} first segments dropped, {} duplicate acknowledgements, \
-             {} replies sent back to front, {} connections opened, {} verdicts sent",
+             {} replies sent back to front, {} connections opened, {} verdicts sent, \
+             {} selective acknowledgements naming {} runs, {} acknowledgements with blocks of \
+             the guest's own, {} segments the guest sent again ({} bytes), {} datagrams refused",
             s.frames,
             s.arp_requests,
             s.arp_answered,
@@ -230,6 +280,12 @@ pub fn serve(ports: NetPorts, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<
             s.replies_reversed,
             s.opened,
             s.verdicts,
+            s.selective_acks,
+            s.blocks_sent,
+            s.guest_blocks,
+            s.guest_retransmits,
+            s.guest_retransmit_bytes,
+            s.refusals,
         );
     })
 }
@@ -366,7 +422,51 @@ impl Peer {
             let tag = tag.to_vec();
             return self.listening(&tag);
         }
+        // The port nothing binds. Silence was all a guest behind the user-mode network could
+        // ever get here; a real network says so, and a connected socket is refused rather than
+        // left waiting out its timeout.
+        if to == self.ports.quiet {
+            self.seen.refusals += 1;
+            return self.unreachable(frame).into_iter().collect();
+        }
         Vec::new()
+    }
+
+    /// The destination-unreachable message for `frame`, a datagram addressed to the quiet port.
+    ///
+    /// RFC 792 has the message carry the offending IPv4 header and the eight bytes behind it,
+    /// which for UDP is its ports — and those are what tell the guest's stack which of its own
+    /// sockets the refusal belongs to. Quoting anything else must refuse nothing, which is one
+    /// of the things a falsification checks.
+    fn unreachable(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        let (ihl, _) = ipv4_header(frame)?;
+        let quoted = frame.get(14..14 + ihl + 8)?.to_vec();
+        let mac = self.guest_mac?;
+        let total = 20 + 8 + quoted.len();
+        let mut f = Vec::with_capacity(14 + total);
+        f.extend_from_slice(&mac);
+        f.extend_from_slice(&PEER_MAC);
+        f.extend_from_slice(&ETHERTYPE_IPV4);
+        f.push(0x45);
+        f.push(0);
+        f.extend_from_slice(&u16::try_from(total).ok()?.to_be_bytes());
+        f.extend_from_slice(&self.next_id().to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.push(64);
+        f.push(PROTO_ICMP);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&GATEWAY);
+        f.extend_from_slice(&GUEST);
+        let sum = ipv4_checksum(f.get(14..34)?);
+        f[24..26].copy_from_slice(&sum.to_be_bytes());
+        f.push(ICMP_UNREACHABLE);
+        f.push(ICMP_PORT_UNREACHABLE);
+        f.extend_from_slice(&[0, 0]); // the checksum, once the body is whole
+        f.extend_from_slice(&[0, 0, 0, 0]); // unused, per RFC 792
+        f.extend_from_slice(&quoted);
+        let sum = ipv4_checksum(f.get(34..)?);
+        f[36..38].copy_from_slice(&sum.to_be_bytes());
+        Some(f)
     }
 
     /// The ports and payload of a datagram addressed to [`GATEWAY`], or nothing.
@@ -426,6 +526,10 @@ impl Peer {
             replied: false,
             fin_sent: false,
             fin_seen: false,
+            // Settled by the guest's SYN-ACK, which this end has not seen yet.
+            sack_ok: false,
+            pending: Vec::new(),
+            seen_through: 0,
             opened: Some(Opened {
                 tag: tag.to_vec(),
                 established: false,
@@ -439,7 +543,7 @@ impl Peer {
     }
 
     /// Finish the handshake of a connection this end opened, and send its request.
-    fn established(&mut self, i: usize, seq: u32) -> Vec<Vec<u8>> {
+    fn established(&mut self, i: usize, seq: u32, sack_ok: bool) -> Vec<Vec<u8>> {
         let tag = {
             let c = &mut self.conns[i];
             let Some(o) = c.opened.as_mut() else {
@@ -451,6 +555,9 @@ impl Peer {
             o.established = true;
             let tag = o.tag.clone();
             c.rcv_nxt = seq.wrapping_add(1);
+            // The guest's SYN-ACK settles whether blocks may be sent to it.
+            c.sack_ok = sack_ok;
+            c.seen_through = c.rcv_nxt;
             tag
         };
         let (port, local, snd, rcv) = {
@@ -585,7 +692,10 @@ impl Peer {
             return Vec::new();
         }
         if seg.flags & TCP_SYN != 0 && seg.flags & TCP_ACK == 0 {
-            return self.accept(seg.guest_port, seg.seq).into_iter().collect();
+            return self
+                .accept(seg.guest_port, seg.seq, seg.sack_permitted)
+                .into_iter()
+                .collect();
         }
         let Some(i) = self
             .conns
@@ -596,9 +706,16 @@ impl Peer {
         };
         // The answer to a SYN this end sent: the handshake finishes and the request goes.
         if seg.flags & TCP_SYN != 0 {
-            return self.established(i, seg.seq);
+            return self.established(i, seg.seq, seg.sack_permitted);
         }
-        let mut out = Vec::new();
+        // Blocks of the guest's own: its receiver reporting what it holds past a hole, which it
+        // sends only to an end that offered `SACK-permitted`.
+        if seg.blocks > 0 {
+            self.seen.guest_blocks += 1;
+        }
+        // Whatever the last reply held back goes now: the guest has spoken, so the run in front
+        // of it has been out of order for a round trip and reported.
+        let mut out: Vec<Vec<u8>> = core::mem::take(&mut self.conns[i].pending);
         if !seg.payload.is_empty() {
             out.extend(self.data(i, seg.seq, &seg.payload));
         }
@@ -622,7 +739,7 @@ impl Peer {
     ///
     /// A SYN for a connection already open is the guest sending it again, so the same answer
     /// goes back rather than a second connection appearing.
-    fn accept(&mut self, guest_port: u16, seq: u32) -> Option<Vec<u8>> {
+    fn accept(&mut self, guest_port: u16, seq: u32, sack_ok: bool) -> Option<Vec<u8>> {
         if let Some(c) = self.conns.iter().find(|c| c.guest_port == guest_port) {
             let (snd, rcv, local) = (c.snd_nxt.wrapping_sub(1), c.rcv_nxt, c.local_port);
             return self.tcp_frame(local, guest_port, snd, rcv, TCP_SYN | TCP_ACK, &[]);
@@ -641,6 +758,9 @@ impl Peer {
             replied: false,
             fin_sent: false,
             fin_seen: false,
+            sack_ok,
+            pending: Vec::new(),
+            seen_through: seq.wrapping_add(1),
             opened: None,
         });
         self.seen.connections += 1;
@@ -650,6 +770,24 @@ impl Peer {
 
     /// Take one data segment, and answer it.
     fn data(&mut self, i: usize, seq: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+        // A segment starting below everything seen so far is one the guest is sending again.
+        // Counted before the drop below, so the segment this end withholds is still on record
+        // as having been seen: what comes back for it is a retransmission, not new data.
+        let end = seq.wrapping_add(payload.len() as u32);
+        let again = {
+            let c = &self.conns[i];
+            c.seen_through != 0 && before(seq, c.seen_through)
+        };
+        if again {
+            self.seen.guest_retransmits += 1;
+            self.seen.guest_retransmit_bytes += payload.len() as u64;
+        }
+        {
+            let c = &mut self.conns[i];
+            if c.seen_through == 0 || before(c.seen_through, end) {
+                c.seen_through = end;
+            }
+        }
         let c = &mut self.conns[i];
         // The dropped first segment is the service's disturbance. A connection this end opened
         // carries the guest's reply, and losing that would slow the exchange with no check
@@ -679,8 +817,16 @@ impl Peer {
             self.seen.duplicate_acks += 1;
         }
         let (port, local, snd, rcv) = (c.guest_port, c.local_port, c.snd_nxt, c.rcv_nxt);
+        // What is held past the hole, named so the guest resends the hole and steps over the
+        // rest. Without these the same acknowledgement says only "still waiting", and the
+        // guest has nothing to go on but go-back-N.
+        let blocks = held_blocks(&self.conns[i]);
+        if !blocks.is_empty() {
+            self.seen.selective_acks += 1;
+            self.seen.blocks_sent += blocks.len() as u64;
+        }
         let mut out: Vec<Vec<u8>> = self
-            .tcp_frame(local, port, snd, rcv, TCP_ACK, &[])
+            .tcp_frame_with(local, port, snd, rcv, TCP_ACK, &blocks, &[])
             .into_iter()
             .collect();
         out.extend(self.reply(i));
@@ -712,10 +858,14 @@ impl Peer {
         let (first, second) = (first.to_vec(), second.to_vec());
         let second_at = snd.wrapping_add(first.len() as u32);
         let mut out = Vec::new();
-        // The half in front goes second, so the guest holds it and joins it when the rest
-        // arrives.
+        // The half in front is held back until the guest has spoken again, so the half behind
+        // it sits out of order for a whole round trip — long enough for the guest's receiver to
+        // report it in blocks of its own, which is the half of selective acknowledgement no
+        // boot had ever drawn out. Sent together, as they were before, the hole closed in the
+        // same poll and there was nothing left to report.
         out.extend(self.tcp_frame(local, port, second_at, rcv, TCP_ACK | TCP_PSH, &second));
-        out.extend(self.tcp_frame(local, port, snd, rcv, TCP_ACK | TCP_PSH, &first));
+        let mut held_back: Vec<Vec<u8>> = Vec::new();
+        held_back.extend(self.tcp_frame(local, port, snd, rcv, TCP_ACK | TCP_PSH, &first));
         let c = &mut self.conns[i];
         c.snd_nxt = c.snd_nxt.wrapping_add(reply.len() as u32);
         c.replied = true;
@@ -723,9 +873,12 @@ impl Peer {
         if peer_closes {
             c.fin_sent = true;
             let (port, local, snd, rcv) = (c.guest_port, c.local_port, c.snd_nxt, c.rcv_nxt);
-            out.extend(self.tcp_frame(local, port, snd, rcv, TCP_ACK | TCP_FIN, &[]));
+            // Behind the half it follows, or the guest would hold a FIN past a hole — which its
+            // stack does not remember, so it would have to be sent again.
+            held_back.extend(self.tcp_frame(local, port, snd, rcv, TCP_ACK | TCP_FIN, &[]));
             self.conns[i].snd_nxt = snd.wrapping_add(1);
         }
+        self.conns[i].pending = held_back;
         out
     }
 
@@ -764,14 +917,39 @@ impl Peer {
         flags: u8,
         payload: &[u8],
     ) -> Option<Vec<u8>> {
+        self.tcp_frame_with(from, guest_port, seq, ack, flags, &[], payload)
+    }
+
+    /// One TCP segment, naming `blocks` as a selective acknowledgement.
+    #[allow(clippy::too_many_arguments)]
+    fn tcp_frame_with(
+        &mut self,
+        from: u16,
+        guest_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        blocks: &[(u32, u32)],
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
         let mac = self.guest_mac?;
-        // The segment size option goes on a SYN, by custom and because that is the only
-        // segment the guest reads it from.
-        let options: &[u8] = if flags & TCP_SYN != 0 {
-            &[2, 4, (PEER_MSS >> 8) as u8, PEER_MSS as u8]
-        } else {
-            &[]
-        };
+        // The segment size and `SACK-permitted` go on a SYN, by custom and because that is the
+        // only segment the guest reads them from; blocks go on everything else, since a SYN has
+        // nothing held to report. Each option is padded to a whole header word.
+        let mut options: Vec<u8> = Vec::new();
+        if flags & TCP_SYN != 0 {
+            options.extend_from_slice(&[TCP_OPT_MSS, 4, (PEER_MSS >> 8) as u8, PEER_MSS as u8]);
+            options.extend_from_slice(&[TCP_OPT_NOP, TCP_OPT_NOP, TCP_OPT_SACK_PERMITTED, 2]);
+        } else if !blocks.is_empty() {
+            let named = &blocks[..blocks.len().min(SACK_BLOCKS)];
+            let len = 2 + 8 * named.len();
+            options.extend_from_slice(&[TCP_OPT_NOP, TCP_OPT_NOP, TCP_OPT_SACK, len as u8]);
+            for (start, end) in named {
+                options.extend_from_slice(&start.to_be_bytes());
+                options.extend_from_slice(&end.to_be_bytes());
+            }
+        }
+        let options = &options[..];
         let header = 20 + options.len();
         let total = 20 + header + payload.len();
         let mut f = Vec::with_capacity(14 + total);
@@ -822,7 +1000,11 @@ impl Peer {
         let seq = u32::from_be_bytes(frame.get(at + 4..at + 8)?.try_into().ok()?);
         let ack = u32::from_be_bytes(frame.get(at + 8..at + 12)?.try_into().ok()?);
         let header = usize::from(frame.get(at + 12)? >> 4) * 4;
+        if header < 20 {
+            return None;
+        }
         let flags = *frame.get(at + 13)?;
+        let (sack_permitted, blocks) = tcp_options(frame.get(at + 20..at + header)?);
         let payload = frame.get(at + header..14 + total)?.to_vec();
         Some(Segment {
             guest_port,
@@ -830,6 +1012,8 @@ impl Peer {
             seq,
             ack,
             flags,
+            sack_permitted,
+            blocks,
             payload,
         })
     }
@@ -847,7 +1031,75 @@ struct Segment {
     seq: u32,
     ack: u32,
     flags: u8,
+    /// The guest offered selective acknowledgement on this SYN.
+    sack_permitted: bool,
+    /// Runs the guest says it holds past its own hole: its receiving half speaking.
+    blocks: usize,
     payload: Vec<u8>,
+}
+
+/// `a` comes before `b` in sequence space, which wraps.
+fn before(a: u32, b: u32) -> bool {
+    a != b && b.wrapping_sub(a) < 1 << 31
+}
+
+/// Whether the options offer `SACK-permitted`, and how many selective blocks they carry.
+///
+/// Every option's length is checked against the bytes actually there before it is stepped
+/// over, so a malformed one ends the walk rather than reading past the header.
+fn tcp_options(opts: &[u8]) -> (bool, usize) {
+    let (mut permitted, mut blocks) = (false, 0);
+    let mut at = 0;
+    while at < opts.len() {
+        match opts[at] {
+            TCP_OPT_END => break,
+            TCP_OPT_NOP => at += 1,
+            kind => {
+                let Some(&len) = opts.get(at + 1) else { break };
+                let n = usize::from(len);
+                if n < 2 || at + n > opts.len() {
+                    break;
+                }
+                if kind == TCP_OPT_SACK_PERMITTED && n == 2 {
+                    permitted = true;
+                }
+                // Whole blocks and nothing else, as the guest's own parser requires.
+                if kind == TCP_OPT_SACK && n >= 10 && (n - 2) % 8 == 0 {
+                    blocks = (n - 2) / 8;
+                }
+                at += n;
+            }
+        }
+    }
+    (permitted, blocks)
+}
+
+/// The runs `c` holds past its hole, coalesced and nearest first: what a selective
+/// acknowledgement names.
+///
+/// Empty for a guest that never offered `SACK-permitted`, because blocks belong to the end
+/// that asked for them — the same rule the guest's own receiver keeps.
+fn held_blocks(c: &Conn) -> Vec<(u32, u32)> {
+    if !c.sack_ok || c.held.is_empty() {
+        return Vec::new();
+    }
+    let mut held: Vec<(u32, u32)> = c
+        .held
+        .iter()
+        .map(|(at, bytes)| (*at, at.wrapping_add(bytes.len() as u32)))
+        .collect();
+    // In sequence order from the hole, so runs that meet are joined and the nearest — the one
+    // the guest's stream needs first — is named first.
+    held.sort_by_key(|(at, _)| at.wrapping_sub(c.rcv_nxt));
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in held {
+        match runs.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => runs.push((start, end)),
+        }
+    }
+    runs.truncate(SACK_BLOCKS);
+    runs
 }
 
 /// A segment's checksum over the IPv4 pseudo-header, for a frame whose IPv4 header is five
@@ -1085,11 +1337,33 @@ mod tests {
     }
 
     #[test]
-    fn the_quiet_port_answers_nothing() {
+    fn the_quiet_port_refuses_rather_than_answering() {
         let mut p = peer();
-        let frame = datagram(GATEWAY, 49152, p.ports.quiet, b"kintane-udp-request 42");
-        assert!(p.udp(&frame).is_empty());
-        assert_eq!(p.seen.service_replies, 0);
+        let quiet = p.ports.quiet;
+        let frame = datagram(GATEWAY, 49152, quiet, b"kintane-udp-request 42");
+        let out = p.udp(&frame);
+        assert_eq!(out.len(), 1, "a refusal, not a reply");
+        assert_eq!(p.seen.service_replies, 0, "nothing answered the datagram itself");
+        assert_eq!(p.seen.refusals, 1);
+        let m = &out[0];
+        assert_eq!(m[23], PROTO_ICMP);
+        let (ihl, total) = ipv4_header(m).expect("a whole datagram");
+        let icmp = 14 + ihl;
+        assert_eq!(m[icmp], ICMP_UNREACHABLE);
+        assert_eq!(m[icmp + 1], ICMP_PORT_UNREACHABLE);
+        assert_eq!(&m[26..30], &GATEWAY, "from the gateway");
+        assert_eq!(&m[30..34], &GUEST, "to the guest");
+        // A checksum computed over a message that carries its own is zero when it is right.
+        assert_eq!(ipv4_checksum(&m[14..14 + ihl]), 0);
+        assert_eq!(ipv4_checksum(&m[icmp..14 + total]), 0);
+        // The quoted header and the eight bytes behind it, which is what names the socket the
+        // refusal belongs to: our datagram, and the two ports it carried.
+        let quoted = icmp + 8;
+        assert_eq!(&m[quoted + 12..quoted + 16], &GUEST, "the datagram was the guest's");
+        assert_eq!(&m[quoted + 16..quoted + 20], &GATEWAY);
+        let ports = quoted + 20;
+        assert_eq!(u16::from_be_bytes([m[ports], m[ports + 1]]), 49152, "from");
+        assert_eq!(u16::from_be_bytes([m[ports + 2], m[ports + 3]]), quiet, "to");
     }
 
     #[test]
@@ -1154,6 +1428,161 @@ mod tests {
         f.extend_from_slice(&[0, 0]);
         f.extend_from_slice(payload);
         f
+    }
+
+    /// The four option bytes that offer selective acknowledgement, padded as they go on a SYN.
+    const SACK_PERMITTED_OPT: [u8; 4] = [TCP_OPT_NOP, TCP_OPT_NOP, TCP_OPT_SACK_PERMITTED, 2];
+
+    /// One segment from the guest carrying `options`, which must be a whole number of words.
+    #[allow(clippy::too_many_arguments)]
+    fn segment_opts(
+        from: u16,
+        to: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        assert_eq!(options.len() % 4, 0, "a header is a whole number of words");
+        let header = 20 + options.len();
+        let total = 20 + header + payload.len();
+        let mut f = Vec::with_capacity(14 + total);
+        f.extend_from_slice(&PEER_MAC);
+        f.extend_from_slice(&GUEST_MAC);
+        f.extend_from_slice(&ETHERTYPE_IPV4);
+        f.push(0x45);
+        f.push(0);
+        f.extend_from_slice(&(total as u16).to_be_bytes());
+        f.extend_from_slice(&[0, 1]);
+        f.extend_from_slice(&[0, 0]);
+        f.push(64);
+        f.push(PROTO_TCP);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&GUEST);
+        f.extend_from_slice(&GATEWAY);
+        f.extend_from_slice(&from.to_be_bytes());
+        f.extend_from_slice(&to.to_be_bytes());
+        f.extend_from_slice(&seq.to_be_bytes());
+        f.extend_from_slice(&ack.to_be_bytes());
+        f.push(((header / 4) as u8) << 4);
+        f.push(flags);
+        f.extend_from_slice(&[0xff, 0xff]);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(options);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// The selective blocks a segment this end sent names.
+    fn blocks_of(frame: &[u8]) -> Vec<(u32, u32)> {
+        let (ihl, _) = ipv4_header(frame).expect("a whole datagram");
+        let at = 14 + ihl;
+        let header = usize::from(frame[at + 12] >> 4) * 4;
+        let opts = &frame[at + 20..at + header];
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < opts.len() {
+            match opts[i] {
+                TCP_OPT_END => break,
+                TCP_OPT_NOP => i += 1,
+                kind => {
+                    let n = usize::from(opts[i + 1]);
+                    if kind == TCP_OPT_SACK {
+                        let mut b = i + 2;
+                        while b + 8 <= i + n {
+                            let word =
+                                |o: usize| u32::from_be_bytes(opts[o..o + 4].try_into().unwrap());
+                            out.push((word(b), word(b + 4)));
+                            b += 8;
+                        }
+                    }
+                    i += n;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_handshake_offers_selective_acknowledgement() {
+        let mut p = peer();
+        let service = p.ports.tcp;
+        let syn = segment_opts(40000, service, 500, 0, TCP_SYN, &SACK_PERMITTED_OPT, &[]);
+        let out = p.tcp(&syn);
+        assert_eq!(out.len(), 1, "the handshake");
+        let (ihl, _) = ipv4_header(&out[0]).expect("a whole datagram");
+        let at = 14 + ihl;
+        let header = usize::from(out[0][at + 12] >> 4) * 4;
+        let (permitted, blocks) = tcp_options(&out[0][at + 20..at + header]);
+        assert!(permitted, "the guest is told it may act on blocks");
+        assert_eq!(blocks, 0, "a SYN has nothing held to report");
+        // The segment size is still offered beside it: 1460, high byte first.
+        assert_eq!(&out[0][at + 20..at + 24], &[TCP_OPT_MSS, 4, 0x05, 0xb4]);
+    }
+
+    #[test]
+    fn the_runs_held_past_a_hole_are_named_nearest_first_and_joined() {
+        let mut p = peer();
+        let (guest, isn) = (40001u16, 900u32);
+        let service = p.ports.tcp;
+        let syn = segment_opts(guest, service, isn, 0, TCP_SYN, &SACK_PERMITTED_OPT, &[]);
+        assert_eq!(p.tcp(&syn).len(), 1);
+        let first = isn + 1;
+        let seg = |n: u32, body: &'static [u8]| {
+            segment_opts(guest, service, first + n, 0, TCP_ACK | TCP_PSH, &[], body)
+        };
+        // The first in-order segment is the one this end drops, so everything behind it lands
+        // past a hole and has somewhere to be held.
+        assert!(p.tcp(&seg(0, b"aa")).is_empty(), "dropped, and in silence");
+        let out = p.tcp(&seg(4, b"ee"));
+        assert_eq!(blocks_of(&out[0]), vec![(first + 4, first + 6)], "the one run held");
+        // A run that meets the one already held is joined to it rather than named twice.
+        let out = p.tcp(&seg(2, b"cc"));
+        assert_eq!(
+            blocks_of(&out[0]),
+            vec![(first + 2, first + 6)],
+            "adjacent runs are one block, and the nearest comes first"
+        );
+        assert_eq!(p.seen.selective_acks, 2);
+    }
+
+    #[test]
+    fn a_guest_that_offered_nothing_is_sent_no_blocks() {
+        let mut p = peer();
+        let (guest, isn) = (40003u16, 700u32);
+        let service = p.ports.tcp;
+        // A SYN with no options at all: this guest never asked for selective acknowledgement,
+        // so nothing may be sent to it however much is held.
+        assert_eq!(
+            p.tcp(&segment_from(guest, service, isn, 0, TCP_SYN, &[]))
+                .len(),
+            1
+        );
+        let first = isn + 1;
+        assert!(
+            p.tcp(&segment_from(guest, service, first, 0, TCP_ACK | TCP_PSH, b"aa"))
+                .is_empty()
+        );
+        let out = p.tcp(&segment_from(guest, service, first + 4, 0, TCP_ACK | TCP_PSH, b"ee"));
+        assert!(blocks_of(&out[0]).is_empty(), "it never asked for them");
+        assert_eq!(p.seen.blocks_sent, 0);
+    }
+
+    #[test]
+    fn blocks_the_guest_sends_of_its_own_are_counted() {
+        let mut p = peer();
+        let (guest, isn) = (40004u16, 300u32);
+        let service = p.ports.tcp;
+        let syn = segment_opts(guest, service, isn, 0, TCP_SYN, &SACK_PERMITTED_OPT, &[]);
+        assert_eq!(p.tcp(&syn).len(), 1);
+        // The guest's own receiver reporting a run it holds past a hole of its own.
+        let mut option = vec![TCP_OPT_NOP, TCP_OPT_NOP, TCP_OPT_SACK, 10];
+        option.extend_from_slice(&100u32.to_be_bytes());
+        option.extend_from_slice(&200u32.to_be_bytes());
+        let _ = p.tcp(&segment_opts(guest, service, isn + 1, 0, TCP_ACK, &option, &[]));
+        assert_eq!(p.seen.guest_blocks, 1);
     }
 
     #[test]
