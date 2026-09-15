@@ -367,7 +367,7 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
                     continue;
                 };
                 let console = Some(s.bound().node()) == console_node;
-                ok &= wire(c, chip, drv, s, console);
+                ok &= wire(c, chip, drv, s, console, &tree);
             }
         }
         None => {
@@ -448,8 +448,19 @@ fn wire(
     drv: &dyn Driver,
     started: &Started,
     console: bool,
+    tree: &DeviceTree<'_, '_>,
 ) -> bool {
     let Some((line, handler)) = drv.interrupt(started.bound()) else {
+        // Right for a device that declares no interrupt; wrong for one that does, which has
+        // asked for a line and not been given one. Every other outcome below prints, and
+        // this one staying quiet is what hid a disk brought up with no handler.
+        // The same lookup `Probe::claim_irq` makes, so a node whose specifier is routed
+        // rather than declared as a property is still named.
+        if tree.interrupt(started.bound().node(), 0).is_ok() {
+            c.write_str("; ");
+            c.write_str(drv.name());
+            c.write_str(" WIRED NO INTERRUPT THOUGH ITS NODE DECLARES ONE");
+        }
         return true;
     };
     let Ok(number) = gic::translate(line.specifier().cells()) else {

@@ -147,8 +147,23 @@ fn on_disk_interrupt(i: usize) {
     {
         return;
     }
-    if let Some(d) = disk_at(i) {
-        d.on_interrupt();
+    if let Some(d) = disk_at(i)
+        && d.on_interrupt()
+    {
+        return;
+    }
+    // Not this disk's, so try the others: a second PCI function on the same INTx line is
+    // refused its own claim (`ClaimError::IrqTaken`) and therefore has no handler of its
+    // own. Its status register is acknowledged only by a handler reaching *that* device, so
+    // without this the line it shares stays asserted and the interrupt path is re-entered
+    // for good the first time interrupts are unmasked.
+    for j in 0..virtio_blk::MAX_DISKS {
+        if j != i
+            && let Some(d) = disk_at(j)
+            && d.on_interrupt()
+        {
+            return;
+        }
     }
 }
 
@@ -304,6 +319,15 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         // SAFETY: once per slot, on the boot path, before any interrupt can be delivered for
         // the line: interrupts are masked here, and the first request is submitted below.
         let _ = unsafe { virtio_blk::set_handler(i, TRAMPOLINES[i]) };
+        // A disk whose line another device already holds is refused its own claim, so the
+        // platform wires nothing for it and it has no handler. Say so here: it is the
+        // difference between a disk that is polled by design and one whose completions
+        // nothing will ever acknowledge.
+        if virtio_blk::irq_refused(i) {
+            c.write_str("; disk ");
+            write_usize(c, i);
+            c.write_str(" SHARES A HELD LINE, serviced through its holder");
+        }
         if disk_at(i).is_none() {
             c.write_str("; the disk could not be read back after it was stored");
             return Check::Failed;

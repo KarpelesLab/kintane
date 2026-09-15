@@ -522,6 +522,20 @@ pub fn window(i: usize) -> Option<(u64, u64)> {
     DISKS.get(i)?.claims.get().map(Claims::window)
 }
 
+/// Whether disk `i` declared an interrupt it could not claim, because another device already
+/// holds that line.
+///
+/// The disk is still usable — bring-up and the checks poll — but it has no handler of its
+/// own, so nothing reaches *that* device to read its status register. On a level-triggered
+/// line that makes its first completion permanent; see `block::on_disk_interrupt`, which
+/// services every started disk for exactly this reason.
+pub fn irq_refused(i: usize) -> bool {
+    DISKS
+        .get(i)
+        .and_then(|d| d.claims.get())
+        .is_some_and(Claims::irq_refused)
+}
+
 /// The MSI-X table entry disk `i`'s interrupt was claimed as, if it was one: what
 /// [`VirtioBlk::bring_up_with_vector`] is given once the platform has wired it.
 pub fn msix_entry(i: usize) -> Option<u16> {
