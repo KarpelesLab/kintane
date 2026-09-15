@@ -6,15 +6,15 @@ section .rodata 200664
 section .stack 32768
 section .text 937984
 section .thread_stacks 491520
-crate (anonymous) text 0 rodata 56900 data 0 bss 0
-crate (unmangled) text 15500 rodata 0 data 1024 bss 32
+crate (anonymous) text 0 rodata 56778 data 0 bss 0
+crate (unmangled) text 14523 rodata 0 data 1024 bss 32
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 6835 rodata 0 data 0 bss 0
 crate acpi text 56552 rodata 0 data 0 bss 0
 crate apic text 6406 rodata 0 data 304 bss 232
 crate arch text 42236 rodata 0 data 2257 bss 148249
 crate bcache text 5555 rodata 0 data 0 bss 0
-crate block text 2052 rodata 0 data 0 bss 0
+crate block text 2658 rodata 0 data 0 bss 0
 crate bootinfo text 2574 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
@@ -24,10 +24,10 @@ crate elf text 3249 rodata 0 data 0 bss 0
 crate fat text 35787 rodata 0 data 0 bss 0
 crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
-crate ipc text 9324 rodata 16 data 0 bss 0
+crate ipc text 3007 rodata 16 data 0 bss 0
 crate kalloc text 13955 rodata 0 data 0 bss 0
-crate kintane text 422379 rodata 272 data 94408 bss 153555
-crate kobject text 6089 rodata 16 data 0 bss 0
+crate kintane text 422225 rodata 272 data 94408 bss 153555
+crate kobject text 6354 rodata 16 data 0 bss 0
 crate linux text 11893 rodata 0 data 0 bss 0
 crate mm text 38737 rodata 0 data 0 bss 0
 crate module text 18869 rodata 0 data 0 bss 0
@@ -37,8 +37,8 @@ crate platform text 39225 rodata 112 data 181010 bss 2922
 crate rfind text 296 rodata 0 data 0 bss 0
 crate sched text 3932 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
-crate sync text 17387 rodata 32 data 1088 bss 2176
-crate thread text 10333 rodata 0 data 0 bss 0
+crate sync text 23242 rodata 32 data 1088 bss 2176
+crate thread text 10468 rodata 0 data 0 bss 0
 crate time text 3222 rodata 0 data 0 bss 0
 crate trim_matches text 903 rodata 0 data 0 bss 0
 crate uart16550 text 2152 rodata 0 data 256 bss 88

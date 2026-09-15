@@ -4,17 +4,17 @@ section .data 280696
 section .note.kintane 36
 section .rodata 200664
 section .stack 32768
-section .text 954368
+section .text 958464
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 57119 data 0 bss 0
-crate (unmangled) text 10886 rodata 0 data 1024 bss 0
+crate (anonymous) text 0 rodata 56970 data 0 bss 0
+crate (unmangled) text 11870 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 6835 rodata 0 data 0 bss 0
 crate acpi text 57173 rodata 0 data 0 bss 0
 crate apic text 6406 rodata 0 data 304 bss 232
 crate arch text 39780 rodata 0 data 2145 bss 90905
 crate bcache text 5555 rodata 0 data 0 bss 0
-crate block text 2052 rodata 0 data 0 bss 0
+crate block text 2658 rodata 0 data 0 bss 0
 crate bootinfo text 2574 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
@@ -26,7 +26,7 @@ crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
 crate ipc text 3007 rodata 16 data 0 bss 0
 crate kalloc text 13896 rodata 0 data 0 bss 0
-crate kintane text 451928 rodata 240 data 94296 bss 141832
+crate kintane text 453308 rodata 240 data 94296 bss 141832
 crate kobject text 6350 rodata 16 data 0 bss 0
 crate linux text 11893 rodata 0 data 0 bss 0
 crate map text 348 rodata 0 data 0 bss 0
@@ -52,4 +52,4 @@ crate virtio_blk text 7550 rodata 32 data 384 bss 0
 crate virtio_blk_core text 2651 rodata 0 data 0 bss 0
 crate virtio_net text 4393 rodata 16 data 176 bss 8
 crate vtd text 7044 rodata 0 data 0 bss 0
-total 2005108
+total 2009204
