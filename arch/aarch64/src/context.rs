@@ -114,15 +114,29 @@ impl Default for FpSimd {
     }
 }
 
-/// Bytes of the state a signal frame carries: the 32 V registers, then `FPSR` and `FPCR` as
-/// two words. Not `size_of::<FpSimd>()`: the frame's order is Linux's, which puts the control
-/// words first, and the two must not be confused.
-pub const FPSIMD_BYTES: usize = 512 + 8;
+/// Bytes of the state a signal frame carries: `FPSR` and `FPCR` as 32-bit fields, then the 32
+/// V registers. Not `size_of::<FpSimd>()`, and not the order the assembly below uses either —
+/// see [`save_live`].
+pub const FPSIMD_BYTES: usize = 8 + 512;
 
-/// Offsets inside the byte image above.
-const VREGS: usize = 0;
-const FPSR_AT: usize = 512;
-const FPCR_AT: usize = 516;
+/// Offsets in the image the **frame** carries, which is Linux's `fpsimd_context` order.
+const FPSR_AT: usize = 0;
+const FPCR_AT: usize = 4;
+const VREGS: usize = 8;
+
+/// Offsets in the aligned buffer the **assembly** below uses, which is not the same thing.
+///
+/// `stp q`/`ldp q` fault on an address that is not 16-byte aligned. In a frame the record's
+/// header sits at offset 592 and Linux puts V0 at 608, so neither the state's start nor V0 is
+/// 16-aligned and the pairs cannot address them at all. The registers are therefore moved
+/// through a buffer of this port's own choosing — V registers first, on a 16-byte boundary,
+/// control words after — and permuted into Linux's order on the way out, and back on the way
+/// in. Getting this wrong is not loud: the two layouts differ by eight bytes, so every V
+/// register lands one slot from where a program reads it, and a handler that edits `d0` edits
+/// what the kernel calls `v1`. That is the bug this comment exists to prevent repeating.
+const BUF_VREGS: usize = 0;
+const BUF_FPSR: usize = 512;
+const BUF_FPCR: usize = 516;
 
 core::arch::global_asm!(
     r#"
@@ -206,7 +220,10 @@ pub fn save_live(out: &mut [u8]) {
     // SAFETY: `image` is 16-aligned by `repr(align(16))` and holds the 520 bytes the routine
     // writes. Boot set `CPACR_EL1.FPEN`, so reaching the registers does not trap.
     unsafe { aarch64_fpsimd_save(image.0.as_mut_ptr()) };
-    out[..FPSIMD_BYTES].copy_from_slice(&image.0);
+    // Into Linux's order: the control words first, then the registers. See the offsets above.
+    out[FPSR_AT..FPSR_AT + 4].copy_from_slice(&image.0[BUF_FPSR..BUF_FPSR + 4]);
+    out[FPCR_AT..FPCR_AT + 4].copy_from_slice(&image.0[BUF_FPCR..BUF_FPCR + 4]);
+    out[VREGS..VREGS + 512].copy_from_slice(&image.0[BUF_VREGS..BUF_VREGS + 512]);
 }
 
 /// Load `bytes` into the running CPU's V registers and control words.
@@ -222,14 +239,17 @@ pub fn load_live(bytes: &[u8]) {
     #[repr(C, align(16))]
     struct Image([u8; FPSIMD_BYTES]);
     let mut image = Image([0; FPSIMD_BYTES]);
-    image.0.copy_from_slice(&bytes[..FPSIMD_BYTES]);
+    // Out of Linux's order and into the one the assembly below addresses.
+    image.0[BUF_VREGS..BUF_VREGS + 512].copy_from_slice(&bytes[VREGS..VREGS + 512]);
+    image.0[BUF_FPSR..BUF_FPSR + 4].copy_from_slice(&bytes[FPSR_AT..FPSR_AT + 4]);
+    image.0[BUF_FPCR..BUF_FPCR + 4].copy_from_slice(&bytes[FPCR_AT..FPCR_AT + 4]);
     let fpcr = u32::from_le_bytes([
-        image.0[FPCR_AT],
-        image.0[FPCR_AT + 1],
-        image.0[FPCR_AT + 2],
-        image.0[FPCR_AT + 3],
+        image.0[BUF_FPCR],
+        image.0[BUF_FPCR + 1],
+        image.0[BUF_FPCR + 2],
+        image.0[BUF_FPCR + 3],
     ]) & FPCR_MASK;
-    image.0[FPCR_AT..FPCR_AT + 4].copy_from_slice(&fpcr.to_le_bytes());
+    image.0[BUF_FPCR..BUF_FPCR + 4].copy_from_slice(&fpcr.to_le_bytes());
     // SAFETY: `image` is 16-aligned and holds the 520 bytes the routine reads, with `FPCR`
     // masked to defined bits. Every V register byte is a value the register may hold.
     unsafe { aarch64_fpsimd_load(image.0.as_ptr()) };
@@ -240,10 +260,18 @@ pub fn load_live(bytes: &[u8]) {
 const FPCR_MASK: u32 = 0x07ff_9f00;
 
 const _: () = {
-    assert!(VREGS == 0);
-    assert!(FPSR_AT == 512);
-    assert!(FPCR_AT == 516);
+    // The frame's order is Linux's: `fpsr`, `fpcr`, then the registers.
+    assert!(FPSR_AT == 0);
+    assert!(FPCR_AT == 4);
+    assert!(VREGS == 8);
+    // The buffer's order is this port's, chosen so `stp q` has a 16-aligned address.
+    assert!(BUF_VREGS == 0);
+    assert!(BUF_FPSR == 512);
+    assert!(BUF_FPCR == 516);
+    // Both hold the same bytes, in different places.
     assert!(FPSIMD_BYTES == 520);
+    assert!(VREGS + 512 == FPSIMD_BYTES);
+    assert!(BUF_FPCR + 4 == FPSIMD_BYTES);
 };
 
 /// The callee-saved state of a suspended thread.

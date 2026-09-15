@@ -1034,6 +1034,14 @@ pub(super) fn sigreturn(
 
 // ---- the check ----------------------------------------------------------------------------
 
+/// `argv` for the program's floating-point mode, and its exit code when every step behaved;
+/// mirror `user/linux-hello/src/main.rs`.
+const FP_ARGV: [&[u8]; 2] = [b"hello", b"fp"];
+const FP_SUCCESS: u64 = 60;
+/// What that mode does at least: two handlers that return, and one child ended by a signal —
+/// the one whose `rt_sigreturn` handed back a frame this kernel refused.
+const FP_HANDLERS: u64 = 2;
+
 /// `argv` for the program's signals mode, and its exit code when every step behaved; mirror
 /// `user/linux-hello/src/main.rs`.
 const SIGNALS_ARGV: [&[u8]; 2] = [b"hello", b"signals"];
@@ -1103,6 +1111,56 @@ pub(super) fn rtsig_check(c: &dyn EarlyConsole) -> Check {
     }
     let clean = super::report_run(c, &run);
     Check::from_ok(run.code == Some(RTSIG_SUCCESS) && counted && clean)
+}
+
+/// Run the program in its floating-point mode and grade it. On the boot thread, after the
+/// real-time run, whose slot and stacks it reuses.
+///
+/// This is the check that says the frame's floating-point state is *carried* rather than merely
+/// shaped. Every other Linux check passes with `save_live` and `load_live` as no-ops, because no
+/// other mode puts a value in a vector register and looks at it again: the frame would still be
+/// the right size, the record would still be well-formed, and the bytes would still be zero.
+/// The three things graded here are the three that a no-op fails.
+pub(super) fn fp_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux fp   ");
+    let before = [&HANDLED, &RETURNED, &SIGNAL_ENDS].map(|n| n.load(Ordering::Relaxed));
+    let run = match super::run_mode(&FP_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
+    let after = [&HANDLED, &RETURNED, &SIGNAL_ENDS].map(|n| n.load(Ordering::Relaxed));
+    let [handled, returned, ends] = [0, 1, 2].map(|i| after[i] - before[i]);
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(FP_SUCCESS)) => c.write_str(
+            "registers held across a handler that used them, a handler's edit of the saved state honoured, a malformed record refused",
+        ),
+        (true, Some(code)) => {
+            c.write_str("the program exited ");
+            write_hex(c, code);
+            c.write_str(", WRONG");
+        }
+    }
+    c.write_str("; ");
+    write_usize(c, handled as usize);
+    c.write_str(" handlers run, ");
+    write_usize(c, returned as usize);
+    c.write_str(" returned, ");
+    write_usize(c, ends as usize);
+    c.write_str(" ended by a refused frame");
+    // The corrupting child's handler runs and never returns, so a run that behaved has one more
+    // handler than it has returns, and exactly one process ended by the signal that refusal
+    // raises. A kernel that accepted the malformed frame would return three times and end none.
+    let counted = handled >= FP_HANDLERS + 1 && returned >= FP_HANDLERS && ends >= 1;
+    if !counted {
+        c.write_str("; NOT WHAT THE MODE DOES");
+    }
+    let clean = super::report_run(c, &run);
+    Check::from_ok(run.code == Some(FP_SUCCESS) && counted && clean)
 }
 
 /// Run the program in its faults mode and grade it: a handler entered for a thread that makes

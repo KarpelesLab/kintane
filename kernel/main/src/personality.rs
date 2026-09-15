@@ -2468,6 +2468,7 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
     rich.and(signals::check(c))
         .and(signals::faults_check(c))
         .and(signals::rtsig_check(c))
+        .and(signals::fp_check(c))
 }
 
 fn free_frames() -> usize {
