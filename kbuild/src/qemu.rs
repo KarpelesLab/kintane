@@ -377,20 +377,17 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
     // order the drives are given here. The kernel picks the disk carrying the volume by
     // reading each disk's header instead (`block::choose_primary`).
     //
-    // Still not behind an IOMMU. Translation is enabled for the whole unit while only the
-    // first disk is attached to a domain, so a second function there is unconfined: its
-    // faults land in the same log the confinement check reads, which then takes a fault that
-    // is not the rogue one. Attached there once each device has its own domain and faults are
-    // attributed by source id.
-    if !res.is_on("IOMMU") {
-        let disk2 = crate::diskcheck::run_copy2(image);
-        args.extend([
-            "-drive".to_string(),
-            format!("file={},if=none,id=kt_disk2,format=raw", disk2.display()),
-            "-device".to_string(),
-            format!("{device},drive=kt_disk2"),
-        ]);
-    }
+    // Behind an IOMMU it works because each device now has a domain of its own and faults are
+    // attributed by source id. While one unit's translation covered a single domain, a second
+    // function there was unconfined and its faults landed in the same log the confinement check
+    // reads, which then took a fault that was not the rogue one.
+    let disk2 = crate::diskcheck::run_copy2(image);
+    args.extend([
+        "-drive".to_string(),
+        format!("file={},if=none,id=kt_disk2,format=raw", disk2.display()),
+        "-device".to_string(),
+        format!("{device},drive=kt_disk2"),
+    ]);
     // QEMU's memory-mapped virtio transport presents the legacy (version 1) register
     // layout unless told otherwise, and the driver speaks only virtio 1.x. Found when the
     // first boot with a disk attached reported the slot as legacy and bound nothing.

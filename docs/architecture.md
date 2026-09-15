@@ -1644,7 +1644,7 @@ tests. kbuild writes files into it as it does the first, and both the file serve
 workload mount it at `/FAT32`, each through a constant of its own, since the crash workload is
 built on configurations that have no file server.
 
-**A second disk.** A test run without an IOMMU attaches two virtio-blk functions, each with its
+**A second disk.** A test run attaches two virtio-blk functions, each with its
 own file: two `-drive`s on one image make QEMU refuse the run with `Failed to get shared "write"
 lock`. The second disk, `testdisk2.img` of `SECTORS2` sectors, carries **no volume at all** —
 both volumes stay on the first disk, where the filesystem checks and the crash campaign already
@@ -1671,11 +1671,28 @@ mean by "the disk" — is that slot, and the boot says so when it is not slot 0:
              bytes, 15 per request; the volume is on disk 1; 32 sectors read back the pattern
 ```
 
-One gap is left, named rather than hidden: the IOMMU presets still attach a single drive.
-Translation is enabled for the whole unit while only the first disk is attached to a domain, so
-a second function there is unconfined and its faults land in the same log the confinement check
-reads — which then takes a fault that is not the rogue one. A second drive is attached there
-once each device has its own domain and faults are attributed by source id.
+**Each device is confined to its own grant.** Behind an IOMMU both disks are attached, each to a
+domain of its own mapping exactly that disk's DMA grant and nothing else. One `Unit`, though:
+translation, the root table and the invalidation queue belong to the hardware unit rather than
+to a device, so the unit is brought up once and each device gets a domain under it (id
+`1 + slot`, zero meaning "no domain" to the hardware). The interrupt remapping table is shared
+the same way — made and latched once, one entry per slot — so a message naming another slot's
+entry is a message for another device:
+
+```
+  block      2 disks bound; VT-d on, 48-bit; disk 00:02.0 mapped to its grant only,
+             invalidation queued; interrupts remapped, 32-bit destinations; 79144 sectors ...;
+             disk 00:03.0 mapped to its grant only; a second interrupt remapped; 4352 sectors ...
+```
+
+The unit's **fault log is shared** by every device behind it, and that changes what a
+confinement check must prove. A fault matched only by its address and direction would be
+satisfied by another device's fault at the same page, so the checks compare the fault's
+`source_id` against the source id *that disk* was attached with, and say
+`STOPPED BUT THE FAULT NAMES ANOTHER DEVICE` when they differ. For the same reason each check
+drains the log before causing the fault it intends to read: a second disk faults once as it is
+brought up behind its own domain — stopped, as it should be — and that record would otherwise
+be the one the check reads.
 
 **Loading a program from a disk.** The boot `fs` check reads `/KINTANE/INIT.ELF` from the volume
 into frames it keeps, runs it once, and only after it exits with the success code makes it the

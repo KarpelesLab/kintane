@@ -238,14 +238,14 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         // behind it, and a second unconfined function would fault into the same log this
         // check reads. The IOMMU presets therefore attach a single drive, which is why this
         // is slot 0 rather than `i` — the loop runs once there.
-        if kconfig::IOMMU && i == 0 {
+        if kconfig::IOMMU {
             if !iommu::confine_disk(c, frames, direct, i, phys, len as u64) {
                 return Check::Failed;
             }
             c.write_str("; ");
             // On MSI-X, the disk's interrupt goes through the IOMMU as well: its table
             // entry, not its message, then names the CPU, and only the disk may use it.
-            if let Some(line) = platform::block_line(0).filter(|&l| platform::interrupt_is_msi(l)) {
+            if let Some(line) = platform::block_line(i).filter(|&l| platform::interrupt_is_msi(l)) {
                 if !iommu::remap_disk_interrupt(c, frames, i, line) {
                     return Check::Failed;
                 }
@@ -273,7 +273,10 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         };
 
         let geometry = blk.geometry();
-        if i > 0 {
+        // The confinement above already ended with "; " for this disk, so a second separator
+        // would read as an empty field. Without an IOMMU nothing was written and the disks'
+        // geometries are a list.
+        if i > 0 && !kconfig::IOMMU {
             c.write_str(", ");
         }
         write_usize(c, geometry.capacity as usize);
@@ -458,6 +461,12 @@ fn iommu_checks(
         c.write_str("\n  iommu      THE DOMAIN DOES NOT MAP EXACTLY THE GRANT");
         return false;
     }
+
+    // Drain what the log already holds, so the fault read below is the one this check caused.
+    // The log is the unit's and every device behind it records there: a second disk faults
+    // once as it is brought up behind its own domain — stopped, as it should be — and that
+    // record would otherwise be the one this check reads and reject as "not the rogue one".
+    while iommu::take_fault().is_some() {}
 
     // The rogue DMA: point the device at a read into the canary, outside its grant.
     let completed = blk.dma_probe(0, cphys, testdisk::SECTOR as u32, ROGUE_POLLS);

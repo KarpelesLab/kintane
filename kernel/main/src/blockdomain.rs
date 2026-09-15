@@ -546,8 +546,10 @@ fn contain_rogue(c: &dyn EarlyConsole, client: &mut Client, dma_phys: u64, dma_l
     }
     let _ = dma_len;
 
-    let before = iommu::take_fault();
-    let _ = before; // drain any earlier fault so the one we read is ours.
+    // Drain every earlier fault, so the one read below is this check's. The unit's log is
+    // shared by every device behind it, and one take is not enough once there is a second
+    // disk that faults as it comes up behind its own domain.
+    while iommu::take_fault().is_some() {}
     let reply = client.request(Request {
         op: Op::RogueDma,
         blocks: 1,

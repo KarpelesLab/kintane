@@ -194,19 +194,25 @@ the device's own address space is irrelevant because the device does not use it.
 
 ### What runs
 
-QEMU is started with `-device intel-iommu,intremap=on` behind a split irqchip, and the disk
+QEMU is started with `-device intel-iommu,intremap=on` behind a split irqchip, and both disks
 with `iommu_platform=on`. On boot:
 
 1. **`boot/acpi::dmar`** reads the DMA remapping table for the one hardware unit's register base —
    no other table names it — its address width, and the interrupt-remapping flag.
 2. **`kernel/platform/acpi`** records that register window among the device windows the kernel maps,
-   and pairs it with the disk's PCI source id.
+   and records each block device's PCI source id **per slot**, from the very function that slot was
+   bound from — as it already does for their interrupt lines. Taking the first block function
+   enumeration happened to list would pair a name with whichever device came out first, and a
+   source id paired with the wrong slot would confine one device to the other's grant.
 3. **`drivers/iommu/vtd`** programs the unit: a root table, a per-bus context table, and a
-   four-level second-level page table for one translation domain. `kernel/main/src/block.rs` maps
-   *exactly* the disk's DMA grant into that domain — at an I/O virtual address equal to its physical
-   one, because the driver puts physical addresses in descriptors and the device treats them as
-   device addresses (`VIRTIO_F_ACCESS_PLATFORM`) — attaches the disk, and turns translation on
-   before the device does any DMA.
+   four-level second-level page table per translation domain. `kernel/main/src/block.rs` gives
+   **each** bound disk a domain of its own and maps *exactly* that disk's DMA grant into it — at an
+   I/O virtual address equal to its physical one, because the driver puts physical addresses in
+   descriptors and the device treats them as device addresses (`VIRTIO_F_ACCESS_PLATFORM`) —
+   attaches each disk, and turns translation on before any of them does DMA. There is one `Unit`:
+   translation, the root table and the invalidation queue belong to the hardware unit, not to a
+   device, and a second `Unit` over the same registers would be two drivers for one piece of
+   hardware.
 
 The driver source does not change between this and a plain boot. `virtio_blk_core` already accepts
 `VIRTIO_F_ACCESS_PLATFORM` and already keeps the device's address and the CPU's apart
@@ -228,6 +234,11 @@ with its DMA translated — the in-grant DMA working end to end. The `iommu` lin
   address — which another device behind the same unit could produce — is not taken for this one.
 - **Restart.** The faulted device is reset and brought up again over the same grant, and serves a
   read — so the host survives a device fault and the stress run still has a disk.
+
+Because the log is the unit's and every device behind it records there, the check drains it
+before causing the fault it means to read. A second disk faults once as it is brought up behind
+its own domain — stopped, as it should be — and without the drain that record, not the rogue
+one, is what the check would find.
 
 Each was falsified; see [testing.md](testing.md#2c-bis-dma-confinement-with-the-iommu).
 
