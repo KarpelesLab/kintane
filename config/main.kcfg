@@ -810,6 +810,25 @@ config QEMU_NET_TEST
         on the PCs. Needs MM_PAGED, because the driver's DMA region is
         mapped through the kernel's direct map.
 
+config QEMU_NET_PEER
+    bool "kbuild is the network, instead of QEMU's user-mode one"
+    depends on QEMU_NET_TEST && ARCH_X86_64
+    help
+        Replace `-netdev user` with `-netdev dgram`: a UDP socket pair
+        carrying one raw Ethernet frame per datagram, with kbuild on the
+        other end. No privileges and no host network, as before — but
+        nothing answers the guest except kbuild, so it must speak ARP,
+        ICMP, UDP and TCP itself rather than mutating frames a NAT
+        already answered.
+
+        This exists so that selective acknowledgement and an ICMP
+        destination-unreachable become reachable in a guest: a packet
+        capture showed QEMU's user-mode network offers only MSS and sends
+        no unreachable message at all, so both are host-tested only.
+
+        The peer is built in stages and this symbol turns on what exists.
+        See docs/testing.md for what each stage proves.
+
 config IOMMU
     bool "Confine device DMA with an Intel VT-d IOMMU"
     depends on QEMU_BLOCK_TEST && ARCH_X86_64
