@@ -646,7 +646,7 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `clone` | with `CLONE_THREAD`: a thread in the same process, on the stack given, which requires `CLONE_VM` and `CLONE_SIGHAND`. `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured, and `CLONE_FS`, `CLONE_FILES` and `CLONE_SYSVSEM` accepted, since the process has one of each. Without `CLONE_THREAD`: a fork, allowed only with nothing but the exit signal in the flags and no stack, which is how an aarch64 C library forks. Anything else, `CLONE_VFORK` included, is `EINVAL` |
 | `fork` | x86_64 only, since aarch64 has no such call: a copy-on-write child whose one thread resumes with the parent's registers and thread pointer, returning 0; the parent is answered the child's pid |
 | `execve` | an absolute path read whole from the namespace, at most 128 KiB, with up to 8 arguments and 8 environment strings. Refused with `EAGAIN` while the process has another thread. Once the old memory is released, a failure ends the process, as Linux's does. The thread pointer starts at zero, and close-on-exec descriptors close |
-| `wait4` | a child by pid, or any child with -1, once its last thread has gone; `WNOHANG`. The status is the exit code's low 8 bits shifted up 8; the signal's number for a child a signal ended, a trap included, which is `SIGSEGV`; or 9, `SIGKILL`'s, for a child the kernel killed for another reason. No core bit is ever set. A process group is `EINVAL`; `rusage` is not written |
+| `wait4` | a child by pid, or any child with -1, once its last thread has gone; `WNOHANG`, `WUNTRACED` and `WCONTINUED`. The status is the exit code's low 8 bits shifted up 8; the signal's number for a child a signal ended, a trap included, which is `SIGSEGV`; or 9, `SIGKILL`'s, for a child the kernel killed for another reason. With `WUNTRACED`, a child a signal stopped reports that signal shifted up 8 with `0x7f` below it, and with `WCONTINUED` a continued child reports `0xffff`; neither reaps the child, which is still there to wait for again. No core bit is ever set. A process group is `EINVAL`; `rusage` is not written |
 | `futex` | `FUTEX_WAIT` with an optional relative timeout, and `FUTEX_WAKE`, private or not; any other operation is `ENOSYS` |
 | `exit` | ends the calling thread, and its process with it when it was the last |
 | `exit_group` | ends every thread of the process; the low 8 bits of the code, as Linux reports a status |
@@ -655,9 +655,51 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `rt_sigpending` | the pending signals the calling thread blocks, its own and its process's |
 | `rt_sigreturn` | resumes from the frame below the stack pointer, validated; a frame it refuses ends the process with `SIGSEGV` |
 | `sigaltstack` | reports that there is no alternate stack; setting one is `ENOSYS`, and logged |
-| `kill` | a signal, or 0 to ask whether the process exists, to a Linux process by pid. A process group and -1 are `EINVAL`, and so is `SIGSTOP`, since nothing here stops a process |
+| `kill` | a signal, or 0 to ask whether the process exists, to a Linux process by pid. A process group and -1 are `EINVAL`. `SIGSTOP` is accepted and stops the process; `SIGCONT` resumes it |
 | `tgkill` | a signal to one thread of a process, by tid; a process's first thread, whose tid is the pid, before it has made a call, takes it as its process |
 | `rt_sigqueueinfo` | a signal to a Linux process carrying a value its handler reads as `si_value`. Only `SI_QUEUE` is accepted in the `siginfo` the sender writes, so no sender may claim the kernel raised the signal, nor that another process sent it. Real-time signals, 32 and up, queue eight deep per process; a ninth is `EAGAIN`. Below 32 a signal coalesces, keeping the first sender's value |
+
+**Stopping a process, and what that word promises here.** `SIGSTOP`, `SIGTSTP`, `SIGTTIN` and
+`SIGTTOU` stop a process; `SIGCONT` resumes it. What follows is what this kernel promises, and
+what it deliberately does not.
+
+*Where a stop takes effect.* At the thread's **next system call**, which is the one place the
+kernel holds a Linux thread's registers — the same rule that makes a handler wait for a call
+rather than interrupting a thread spinning in user code. A thread that never calls is never
+stopped. This is visible: a process sent `SIGSTOP` while computing keeps computing until it
+calls.
+
+*Stopped is not blocked.* To the scheduler a stopped thread is blocked, because that is the only
+state it has for "not runnable until woken". The personality keeps the distinction itself,
+because the two behave differently in the one place it matters: a blocked call ends with `EINTR`
+when a signal arrives, while a stop **resumes the very call it interrupted** — the call restarts
+from its own instruction, exactly as it does when a signal turns out to have no handler. A
+program cannot tell that its `read` was stopped in the middle, which is the point.
+
+*Per thread, not atomically per process.* Linux stops every thread of a process together. Here
+each thread parks as it reaches its next call, so a multi-threaded process passes through a state
+where some of its threads are stopped and others are not. Nothing here promises otherwise.
+
+*What `SIGCONT` does, and when.* It resumes where it is **sent**, not where it is delivered: a
+stopped process has no running thread to deliver anything to. So `SIGCONT` resumes a process
+whose disposition for it is the default, which is "ignore" — the resuming is not the delivery.
+A handler for `SIGCONT`, if the program installed one, runs afterwards in the ordinary way.
+Sending `SIGCONT` discards stop signals that have not been acted on, and sending a stop discards
+an undelivered `SIGCONT`: the later of the two decides, as Linux promises.
+
+*What cannot be caught.* `SIGSTOP` takes no disposition and no mask. `rt_sigaction` on it is
+`EINVAL` — refused before the action is even read — and `rt_sigprocmask` drops it from any mask
+it is given, so blocking it does not stop it from stopping the process. `SIGKILL` ends a stopped
+process rather than waiting for it to be continued.
+
+*What a parent sees.* Only by asking. `wait4` reports a stop with `WUNTRACED` and a continue with
+`WCONTINUED`, each **once**, and neither reaps the child. **No `SIGCHLD` is sent when a child
+stops or continues**, so `SA_NOCLDSTOP` has nothing to suppress. A parent that asks for neither
+option never learns the child stopped, and waits on.
+
+*Not built at all:* process groups and job control — there are none, so nothing sends `SIGTTIN`
+or `SIGTTOU` of its own accord and the terminal signals only arrive if a program sends them;
+`ptrace`, and with it any notion of a traced stop distinct from a job-control stop.
 
 **Asking what filesystem a file is on.** `statfs` takes a path and answers for the filesystem
 *covering that path*, not for the one mounted at the root: a name on the second volume answers for
@@ -791,9 +833,10 @@ no corpus yet for a gap to fail.
 
 **What it does not do yet:**
 
-- **Signals are not complete.** Nothing stops a process: `SIGSTOP` is refused, and the default
-  action of the other stop signals does nothing. There is no alternate signal stack,
-  `rt_sigsuspend`, `rt_sigtimedwait` or `signalfd`.
+- **Signals are not complete.** There is no alternate signal stack, `rt_sigsuspend`,
+  `rt_sigtimedwait` or `signalfd`, and no `SIGCHLD` is sent to a parent when a child stops or
+  continues — so `SA_NOCLDSTOP` has nothing to suppress, and a parent learns of a stop by asking
+  with `WUNTRACED` or `WCONTINUED` rather than by being told.
 - **Real-time signals queue; the rest coalesce.** A signal of 32 or above sent with
   `rt_sigqueueinfo` is kept whole — three sent are three delivered, oldest first, each with its
   own `si_value` — up to eight entries per process, after which a send is `EAGAIN` rather than a

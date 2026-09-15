@@ -1755,6 +1755,12 @@ fn wait4(slot: usize, pid_arg: u64, status: u64, options: u64) -> Result<u64, Fa
                 continue;
             }
             any = true;
+            // A stop or a continue, when this caller asked for one. Reported **without**
+            // reaping: a stopped child is still there and still this process's child, so
+            // `PARENT` is left alone and the same child can be waited for again.
+            if let Some(status) = signals::take_stop_event(child, options) {
+                return Some(Ok((child, status)));
+            }
             let s = STATUS[child].load(Ordering::Acquire);
             // Claimed, so a second waiter cannot report the same child.
             if s & ENDED != 0
@@ -1798,6 +1804,9 @@ pub(crate) fn wake_all_waiters() {
     }
     CHILD_WAIT.wake_all();
     NS_WAIT.wake_all();
+    // And any thread a stop has parked, so a process that is stopped can still be killed
+    // rather than waiting for a `SIGCONT` that is never coming.
+    signals::wake_stopped();
     crate::sockets::waits().wake_all();
 }
 
@@ -2469,6 +2478,7 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
         .and(signals::faults_check(c))
         .and(signals::rtsig_check(c))
         .and(signals::fp_check(c))
+        .and(signals::stop_check(c))
 }
 
 fn free_frames() -> usize {

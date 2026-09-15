@@ -493,6 +493,10 @@ pub const FUTEX_CLOCK_REALTIME: u64 = 256;
 
 /// `wait4`'s "do not wait".
 pub const WNOHANG: u64 = 1;
+/// Report a child that a signal stopped, as well as one that ended.
+pub const WUNTRACED: u64 = 2;
+/// Report a child that `SIGCONT` resumed.
+pub const WCONTINUED: u64 = 8;
 
 /// The socket calls' constants, and `struct sockaddr_in`, as far as the personality reads them.
 /// The values are the same on x86_64 and aarch64.
@@ -600,6 +604,18 @@ pub const fn exited_status(code: u64) -> u32 {
 /// as a system call under LINUX_ENOSYS_FATAL: `SIGKILL`'s, which is what the kernel did. A child
 /// a signal ended reports that signal ([`signal::status`]).
 pub const KILLED_STATUS: u32 = 9;
+
+/// The status `wait4` reports for a child a signal stopped: the signal in the second byte and
+/// `0x7f` in the low one, which is what tells a program a stop from an exit. No exit status can
+/// collide with it, since [`exited_status`] leaves the low byte zero and a signal's own status
+/// ([`signal::status`]) is at most 0x7f with the byte above it zero.
+pub const fn stopped_status(sig: u64) -> u32 {
+    (((sig & 0x7f) as u32) << 8) | 0x7f
+}
+
+/// The status `wait4` reports for a child `SIGCONT` resumed, which is Linux's own value and
+/// carries no signal number: what continued it is always `SIGCONT`.
+pub const CONTINUED_STATUS: u32 = 0xffff;
 
 /// Linux error numbers the personality returns. Linux's values.
 pub mod errno {

@@ -32,11 +32,31 @@
 //! handler runs after all — the signal went to another thread, or turned out to be ignored — the
 //! call returns to its own system call instruction with its arguments, and runs again.
 //!
+//! # Stopping
+//!
+//! A stop signal parks the thread in [`deliver`], on [`STOP_WAIT`], and `SIGCONT` wakes it. That
+//! places a stop at the same point a handler runs — the way out of a system call — so a thread
+//! spinning in user mode is not stopped until its next call, exactly as it is not interrupted to
+//! run a handler. Each thread of a process parks as it reaches that point rather than all at
+//! once, so this kernel does not promise Linux's atomic whole-process stop.
+//!
+//! **Stopped is not blocked.** To the scheduler a parked thread is `Blocked`, but the personality
+//! keeps its own [`STOPPED`] per process, because the two answer different questions: a blocked
+//! call ends with `EINTR` when a signal arrives, while a stop resumes *the same call* — the
+//! restart the existing "no handler ran" path already performs. A fifth scheduler state would
+//! touch every port's context switch and change nothing either `wait4` or `SIGCONT` can see.
+//!
+//! `SIGCONT` resumes where it is *sent*, not where it is delivered: a stopped thread is not
+//! running to deliver anything to. Sending it discards pending stop signals, and sending a stop
+//! discards a pending `SIGCONT`, as Linux does. `SIGKILL` ends a stopped process rather than
+//! waiting for it to be continued.
+//!
 //! # Not built
 //!
-//! Stopping: `SIGSTOP` is refused by `kill` and `tgkill`, and the other stop signals' default
-//! action does nothing. Alternate signal stacks: `sigaltstack` reports none and refuses to set
-//! one. `rt_sigsuspend`, `rt_sigtimedwait` and `signalfd`.
+//! Alternate signal stacks: `sigaltstack` reports none and refuses to set one.
+//! `rt_sigsuspend`, `rt_sigtimedwait` and `signalfd`. `SIGCHLD` is not sent to a parent when a
+//! child stops or continues, so `SA_NOCLDSTOP` has nothing to suppress; a parent learns of a stop
+//! by asking, with `WUNTRACED` or `WCONTINUED`.
 //!
 //! # Queued signals
 //!
@@ -59,6 +79,7 @@ use sync::lockdep::LockClass;
 
 use super::{ABI, ENDED, PARENT, STATUS};
 use crate::userproc::{self, MAX_PROCS};
+use crate::wait::WaitQueue;
 use crate::{Check, preempt, write_hex, write_usize};
 
 const _: () = assert!(
@@ -143,6 +164,107 @@ static ACTIONS: SpinLock<[[Action; SIGNALS]; MAX_PROCS], Cpu> =
     SpinLock::with_class([[Action::DEFAULT; SIGNALS]; MAX_PROCS], &ACTION_CLASS);
 /// Signals sent to each process as a whole.
 static PROCESS_PENDING: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
+
+/// The signal that stopped each process, or zero for one that is running. Written by the thread
+/// that parks itself and cleared by `SIGCONT`'s sender; the scheduler knows only that the thread
+/// is blocked, so this is what tells a stop from a wait.
+static STOPPED: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
+
+/// What each process's parent has not been told yet: that it stopped, or that it continued.
+/// Taken by `wait4`, so an event is reported once rather than every time a parent asks. Zero is
+/// nothing to report.
+static STOP_EVENT: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
+/// [`STOP_EVENT`]'s tags. A stop carries in its low byte the signal that caused it, which is
+/// what `wait4` reports; a continue carries no number, since only `SIGCONT` continues.
+const EVENT_STOPPED: u64 = 1 << 8;
+const EVENT_CONTINUED: u64 = 1 << 9;
+
+/// The four signals whose default action stops.
+const STOP_SIGNALS: u64 = sig::bit(sig::SIGSTOP)
+    | sig::bit(sig::SIGTSTP)
+    | sig::bit(sig::SIGTTIN)
+    | sig::bit(sig::SIGTTOU);
+
+/// Where stopped threads park. Woken by `SIGCONT`, and by a process ending, so `SIGKILL` reaches
+/// a stopped process instead of waiting for it to be continued.
+static STOP_WAIT: WaitQueue = WaitQueue::new();
+
+/// Threads parked by a stop, and continues that resumed one: what the check counts.
+static STOPS: AtomicU64 = AtomicU64::new(0);
+static CONTINUES: AtomicU64 = AtomicU64::new(0);
+
+/// Wake every thread a stop has parked. Called where a process starts to end, so a stopped one
+/// can be killed.
+pub(super) fn wake_stopped() {
+    STOP_WAIT.wake_all();
+}
+
+/// Clear `bits` wherever they are pending in `slot`: the process's own set and every thread's.
+fn discard(slot: usize, bits: u64) {
+    PROCESS_PENDING[slot].fetch_and(!bits, Ordering::AcqRel);
+    for t in THREAD_SIGNALS
+        .iter()
+        .filter(|t| held(t) && t.slot.load(Ordering::Acquire) == slot)
+    {
+        t.pending.fetch_and(!bits, Ordering::AcqRel);
+    }
+}
+
+/// Resume `slot` if a stop has parked it, and drop whatever stop signals it has pending but has
+/// not acted on. A `SIGCONT` that arrives before a stop is delivered cancels that stop: the
+/// later of the two is the one that decides, which is what Linux promises.
+fn continue_process(slot: usize) {
+    discard(slot, STOP_SIGNALS);
+    if STOPPED[slot].swap(0, Ordering::AcqRel) != 0 {
+        CONTINUES.fetch_add(1, Ordering::Relaxed);
+        STOP_EVENT[slot].store(EVENT_CONTINUED, Ordering::Release);
+        STOP_WAIT.wake_all();
+    }
+}
+
+/// The stop or continue `slot` has not reported yet, as `wait4` reports it, taken so it is
+/// reported once. `None` unless `options` asked for that kind of event.
+///
+/// A stopped child is **not** reaped: it is still there, and its parent stays its parent. Only
+/// an ended child is claimed, which is why this does not touch [`PARENT`].
+pub(super) fn take_stop_event(slot: usize, options: u64) -> Option<u32> {
+    let event = STOP_EVENT[slot].load(Ordering::Acquire);
+    if event == 0 {
+        return None;
+    }
+    let asked = if event & EVENT_STOPPED != 0 {
+        linux::WUNTRACED
+    } else {
+        linux::WCONTINUED
+    };
+    if options & asked == 0 {
+        return None;
+    }
+    STOP_EVENT[slot]
+        .compare_exchange(event, 0, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some(if event & EVENT_STOPPED != 0 {
+        linux::stopped_status(event & 0xff)
+    } else {
+        linux::CONTINUED_STATUS
+    })
+}
+
+/// Park the calling thread of `slot`, stopped by `signo`, until `SIGCONT` or until its process
+/// ends. The event is recorded and the waiters woken *before* parking, so a parent already
+/// blocked in `wait4` sees the stop rather than waiting for something that has already happened.
+fn stop_here(slot: usize, signo: u64) {
+    STOPPED[slot].store(signo, Ordering::Release);
+    STOP_EVENT[slot].store(EVENT_STOPPED | (signo & 0xff), Ordering::Release);
+    STOPS.fetch_add(1, Ordering::Relaxed);
+    super::wake_all_waiters();
+    let _ = STOP_WAIT.wait_until(None, || {
+        (STOPPED[slot].load(Ordering::Acquire) == 0 || userproc::exiting(slot)).then_some(())
+    });
+    // A stop that ended in a kill rather than a continue: end here rather than returning to user
+    // code, since the call this thread is on its way out of is not going to run again.
+    userproc::end_if_exiting(slot);
+}
 /// The mask each process's first thread starts with: its forking parent thread's.
 static FIRST_MASK: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
 /// The pid that last sent each process each signal, zero for the kernel: `siginfo`'s `si_pid`.
@@ -331,6 +453,9 @@ pub(super) fn forked(parent: usize, child: usize) {
     forget_queued(child, None);
     FIRST_MASK[child].store(mask, Ordering::Release);
     PROCESS_PENDING[child].store(0, Ordering::Release);
+    // A child of a process that is stopped is not itself stopped, and has nothing to report.
+    STOPPED[child].store(0, Ordering::Release);
+    STOP_EVENT[child].store(0, Ordering::Release);
     let mut actions = ACTIONS.lock_irqsave();
     actions[child] = actions[parent];
 }
@@ -362,6 +487,11 @@ pub(super) fn release(slot: usize) {
     forget_queued(slot, None);
     PROCESS_PENDING[slot].store(0, Ordering::Release);
     FIRST_MASK[slot].store(0, Ordering::Release);
+    // The slot is about to be reused: a stop left set here would park the next process's first
+    // thread for a signal sent to a process that no longer exists.
+    STOPPED[slot].store(0, Ordering::Release);
+    STOP_EVENT[slot].store(0, Ordering::Release);
+    STOP_WAIT.wake_all();
     for s in &SENDER[slot] {
         s.store(0, Ordering::Release);
     }
@@ -432,12 +562,21 @@ fn send_process(target: usize, signo: u64, from: u32) -> Result<u64, Failure> {
         return Ok(0);
     }
     let bit = sig::bit(signo);
-    match sig::effect(signo, &action_of(target, signo)) {
+    let effect = sig::effect(signo, &action_of(target, signo));
+    // Stopping and resuming are settled where the signal is sent, before anything is delivered:
+    // a stopped process has no thread running to deliver to. Each cancels the other's undelivered
+    // signals, so the later of the two is the one that decides.
+    if signo == sig::SIGCONT {
+        continue_process(target);
+    } else if effect == Effect::Stop {
+        discard(target, sig::bit(sig::SIGCONT));
+    }
+    match effect {
         Effect::Ignore => {}
         Effect::Terminate if signo == sig::SIGKILL || !masked_everywhere(target, bit) => {
             end_by(target, signo)
         }
-        Effect::Terminate | Effect::Handle => {
+        Effect::Terminate | Effect::Handle | Effect::Stop => {
             SENDER[target][(signo - 1) as usize].store(from, Ordering::Release);
             PROCESS_PENDING[target].fetch_or(bit, Ordering::AcqRel);
             super::wake_all_waiters();
@@ -448,12 +587,19 @@ fn send_process(target: usize, signo: u64, from: u32) -> Result<u64, Failure> {
 
 fn send_thread(target: usize, t: &ThreadSignals, signo: u64, from: u32) {
     let bit = sig::bit(signo);
-    match sig::effect(signo, &action_of(target, signo)) {
+    let effect = sig::effect(signo, &action_of(target, signo));
+    // As in `send_process`: stopping and resuming happen here, not at a delivery point.
+    if signo == sig::SIGCONT {
+        continue_process(target);
+    } else if effect == Effect::Stop {
+        discard(target, sig::bit(sig::SIGCONT));
+    }
+    match effect {
         Effect::Ignore => {}
         Effect::Terminate if signo == sig::SIGKILL || t.mask.load(Ordering::Acquire) & bit == 0 => {
             end_by(target, signo)
         }
-        Effect::Terminate | Effect::Handle => {
+        Effect::Terminate | Effect::Handle | Effect::Stop => {
             SENDER[target][(signo - 1) as usize].store(from, Ordering::Release);
             t.pending.fetch_or(bit, Ordering::AcqRel);
             super::wake_all_waiters();
@@ -533,6 +679,10 @@ pub(super) fn deliver(
                     SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
                     super::exit_group(slot, sig::exit_code(signo))
                 }
+                // Park here and, once continued, go round again: the call this thread is on its
+                // way out of restarts through the "no handler ran" path below, so a stop resumes
+                // the very call it interrupted rather than failing it with `EINTR`.
+                Effect::Stop => stop_here(slot, signo),
                 Effect::Handle => {
                     handle(slot, me, frame, entry, interrupted, signo, action, mask);
                     return;
@@ -701,6 +851,14 @@ pub(super) fn deliver_interrupted(slot: usize, regs: &mut Words) -> bool {
             Effect::Terminate => {
                 SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
                 super::exit_group(slot, sig::exit_code(signo))
+            }
+            Effect::Stop => {
+                // An interrupt's return path has no system call to park in, and none to restart
+                // afterwards. Put the signal back and let the thread's next call stop it — the
+                // same rule that makes a spinning thread wait for its next call to take a
+                // handler.
+                me.pending.fetch_or(sig::bit(signo), Ordering::AcqRel);
+                return false;
             }
             Effect::Handle => {
                 let Some(next) = enter_handler(slot, me, regs, signo, action, mask) else {
@@ -897,10 +1055,9 @@ pub(super) fn altstack(ss: u64, old: u64) -> Result<u64, Failure> {
     Ok(0)
 }
 
-/// A signal number `kill` and `tgkill` accept: 0, the existence check, to 64. `SIGSTOP` is
-/// refused, since nothing here can stop a process.
+/// A signal number `kill` and `tgkill` accept: 0, the existence check, to 64.
 fn sendable(signo: u64) -> Result<(), Failure> {
-    if signo > sig::NSIG || signo == sig::SIGSTOP {
+    if signo > sig::NSIG {
         Err(Failure::InvalidArgument)
     } else {
         Ok(())
@@ -1156,6 +1313,62 @@ pub(super) fn fp_check(c: &dyn EarlyConsole) -> Check {
     }
     let clean = super::report_run(c, &run);
     Check::from_ok(run.code == Some(FP_SUCCESS) && counted && clean)
+}
+
+/// `argv` for the program's stopping mode, and its exit code when every step behaved; mirror
+/// `user/linux-hello/src/main.rs`.
+const STOP_ARGV: [&[u8]; 2] = [b"hello", b"stop"];
+const STOP_SUCCESS: u64 = 55;
+/// What that mode does at least: two children parked by a stop — one continued, one killed while
+/// it was stopped — and the one continue that resumed the first.
+const STOPS_EXPECTED: u64 = 2;
+const CONTINUES_EXPECTED: u64 = 1;
+
+/// Run the program in its stopping mode and grade it: a child stops and is reported stopped
+/// without being reaped, `SIGCONT` resumes it and is reported, `SIGSTOP` takes no handler and no
+/// mask, and a child killed while stopped ends rather than waiting to be continued. On the boot
+/// thread, after the floating-point run, whose slot and stacks it reuses.
+///
+/// The counters matter here more than usual: every step of this mode would also pass on a kernel
+/// that ignored stop signals outright *except* the ones that look at whether anything actually
+/// parked. A program cannot see the difference between "stopped and resumed" and "never stopped"
+/// except by timing, which a check must not depend on — so the kernel's own count of parked
+/// threads is what separates them.
+pub(super) fn stop_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux stop ");
+    let before = [&STOPS, &CONTINUES].map(|n| n.load(Ordering::Relaxed));
+    let run = match super::run_mode(&STOP_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
+    let after = [&STOPS, &CONTINUES].map(|n| n.load(Ordering::Relaxed));
+    let [stops, continues] = [0, 1].map(|i| after[i] - before[i]);
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(STOP_SUCCESS)) => c.write_str(
+            "a child stopped and was reported stopped, SIGCONT resumed it and was reported, SIGSTOP took no handler and no mask, a stopped child was killed",
+        ),
+        (true, Some(code)) => {
+            c.write_str("the program exited ");
+            write_hex(c, code);
+            c.write_str(", WRONG");
+        }
+    }
+    c.write_str("; ");
+    write_usize(c, stops as usize);
+    c.write_str(" threads parked, ");
+    write_usize(c, continues as usize);
+    c.write_str(" continued");
+    let counted = stops >= STOPS_EXPECTED && continues >= CONTINUES_EXPECTED;
+    if !counted {
+        c.write_str("; NOTHING REALLY STOPPED");
+    }
+    let clean = super::report_run(c, &run);
+    Check::from_ok(run.code == Some(STOP_SUCCESS) && counted && clean)
 }
 
 /// Run the program in its faults mode and grade it: a handler entered for a thread that makes
