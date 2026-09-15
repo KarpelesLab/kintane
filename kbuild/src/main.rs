@@ -25,6 +25,7 @@ mod kcfg;
 mod lint;
 mod menuconfig;
 mod modules;
+mod netpeer;
 mod pe;
 mod portable;
 mod qemu;
