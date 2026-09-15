@@ -13,9 +13,99 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 2 — Core kernel | **every item landed**; the stress audit is judged in slices rather than wall-clock windows, and `kbuild soak` runs it unattended; **a two-hour soak at 8 CPUs passed 7,200 audits of 7,200** while five branches shared the host, and the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on PCIe |
+| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on a device being on PCIe at all: the bridge is now found from the device tree and the bus behind it walked, at the first moment the device mapping reaches a window the boot tables cannot cover, but nothing is attached to it yet |
 | 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Queued real-time signals, `MSG_PEEK`, scattered and gathered messages, and floating-point state carried in a signal frame and validated on return are built too. Stopping signals too: a stop parks a process at its next system call and `SIGCONT` resumes it, reported to a parent by `wait4` with `WUNTRACED` and `WCONTINUED`. What remains unbuilt is alternate signal stacks, `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd`, and `SIGCHLD` on a child's stop |
 | 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, and a disk sharing an interrupt line serviced rather than silently unwired, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end, where a partial acknowledgement is reachable in a guest and the measurement shows the blocks themselves saving nothing; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The sixteenth round of landings
+
+Twenty-one presets build and boot, with `aarch64-pcie` new. Four briefs ran, and every one of them
+contradicted something it had been told or something it believed — which is the round's real result.
+
+- **A disk's expected contents are keyed by the image it carries, not by the slot it sits in.** Two
+  rounds ago three two-device checks were written and withheld because they did not fit the size
+  budgets; last round the ceiling was raised and they turned out to cost nothing, which exposed the
+  real blocker underneath. The comparison keyed expected contents by **slot index** — true on PCI and
+  false on memory-mapped virtio, where the machine fills its slots downwards — so every aarch64 preset
+  reported the volume on the second disk and then failed at the first byte. The fix reuses what the
+  kernel had already established by reading each disk's header, rather than trusting a number. **The
+  tree had already written the rule down**: a comment in the build tool says the kernel no longer
+  trusts a slot's number and picks the disk carrying the volume by reading headers — and the check
+  contradicted the design note sitting beside it.
+- **That check's falsification is asymmetric, and the asymmetry is the finding.** Keying by slot fails
+  on the memory-mapped port and **still passes on PCI** — a check that works where it was written and
+  breaks where it was needed. That is precisely why the assumption survived a full round: it lived
+  inside a check no one had ever gated on the architecture whose shape differs. The checks now land
+  everywhere they build, with no budget raised.
+- **A cached artifact is landed by rename rather than by unlink-then-link**, which closes a window in
+  which the destination briefly does not exist while a concurrent build names that exact path. The
+  investigation is worth more than the fix. The failure it was sent to reproduce **does not reproduce**
+  across configurations, and the premise behind it is refuted outright: cross-configuration builds
+  recompile most units, the cache demonstrably works cold and warm and warm again with another
+  configuration in between. What actually breaks is **two processes sharing one output directory**,
+  every time it is tried.
+- **And that work states the limits of its own claim.** It never observed the reported error directly,
+  says so rather than implying a reproduction, and declines to claim its fix improved anything —
+  concurrent runs went from six failures in six to four in six, which three trials cannot distinguish,
+  and the remaining race is one the change never targeted. It also leaves one anomaly unexplained
+  rather than dressed up: a build recompiling fifty-two units for a preset built minutes earlier, never
+  reproduced in eleven further attempts. A mechanism it had proved in every detail — that hardlinked
+  cache slots must alias the output — died on the one step that mattered, because the compiler
+  create-and-renames.
+- **The regression test is built so that it cannot pass for the wrong reason.** It asserts that the old
+  unlink-then-recreate path *does* expose a window before asserting that the new path does not, so a
+  test which has lost the ability to detect absence fails loudly instead of reporting success.
+- **The exception trace is bounded, keeping both ends with a marked seam.** An interrupt storm had
+  produced a log of a hundred and forty million lines, and the emulator has no cap of its own — its
+  logging options select *which* events are recorded and nothing bounds the file. The obvious shape, a
+  capped filter, was rejected on a mechanism rather than a preference: the option takes a path, so
+  filtering means handing the emulator a named pipe, and a pipe whose reader falls behind **blocks the
+  writer** — turning a diagnostic into a hang on every port, in order to bound a file nothing reads
+  while the guest is alive. Cutting afterwards cannot affect the run at all. Both ends are kept because
+  the two failures want opposite halves: a boot that dies early leaves its evidence at the start, a
+  storm at the end.
+- **Where the cut happens mattered more than what shape it took.** It runs before the paths that return
+  "hung" and "timed out", because **a storm is a timeout** — a cut placed on the way out would never
+  once have fired in the situation the whole feature exists for.
+- **And the bound is measured rather than chosen, including the two times the measurement refuted it.**
+  An initial eight megabytes would have cut *normal* traces on every aarch64 preset, and did: three
+  passing runs came back marked as cut. The largest trace on record was then understated twice, because
+  that preset's output moves by about four percent between identical runs — the record is a moving
+  target, which is the real argument for a margin of eight times rather than a tight fit. Safety no
+  longer rests on having measured every preset at all: a cut on a run that **passed** is reported
+  distinctly and names its own remedy, so a preset nobody measured announces itself instead of quietly
+  losing its tail.
+- **The PCIe bridge is found on aarch64 and the bus behind it walked** — two of the three stages that
+  confinement on that port waits for. The staging is forced by the machine rather than chosen: the boot
+  tables map two gigabytes, while the machine places configuration space two hundred and fifty-six
+  gigabytes up, so it simply cannot be read during discovery — which is why the other platform, whose
+  window sits low, enumerates then and this one cannot. A claim-only driver takes the window during
+  discovery touching nothing, the address space maps it, and the walk happens at the first moment the
+  device mapping reaches it. The generic PCI code needed no change at all, and the walk was kept in the
+  platform rather than the kernel's core, because that core deliberately does not depend on the device
+  layer and crossing the line was refused. The third stage — a disk actually on that bus — is not
+  attempted, and what it needs is written down so the next attempt starts where this one stopped.
+- **And that work carries a cost accepted rather than hidden.** One entry in the verdict chain costs
+  two ports 2,837 and 390 bytes, on architectures that can never have PCIe. The obvious remedy —
+  routing the entry through the memory model so a skipping port never carries it — was proposed,
+  implemented and **measured to be byte-for-byte identical**, so the cost is the extra link perturbing
+  code generation rather than anything it dispatches to. One port escapes it because it is the
+  size-optimised build. A second appeared to escape and does not: measured in the same unit it pays
+  *more* than the port beside it, and neither compiles a byte of the new code. That apparent exception
+  was an artefact of comparing a page-padded image total against a per-crate figure — the same
+  distinction this round had just finished arguing for, mixed up one paragraph later.
+
+**What the round taught.** Four briefs, four contradicted premises, and in each case the correction
+came from comparing against observed output rather than reasoning about what ought to be true. One
+found the tree had already documented the rule its own check violated. One found the failure it was
+sent to fix does not reproduce at all, then killed its own replacement explanation with the very
+measurement that had supported it, and declined to claim its fix improved anything because three
+trials cannot distinguish six failures from four. One had its first bound refuted by its own data, and
+then its record of the largest trace refuted twice more, because that measurement moves by four
+percent between identical runs. One had a falsification refute a comment it had written, and then
+refuted a coordinator's proposed optimisation exactly. The habit that produced all four is the same:
+confirm that a mutation was **applied**, and separately that it was **exercised** — because a check
+that cannot fail reports success in precisely the same words as one that passes.
 
 ### The fifteenth round of landings
 
