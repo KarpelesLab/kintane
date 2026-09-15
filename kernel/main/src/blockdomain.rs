@@ -232,7 +232,7 @@ fn stop_forwarder(id: ThreadId) -> bool {
 
 /// Interrupts the platform dispatched on the disk's line, on every CPU.
 fn line_taken() -> u64 {
-    platform::block_line(0).map_or(0, |line| {
+    platform::block_line(crate::block::primary()).map_or(0, |line| {
         (0..mp::CPUS)
             .map(|cpu| platform::interrupts_on_cpu(line, cpu))
             .sum()
@@ -291,20 +291,20 @@ fn grant(c: &dyn EarlyConsole) -> Result<Setup, Check> {
         c.write_str("skipped: no disk to hand to a domain");
         return Err(Check::Skipped);
     };
-    let (_window_phys, window_len) = match virtio_blk::window(0) {
+    let (_window_phys, window_len) = match virtio_blk::window(crate::block::primary()) {
         Some(w) => w,
         None => {
             c.write_str("NO DISK WINDOW TO GRANT");
             return Err(Check::Failed);
         }
     };
-    let Some((layout, bar, device_id)) = virtio_blk::pci_layout(0) else {
+    let Some((layout, bar, device_id)) = virtio_blk::pci_layout(crate::block::primary()) else {
         c.write_str("THE DISK IS NOT ON PCI");
         return Err(Check::Failed);
     };
-    let vector = match virtio_blk::msix_entry(0)
-        .filter(|_| platform::block_line(0).is_some_and(platform::interrupt_is_msi))
-    {
+    let vector = match virtio_blk::msix_entry(crate::block::primary()).filter(|_| {
+        platform::block_line(crate::block::primary()).is_some_and(platform::interrupt_is_msi)
+    }) {
         Some(v) => v,
         None => {
             // A polled domain is exactly what this host refuses; the in-kernel path handles a
@@ -726,7 +726,9 @@ pub fn smp_check(c: &dyn EarlyConsole) -> Check {
         Ok(setup) => setup,
         Err(check) => return check,
     };
-    let (Some(line), Some(me)) = (platform::block_line(0), preempt::current_thread()) else {
+    let (Some(line), Some(me)) =
+        (platform::block_line(crate::block::primary()), preempt::current_thread())
+    else {
         c.write_str("NO DISK LINE, OR NOT ON A SCHEDULED THREAD");
         return Check::Failed;
     };
@@ -1061,7 +1063,7 @@ fn map_grant(setup: &Setup) -> Result<usize, &'static str> {
 /// The disk's register window, physical: what [`map_grant`] maps and what `Setup::window` was
 /// derived from.
 fn window_phys() -> u64 {
-    virtio_blk::window(0).map_or(0, |(phys, _)| phys)
+    virtio_blk::window(crate::block::primary()).map_or(0, |(phys, _)| phys)
 }
 
 /// Set or clear the interrupt channel's kernel end the handler forwards on.

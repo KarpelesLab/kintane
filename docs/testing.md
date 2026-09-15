@@ -492,21 +492,28 @@ path they have (`-kernel`, BIOS and UEFI). The format is written twice, in
 `kernel/block/src/testdisk.rs` and `kbuild/src/testdisk.rs`, and a pinned set of bytes
 that both sides' tests assert keeps the two in step.
 
-A PCI run without an IOMMU attaches a **second disk** as well, `testdisk2.img`, on its own
+A run without an IOMMU attaches a **second disk** as well, `testdisk2.img`, on its own
 virtio-blk function and its own file — two `-drive`s on one image make QEMU refuse the run with
 `Failed to get shared "write" lock`. It carries no volume: both volumes stay on the first disk,
 so `FS_START` and `FS32_START` are unchanged. Its bytes are the same pattern with the disk's
 index folded into the hash, so disk 0's image is untouched and a sector read from the wrong disk
 matches nothing. The `block` line reports how many disks the boot bound, so a run that attached
-two and bound one is visible there rather than only as a later check quietly skipping:
+two and bound one is visible there rather than only as a later check quietly skipping, and every
+disk's geometry is reported:
 
 ```
-  block      2 disks bound; 79144 sectors of 512 bytes, 15 per request; 32 sectors read back
-             the pattern; ...
+  block      2 disks bound; 4352 sectors of 512 bytes, 15 per request, 79144 sectors of 512
+             bytes, 15 per request; the volume is on disk 1; 32 sectors read back the pattern
 ```
 
-The IOMMU presets and the memory-mapped transport still attach one, for the reasons given under
-"A second disk" in [architecture.md](architecture.md).
+That line is from `aarch64-virt`, and it shows why the slot's number is not trusted: QEMU fills
+`virt`'s virtio-mmio slots downwards as devices are created while enumeration walks the tree
+upwards, so slot 0 is the second drive there. The kernel brings up every bound disk and then
+reads each one's header to find the one carrying the volume, saying so when it is not slot 0.
+The interrupt checks follow that disk too, so `block irq` measures the disk the kernel drives.
+
+The IOMMU presets still attach one drive, for the reason given under "A second disk" in
+[architecture.md](architecture.md).
 
 The boot gates on the `block` line ([architecture.md](architecture.md#block--the-block-layer-and-the-first-driver-with-dma)):
 

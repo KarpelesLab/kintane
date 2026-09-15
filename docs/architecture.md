@@ -1644,7 +1644,7 @@ tests. kbuild writes files into it as it does the first, and both the file serve
 workload mount it at `/FAT32`, each through a constant of its own, since the crash workload is
 built on configurations that have no file server.
 
-**A second disk.** A test run on a PCI machine attaches two virtio-blk functions, each with its
+**A second disk.** A test run without an IOMMU attaches two virtio-blk functions, each with its
 own file: two `-drive`s on one image make QEMU refuse the run with `Failed to get shared "write"
 lock`. The second disk, `testdisk2.img` of `SECTORS2` sectors, carries **no volume at all** —
 both volumes stay on the first disk, where the filesystem checks and the crash campaign already
@@ -1655,15 +1655,27 @@ while disk 1 shares almost no byte of any sector with it. Each disk's header nam
 length. That is what lets a read served through the wrong device's binding be caught by content,
 rather than by trusting the binding that served it.
 
-It is not attached everywhere yet, and the two gaps are named rather than hidden. On the IOMMU
-presets translation is enabled for the whole unit while only the first disk is attached to a
-domain, so a second function there is unconfined and its faults land in the same log the
-confinement check reads — which then takes a fault that is not the rogue one. On the
-memory-mapped transport QEMU fills `virt`'s virtio-mmio slots downwards as devices are created
-while enumeration walks the tree upwards, so the slots arrive in the reverse of the order the
-drives were given and slot 0 would be the second drive. Both are attached once each device has
-its own domain with faults attributed by source id, and once the kernel picks the disk carrying
-the volume by reading its header rather than by trusting the slot's number.
+**Which disk carries the volume is read, not assumed.** A slot's number is the order the
+platform enumerated the devices in, which need not be the order the run gave the drives: QEMU
+fills `virt`'s virtio-mmio slots downwards as devices are created while enumeration walks the
+tree upwards, so on `virt` the slots arrive in the reverse of the order the drives were given
+and slot 0 is the *second* drive. Trusting the number there mounted the wrong disk — observed
+as a `block` line reporting `4352 sectors`, which is `SECTORS2`. So `block::check` brings up
+every bound disk, each over a grant and an interrupt trampoline of its own, then reads each
+one's sector 0 and records as `PRIMARY` the slot whose header names the volume-carrying image's
+length. `block::disk()` — what the filesystem, the stress workload and the driver domain all
+mean by "the disk" — is that slot, and the boot says so when it is not slot 0:
+
+```
+  block      2 disks bound; 4352 sectors of 512 bytes, 15 per request, 79144 sectors of 512
+             bytes, 15 per request; the volume is on disk 1; 32 sectors read back the pattern
+```
+
+One gap is left, named rather than hidden: the IOMMU presets still attach a single drive.
+Translation is enabled for the whole unit while only the first disk is attached to a domain, so
+a second function there is unconfined and its faults land in the same log the confinement check
+reads — which then takes a fault that is not the rogue one. A second drive is attached there
+once each device has its own domain and faults are attributed by source id.
 
 **Loading a program from a disk.** The boot `fs` check reads `/KINTANE/INIT.ELF` from the volume
 into frames it keeps, runs it once, and only after it exits with the success code makes it the

@@ -371,20 +371,18 @@ fn block_disk(res: &Resolution, image: &Path, device: &str) -> Vec<String> {
     // `Failed to get shared "write" lock` — holding its own pattern, so a read served by the
     // wrong device's binding comes back as bytes that match nothing.
     //
-    // Two deferrals, both of which need work above this file before a second drive is honest
-    // here, and neither of which is hidden by attaching one anyway:
+    // On the memory-mapped transport this works only because the kernel no longer trusts a
+    // slot's number: QEMU fills `virt`'s virtio-mmio slots downwards as devices are created
+    // while enumeration walks the tree upwards, so the slots arrive in the reverse of the
+    // order the drives are given here. The kernel picks the disk carrying the volume by
+    // reading each disk's header instead (`block::choose_primary`).
     //
-    // * Not behind an IOMMU. Translation is enabled for the whole unit, and only the first
-    //   disk is attached to a domain, so a second function there is unconfined: its faults
-    //   land in the same log the confinement check reads, which then takes a fault that is
-    //   not the rogue one. Attached there once each device has its own domain and faults are
-    //   attributed by source id.
-    // * Not on the memory-mapped transport. QEMU fills `virt`'s virtio-mmio slots downwards
-    //   from the highest as devices are created, while enumeration walks the tree upwards, so
-    //   the slots come out in the reverse of the order the drives were given — and slot 0 is
-    //   then the second drive. Attached there once the kernel picks the disk carrying the
-    //   volume by reading its header rather than by trusting the slot's number.
-    if !res.is_on("IOMMU") && device.starts_with("virtio-blk-pci") {
+    // Still not behind an IOMMU. Translation is enabled for the whole unit while only the
+    // first disk is attached to a domain, so a second function there is unconfined: its
+    // faults land in the same log the confinement check reads, which then takes a fault that
+    // is not the rogue one. Attached there once each device has its own domain and faults are
+    // attributed by source id.
+    if !res.is_on("IOMMU") {
         let disk2 = crate::diskcheck::run_copy2(image);
         args.extend([
             "-drive".to_string(),

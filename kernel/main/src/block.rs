@@ -19,7 +19,7 @@
 //! The started device outlives the check: [`disk`] is how the stress run reaches it.
 
 use core::cell::SyncUnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arch::Cpu;
 use block::{BlockDevice, Error as BlockError, testdisk};
@@ -48,81 +48,136 @@ const REPEATS: u64 = 64;
 static BUF: SyncUnsafeCell<[u8; READ_SECTORS * testdisk::SECTOR]> =
     SyncUnsafeCell::new([0; READ_SECTORS * testdisk::SECTOR]);
 
-/// SAFETY INVARIANT: written once, by [`check`], before `STARTED` is set; read only after
-/// it is set, through [`disk`].
-static DISK: SyncUnsafeCell<Option<VirtioBlk<Locks>>> = SyncUnsafeCell::new(None);
-static STARTED: AtomicBool = AtomicBool::new(false);
+/// The bound disks, each brought up by [`check`] over a grant of its own.
+///
+/// SAFETY INVARIANT: a slot is written only by [`check`], or by [`restart`] which clears it
+/// first; in both cases before that slot's flag in `STARTED` is set, and it is read only
+/// after that flag is set, through [`disk_at`].
+static DISKS: [SyncUnsafeCell<Option<VirtioBlk<Locks>>>; virtio_blk::MAX_DISKS] =
+    [const { SyncUnsafeCell::new(None) }; virtio_blk::MAX_DISKS];
+static STARTED: [AtomicBool; virtio_blk::MAX_DISKS] =
+    [const { AtomicBool::new(false) }; virtio_blk::MAX_DISKS];
 
-/// The started disk, once the check has brought it up.
+/// Which bound disk carries the volumes.
+///
+/// Not assumed to be slot 0. A slot's number is the order the platform enumerated the devices
+/// in, which need not be the order the run gave the drives — QEMU fills `virt`'s virtio-mmio
+/// slots downwards as devices are created while enumeration walks the tree upwards — so
+/// trusting the number would mount whichever disk happened to be enumerated first. [`check`]
+/// reads each disk's header and records the slot whose header names the volume-carrying
+/// image's length.
+static PRIMARY: AtomicUsize = AtomicUsize::new(0);
+
+/// The disk carrying the volumes: what the filesystem, the stress workload and the driver
+/// domain all mean by "the disk".
 pub fn disk() -> Option<&'static VirtioBlk<Locks>> {
-    if !STARTED.load(Ordering::Acquire) {
-        return None;
-    }
-    // SAFETY: `STARTED` is set only after the one write, and nothing writes again.
-    unsafe { (*DISK.get()).as_ref() }
+    disk_at(primary())
 }
 
-/// The DMA grant the disk runs on: the address the CPU reaches it at, the address the device
+/// Which slot [`disk`] is.
+pub fn primary() -> usize {
+    PRIMARY.load(Ordering::Acquire)
+}
+
+/// The started disk in slot `i`, once the check has brought it up.
+pub fn disk_at(i: usize) -> Option<&'static VirtioBlk<Locks>> {
+    if !STARTED.get(i)?.load(Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: the slot's flag is set only after its one write, and nothing writes again
+    // except `restart`, which clears the flag first.
+    unsafe { (*DISKS.get(i)?.get()).as_ref() }
+}
+
+/// The DMA grant each disk runs on: the address the CPU reaches it at, the address the device
 /// (and the IOMMU) uses, and its length. The block-domain check reuses exactly this — the
 /// IOMMU already maps `[phys, phys + len)` for the device and nothing else — so a domain
 /// serving the disk needs no second grant to confine.
 ///
-/// SAFETY INVARIANT: written once by [`check`], before `STARTED`; read only after.
-static GRANT: SyncUnsafeCell<Option<(usize, u64, usize)>> = SyncUnsafeCell::new(None);
+/// SAFETY INVARIANT: a slot is written once by [`check`], before that slot's flag in
+/// `STARTED`; read only after.
+static GRANTS: [SyncUnsafeCell<Option<(usize, u64, usize)>>; virtio_blk::MAX_DISKS] =
+    [const { SyncUnsafeCell::new(None) }; virtio_blk::MAX_DISKS];
 
-/// `(virt, phys, len)` of the disk's DMA grant, once the disk is up.
+/// `(virt, phys, len)` of the volume-carrying disk's DMA grant, once it is up.
 #[cfg_attr(
     not(CONFIG_BLOCK_DOMAIN),
     expect(dead_code, reason = "read only by the block-domain check")
 )]
 pub fn grant() -> Option<(usize, u64, usize)> {
-    disk().and(unsafe { *GRANT.get() })
+    grant_at(primary())
 }
 
-/// Whether the disk's interrupt is being forwarded to a driver domain instead of collected
-/// in the kernel. Set around [`crate::blockdomain`]'s run.
-static FORWARDING: AtomicBool = AtomicBool::new(false);
+/// The same for the disk in slot `i`.
+fn grant_at(i: usize) -> Option<(usize, u64, usize)> {
+    // SAFETY: read after that slot's one write; `disk_at` gates on the flag set after it.
+    disk_at(i).and(unsafe { *GRANTS.get(i)?.get() })
+}
 
-/// Hand the disk's interrupt to the domain, or take it back. While forwarding, the handler
-/// does not touch the in-kernel `VirtioBlk`, whose engine the domain has reset out from under.
+/// Whether a disk's interrupt is being forwarded to a driver domain instead of collected in
+/// the kernel. Set around [`crate::blockdomain`]'s run.
+static FORWARDING: [AtomicBool; virtio_blk::MAX_DISKS] =
+    [const { AtomicBool::new(false) }; virtio_blk::MAX_DISKS];
+
+/// Hand the volume-carrying disk's interrupt to the domain, or take it back. While
+/// forwarding, the handler does not touch the in-kernel `VirtioBlk`, whose engine the domain
+/// has reset out from under. Only that disk is served from a domain today, so only its slot
+/// is forwarded; the other disk keeps collecting its own completions in the kernel.
 #[cfg_attr(
     not(CONFIG_BLOCK_DOMAIN),
     expect(dead_code, reason = "set only by the block-domain check")
 )]
 pub fn forward_interrupts(on: bool) {
-    FORWARDING.store(on, Ordering::Release);
+    if let Some(f) = FORWARDING.get(primary()) {
+        f.store(on, Ordering::Release);
+    }
 }
 
-/// The disk's interrupt handler, installed with `virtio_blk::set_handler`.
+/// A disk's interrupt handler, installed with `virtio_blk::set_handler`.
 ///
-/// The device model's table holds a plain function, and the started device belongs to the
-/// kernel, which brought it up with memory it provides. So the handler reaches the device
-/// through [`disk`], which is readable before the first request is submitted.
+/// The device model's table holds a plain `fn()`, which cannot say which device fired, so
+/// each slot is installed with a trampoline of its own from [`TRAMPOLINES`] and the slot is
+/// what reaches the right device through [`disk_at`].
 ///
-/// While the disk is served from a driver domain, the completion is the domain's to collect;
+/// While a disk is served from a driver domain, the completion is the domain's to collect;
 /// the handler forwards the interrupt to it as a message instead (see [`crate::blockdomain`]).
-fn on_disk_interrupt() {
-    if FORWARDING.load(Ordering::Acquire) && crate::blockdomain::forward_interrupt() {
+fn on_disk_interrupt(i: usize) {
+    if FORWARDING.get(i).is_some_and(|f| f.load(Ordering::Acquire))
+        && crate::blockdomain::forward_interrupt()
+    {
         return;
     }
-    if let Some(d) = disk() {
+    if let Some(d) = disk_at(i) {
         d.on_interrupt();
     }
 }
 
-/// Reset the disk and bring a fresh in-kernel driver up over the same grant, after a driver
-/// domain has run on it, so the stress run and the filesystem find a working disk. `false` if
-/// the disk was never up or the fresh bring-up fails.
+fn on_disk_0() {
+    on_disk_interrupt(0);
+}
+
+fn on_disk_1() {
+    on_disk_interrupt(1);
+}
+
+/// One trampoline per slot, because the interrupt table holds a bare `fn()`.
+const TRAMPOLINES: [fn(); virtio_blk::MAX_DISKS] = [on_disk_0, on_disk_1];
+
+/// Reset the volume-carrying disk and bring a fresh in-kernel driver up over the same grant,
+/// after a driver domain has run on it, so the stress run and the filesystem find a working
+/// disk. `false` if the disk was never up or the fresh bring-up fails.
 #[cfg_attr(
     not(CONFIG_BLOCK_DOMAIN),
     expect(dead_code, reason = "called only after the block-domain check")
 )]
 pub fn restart_in_kernel(c: &dyn EarlyConsole) -> bool {
-    let Some((virt, phys, len)) = (unsafe { *GRANT.get() }) else {
+    let i = primary();
+    // SAFETY: read after that slot's one write, on the boot path.
+    let Some((virt, phys, len)) = (unsafe { *GRANTS[i].get() }) else {
         return false;
     };
     let mut sector = [0u8; testdisk::SECTOR];
-    restart(c, virt, phys, len, &mut sector)
+    restart(c, i, virt, phys, len, &mut sector)
 }
 
 /// Bring the disk up and check it.
@@ -147,96 +202,133 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
         return Check::Failed;
     };
 
-    // Device memory: a contiguous run the device will address by its physical address.
-    let Ok(run) = frames.alloc_contiguous(DMA_PAGES) else {
-        c.write_str("no run of frames for the device's memory");
-        return Check::Failed;
-    };
-    let phys = run.start().start().raw();
-    let len = DMA_PAGES * <Cpu as hal::Arch>::PAGE_SIZE;
-    let Ok(virt) = direct.to_virt(PhysAddr::new(phys)) else {
-        c.write_str("the device's memory is outside the direct map");
-        let _ = frames.free_contiguous(run);
-        return Check::Failed;
-    };
-    if !direct.covers_phys(PhysAddr::new(phys + len as u64 - 1)) {
-        c.write_str("the device's memory runs past the direct map");
-        let _ = frames.free_contiguous(run);
-        return Check::Failed;
-    }
-    // SAFETY: the run was just taken from the frame allocator, so nothing else refers to
-    // it, and the direct map maps `[phys, phys + len)` at `virt` writable. It is never
-    // freed: the device keeps using it for as long as the kernel runs.
-    let dma = unsafe { Dma::new(virt.raw(), phys, len) };
-
-    // With an IOMMU, put the disk behind it *before* it does any DMA: a translation domain
-    // that maps exactly this grant and nothing else. `iommu` does nothing on a build without
-    // one, and there the disk's DMA reaches memory directly as before.
-    let confined = if kconfig::IOMMU {
-        if !iommu::confine_disk(c, frames, direct, phys, len as u64) {
+    // Every bound disk is brought up, each over a grant of its own, before any of them is
+    // checked: which one carries the volumes is not known until their headers are read, and
+    // a slot's number is only the order the platform enumerated the devices in.
+    let mut up = 0;
+    let mut primary_grant = None;
+    for i in 0..virtio_blk::bound().min(virtio_blk::MAX_DISKS) {
+        // Device memory: a contiguous run the device will address by its physical address.
+        let Ok(run) = frames.alloc_contiguous(DMA_PAGES) else {
+            c.write_str("no run of frames for the device's memory");
+            return Check::Failed;
+        };
+        let phys = run.start().start().raw();
+        let len = DMA_PAGES * <Cpu as hal::Arch>::PAGE_SIZE;
+        let Ok(virt) = direct.to_virt(PhysAddr::new(phys)) else {
+            c.write_str("the device's memory is outside the direct map");
+            let _ = frames.free_contiguous(run);
+            return Check::Failed;
+        };
+        if !direct.covers_phys(PhysAddr::new(phys + len as u64 - 1)) {
+            c.write_str("the device's memory runs past the direct map");
+            let _ = frames.free_contiguous(run);
             return Check::Failed;
         }
-        c.write_str("; ");
-        // On MSI-X, the disk's interrupt goes through the IOMMU as well: its table entry, not
-        // its message, then names the CPU, and only the disk may use it.
-        if let Some(line) = platform::block_line(0).filter(|&l| platform::interrupt_is_msi(l)) {
-            if !iommu::remap_disk_interrupt(c, frames, line) {
+        // SAFETY: the run was just taken from the frame allocator, so nothing else refers to
+        // it, and the direct map maps `[phys, phys + len)` at `virt` writable. It is never
+        // freed: the device keeps using it for as long as the kernel runs.
+        let dma = unsafe { Dma::new(virt.raw(), phys, len) };
+
+        // With an IOMMU, put the disk behind it *before* it does any DMA: a translation
+        // domain that maps exactly this grant and nothing else. `iommu` does nothing on a
+        // build without one, and there the disk's DMA reaches memory directly as before.
+        //
+        // One confinement, so one disk: the unit's translation is enabled for every device
+        // behind it, and a second unconfined function would fault into the same log this
+        // check reads. The IOMMU presets therefore attach a single drive, which is why this
+        // is slot 0 rather than `i` — the loop runs once there.
+        if kconfig::IOMMU && i == 0 {
+            if !iommu::confine_disk(c, frames, direct, phys, len as u64) {
                 return Check::Failed;
             }
             c.write_str("; ");
+            // On MSI-X, the disk's interrupt goes through the IOMMU as well: its table
+            // entry, not its message, then names the CPU, and only the disk may use it.
+            if let Some(line) = platform::block_line(0).filter(|&l| platform::interrupt_is_msi(l)) {
+                if !iommu::remap_disk_interrupt(c, frames, line) {
+                    return Check::Failed;
+                }
+                c.write_str("; ");
+            }
         }
-        true
-    } else {
-        false
-    };
 
-    // SAFETY: the claimed window is mapped by the kernel's address space, which maps
-    // every window a bound driver claimed, and this is the one transport made for it.
-    let Some(transport) = (unsafe { virtio_blk::transport(0) }) else {
-        c.write_str("the device's window is outside the address space");
-        return Check::Failed;
-    };
-    // The queue on its MSI-X entry when that is how the platform wired the disk's interrupt;
-    // on a line, or polled, bring-up needs to know nothing.
-    let vector = virtio_blk::msix_entry(0)
-        .filter(|_| platform::block_line(0).is_some_and(platform::interrupt_is_msi));
-    let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
-        Ok(b) => b,
-        Err(e) => {
-            c.write_str("bring-up FAILED: ");
-            c.write_str(bring_up_error(e));
+        // SAFETY: the claimed window is mapped by the kernel's address space, which maps
+        // every window a bound driver claimed, and this is the one transport made for it.
+        let Some(transport) = (unsafe { virtio_blk::transport(i) }) else {
+            c.write_str("the device's window is outside the address space");
+            return Check::Failed;
+        };
+        // The queue on its MSI-X entry when that is how the platform wired this disk's
+        // interrupt; on a line, or polled, bring-up needs to know nothing.
+        let vector = virtio_blk::msix_entry(i)
+            .filter(|_| platform::block_line(i).is_some_and(platform::interrupt_is_msi));
+        let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
+            Ok(b) => b,
+            Err(e) => {
+                c.write_str("bring-up FAILED: ");
+                c.write_str(bring_up_error(e));
+                return Check::Failed;
+            }
+        };
+
+        let geometry = blk.geometry();
+        if i > 0 {
+            c.write_str(", ");
+        }
+        write_usize(c, geometry.capacity as usize);
+        c.write_str(" sectors of ");
+        write_usize(c, geometry.block_size);
+        c.write_str(" bytes, ");
+        write_usize(c, blk.max_transfer_blocks() as usize);
+        c.write_str(" per request");
+
+        // The device is stored, and its interrupt handler installed, *before* the checks run.
+        //
+        // The platform registered and enabled the device's line during discovery, and the
+        // device raises it for every completion. Its interrupt status is acknowledged only by
+        // the handler, not by a caller draining the ring, so a line with a handler that cannot
+        // reach the device stays asserted: level-triggered, it would re-enter the interrupt
+        // path for good the first time interrupts were unmasked after this check.
+        //
+        // SAFETY: the one write to this slot, before its flag makes it readable.
+        unsafe { *DISKS[i].get() = Some(blk) };
+        // The grant this disk runs on, for the block-domain check to reuse: written before
+        // the flag, and read only through `grant_at`, which gates on it.
+        // SAFETY: the one write, on the boot path before the flag.
+        unsafe { *GRANTS[i].get() = Some((virt.raw(), phys, len)) };
+        STARTED[i].store(true, Ordering::Release);
+        // SAFETY: once per slot, on the boot path, before any interrupt can be delivered for
+        // the line: interrupts are masked here, and the first request is submitted below.
+        let _ = unsafe { virtio_blk::set_handler(i, TRAMPOLINES[i]) };
+        if disk_at(i).is_none() {
+            c.write_str("; the disk could not be read back after it was stored");
             return Check::Failed;
         }
-    };
+        up += 1;
+        if primary_grant.is_none() {
+            primary_grant = Some((virt.raw(), phys, len));
+        }
+    }
+    if up == 0 {
+        c.write_str("NO DISK CAME UP");
+        return Check::Failed;
+    }
 
-    let geometry = blk.geometry();
-    write_usize(c, geometry.capacity as usize);
-    c.write_str(" sectors of ");
-    write_usize(c, geometry.block_size);
-    c.write_str(" bytes, ");
-    write_usize(c, blk.max_transfer_blocks() as usize);
-    c.write_str(" per request");
+    // Which disk carries the volumes, by its header rather than by its slot number. Each
+    // image's header names its own length, so the volume-carrying one identifies itself; a
+    // machine whose enumeration order differs from the order the drives were given would
+    // otherwise mount whichever disk happened to come first.
+    if !choose_primary(c, &mut primary_grant) {
+        return Check::Failed;
+    }
 
-    // The device is stored, and its interrupt handler installed, *before* the checks run.
-    //
-    // The platform registered and enabled the device's line during discovery, and the
-    // device raises it for every completion. Its interrupt status is acknowledged only by
-    // the handler, not by a caller draining the ring, so a line with a handler that cannot
-    // reach the device stays asserted: level-triggered, it would re-enter the interrupt
-    // path for good the first time interrupts were unmasked after this check.
-    //
-    // SAFETY: the one write to `DISK`, before `STARTED` makes it readable.
-    unsafe { *DISK.get() = Some(blk) };
-    // The grant the disk runs on, for the block-domain check to reuse: written before
-    // `STARTED`, like `DISK`, and read only through `grant`, which gates on `STARTED`.
-    // SAFETY: the one write, on the boot path before `STARTED`.
-    unsafe { *GRANT.get() = Some((virt.raw(), phys, len)) };
-    STARTED.store(true, Ordering::Release);
-    // SAFETY: once, on the boot path, before any interrupt can be delivered for the line:
-    // interrupts are masked here, and the first request is submitted below.
-    let _ = unsafe { virtio_blk::set_handler(0, on_disk_interrupt) };
     let Some(blk) = disk() else {
-        c.write_str("; the disk could not be read back after it was stored");
+        c.write_str("; the volume's disk could not be read back");
+        return Check::Failed;
+    };
+    let Some((virt, phys, len)) = primary_grant else {
+        c.write_str("; the volume's disk has no grant");
         return Check::Failed;
     };
 
@@ -246,14 +338,53 @@ pub fn check(c: &dyn EarlyConsole, frames: &mut FrameAllocator<'_, Cpu>, live: L
     // With the IOMMU on, prove the confinement: an out-of-grant DMA is stopped and logged,
     // and the device restarts and serves again. `blk` is re-fetched inside, because a
     // restart replaces the stored device.
-    if ok && confined {
-        ok = iommu_checks(c, frames, direct, virt.raw(), phys, len, buf);
+    if ok && kconfig::IOMMU {
+        ok = iommu_checks(c, frames, direct, virt, phys, len, buf);
     }
     if ok {
         c.write_str(" ok");
         Check::Passed
     } else {
         Check::Failed
+    }
+}
+
+/// Record which bound disk carries the volumes, by reading each one's header, and set
+/// `primary_grant` to that disk's grant.
+///
+/// The volume-carrying image's header names [`testdisk::SECTORS`]; the second disk's names
+/// its own, shorter length. So the disks identify themselves and nothing here trusts a slot
+/// number. With one disk this chooses it and says nothing, leaving the single-drive path
+/// exactly as it was.
+fn choose_primary(c: &dyn EarlyConsole, primary_grant: &mut Option<(usize, u64, usize)>) -> bool {
+    let mut sector = [0u8; testdisk::SECTOR];
+    let mut found = None;
+    for i in 0..virtio_blk::MAX_DISKS {
+        let Some(blk) = disk_at(i) else { continue };
+        if blk.read_blocks(0, &mut sector).is_err() {
+            continue;
+        }
+        if testdisk::header(&sector) == Some(testdisk::SECTORS) {
+            found = Some(i);
+            break;
+        }
+    }
+    match found {
+        Some(i) => {
+            PRIMARY.store(i, Ordering::Release);
+            *primary_grant = grant_at(i);
+            if i != 0 {
+                c.write_str("; the volume is on disk ");
+                write_usize(c, i);
+            }
+            true
+        }
+        None if kconfig::QEMU_BLOCK_TEST => {
+            c.write_str("; NO BOUND DISK CARRIES THE TEST DISK'S HEADER");
+            false
+        }
+        // Without the test disk attached there is no header to match, and slot 0 stands.
+        None => true,
     }
 }
 
@@ -367,29 +498,36 @@ fn iommu_checks(
 
     // Restart: the faulted device is reset and a fresh one brought up over the same grant,
     // which the IOMMU domain still maps, so it serves again — and the stress run can use it.
-    let served = restart(c, virt, phys, len, buf);
+    let served = restart(c, primary(), virt, phys, len, buf);
     stopped && untouched && served
 }
 
 /// Reset the device after the fault and bring a fresh one up over the same DMA grant and
 /// window, then prove it serves a read. Replaces the stored device.
-fn restart(c: &dyn EarlyConsole, virt: usize, phys: u64, len: usize, buf: &mut [u8]) -> bool {
+fn restart(
+    c: &dyn EarlyConsole,
+    i: usize,
+    virt: usize,
+    phys: u64,
+    len: usize,
+    buf: &mut [u8],
+) -> bool {
     // SAFETY: the single-threaded boot path. The old device is dropped before the new one is
     // built, so the DMA region and the register window have exactly one owner at a time; the
     // new bring-up resets the device (status 0) and re-lays the queue, discarding the faulted
     // request. `virt`/`phys`/`len` are the same region `check` mapped, still direct-mapped.
-    unsafe { *DISK.get() = None };
-    STARTED.store(false, Ordering::Release);
+    unsafe { *DISKS[i].get() = None };
+    STARTED[i].store(false, Ordering::Release);
     let dma = unsafe { Dma::new(virt, phys, len) };
-    let Some(transport) = (unsafe { virtio_blk::transport(0) }) else {
+    let Some(transport) = (unsafe { virtio_blk::transport(i) }) else {
         c.write_str("; NO TRANSPORT ON RESTART");
         return false;
     };
     // Keep the disk on its MSI-X vector across the restart: the device reset forgot the queue
     // vector, but the platform's MSI-X table entry still stands, so bring-up sets the vector
     // again. Otherwise the restarted disk would drop to polling and the block-irq check fail.
-    let vector = virtio_blk::msix_entry(0)
-        .filter(|_| platform::block_line(0).is_some_and(platform::interrupt_is_msi));
+    let vector = virtio_blk::msix_entry(i)
+        .filter(|_| platform::block_line(i).is_some_and(platform::interrupt_is_msi));
     let blk = match VirtioBlk::<Locks>::bring_up_with_vector(transport, dma, vector) {
         Ok(b) => b,
         Err(e) => {
@@ -398,10 +536,10 @@ fn restart(c: &dyn EarlyConsole, virt: usize, phys: u64, len: usize, buf: &mut [
             return false;
         }
     };
-    // SAFETY: the one write to `DISK` after the old one was cleared, before `STARTED`.
-    unsafe { *DISK.get() = Some(blk) };
-    STARTED.store(true, Ordering::Release);
-    let Some(blk) = disk() else {
+    // SAFETY: the one write to this slot after the old one was cleared, before its flag.
+    unsafe { *DISKS[i].get() = Some(blk) };
+    STARTED[i].store(true, Ordering::Release);
+    let Some(blk) = disk_at(i) else {
         return false;
     };
     let sector0 = &mut buf[..testdisk::SECTOR];
@@ -565,9 +703,9 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
     // anything else fell back somewhere; one whose function has none must be on its pin,
     // routed through `_PRT`. Falling back to polling would turn this check and the next into
     // skips where they should have measured.
-    let pin = platform::block_line(0).and_then(intx::pin_route);
+    let pin = platform::block_line(primary()).and_then(intx::pin_route);
     if kconfig::QEMU_BLOCK_TEST && platform::delivers_msi() && !blk.uses_msix() {
-        if intx::block_has_msix(0) {
+        if intx::block_has_msix(primary()) {
             c.write_str("THE DISK IS NOT ON MSI-X, THOUGH QEMU'S FUNCTION HAS IT");
             return Check::Failed;
         }
@@ -576,7 +714,7 @@ pub fn interrupt_check(c: &dyn EarlyConsole) -> Check {
             return Check::Failed;
         }
     }
-    let Some(line) = platform::block_line(0) else {
+    let Some(line) = platform::block_line(primary()) else {
         c.write_str("skipped: the disk is polled, no interrupt route on this port");
         return Check::Skipped;
     };
@@ -659,7 +797,8 @@ pub fn remap_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no block device");
         return Check::Skipped;
     };
-    let Some(line) = platform::block_line(0).filter(|&l| platform::interrupt_is_msi(l)) else {
+    let Some(line) = platform::block_line(primary()).filter(|&l| platform::interrupt_is_msi(l))
+    else {
         c.write_str("THE DISK IS NOT ON MSI-X, SO NOTHING IS REMAPPED");
         return Check::Failed;
     };
@@ -869,7 +1008,8 @@ pub fn cpu_check(c: &dyn EarlyConsole) -> Check {
         c.write_str("skipped: no block device");
         return Check::Skipped;
     };
-    let Some(line) = platform::block_line(0).filter(|l| platform::interrupt_is_msi(*l)) else {
+    let Some(line) = platform::block_line(primary()).filter(|l| platform::interrupt_is_msi(*l))
+    else {
         c.write_str("skipped: the disk's interrupt is not one the platform can move");
         return Check::Skipped;
     };
