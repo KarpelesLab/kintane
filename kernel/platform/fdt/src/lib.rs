@@ -20,6 +20,14 @@
 #![no_std]
 #![feature(sync_unsafe_cell)]
 
+/// Finding the PCI Express host bridge the tree describes. Reading only; nothing is claimed,
+/// no register is touched, and no bus is enumerated. Without `PCIE`, the same calls finding
+/// nothing: `cfg` selects the module, never the call, so `discover` reads the same on every port.
+#[cfg(CONFIG_PCIE)]
+mod pcie;
+#[cfg(not(CONFIG_PCIE))]
+#[path = "pcie_off.rs"]
+mod pcie;
 /// Finding an Arm SMMUv3 and reading what it can do. Discovery only; nothing is programmed.
 /// Without `SMMUV3`, the same calls finding nothing: `cfg` selects the module, never the call,
 /// so `discover` reads the same on every port.
@@ -39,6 +47,7 @@ use device::{
 };
 use hal::paging::DeviceWindow;
 use hal::{EarlyConsole, IrqChip, IrqNumber};
+pub use pcie::{PcieFacts, facts as pcie};
 pub use smmuv3::{SmmuFacts, facts as smmu};
 use sync::{LockClass, SpinLock};
 
@@ -274,6 +283,9 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
     // no driver is bound yet, and discovery only reads identification registers. Nothing is
     // programmed.
     smmuv3::discover(c, &tree);
+    // The PCIe host bridge, read from the tree alone: its window is far above what the
+    // boot tables map, so unlike the SMMU nothing here is read from hardware.
+    pcie::discover(c, &tree);
 
     let mut bound: [Option<(usize, Bound)>; MAX_BOUND] = [const { None }; MAX_BOUND];
     let mut ok = true;
