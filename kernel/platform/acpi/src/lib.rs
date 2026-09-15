@@ -1047,7 +1047,20 @@ unsafe fn wire_all(
             let _ = unsafe { cell.set(source) };
         }
         match wire(c, chip, drv, s, function, Some(messages)) {
-            Wired::Nothing => {}
+            Wired::Nothing => {
+                // Right for a device that declares no interrupt; wrong for one that does.
+                // Every other outcome here prints, so staying quiet on this one is what hid
+                // a disk brought up with no handler on a line it shares.
+                // The same lookup `Probe::claim_irq` makes, not `interrupt_count`: a PCI
+                // function's specifier comes from its `_PRT` route rather than from an
+                // `interrupts` property, so counting properties is silent for exactly the
+                // devices this line exists to name.
+                if tree.interrupt(s.bound().node(), 0).is_ok() {
+                    c.write_str("; ");
+                    c.write_str(drv.name());
+                    c.write_str(" WIRED NO INTERRUPT THOUGH ITS NODE DECLARES ONE");
+                }
+            }
             Wired::Failed => ok = false,
             Wired::Line(line) => {
                 if drv.name() == virtio_blk::DRIVER.name()

@@ -13,4 +13,7 @@ KINBOOT_BIOS=y
 # QEMU's default 32-bit core, not `max`: this target exists for legacy machines.
 QEMU_CPU="qemu32"
 # The kernel's budget, as in i686-qemu; the loader's stages carry their own.
-SIZE_BUDGET_KIB=1024
+#
+# 1028 rather than 1024, for the same reason and the same measurement as i686-qemu: the
+# unwired-disk fix costs one page, 1,044,480 -> 1,048,576, exactly the old ceiling.
+SIZE_BUDGET_KIB=1028

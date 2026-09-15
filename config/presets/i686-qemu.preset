@@ -11,4 +11,9 @@ QEMU_EXIT=y
 # QEMU's default 32-bit core, not `max`: this target exists for legacy machines.
 QEMU_CPU="qemu32"
 # 548 KiB when set. `kbuild size --preset i686-qemu` shows where it goes.
-SIZE_BUDGET_KIB=1024
+#
+# 1028 rather than 1024: naming a disk whose line another device holds, and servicing that
+# disk from the holder's handler, costs this image one page — 1,044,480 -> 1,048,576, which
+# is exactly the old ceiling. 100% of budget boots (measured, not assumed), but it leaves
+# nothing for the next byte. 1028 KiB is 1,052,672, so 4,096 spare again.
+SIZE_BUDGET_KIB=1028

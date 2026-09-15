@@ -31,6 +31,13 @@ pub struct Claims {
     /// platform, which programs the table through it.
     table: Option<MmioClaim>,
     irq: Option<IrqLine>,
+    /// Set when the node declared an interrupt that could not be claimed, because another
+    /// device already holds that line — the second function on a shared INTx line.
+    ///
+    /// Kept rather than folded into `irq: None`, which cannot tell a device that wants no
+    /// interrupt from one that was refused the interrupt it declared. Only the second leaves
+    /// a level-triggered line with no handler able to acknowledge it.
+    irq_refused: bool,
     bus: Bus,
 }
 
@@ -115,14 +122,26 @@ impl Claims {
                 }
             }
         }
+        // Not refusing the device is right; discarding *why* was not. `Claim` is a line the
+        // node declares and another device holds, `Tree` a node that declares none — folding
+        // both into `None` is what let a disk be brought up with no handler in silence.
+        let mut irq_refused = false;
         let irq = match irq {
             Some(vector) => Some(vector),
-            None => p.claim_irq(0).ok(),
+            None => match p.claim_irq(0) {
+                Ok(line) => Some(line),
+                Err(ProbeError::Claim(_)) => {
+                    irq_refused = true;
+                    None
+                }
+                Err(_) => None,
+            },
         };
         Ok(Claims {
             mmio,
             table,
             irq,
+            irq_refused,
             bus,
         })
     }
@@ -135,6 +154,12 @@ impl Claims {
     /// The claimed interrupt, a line or an MSI-X vector, if one was.
     pub fn irq(&self) -> Option<&IrqLine> {
         self.irq.as_ref()
+    }
+
+    /// Whether the node declared an interrupt that could not be claimed because another
+    /// device holds that line. The device is still usable by polling.
+    pub fn irq_refused(&self) -> bool {
+        self.irq_refused
     }
 
     /// The MSI-X table entry the interrupt was claimed as, if it was one: what a driver's
