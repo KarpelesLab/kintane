@@ -1209,10 +1209,7 @@ mod tests {
             (NET_GUEST_TCP_PORT, NET_GUEST_TCP_PORT),
             "both reach the one listener"
         );
-        assert_ne!(
-            from_one, from_two,
-            "so only this end's port tells them apart"
-        );
+        assert_ne!(from_one, from_two, "so only this end's port tells them apart");
         assert_eq!(p.seen.opened, 2);
     }
 
@@ -1237,17 +1234,13 @@ mod tests {
         let handshake = p.tcp(&syn_ack(&syn[0], 0x9000));
         let (.., request) = tcp_parts(&handshake[1]);
         let reply = b"kintane-tcp-inbound-reply 12345\n";
-        let out = p.tcp(&segment_from(
-            NET_GUEST_TCP_PORT,
-            local,
-            0x9001,
-            0,
-            TCP_ACK | TCP_PSH,
-            reply,
-        ));
+        let out =
+            p.tcp(&segment_from(NET_GUEST_TCP_PORT, local, 0x9001, 0, TCP_ACK | TCP_PSH, reply));
         let lines: Vec<Vec<u8>> = out.iter().map(|f| tcp_parts(f).5).collect();
         assert!(
-            lines.iter().any(|l| l == b"kintane-tcp-inbound-verified 12345\n"),
+            lines
+                .iter()
+                .any(|l| l == b"kintane-tcp-inbound-verified 12345\n"),
             "the verdict names the tag: {lines:?}"
         );
         assert!(
@@ -1274,7 +1267,9 @@ mod tests {
         ));
         let lines: Vec<Vec<u8>> = out.iter().map(|f| tcp_parts(f).5).collect();
         assert!(
-            lines.iter().any(|l| l.starts_with(b"kintane-tcp-inbound-wrong ")),
+            lines
+                .iter()
+                .any(|l| l.starts_with(b"kintane-tcp-inbound-wrong ")),
             "a reply for another listener is refused, not accepted: {lines:?}"
         );
     }
