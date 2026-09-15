@@ -38,11 +38,6 @@
 //! action does nothing. Alternate signal stacks: `sigaltstack` reports none and refuses to set
 //! one. `rt_sigsuspend`, `rt_sigtimedwait` and `signalfd`.
 //!
-//! Floating-point state is not saved in the frame, and cannot honestly be until `hal::HasFpu`
-//! exists: no context switch on either port saves those registers either, so a handler is not
-//! the only thing that changes them under the code it interrupted.
-//! `linux::signal::restore` refuses a frame that carries such state rather than reading past it.
-//!
 //! # Queued signals
 //!
 //! A signal from [`RT_FIRST`] up queues: three sent are three delivered, oldest first, each with

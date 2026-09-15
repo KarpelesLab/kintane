@@ -1369,6 +1369,28 @@ deliveries and at least one send refused. On `x86_64-qemu` and `aarch64-virt`:
   linux rt   queued three deep and delivered in order, lowest number first, a full queue refused; 8 queued signals delivered, 1 refused when full; 0 frames left ok
 ```
 
+**Floating-point state in the frame.** A fifth run, `linux fp`, follows `linux rt` on the same
+slot and stacks, as `hello fp`. It is the only mode that needs `linux-hello` built for the
+architecture's hard-float specification, and the only one that would notice if the frame's
+floating-point area were carried but never filled: every other check here passes with
+`HasFpu::save_live` and `load_live` as no-ops, because no other mode puts a value in a vector
+register and looks at it again. Its exit code is 60 when every step behaved:
+
+| Step | What it checks |
+|---|---|
+| 120 | the arithmetic runs at all. On x86_64 an SSE instruction raises `#UD` unless boot set `CR4.OSFXSR` and cleared `CR0.EM`, so this is the enable bits as much as the arithmetic |
+| 121–123 | eight registers are marked, a signal is sent, and every mark is still there afterwards — with a handler that does floating-point arithmetic of its own in between, so a kernel saving none of this is caught by the compare rather than by luck |
+| 124–126 | a handler edits the saved state in its own frame, and the interrupted code resumes with what the handler wrote. This is what says the frame is the source of truth rather than a copy the kernel kept elsewhere: a kernel restoring from its own copy passes every other step here and fails this one |
+| 127–129 | a child's handler makes its own record malformed — a pointer of its choosing on x86_64, a record of the wrong size on aarch64 — and returns into it. `rt_sigreturn` must refuse and end it with `SIGSEGV` rather than follow what the program wrote |
+
+The check requires that exit code and, from the kernel's own counters, three handlers against
+two returns and one process ended by a refused frame. The asymmetry is the point: the third
+handler is the corrupting child's, which never returns. On `x86_64-qemu` and `aarch64-virt`:
+
+```
+  linux fp   registers held across a handler that used them, a handler's edit of the saved state honoured, a malformed record refused; 3 handlers run, 2 returned, 1 ended by a refused frame; 0 frames left ok
+```
+
 **In the stress run.** Every fourth audit interval, after the waiting process, the auditor starts
 the program twice as `hello tls`, on the two stacks the process and waiting-process cycles use.
 It starts each process as it builds it and pins both to one CPU, a
@@ -1499,7 +1521,11 @@ was restored and compared byte for byte.
 | A queued signal delivered once instead of three times (`pop_queued` not putting the pending bit back while another entry of that number is held) | boot: `linux rt  the program exited 0x00000000000000f7, WRONG; 2 queued signals delivered, 1 refused when full; NOT WHAT THE MODE DOES`, step 247: the first of each number arrived and the rest stayed in the queue, which the kernel's own count confirms |
 | Delivery ignoring the order entries went in (`pop_queued` taking the newest rather than the oldest) | boot: `linux rt  the program exited 0x00000000000000f8, WRONG; 8 queued signals delivered, 1 refused when full`, step 248: all eight arrived, so the count is right and only the order is wrong |
 | A full queue dropping a send silently instead of refusing it (`queue` answering `Ok` when no slot is free) | boot: `linux rt  the program exited 0x00000000000000f5, WRONG; 0 queued signals delivered, 0 refused when full`, step 245: the ninth send was accepted, so the program never unblocked and nothing was delivered at all |
-| `restore` reading past a frame that claims floating-point state instead of refusing it | host: `a_frame_that_asks_for_floating_point_state_back_is_refused` fails on both architectures; a 20,000-input `sigframe` campaign stops with `Aarch64: a frame claiming floating-point state was accepted` |
+| `save_live` writing nothing, so the frame carries zeros (x86_64, then aarch64) | boot: `linux fp  the program exited 0x000000000000007a, WRONG; 1 handlers run, 1 returned, 0 ended by a refused frame; NOT WHAT THE MODE DOES`, step 122: the eight marked registers did not come back |
+| `load_live` doing nothing, so the frame is never read back (x86_64) | boot: the same, step 122 |
+| The aarch64 record's size not checked (`restore` accepting any `fpsimd_context`) | boot: `linux fp  the program exited 0x0000000000000080, WRONG; 3 handlers run, 3 returned, 0 ended by a refused frame`, step 128: the child's malformed frame was accepted, so it returned instead of being ended — three handlers and *three* returns, where a kernel that refuses has three and two |
+| aarch64's frame image reverted to the port's own order (V registers first) | the build fails: `error[E0080]: evaluation panicked: assertion failed: FPSR_AT == 0`. With the assertions relaxed so it reaches a boot: `linux fp  the program exited 0x000000000000007e, WRONG`, step 126 — eight bytes of skew put every V register one slot from where a program reads it, so a handler editing `d0` edits what the kernel calls `v1`. This is the bug that shipped and the boot found |
+| `restore` accepting a frame whose floating-point field is not the one `build` wrote | host: `a_frame_carries_floating_point_state_and_only_the_one_this_kernel_wrote` fails on both architectures; a 20,000-input `sigframe` campaign stops with `a frame was accepted whose floating-point field is not the one build writes` |
 | The same, with the re-fault bound removed (`REFAULTS` raised) | boot: `linux flt  the program NEVER EXITED; 1 from an interrupt, 317451 from a fault, 317451 of 317452 returned; A THREAD NEVER ENDED, its processes left in place; 15 FRAMES LEAKED`. This is what the bound exists to stop, and what Linux itself leaves to the program |
 
 `LINUX_ENOSYS_FATAL=y` was booted as well. The boot passes, with `exit 0xffffffffffffffff ok` and

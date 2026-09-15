@@ -25,15 +25,26 @@
 //! down twice; `kernel/main` asserts the word count agrees, and the boot check that a handler
 //! returns with every callee-saved register intact is what proves the order does.
 //!
-//! # What the frame does not hold
+//! # Floating-point state, and how much of it is trusted
 //!
-//! Floating-point and SIMD state: x86_64's `fpstate` pointer is null and aarch64's reserved
-//! space holds only the terminating null record. A handler that uses those registers changes
-//! them under the code it interrupted — on the ports as they are, so does any other thread that
-//! runs, because no context switch saves them either (`hal::HasFpu` is the unbuilt work that
-//! would). [`restore`] therefore **refuses** a frame that carries such state rather than reading
-//! past it: a program that writes an `fpstate` pointer or an `fpsimd_context` record is asking
-//! for registers back, and this kernel would not give them.
+//! The frame carries it: x86_64's `fpstate` pointer names a 512-byte `FXSAVE` area at the end of
+//! the frame, and aarch64's reserved space opens with a `fpsimd_context` record — Linux's magic
+//! and size, `fpsr` and `fpcr`, then the 32 V registers — terminated by a null record. A handler
+//! is the program's own code and may use those registers, so the interrupted code's values have
+//! to be somewhere.
+//!
+//! This crate only *places* those bytes. It depends on nothing and has no architecture to ask,
+//! so the personality fills them from `hal::HasFpu::save_live` and hands them back to
+//! `load_live`; [`FPU_AT`] and [`FPU_BYTES`] say where and how many, and `kernel/main` asserts
+//! the size against the port's own at compile time.
+//!
+//! **What [`restore`] will accept is narrower than what a program can write.** That field is the
+//! one a program would use to aim the kernel at memory of its choosing, so it is checked rather
+//! than followed: on x86_64 the only pointer accepted is the one naming the area inside that very
+//! frame — which is why `restore` needs the frame's address, since the saved `rsp` is the
+//! interrupted stack pointer and nothing in the bytes says where they came from — and on aarch64
+//! the record must carry exactly Linux's magic and size. Null is not "no state claimed" but a
+//! malformed frame, because every frame this kernel writes carries the state.
 
 #[cfg(test)]
 mod tests;
