@@ -3292,6 +3292,17 @@ the `.config`, the kernel image and its symbol bundle, a monitor state dump, and
 replay trace where one exists. A failure that cannot be investigated from CI output
 alone is itself a harness bug.
 
+`qemu.log` is bounded after the run, because QEMU caps nothing: `-d` selects which items
+are logged and the file then grows until the disk is full. An unacknowledged shared
+interrupt line once took it to 140,096,133 lines of the same servicing message, where the
+diagnosis needed the last few thousand. Past 128 MiB, kbuild keeps the first 4 MiB and the
+last 12 MiB and says in the file where the middle went — both ends, because a boot that
+dies early leaves its evidence at the start while a storm leaves it at the end. A passing
+run is never cut: the largest measured writes 16,958,514 bytes, on `aarch64-virt`, and the
+bound is held above that at compile time rather than by anyone's memory. A preset whose
+normal trace does exceed the bound is not truncated in silence — the run reports that a
+*passing* boot was cut, and names the two constants to raise.
+
 ### No automatic retries
 
 A test that fails intermittently is **a bug, most likely a real race**. It is not
