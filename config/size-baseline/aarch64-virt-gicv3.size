@@ -1,16 +1,16 @@
 # kbuild size report for preset aarch64-virt-gicv3. Rewrite with `kbuild size --preset aarch64-virt-gicv3 --update-baseline`.
 section .bss 229376
-section .data 149624
-section .rodata 540672
+section .data 150720
+section .rodata 548864
 section .stack 32768
 section .stack_guard 4096
-section .text 737280
+section .text 745472
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 107379 data 0 bss 0
-crate (unmangled) text 12504 rodata 0 data 0 bss 0
+crate (anonymous) text 0 rodata 112933 data 0 bss 0
+crate (unmangled) text 13492 rodata 0 data 0 bss 0
 crate __rustc text 172 rodata 0 data 0 bss 0
 crate abi text 5036 rodata 0 data 0 bss 0
-crate arch text 11540 rodata 0 data 1032 bss 71117
+crate arch text 12088 rodata 0 data 1032 bss 71117
 crate bcache text 4808 rodata 0 data 0 bss 0
 crate block text 1896 rodata 0 data 0 bss 0
 crate bootinfo text 1544 rodata 0 data 0 bss 0
@@ -24,29 +24,29 @@ crate fdt text 7076 rodata 0 data 0 bss 0
 crate gic text 2652 rodata 0 data 0 bss 112
 crate hal text 632 rodata 0 data 0 bss 0
 crate hwproxy text 384 rodata 0 data 0 bss 0
-crate ipc text 3512 rodata 16 data 0 bss 0
-crate kalloc text 12508 rodata 0 data 0 bss 0
-crate kintane text 419116 rodata 240 data 76464 bss 142327
-crate kobject text 6760 rodata 16 data 0 bss 0
-crate linux text 10580 rodata 0 data 0 bss 0
-crate mm text 30024 rodata 0 data 0 bss 0
+crate ipc text 9848 rodata 16 data 0 bss 0
+crate kalloc text 12516 rodata 0 data 0 bss 0
+crate kintane text 423596 rodata 240 data 77560 bss 142912
+crate kobject text 6424 rodata 16 data 0 bss 0
+crate linux text 10628 rodata 0 data 0 bss 0
+crate mm text 29756 rodata 0 data 0 bss 0
 crate net text 43608 rodata 0 data 0 bss 0
 crate pl011 text 1660 rodata 0 data 80 bss 108
-crate platform text 7536 rodata 16 data 70392 bss 1715
+crate platform text 7672 rodata 16 data 70392 bss 1715
 crate rfind text 316 rodata 0 data 0 bss 0
-crate sched text 2956 rodata 0 data 0 bss 0
+crate sched text 2796 rodata 0 data 0 bss 0
 crate strip_suffix text 52 rodata 0 data 0 bss 0
-crate sync text 18812 rodata 32 data 1088 bss 272
-crate thread text 8992 rodata 0 data 0 bss 0
+crate sync text 14560 rodata 32 data 1088 bss 272
+crate thread text 8984 rodata 0 data 0 bss 0
 crate time text 3324 rodata 0 data 0 bss 0
 crate trim_matches text 820 rodata 0 data 0 bss 0
 crate unwind text 2500 rodata 0 data 0 bss 0
-crate vfs text 18040 rodata 0 data 0 bss 0
+crate vfs text 18212 rodata 0 data 0 bss 0
 crate vfsproto text 2720 rodata 0 data 0 bss 0
 crate virtio text 6036 rodata 0 data 0 bss 0
 crate virtio_bind text 1560 rodata 0 data 0 bss 0
-crate virtio_blk text 2976 rodata 32 data 384 bss 0
+crate virtio_blk text 3024 rodata 32 data 384 bss 0
 crate virtio_blk_core text 2480 rodata 0 data 0 bss 0
 crate virtio_net text 3716 rodata 16 data 176 bss 8
 crate virtio_probe text 464 rodata 0 data 0 bss 0
-total 1955960
+total 1973440
