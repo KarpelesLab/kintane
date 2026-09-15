@@ -20,6 +20,14 @@
 #![no_std]
 #![feature(sync_unsafe_cell)]
 
+/// Finding an Arm SMMUv3 and reading what it can do. Discovery only; nothing is programmed.
+/// Without `SMMUV3`, the same calls finding nothing: `cfg` selects the module, never the call,
+/// so `discover` reads the same on every port.
+#[cfg(CONFIG_SMMUV3)]
+mod smmuv3;
+#[cfg(not(CONFIG_SMMUV3))]
+#[path = "smmuv3_off.rs"]
+mod smmuv3;
 mod smp;
 
 use core::cell::SyncUnsafeCell;
@@ -31,6 +39,7 @@ use device::{
 };
 use hal::paging::DeviceWindow;
 use hal::{EarlyConsole, IrqChip, IrqNumber};
+pub use smmuv3::{SmmuFacts, facts as smmu};
 use sync::{LockClass, SpinLock};
 
 /// Every driver this image carries, in the order ties between equally specific matches go.
@@ -259,6 +268,12 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
         // Said here, because the block check can only report that no device was bound.
         c.write_str(" (a legacy virtio-blk slot, which the driver does not drive)");
     }
+
+    // An SMMUv3, where this build asked for one; nothing, where it did not. Read here, on the
+    // identity map, for the same reason the virtio slots above are: no window is claimed and
+    // no driver is bound yet, and discovery only reads identification registers. Nothing is
+    // programmed.
+    smmuv3::discover(c, &tree);
 
     let mut bound: [Option<(usize, Bound)>; MAX_BOUND] = [const { None }; MAX_BOUND];
     let mut ok = true;

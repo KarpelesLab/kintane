@@ -1,0 +1,21 @@
+# aarch64 under QEMU `virt` with an Arm SMMUv3 the kernel discovers and reports.
+#
+# The same kernel as aarch64-virt, with SMMUV3 on. QEMU is started with
+# `-machine virt,iommu=smmuv3`, which adds an `arm,smmu-v3` node to the device tree and an
+# `iommu-map` property to the PCIe host bridge. The kernel finds the node, reads the unit's
+# identification registers on the boot identity map, and reports what it could translate
+# for: its stream id width, its granules, its output address size, and how many stream ids
+# the tree maps to it.
+#
+# Discovery only. Nothing is programmed, and no device is confined -- on this machine QEMU
+# wires the SMMU to the PCIe root complex alone, while this port's disk is a memory-mapped
+# virtio slot that carries no `iommus` property, so there is no device here whose DMA the
+# unit could translate. The `smmu` check asserts that too, so the day the machine changes,
+# the boot says so instead of the claim quietly going stale. See docs/isolation.md.
+ARCH_AARCH64=y
+SMP=n
+EARLY_CONSOLE=y
+DEBUG_BUILD=y
+QEMU_EXIT=y
+SMMUV3=y
+SIZE_BUDGET_KIB=2048

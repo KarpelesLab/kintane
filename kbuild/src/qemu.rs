@@ -224,39 +224,41 @@ pub fn machine_for(res: &Resolution, image: &Path, log: &Path) -> Result<Machine
             n if n > 1 => vec![s("-smp"), n.to_string()],
             _ => Vec::new(),
         };
+        // An SMMUv3, which QEMU wires to the PCIe root complex and to nothing else: it adds
+        // an `arm,smmu-v3` node and an `iommu-map` on the host bridge, and leaves the
+        // memory-mapped virtio slots — where this port's disk lives — outside it. The
+        // kernel discovers and reports the unit; see docs/isolation.md.
+        let machine = if res.is_on("SMMUV3") {
+            "virt,gic-version=3,iommu=smmuv3"
+        } else {
+            "virt,gic-version=3"
+        };
         return Ok(Machine {
             binary: "qemu-system-aarch64",
-            args: [
-                s("-machine"),
-                s("virt,gic-version=3"),
-                s("-cpu"),
-                cpu,
-                s("-m"),
-                mem,
-            ]
-            .into_iter()
-            .chain(smp)
-            .chain(block_disk(res, image, "virtio-blk-device"))
-            .chain(net_card(res, "virtio-net-device", net_port))
-            .chain([
-                s("-kernel"),
-                image.display().to_string(),
-                // QEMU writes this into the device tree's `/chosen/bootargs`.
-                s("-append"),
-                crate::bootcfg::kernel_command_line(res),
-                s("-semihosting-config"),
-                s("enable=on,target=native"),
-                s("-serial"),
-                s("stdio"),
-                s("-display"),
-                s("none"),
-                s("-no-reboot"),
-                s("-d"),
-                s("int,guest_errors"),
-                s("-D"),
-                log.display().to_string(),
-            ])
-            .collect(),
+            args: [s("-machine"), s(machine), s("-cpu"), cpu, s("-m"), mem]
+                .into_iter()
+                .chain(smp)
+                .chain(block_disk(res, image, "virtio-blk-device"))
+                .chain(net_card(res, "virtio-net-device", net_port))
+                .chain([
+                    s("-kernel"),
+                    image.display().to_string(),
+                    // QEMU writes this into the device tree's `/chosen/bootargs`.
+                    s("-append"),
+                    crate::bootcfg::kernel_command_line(res),
+                    s("-semihosting-config"),
+                    s("enable=on,target=native"),
+                    s("-serial"),
+                    s("stdio"),
+                    s("-display"),
+                    s("none"),
+                    s("-no-reboot"),
+                    s("-d"),
+                    s("int,guest_errors"),
+                    s("-D"),
+                    log.display().to_string(),
+                ])
+                .collect(),
             success_code: 0,
             input: res.str("BOOT_TEST_KEYS").as_bytes().to_vec(),
             serial_probe: res.is_on("SERIAL_IRQ_TEST"),

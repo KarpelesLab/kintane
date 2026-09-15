@@ -811,6 +811,46 @@ table entry, with the entry's cache flushed, and requires all 32 completions tak
   block cpu  line 16 to CPU 1 through its remapping entry; 32 requests, 32 completions in 32 interrupts, 0 polled; taken on CPU 1: 32, on CPU 0: 0 ok
 ```
 
+### 2c-quater. Discovering an SMMUv3 (aarch64)
+
+On aarch64 with `SMMUV3` (the `aarch64-smmu` preset), QEMU runs with
+`-machine virt,iommu=smmuv3` and the kernel discovers the machine's unit. The `smmu` line gates
+the boot:
+
+```
+  smmu       16-bit stream ids, 4K and 64K granules, 44-bit output; the tree maps 65536 ids to it from the PCIe root complex; none of 32 virtio-mmio slots is behind it, so no disk here is translated
+```
+
+Discovery only: nothing is programmed and no device is confined — `docs/isolation.md` records
+why. The line requires all of:
+
+- an `arm,smmu-v3` node whose `reg` lies inside the device window;
+- registers that read back as an SMMUv3: `IDR0` neither zero nor all ones, the second being what
+  an unmapped read returns on this port;
+- a translation stage implemented (`IDR0.S1P` or `S2P`) and the kernel's 4 KiB granule walked
+  (`IDR5.GRAN4K`), since a unit with neither could not be programmed;
+- a node mapping stream ids to *this* unit by phandle (`iommu-map`), because a unit nothing maps
+  to translates for nothing;
+- the unit naming at least as many stream ids as the tree maps to it (`IDR1.SIDSIZE` against the
+  map's length), or the mapping describes devices it could not tell apart;
+- **no `virtio,mmio` slot behind the unit.** This is the fact that decides whether a disk on this
+  port could be confined at all, and it is asserted rather than assumed: the day a machine puts a
+  slot there, the check fails and says so.
+
+Each mutation below was confirmed applied before its run, and every one of them exits the boot
+non-zero — the check gates rather than only printing:
+
+| Mutation | Result |
+|---|---|
+| Look for `arm,smmu-v4`, so the node is never found | `NO arm,smmu-v3 NODE ON A BUILD THAT ASKED FOR ONE` |
+| Read `IDR0` at an unimplemented offset (`0xf00`) | `THE SMMU'S REGISTERS DID NOT READ BACK AS AN SMMUv3` |
+| Take `IDR1.SIDSIZE` as two bits instead of six, so the unit names fewer ids than the tree maps | `THE SMMU NAMES FEWER STREAM IDS THAN THE TREE MAPS TO IT` |
+| Match `iommu-map`'s phandle against one that is not the unit's | `NO NODE MAPS STREAM IDS TO THE SMMU, SO IT TRANSLATES FOR NOTHING` |
+| Count every virtio-mmio slot as being behind the unit | `virtio-mmio slots ARE BEHIND IT: … confinement is reachable and this check is out of date` |
+
+The last is the one worth keeping: it is the check that fails if QEMU ever puts the memory-mapped
+transport behind the SMMU, which is exactly when the next stage becomes possible.
+
 ### 2c-ter. The disk's driver in a domain
 
 On x86_64 with `BLOCK_DOMAIN` (the `x86_64-isolated` preset), the disk's driver runs in an
