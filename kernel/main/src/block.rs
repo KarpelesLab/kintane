@@ -394,6 +394,15 @@ const PROBE_LBA: u64 = 7;
 /// downwards and the volume's disk lands in the higher one. Keying by slot reads the right bytes
 /// on one port and the wrong ones on the other, which is a check that passes where it is written
 /// and fails where it is needed.
+/// `image_of`'s mapping is exhaustive only while there are two disks: every slot that is not the
+/// primary's is taken to carry [`testdisk::DISK2`]. A third disk would key to the second one's
+/// image and be checked against bytes that are not its own -- this very bug, one slot further
+/// along, and visible only on a port that attached three disks.
+const _: () = assert!(
+    virtio_blk::MAX_DISKS == 2,
+    "image_of maps every non-primary slot to DISK2; a third disk needs an image of its own"
+);
+
 fn image_of(slot: usize) -> usize {
     if slot == primary() {
         0
