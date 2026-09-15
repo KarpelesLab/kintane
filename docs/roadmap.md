@@ -15,7 +15,85 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
 | 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
 | 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Stopping signals, queued real-time signals, floating-point state in a signal frame, `MSG_PEEK` and scatter/gather are not built |
-| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+| 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The thirteenth round of landings
+
+Nineteen presets build and boot, with `x86_64-peer` new. Four briefs ran; two of them stopped short
+on purpose, and the stopping is where the round's value is.
+
+- **Floating-point state survives a context switch, and a guest proves it.** Each port's own
+  `Context` carries the whole user-visible set — a 512-byte `FXSAVE` image on x86_64, the vector
+  registers and their control words on aarch64 — saved eagerly. `FXSAVE` rather than `XSAVE`,
+  because the visible set is x87, MMX and SSE, which it covers in a fixed size needing no run-time
+  negotiation, and nothing this kernel builds enables anything wider; the default image is
+  deliberately not zero, since an all-zero one unmasks every SSE exception. Eager was chosen against
+  a measurement, and because lazy saving fails **silently** — as a thread computing with another
+  thread's numbers. A boot check now runs the hard-float program and grades it, so the x86_64 enable
+  bits are tested at runtime rather than argued, and two threads hold different values in the same
+  eight vector registers across sixty-four yields.
+- **An ABI bug older than the round, found by that work.** Native threads were entered on a
+  sixteen-byte aligned stack, where System V promises an `extern "C"` entry the eight-byte gap a
+  call would have pushed. It surfaced as a fault on a **compiler-generated** aligned vector store —
+  invisible to every soft-float program ever run here, and unsurvivable for the first hard-float
+  one. It is a HAL constant now: eight on x86_64, zero on aarch64, which is exactly why the same
+  test passed there untouched.
+- **A program can list a directory.** `getdents64` answers on both architectures at Linux's own
+  numbers, reporting long names as themselves rather than the short aliases FAT also answers to,
+  distinguishing a directory from a file, and filling a small buffer across repeated calls without
+  losing or repeating an entry — a record that does not fit is never consumed, because the cursor
+  advances only once the record reaches user memory. What an offset *promises* is written down
+  rather than implied: an index names a place in the directory as it is now, not a name, because no
+  filesystem here has a stable per-entry cookie, so a program removing entries while listing may see
+  a name twice or miss one. The cost is stated with it — finding the *n*th entry counts from the
+  first.
+- **A `statfs` answer is now held against the kernel's own walk**, and falsifying it showed exactly
+  the gap that closes: a fabricated free count satisfied **every step the program runs on itself**
+  and still exited successfully, while the kernel's walk caught it. Self-coherence proves only that
+  a program was answered consistently; a driver reporting the same wrong number to every asker would
+  pass.
+- **kbuild is now a network peer of its own, in four verified stages.** With the user-mode network
+  replaced by a socket pair carrying raw Ethernet, kbuild answers ARP to the guest's own request,
+  echoes, the announcements, acknowledgements, a UDP service, a deliberately silent port and a
+  fragmented datagram it builds and splits itself; then accepts TCP across three rounds — both close
+  orders, and a bulk round where dropping each connection's first in-order segment makes the guest's
+  **fast retransmit** reachable in a guest for the first time; and finally **originates**, opening
+  the connection the guest announces, so the server, poll and peek modes pass and the preset joins
+  the gate.
+- **The device layer went further without the second drive landing.** A block device's interrupt
+  line now belongs to that device: the driver's slot numbering is authoritative, so the platforms no
+  longer keep a parallel counter that agrees until probe order and wiring order diverge, and the
+  platforms' line and message-signalled-interrupt facts became arrays — because a cell whose first
+  write wins was **discarding a second device's line at the moment discovery found it**.
+
+**Two briefs stopped deliberately, and both left the next attempt strictly better off.**
+
+- **The second drive.** Before editing anything, the fork attached a second drive and asked the
+  kernel what it had bound: `bound=2`, boot green, two register windows and two interrupt tables.
+  Enumeration already claims both functions, so the blocker was never discovery — it is that every
+  layer above is a singleton *by shape rather than by parameter*: one disk, one grant, one
+  confinement taken from the first matching device, one forwarder, one mount, one drive in the build
+  tool. It stopped on a clean line with nothing half-applied.
+- **`HasFpu`'s signal frame.** The frame still *refuses* a frame claiming floating-point state
+  rather than carrying one. Making that honest needs a hard-float Linux program, which does not yet
+  exist — only the dedicated test program opts in.
+
+**What the round taught about landing large work.** Two earlier attempts at the network peer
+concluded it could not land incrementally, because any preset carrying a partial peer fails its own
+network check. That is true only of a preset the gate already runs — and the gate's list is
+explicit. Held outside it, the same job produced four committed, individually verified stages, each
+finding something the next one needed: that a frame count means nothing until the card actually
+initialises; that with no network in between, a disturbance must be something the peer *chooses* to
+send; that forgetting a connection one acknowledgement too early strands the guest in LAST-ACK; and
+that a requirement in the brief — sending frames unprompted — was unnecessary, because the guest
+re-announces every half second, so the announcement is the prompt and no retransmit timer is needed
+anywhere.
+
+**Still open.** Selective acknowledgement and an ICMP refusal exercised in a guest, which the peer
+can now offer for the first time; the second drive, starting from the singletons above the device;
+floating-point state in a signal frame, which needs a hard-float Linux program; the file server's
+listing arm, implemented and documented but not yet exercised over a channel in a boot; and, as
+before, real hardware, Secure Boot with a TPM, and the 24-hour soak.
 
 ### The twelfth round of landings
 
