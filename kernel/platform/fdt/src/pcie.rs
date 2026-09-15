@@ -285,6 +285,11 @@ pub struct PcieScan {
     pub functions: usize,
     /// How many of them are host bridges.
     pub bridges: usize,
+    /// Functions that are not host bridges: what the command line attached behind it.
+    ///
+    /// A bridge presents its own function whether or not anything is plugged in, so the
+    /// count of functions alone cannot say whether a device is there. This can.
+    pub endpoints: usize,
     /// The buffer filled before the walk finished, so there may be more.
     pub truncated: bool,
     /// Every base address register read back as enumeration left it.
@@ -325,6 +330,7 @@ pub fn enumerate(c: &dyn EarlyConsole) -> Option<PcieScan> {
     Some(PcieScan {
         functions: n,
         bridges: found.iter().filter(|f| f.is_host_bridge()).count(),
+        endpoints: found.iter().filter(|f| !f.is_host_bridge()).count(),
         truncated,
         restored: pci::verify_restored(&cfg, found).is_ok(),
     })

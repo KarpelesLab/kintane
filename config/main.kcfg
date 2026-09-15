@@ -867,6 +867,31 @@ config PCIE
         wired to the PCIe root complex alone, and every device here today is a
         memory-mapped virtio slot outside it. See docs/isolation.md.
 
+config QEMU_PCIE_BLOCK
+    bool "A virtio-blk function on the PCIe bus under QEMU"
+    depends on PCIE
+    help
+        Attach a `virtio-blk-pci` function to the machine's PCIe bus, so that
+        walking the bus finds something beyond the bridge's own function, and
+        gate the `pcie` check on finding it. A bridge presents its own function
+        whether or not anything is plugged in, so the count of functions alone
+        cannot say a device is there.
+
+        Attaching only: nothing binds this function. It is a symbol of its own
+        rather than part of QEMU_BLOCK_TEST, whose contract is that a driver
+        binds the disk and the boot gates on reading it -- true of the
+        memory-mapped disks this port already has, and not of a PCI function
+        here. The drive is read-only and points at the second disk's pristine
+        image, because nothing writes what nothing drives, and because both run
+        copies are already attached to the memory-mapped devices.
+
+        A PCI function cannot be bound on this port today. The walk happens in
+        the check phase, because configuration space is out of reach until the
+        kernel's address space maps the ECAM window; by then the resource ledger
+        `discover` binds through has been dropped. Binding one needs a ledger
+        that outlives discovery, which is a device-model change rather than a
+        new call site. See docs/isolation.md.
+
 config SMMUV3
     bool "Discover an Arm SMMUv3 and report what it covers"
     depends on ARCH_AARCH64

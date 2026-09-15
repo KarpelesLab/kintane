@@ -884,7 +884,7 @@ On aarch64 with `PCIE` (the `aarch64-pcie` preset), the kernel reads the machine
 `pcie` line gates the boot:
 
 ```
-  pcie       256 buses at 262400 MiB, a 256 MiB window holding 256; 65536 requester ids mapped to an MSI controller; forwards io 32-bit memory 64-bit memory; the window is above what the boot tables map; walked 1 functions, 1 host bridge, every register restored
+  pcie       256 buses at 262400 MiB, a 256 MiB window holding 256; 65536 requester ids mapped to an MSI controller; forwards io 32-bit memory 64-bit memory; the window is above what the boot tables map; walked 2 functions, 1 host bridge, 1 endpoint, every register restored
 ```
 
 **It happens in two phases, and the split is the machine's doing rather than a choice.** The
@@ -899,10 +899,36 @@ takes it and drives nothing, because a window no driver claimed is in nobody's l
 kernel's address space would never map it. `docs/isolation.md` records why this matters beyond
 PCI.
 
+Each mutation below was confirmed *applied* — the exact text present once before and gone after —
+and separately *exercised*, by something the failing boot printed. The two cases differ in one
+observation, and that difference is the point: the gate's message is identical in both, so only the
+command line says whether the count was falsified or the bus was genuinely empty.
+
+| mutation | applied | exercised | what the boot did |
+| --- | --- | --- | --- |
+| **The endpoint count is always zero.** `kernel/platform/fdt/src/pcie.rs`, in `enumerate`: `endpoints: found.iter().filter(\|f\| !f.is_host_bridge()).count(),` → `endpoints: 0,` | old 1 → 0, new 1 | the `pcie` line printed through `the window is above what the boot tables map`, so the check reached the walk; and `virtio-blk-pci` is on the command line, so the function **was** attached | `rc=1`, `AND NOTHING BEHIND THE BRIDGE, THOUGH THE RUN ATTACHED A FUNCTION` |
+| **Nothing is attached.** `kbuild/src/qemu.rs`, in `pcie_endpoint`: `if !res.is_on("QEMU_PCIE_BLOCK") {` → `if true {` | old 1 → 0, new 1 | the same `pcie` line up to the gate; `virtio-blk-pci` appears **zero** times on the command line, so the bus really was empty | `rc=1`, the same message |
+
+The first proves the check reads the walk's result rather than a constant; the second proves it
+gates on what was found rather than on the symbol being set. Restores were confirmed by comparing
+each file against a copy taken before the run rather than by an empty working tree: this was
+uncommitted work, so an empty tree would have been the wrong question.
+
+One correction belongs here rather than only in a report. The first run of that pair printed
+`exercised:` with nothing after it, because the driver looked for `walked N functions` — which the
+check emits only *after* the endpoint gate passes, so on a failing run it never exists. A guard that
+cannot match is not evidence. What the failing path does print is the `pcie` line up to the gate,
+and the command line, which is what the table above records.
+
 The line requires all of:
 
 - a `pci-host-ecam-generic` node with a readable `reg`, decoded with the *parent's* address
   cells — the bridge's own `#address-cells` of three describe its children, not itself;
+- with `QEMU_PCIE_BLOCK`, at least one function behind the bridge that is **not** a host bridge.
+  A bridge presents its own function whether or not anything is plugged in, so the number of
+  functions cannot say a device is there, and the endpoint count is what gates. What a machine
+  presents is reported rather than asserted; what *is* asserted is that a run which attached a
+  function finds one;
 - a window that is not empty, and one big enough to address every bus `bus-range` claims. One bus
   is a megabyte of configuration space, so the tree can contradict itself here, and a bridge whose
   range outran its window would have an enumerator read one bus's space believing it was another's;

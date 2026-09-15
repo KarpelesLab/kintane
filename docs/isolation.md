@@ -308,8 +308,8 @@ one property.
 
 This port's disk is a `virtio-blk-device` in one of those memory-mapped slots. So there is no
 device here whose DMA the unit could translate, and confining one would mean first putting the
-disk on PCIe — an ECAM host bridge driver, enumeration from the tree, and message-signalled
-interrupts through the ITS. That is a separate piece of work rather than a step inside this one:
+disk on PCIe — an ECAM host bridge driver, enumeration from the tree, and a driver bound to the
+function. That is a separate piece of work rather than a step inside this one:
 `kernel/device/src/pci.rs` reaches configuration space through the windows an ACPI MCFG
 describes, and the FDT platform never builds one.
 
@@ -321,10 +321,17 @@ going stale.
 ## Reaching the bridge the SMMU translates for (aarch64)
 
 The section above stops at a specific obstacle: confining a device on this port "would mean first
-putting the disk on PCIe — an ECAM host bridge driver, enumeration from the tree, and
-message-signalled interrupts through the ITS". With `PCIE` (the `aarch64-pcie` preset) the first
-two of those three are built. The disk is still not on PCIe, so nothing is confined yet, but the
-bus the SMMU translates for is now reachable and walked.
+putting the disk on PCIe — an ECAM host bridge driver, enumeration from the tree, and a driver
+bound to the function". With `PCIE` and `QEMU_PCIE_BLOCK` (the `aarch64-pcie` preset) the first
+two of those three are built and a function is attached for the walk to find. No driver binds it,
+so nothing is confined yet, but the bus the SMMU translates for is now reachable, walked, and
+carrying a device.
+
+**An earlier draft of this document named message-signalled interrupts through the ITS as the
+third requirement. That was a prediction, and it was wrong.** `virt`'s bridge node carries
+`interrupt-map` and `interrupt-map-mask` as well as `msi-map`, so a function's legacy INTx pin
+routes to a GIC SPI the existing driver already handles; no ITS is needed for a first interrupt.
+What the third requirement actually is appears under "What the next stage needs" below.
 
 ### What runs
 
@@ -374,13 +381,28 @@ walks the bus and `kmain` reports what it found.
 
 A disk on PCIe, which is where confinement becomes reachable:
 
-- `virtio-blk-pci` on the QEMU command line for this port, in place of the `virtio-blk-device` that
-  lands in a memory-mapped slot today;
-- the block driver binding through PCI on aarch64 — the enumerator already produces `compatible`
-  strings for a function the same way the device tree produces them for a node, so the binding path
-  exists, but it has never run on this port;
-- message-signalled interrupts through the ITS, which `msi-map` shows the tree routes but nothing
-  has yet used.
+- `virtio-blk-pci` on the QEMU command line for this port. **Built**, with `QEMU_PCIE_BLOCK`: the
+  function is attached and the `pcie` check gates on the walk finding it, because a bridge presents
+  its own function whether or not anything is plugged in. Nothing binds the function and nothing
+  reads it: its drive is read-only and points at the second disk's pristine image, because both run
+  copies are already attached to the memory-mapped devices. The `block` check is untouched and still
+  passes — this port's disks are the memory-mapped ones, which `QEMU_BLOCK_TEST` attaches by default
+  on aarch64 whether or not a preset names the symbol.
+- the block driver binding through PCI on aarch64. **This is what the next stage is actually blocked
+  on, and it is not a matching problem.** `virtio-blk` already lists `pci1af4,1042` and `pci1af4,1001`
+  among its `compatible` strings, exactly what enumeration synthesises for the function, so the driver
+  would be chosen the moment a node existed for it. The obstacle is *when*: `discover` builds the tree
+  and binds it in one pass, while the walk cannot run until the check phase, because configuration
+  space is unreachable until the kernel's address space maps the ECAM window. By then the
+  `Resources` ledger that `discover` claims through is a local that has been dropped. Binding a PCI
+  function here needs a ledger that outlives discovery — a change to the device model's shape, not an
+  extra call site.
+- an interrupt. **Not the ITS, and not message-signalled at all, necessarily.** `virt`'s bridge node
+  carries `interrupt-map` and `interrupt-map-mask` as well as `msi-map`, so a function's legacy INTx
+  pin is routed to a GIC SPI the existing driver already handles. The GICv3 driver states it
+  implements no LPIs or ITS, and `platform::delivers_msi()` answers `false` here; neither has to
+  change for a first interrupt to arrive. Which of the two paths is right is a decision for whoever
+  binds the device, not a prerequisite for binding it.
 
 Once a disk is a PCI function, it is behind the root complex the SMMU translates for, and the
 coverage assertion in the `smmu` check — that no `virtio,mmio` slot sits behind the unit — stops

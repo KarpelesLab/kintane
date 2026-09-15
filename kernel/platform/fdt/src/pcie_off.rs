@@ -85,6 +85,7 @@ pub static DRIVER: Ecam = Ecam;
 pub struct PcieScan {
     pub functions: usize,
     pub bridges: usize,
+    pub endpoints: usize,
     pub truncated: bool,
     pub restored: bool,
 }
