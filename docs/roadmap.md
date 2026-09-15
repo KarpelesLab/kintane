@@ -14,8 +14,87 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
 | 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi, SMMUv3 and per-domain quotas remain |
-| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Stopping signals, queued real-time signals, floating-point state in a signal frame, `MSG_PEEK` and scatter/gather are not built |
+| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Queued real-time signals, `MSG_PEEK`, scattered and gathered messages, and floating-point state carried in a signal frame and validated on return are built too. Stopping signals are not: the default action is classified, but `SIGSTOP` is refused at `kill` and `tgkill` |
 | 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The fourteenth round of landings
+
+Nineteen presets build and boot. Four briefs ran; three have landed, and the round's most useful
+result is a measurement that found nothing.
+
+- **Selective acknowledgement and a refused datagram, exercised in a guest at last.** Both halves of
+  selective acknowledgement have existed since round 12 and had never once run in a boot, because
+  QEMU's user-mode network offers no SACK-permitted and sends no unreachable message — established by
+  packet capture rather than assumed. kbuild's own peer now offers both: it acknowledges selectively,
+  and refuses a datagram to a quiet port so a connected socket answers `ECONNREFUSED`. Three rounds
+  of work reach a guest, and the two "host-tested only" notes come **out** of the documents rather
+  than standing next to checks that now contradict them.
+- **And selective retransmission turns out to save nothing at this ring size.** Seven segments, 610
+  bytes, resent identically across five boots whether blocks are sent, ignored, disbelieved or never
+  offered — a ratio of 1.00. That is arithmetic, not a defect: a send ring is one pool buffer, so a
+  bulk round is four segments and exactly one may be dropped; a single hole yields a *full*
+  acknowledgement, which NewReno already answers with one resend. The saving lives at a **partial**
+  acknowledgement — two holes and five segments in flight, one more than the ring holds. Raising the
+  ring is memory every port pays for, so it was left to a round willing to decide that cost
+  deliberately, with the number written down rather than the conclusion.
+- **A program lists a directory through the file server.** `Op::Getdents` is driven over a channel in
+  a boot and the verdict gates on it, so the listing arm is no longer implemented, documented and
+  unexercised. Listing runs on the **read-only** connection, since listing is read-side; the writable
+  one only creates the fixtures. The kernel then walks the same directories itself and requires every
+  name to be listed with matching kind **and** the record counts to agree — the two directions being a
+  dropped entry and an invented one. `..` stays a refusal, now with its reason recorded: FAT's one
+  scan skips it, `/FAT32/..` names another filesystem's root that `lookup` cannot express, FAT's
+  on-disk `..` records cluster 0 as a sentinel, and ascending would let a read-only connection escape
+  its subtree.
+- **A signal frame carries floating-point state instead of refusing it.** `HasFpu` grew `save_live`
+  and `load_live`, because a context switch moves state between two stored `Context`s while a frame's
+  bytes belong to nobody — a distinction earlier rounds never had to make. `restore` now *validates*:
+  x86_64 accepts only the pointer naming the area inside that very frame, aarch64 exactly Linux's
+  magic and size, and null is malformed rather than "nothing claimed". `linux-hello` became the
+  hard-float Linux program at zero image cost, which is precisely the prerequisite round 13 recorded
+  as missing.
+- **A bug the ports could not show, and the boot did.** aarch64 saved the vector registers before the
+  control words while Linux's order is the reverse, because the paired store needs a 16-byte aligned
+  address. Eight bytes of skew: a handler editing `d0` edited `v1`. x86_64 never showed it, since
+  `FXSAVE`'s layout is the hardware's — and it surfaced only in the check its author called the one
+  he would have been most tempted to skip.
+
+**What the round taught about checks.** Five times this round the code under test was sound and the
+thing proving it was broken: a falsification grep that also matched a test fixture; a guard using
+`grep -q` with `\{` and `\(`, which a basic regular expression reads as operators, so it reported
+mutations as unapplied that had applied; a restore set that omitted one file and left a mutation in
+the tree; a step-code audit that examined only explicit `return` statements and silently skipped five
+functions that return trailing expressions; and an isolation test whose verdict read the exit status
+of a pipeline instead of the command. Every one of them **passed**. The habit that answers it is the
+one the floating-point work committed: its two corpus seeds are pinned by a test asserting that the
+well-formed one is accepted, the malformed one is refused, and the two differ in nothing but the size
+field — so a seed that decays into a no-op fails loudly instead of replaying nothing.
+- **A second drive, each disk confined to a grant of its own.** Two drives now, each with its own
+  file, distinguishable by content: the disk index folds into the existing hash *before* its shift,
+  so the first disk's image does not change a byte while the second shares almost no sector with it.
+  That detail is the check — two identical images would have left "did this read come from the right
+  disk?" satisfiable by exactly the confusion it exists to catch. The block layer carries the device
+  through as per-slot arrays with an interrupt trampoline each, since the device model's table holds a
+  bare function pointer that cannot say which device fired; and the IOMMU gained a domain per device
+  with faults attributed by **source id**, because the fault log is shared and matching only on
+  address and direction would accept another device's fault as this one's.
+- **The volume is now found by reading rather than by assuming, and that was a real bug.** QEMU fills
+  the virtio-mmio slots *downwards* as devices are created while enumeration walks the tree *upwards*,
+  so on aarch64 slot 0 is the **second** drive: trusting the slot number mounted the wrong disk. The
+  primary is chosen by reading each disk's header. `disk()` now means the volume-carrying disk, which
+  is what all fifteen of its callers already meant — so none of them changed.
+- **Three of that brief's four checks were written, falsified, and deliberately not landed.** They
+  compile, pass, and fail in three directions when mutated; they are kept as a patch. The blocker was
+  size, measured rather than estimated: one preset went over by 6,828 bytes, and the two i686 images
+  reached exactly 100% of their budget and **hung at boot**. The obvious remedy was tried first and
+  reported insufficient rather than abandoned quietly. Raising three budgets to carry a
+  verification-only check, in a round whose brief was to defend them, is a trade worth refusing.
+
+**The round found a hole in its own gate.** `kbuild size` returns success at *exactly* 100% of
+budget, so the size check passed the two i686 presets while their boots hung — every "all nineteen
+within budget" statement this round rested on a check that cannot tell "fits" from "exactly fills and
+will not boot". It was found by the one brief that pushed an image hard enough to sit on the
+boundary, which is the argument for briefs that defend a budget rather than raise it.
 
 ### The thirteenth round of landings
 
