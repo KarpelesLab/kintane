@@ -1307,10 +1307,13 @@ user-mode network, and sockets put TCP and UDP behind handles. What it is not:
 - **Destination unreachable, parsed and delivered** (RFC 792). A message quoting a datagram
   this machine sent names the port that sent it, and a datagram socket's next receive on that
   port reports the refusal rather than waiting out its timeout. A message quoting somebody
-  else's datagram, or naming another port, refuses nothing. **No boot exercises this either**:
-  a capture of a whole boot shows QEMU's user-mode network sending echo replies and no
-  unreachable message at all, for the quiet port or anything else, so it too is proven by host
-  tests.
+  else's datagram, or naming another port, refuses nothing. A Linux program sees `ECONNREFUSED`
+  rather than a reset, because a datagram socket holds no connection and so has no peer to
+  close. **A boot exercises this on `x86_64-peer`**, where kbuild is the whole network and
+  answers the quiet port with the message; the check requires the refusal there. Behind QEMU's
+  user-mode network nothing sends one — a capture of a whole boot shows echo replies and no
+  unreachable message at all, for the quiet port or anything else — so every other preset still
+  accepts the timeout, and the host tests remain what prove the parsing.
 - **No IPv6, DHCP, DNS or routing table.** One static address, a netmask and a gateway.
 
 **Who runs the stack.** The stack is `&mut self`, driven by whoever holds it under one lock:
@@ -1410,9 +1413,15 @@ Exactly what is implemented:
   where the next reported run begins and steps over it, and the record is dropped when recovery
   ends and when a timeout falls back to go-back-N, which resends from the oldest byte whatever
   the peer last said. Without blocks every one of those reduces to the go-back-N it replaces.
-  **No boot exercises either half**: QEMU's user-mode network, which is the only peer these
-  checks have, offers no SACK, so a capture of a whole boot shows `MSS` and nothing else from
-  it. Both are proven by host tests, and that is said rather than implied.
+  **A boot exercises both halves on `x86_64-peer`**, where kbuild is the network: it offers
+  SACK-permitted on its SYN, names the runs it holds past a hole, and holds the front half of a
+  reply back a round trip so the guest's receiver has a moment in which to report. The `net`
+  check there fails unless a retransmission stepped over a run the peer reported. QEMU's
+  user-mode network, the only peer every other preset has, offers no SACK — a capture of a whole
+  boot shows `MSS` and nothing else from it — so those presets exercise neither half, and the
+  host tests remain what prove them. What a boot does *not* show is a saving: at this ring size
+  selective recovery and go-back-N resend the same bytes, for the reason `docs/testing.md`
+  measures under stage five of the peer.
 - **A segment this stack sends is at most a quarter of the send ring** (`SEND_SEG`, 378
   bytes), whatever the peer announces, and the congestion window is counted in those terms. A
   ring is one pool buffer, so a ring's worth is all that can be outstanding; sending a whole
