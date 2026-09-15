@@ -83,6 +83,45 @@ impl Target {
 }
 
 /// Where a built unit's artifact ended up, and the cache key that produced it.
+/// A private path to compile into, beside `dest`, for this process alone.
+///
+/// rustc writes each codegen unit's object next to the path given to `-o`, under a name
+/// derived from the crate and its metadata hash -- `libcore.core.<hash>-cgu.00.rcgu.o` --
+/// and removes it once the archive is built. Two invocations compiling the same crate
+/// with the same flags into one directory therefore race on the *same* intermediate
+/// names, and one reports `failed to build archive: No such file or directory` against an
+/// object the other has just deleted. Every preset built for one target shares
+/// `build/<target>/out/`, and every host test shares `build/host/out`, so this is two
+/// ordinary builds side by side rather than a contrived case.
+///
+/// A directory per process makes those names unique. Taking `dest` rather than a filename
+/// keeps the staged name equal to the canonical one by construction. The artifact is moved
+/// onto `dest` by `land`.
+pub fn stage(dest: &Path) -> Result<PathBuf, String> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", dest.display()))?;
+    let name = dest
+        .file_name()
+        .ok_or_else(|| format!("{}: no file name", dest.display()))?;
+    let dir = parent.join(format!(".build-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir.join(name))
+}
+
+/// Move a staged artifact onto its canonical path, and drop the staging directory.
+///
+/// `rename` is atomic, so a build running beside this one sees the previous artifact or
+/// this one and never a partial write -- the same property the cache's own landings have.
+pub fn land(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::rename(from, to)
+        .map_err(|e| format!("{} -> {}: {e}", from.display(), to.display()))?;
+    if let Some(d) = from.parent() {
+        let _ = std::fs::remove_dir(d);
+    }
+    Ok(())
+}
+
 pub struct Built {
     pub path: PathBuf,
     pub key: String,
@@ -285,9 +324,11 @@ impl Build {
             return Ok(Built::linked(dest, key));
         }
 
+        let staged = stage(&dest)?;
         args.push("-o".into());
-        args.push(dest.display().to_string());
+        args.push(staged.display().to_string());
         self.run(&args, "core")?;
+        land(&staged, &dest)?;
         self.cache.store(&key, "libcore.rlib", &dest)?;
         Ok(Built::linked(dest, key))
     }
@@ -465,9 +506,11 @@ impl Build {
             });
         }
 
+        let staged = stage(&dest)?;
         args.push("-o".into());
-        args.push(dest.display().to_string());
+        args.push(staged.display().to_string());
         self.run(&args, &unit.name)?;
+        land(&staged, &dest)?;
         self.cache.store(&key, &filename, &dest)?;
         Ok(Built {
             embed,
@@ -503,9 +546,11 @@ impl Build {
         if self.cache.restore(&key, "libkconfig.rlib", &dest) {
             return Ok(Built::linked(dest, key));
         }
+        let staged = stage(&dest)?;
         args.push("-o".into());
-        args.push(dest.display().to_string());
+        args.push(staged.display().to_string());
         self.run(&args, "kconfig")?;
+        land(&staged, &dest)?;
         self.cache.store(&key, "libkconfig.rlib", &dest)?;
         Ok(Built::linked(dest, key))
     }

@@ -70,10 +70,12 @@ impl<'a> HostBuild<'a> {
             "--crate-name".into(),
             "kconfig".into(),
             self.generated.config_rs.display().to_string(),
-            "-o".into(),
-            dest.display().to_string(),
         ]);
+        let staged = crate::build::stage(&dest)?;
+        args.push("-o".into());
+        args.push(staged.display().to_string());
         self.run(&args, "kconfig")?;
+        crate::build::land(&staged, &dest)?;
         Ok(dest)
     }
 
@@ -105,9 +107,11 @@ impl<'a> HostBuild<'a> {
             args.push(format!("{}={}", unit.name.replace('-', "_"), p.display()));
         }
         args.push(unit.dir.join(file).display().to_string());
+        let staged = crate::build::stage(&dest)?;
         args.push("-o".into());
-        args.push(dest.display().to_string());
+        args.push(staged.display().to_string());
         self.run(&args, bin_name)?;
+        crate::build::land(&staged, &dest)?;
         Ok(dest)
     }
 
@@ -163,9 +167,11 @@ impl<'a> HostBuild<'a> {
         ]);
         self.externs(&mut args, unit, deps);
         args.push(unit.root_path().display().to_string());
+        let staged = crate::build::stage(&dest)?;
         args.push("-o".into());
-        args.push(dest.display().to_string());
+        args.push(staged.display().to_string());
         self.run(&args, &unit.name)?;
+        crate::build::land(&staged, &dest)?;
         Ok(dest)
     }
 
@@ -180,9 +186,11 @@ impl<'a> HostBuild<'a> {
         args.extend(["--test".into(), "--crate-name".into(), name]);
         self.externs(&mut args, unit, deps);
         args.push(unit.root_path().display().to_string());
+        let staged = crate::build::stage(&dest)?;
         args.push("-o".into());
-        args.push(dest.display().to_string());
+        args.push(staged.display().to_string());
         self.run(&args, &format!("{} (tests)", unit.name))?;
+        crate::build::land(&staged, &dest)?;
         Ok(dest)
     }
 
