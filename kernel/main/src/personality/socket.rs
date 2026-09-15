@@ -257,6 +257,18 @@ fn connect_failure(e: abi::Error) -> Failure {
     }
 }
 
+/// A datagram socket's failure, which differs in one place. A datagram has no connection and so
+/// no peer to close, so `PeerClosed` from one of these can only be the destination-unreachable
+/// message the stack matched to the port that sent: `ECONNREFUSED`, which is what Linux answers
+/// a connected datagram socket whose peer refused it, rather than the reset [`failure`] would
+/// report.
+fn datagram_failure(e: abi::Error) -> Failure {
+    match e {
+        abi::Error::PeerClosed => Failure::ConnectionRefused,
+        e => failure(e),
+    }
+}
+
 /// The `struct sockaddr_in` of `len` bytes at user address `at`.
 fn read_sockaddr(at: u64, len: u64) -> Result<([u8; 4], u16), Failure> {
     if len < SOCKADDR_IN_LEN as u64 {
@@ -606,7 +618,7 @@ fn recv_datagram(
         } else {
             crate::sockets::datagram_recv(id, &mut bytes[..cap])
         };
-        let Some((from, copied, whole)) = taken.map_err(failure)? else {
+        let Some((from, copied, whole)) = taken.map_err(datagram_failure)? else {
             return Ok(None);
         };
         to_user(buf, bytes.get(..copied).unwrap_or(&[]))?;
@@ -883,7 +895,7 @@ fn recv_into(
             } else {
                 crate::sockets::datagram_recv(id, into)
             };
-            taken.map_err(failure)
+            taken.map_err(datagram_failure)
         })?;
         if addr != 0 {
             write_sockaddr(addr, len_at, abi::socket::ip(from), abi::socket::port(from))?;
@@ -1075,6 +1087,10 @@ const TCP_SUCCESS: u64 = 48;
 const SERVE_SUCCESS: u64 = 49;
 /// The `udp` mode's, which mirrors `UDP_SUCCESS` in `user/linux-hello/src/main.rs`.
 const UDP_SUCCESS: u64 = 52;
+/// What the same mode exits with where the quiet port was *refused* rather than left to time
+/// out: `UDP_REFUSED` there. Only kbuild's own peer sends the destination-unreachable message
+/// that produces it, so every other network still earns [`UDP_SUCCESS`].
+const UDP_REFUSED: u64 = 53;
 
 /// The `peek` mode's, which mirrors `PEEK_SUCCESS` in `user/linux-hello/src/main.rs`.
 const PEEK_SUCCESS: u64 = 59;
@@ -1299,8 +1315,18 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
         // and not the other heard half of what it was told.
         _ => None,
     };
+    // With kbuild as the whole network the quiet port answers a refusal, and the program must
+    // have been refused; on every other network nobody sends one, so the timeout stands and
+    // either outcome is accepted.
     let datagram_ok = match datagram {
-        Some(run) => run.code == Some(UDP_SUCCESS) && run.ended,
+        Some(run) => {
+            let wanted = if kconfig::QEMU_NET_PEER {
+                run.code == Some(UDP_REFUSED)
+            } else {
+                run.code == Some(UDP_SUCCESS) || run.code == Some(UDP_REFUSED)
+            };
+            wanted && run.ended
+        }
         None => !kconfig::QEMU_NET_TEST,
     };
 
@@ -1358,7 +1384,18 @@ pub(super) fn check(c: &dyn EarlyConsole) -> Check {
     c.write_str(" announcements)");
     c.write_str("; ");
     match datagram {
-        Some(run) => report(c, "udp", run, UDP_SUCCESS),
+        // Where kbuild is the whole network the quiet port answers a refusal, and that is the
+        // code the mode ends with; elsewhere nobody sends the message and the timeout stands.
+        Some(run) => report(
+            c,
+            "udp",
+            run,
+            if kconfig::QEMU_NET_PEER {
+                UDP_REFUSED
+            } else {
+                UDP_SUCCESS
+            },
+        ),
         None => c.write_str("udp skipped: kbuild announced no datagram service"),
     }
     c.write_str("; ");

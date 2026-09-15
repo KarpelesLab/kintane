@@ -786,6 +786,10 @@ static UDP_ELF: &[u8] = include_bytes!(env!("KINTANE_USER_USERUDP"));
 const SUCCESS: u64 = 0x7c;
 /// What `user/udp-client` exits with when everything behaved. Mirrors its `SUCCESS`.
 const UDP_SUCCESS: u64 = 0x7d;
+/// What it exits with when the quiet port was *refused* rather than merely silent: its
+/// `REFUSED`. Only kbuild's own peer sends the destination-unreachable message that produces
+/// it, so every other network still earns [`UDP_SUCCESS`].
+const UDP_REFUSED: u64 = 0x7e;
 
 /// The process slot, and the scheduler stack slots its thread runs on: `waits` has torn its
 /// process down and reaped its threads by the time this runs.
@@ -840,8 +844,17 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
     }
     // Then datagrams, on the slot and stacks the stream program's threads have just given up.
     let datagram = datagram_run();
+    // With kbuild as the whole network the quiet port answers a refusal, and the program must
+    // have been refused; on every other network nobody sends one, so the timeout stands.
     let datagram_ok = match datagram {
-        Some(d) => d.code == Some(UDP_SUCCESS) && d.ended,
+        Some(d) => {
+            let wanted = if kconfig::QEMU_NET_PEER {
+                d.code == Some(UDP_REFUSED)
+            } else {
+                d.code == Some(UDP_SUCCESS) || d.code == Some(UDP_REFUSED)
+            };
+            wanted && d.ended
+        }
         // kbuild announces its datagram service beside its TCP service, so a run that heard
         // one and not the other heard half of what it was told.
         None => !kconfig::QEMU_NET_TEST,
@@ -910,6 +923,9 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
                 (true, None) => c.write_str("udp-client NEVER EXITED"),
                 (true, Some(UDP_SUCCESS)) => c.write_str(
                     "udp-client: a reply from the service, a truncation reported whole, a foreign datagram refused, nothing on the quiet port",
+                ),
+                (true, Some(UDP_REFUSED)) => c.write_str(
+                    "udp-client: a reply from the service, a truncation reported whole, a foreign datagram refused, the quiet port refused",
                 ),
                 (true, Some(code)) => {
                     c.write_str("udp-client exited ");

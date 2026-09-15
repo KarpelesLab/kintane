@@ -1610,16 +1610,22 @@ does the same over Linux's calls, and adds what a wrong call earns: `EOPNOTSUPP`
 and `shutdown` on a datagram socket, `EMSGSIZE` past 256 bytes, `EAGAIN` when `SO_RCVTIMEO`
 expires, `ENOPROTOOPT` for `SO_BROADCAST`, and a `sendmsg`/`recvmsg` round trip of one buffer.
 
-**What the quiet port answers is nothing.** A datagram sent to a port nobody listens on earns a
-timeout rather than `ECONNREFUSED`, and both programs still accept the timeout — but the reason
-has changed. The stack now parses ICMP destination-unreachable, matches it to the port that
-sent, and reports the refusal on that socket's next receive; what is missing is anyone to send
-the message. A packet capture of a whole boot (`filter-dump` on the network, read back frame by
-frame) shows QEMU's user-mode network sending echo replies and nothing else of ICMP: no
-unreachable message for the quiet port or for any other. So the path is proven by host tests —
-a refusal reaches the port that sent it, one quoting another address or port refuses nothing —
-and the programs keep accepting either outcome, because on this network only one of them can
-happen.
+**What the quiet port answers depends on who is on the other end.** A datagram sent to a port
+nobody listens on earns a timeout behind QEMU's user-mode network and `ECONNREFUSED` behind
+kbuild's own peer. Neither program chooses which of those is right: each reports in its exit
+code which one it met, and the kernel judges, because the kernel is the side that knows which
+network the run was against. The stack parses ICMP destination-unreachable, matches it to the
+port that sent, and reports the refusal on that socket's next receive; a Linux program sees
+`ECONNREFUSED` rather than a reset, since a datagram socket holds no connection and so has no
+peer to close.
+
+What was missing until stage five of the peer was anyone to send the message. A packet capture
+of a whole boot (`filter-dump` on the network, read back frame by frame) shows QEMU's user-mode
+network sending echo replies and nothing else of ICMP: no unreachable message for the quiet port
+or for any other. So on every preset but `x86_64-peer` the timeout still stands and is still
+accepted, and the host tests — a refusal reaches the port that sent it, one quoting another
+address or port refuses nothing — remain what prove the parsing. On `x86_64-peer` the refusal is
+required, and a boot fails without it.
 
 That is aarch64, where every frame arrives by interrupt. i686 reads the same on line 10,
 through the 8259A, and x86_64 on `line 17, MSI-X`. On a platform that delivers
@@ -1748,9 +1754,11 @@ Host tests, without QEMU:
   applied, each failed its own test while leaving the other passing, and `tcp.rs` was restored
   byte for byte afterwards.
 
-  **No boot exercises either half**, and that is a property of the peer rather than of the
-  stack: QEMU's user-mode network offers no SACK-permitted, as the capture in this document's
-  network section shows, so nothing in a guest can send a block to act on.
+  **A boot exercises both halves on `x86_64-peer`**, and that it took until the fifth stage of
+  the peer is a property of the peer rather than of the stack: QEMU's user-mode network offers
+  no SACK-permitted, as the capture in this document's network section shows, so behind it
+  nothing in a guest can send a block or be sent one. kbuild's peer offers it, and the `net`
+  check there now fails unless a retransmission stepped over a run the peer reported.
 - `kbuild`: the relay drops each connection's first data segment once and passes everything
   else.
 - `drivers/net/virtio-net`: 16 tests against the shared fake device on both queues, three of
@@ -1853,8 +1861,8 @@ run only under QEMU.
 **kbuild as the whole network** (`QEMU_NET_PEER`, the `x86_64-peer` preset). Everything above is
 QEMU's user-mode network with kbuild disturbing frames in flight. That network is also what keeps
 two things out of reach of a guest: it offers no SACK-permitted on a SYN and sends no ICMP
-destination-unreachable, so neither selective acknowledgement nor a refused datagram can be
-exercised however the frames are mutated. The alternative is to be the network:
+destination-unreachable, so behind it neither selective acknowledgement nor a refused datagram
+can be exercised however the frames are mutated. The alternative is to be the network:
 
 ```
 -netdev dgram,id=kt_net,local.type=inet,local.host=127.0.0.1,local.port=<local>,
@@ -1891,9 +1899,13 @@ listener — a TCP endpoint that both accepts and originates.
   - **Segments past the hole are held, not discarded**, and each earns an acknowledgement naming
     what is still missing. Discarding them would cost a window of retransmissions where the
     protocol costs one.
-  - **The reply goes out as two segments, the half in front sent second**, so the guest holds one
-    out of order and joins it to the stream when the rest arrives. One segment would leave
-    nothing to hold, and the check requires both the holding and the joining.
+  - **The reply goes out as two segments, the half in front sent second and a round trip late**,
+    so the guest holds one out of order and joins it to the stream when the rest arrives. One
+    segment would leave nothing to hold, and the check requires both the holding and the joining.
+    Sending the two together was enough for that, but not for stage five: the hole closed in the
+    same poll, so the guest's receiver never had a moment in which to report the run it held. The
+    front half now waits until the guest says anything at all, and the peer's count of
+    acknowledgements carrying blocks of the guest's own went from 0 to 7.
   - **A connection is forgotten only once both ends have finished.** Forgetting it when the guest
     acknowledges the peer's FIN left the guest's own FIN, which follows, arriving for a
     connection the peer no longer had — unanswered, so the guest stayed in LAST-ACK and its round
@@ -1904,17 +1916,25 @@ own count:
 
 ```
   net        line 17, MSI-X; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555,
-             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 61753,
+             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 51981,
              closed by the kernel [syn-sent established fin-wait-1 fin-wait-2 time-wait]
-             and by kbuild [syn-sent established close-wait last-ack], ...
+             and by kbuild [syn-sent established close-wait last-ack], 2 data retransmits,
+             3 segments held out of order, 3 runs joined up, bulk round 1 fast retransmits
+             in 1 resends, 1 selective; 116 frames in, 33 out, 69 interrupts, 0 polled,
+             0 stack buffers held ok
+  sockets    ... udp-client: a reply from the service, a truncation reported whole, a
+             foreign datagram refused, the quiet port refused ...
   linux net  tcp client ok; server ok; poll ok (two connections, 4 announcements);
              udp ok; peek ok (kbuild told of its listener 1 time); waits woken by the
-             card 33, armed for a TCP timer 15, polled 0; closed in order, every buffer
+             card 35, armed for a TCP timer 13, polled 0; closed in order, every buffer
              back; 0 objects left, 0 frames left ok
-  net peer:  87 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
-             3 acknowledgements, 12 service replies, 51 rounds of announcements,
+  net peer:  95 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
+             3 acknowledgements, 12 service replies, 47 rounds of announcements,
              7 connections, 7 first segments dropped, 3 duplicate acknowledgements,
-             7 replies sent back to front, 3 connections opened, 3 verdicts sent
+             7 replies sent back to front, 3 connections opened, 3 verdicts sent,
+             3 selective acknowledgements naming 3 runs, 7 acknowledgements with blocks
+             of the guest's own, 7 segments the guest sent again (610 bytes),
+             2 datagrams refused
 ```
 
 The peer counts the two kinds of connection separately, because they are not the same thing to
@@ -1949,9 +1969,44 @@ port alone cannot tell them apart; the peer keys a connection by both ports and 
 of its own, drawn from 49152 upwards. And the guest's `serve` reads the verdict line and then
 reads again expecting end-of-stream, so the peer sends the verdict and the FIN in one batch.
 
-**Nothing said above about selective acknowledgement or the quiet port changes yet**: both stay
-host-tested until the peer offers SACK-permitted and sends a destination-unreachable, which is
-stage five and wants a solid endpoint beneath it.
+**Stage five** is the pair of things the user-mode network cannot do at all, and so the pair no
+boot had ever exercised. The peer offers `SACK-permitted` beside the segment size on its SYN,
+and an acknowledgement for a segment that arrived past a hole names the runs held behind it —
+coalesced where they meet, nearest first, at most three, and only to a guest that asked. The
+guest's *sending* half records them, clamps them to what it actually sent, and steps a
+retransmission over what the peer says it holds; `net` prints the count and fails on this preset
+if it is zero. Its *receiving* half is drawn out by the deferred half-reply described above. And
+a datagram to the quiet port earns an ICMP destination-unreachable quoting the offending IPv4
+header and the eight bytes behind it, which is what names the socket the refusal belongs to.
+
+**Four falsifications**, each a single edit, applied alone and booted on `x86_64-peer`. The
+source *and* the kbuild binary were put back before the next one: a mutated build tool left in
+place reports success from stale artifacts, which has cost this project a day before. Each is
+spelled out here rather than kept in a script, because a script nothing in the gate runs rots at
+the first refactor that renames what it patches.
+
+| mutation | what the boot did |
+| --- | --- |
+| **The guest ignores the peer's blocks.** `kernel/net/src/tcp.rs`, in `segment`'s duplicate-acknowledgement arm: `t.record_sack(&seg.sack);` → `t.record_sack(&[None; wire::SACK_BLOCKS]);` | `bulk round 1 fast retransmits in 1 resends, 0 selective`, and the check fails with `NO RETRANSMISSION STEPPED OVER A RUN THE PEER ACKNOWLEDGED SELECTIVELY`. Recovery is go-back-N again |
+| **The peer names data the guest never sent.** `kbuild/src/netpeer.rs`, in `held_blocks`, immediately before `runs.truncate(SACK_BLOCKS);` insert `let mut runs: Vec<(u32, u32)> = runs.iter().map(\|(s, e)\| (*s, e.wrapping_add(4096))).collect();`, stretching every run past anything sent | `0 selective`, and the same failure — which is the point. `record_sack`'s clamp to `snd_max` drops such a block whole rather than believing it, so nothing is stepped over; a guest that believed it would have stepped over bytes the peer never held |
+| **The unreachable message quotes another connection.** `kbuild/src/netpeer.rs`, in `unreachable`: make `let quoted = frame.get(14..14 + ihl + 8)?.to_vec();` a `let mut`, then add `quoted[ihl] ^= 0xff;`, which corrupts the quoted source port so the message names a port that never sent | `udp-client: … nothing on the quiet port`, where the truth reads `the quiet port refused`: the refusal is not applied, the program times out, and the `sockets` check fails for want of the refusal this preset requires. Selective acknowledgement is untouched — still `1 selective` |
+| **The peer offers no `SACK-permitted`.** `kbuild/src/netpeer.rs`, in `tcp_frame_with`, delete `options.extend_from_slice(&[TCP_OPT_NOP, TCP_OPT_NOP, TCP_OPT_SACK_PERMITTED, 2]);` | `0 selective` *and* `0 acknowledgements with blocks of the guest's own`: both halves fall silent together, with the same gate failure. To confirm this one applied, count that line as written into a SYN — the bare option bytes also match the test fixture `SACK_PERMITTED_OPT` further down the file, which made a first check report a failure for a mutation that had in fact applied |
+
+**What selective retransmission saves here, measured: nothing.** The guest sent the same
+`7 segments ... (610 bytes)` again in every one of those five boots — blocks sent, ignored,
+disbelieved, or never offered. That is arithmetic rather than a defect. A send ring is one pool
+buffer, so `SEND_SEG` is a quarter of it and the bulk round is exactly four segments; a fast
+retransmit needs three duplicate acknowledgements, so the peer can afford to drop exactly one of
+them. With a single hole, filling it lets the receiver deliver everything contiguous and
+acknowledge all of it — a *full* acknowledgement, never a partial one — and NewReno already
+resends exactly one segment per recovery event. So go-back-N and selective recovery send the
+identical segment, and what the blocks change is where `snd_nxt` lands afterwards: the counter,
+not the wire. The saving lives at a *partial* acknowledgement, which needs two holes, which
+needs five segments in flight to still draw three duplicates — one more than the ring holds.
+That case is the host test `only_the_holes_are_resent_when_the_peer_acknowledges_selectively`,
+which constructs it deliberately. And this is an emulated peer over a loopback socket in any
+case: the figure is a ratio between two arrangements of the same guest, not a throughput claim
+about anything.
 
 ### 2h. Waiting on many things at once
 

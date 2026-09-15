@@ -1042,6 +1042,9 @@ const EOPNOTSUPP: i64 = 95;
 const EAFNOSUPPORT: i64 = 97;
 const EISCONN: i64 = 106;
 const ENOTCONN: i64 = 107;
+/// What a connected datagram socket is owed once a destination-unreachable message for its peer
+/// has been matched to the port that sent: the refusal, not a reset.
+const ECONNREFUSED: i64 = 111;
 const EALREADY: i64 = 114;
 const EINPROGRESS: i64 = 115;
 
@@ -1139,6 +1142,10 @@ fn decimal(digits: &[u8]) -> u16 {
 // ---- udp: datagram sockets -----------------------------------------------------------------
 
 const UDP_SUCCESS: u64 = 52;
+/// What the `udp` mode exits with when the quiet port was *refused* rather than left to time
+/// out. Only a network that sends an ICMP destination-unreachable for it produces this, which
+/// is kbuild's own peer and nothing else; the kernel knows which it ran against and judges.
+const UDP_REFUSED: u64 = 53;
 
 const SOCK_DGRAM: u64 = 2;
 const IPPROTO_UDP: u64 = 17;
@@ -1462,10 +1469,22 @@ fn udp(ports: &[u8]) -> ! {
         send_to(elsewhere, UDP_REQUEST, Some((GATEWAY, service)), 0) == UDP_REQUEST.len() as i64,
         180,
     );
-    let (refused, _) = recv_from(elsewhere, &mut buf, 0);
-    expect(refused == -EAGAIN, 180);
-    expect(call1(sys::CLOSE, elsewhere) == 0, 180);
+    let (foreign, _) = recv_from(elsewhere, &mut buf, 0);
+    expect(foreign == -EAGAIN, 180);
+
+    // 181: and the port itself, which this socket is connected to. Nothing answers it with a
+    //      datagram; a network that sends an ICMP destination-unreachable for it turns that
+    //      silence into ECONNREFUSED, which is what a connected datagram socket is owed. Which
+    //      of the two happened is not this program's to judge — it depends on the network it
+    //      was run against — so it is said in the exit code and the kernel decides.
+    expect(send_to(elsewhere, UDP_REQUEST, None, 0) == UDP_REQUEST.len() as i64, 181);
+    let (quiet_answer, _) = recv_from(elsewhere, &mut buf, 0);
+    expect(quiet_answer == -EAGAIN || quiet_answer == -ECONNREFUSED, 181);
+    expect(call1(sys::CLOSE, elsewhere) == 0, 181);
     expect(call1(sys::CLOSE, c) == 0, 180);
+    if quiet_answer == -ECONNREFUSED {
+        exit(UDP_REFUSED)
+    }
     exit(UDP_SUCCESS)
 }
 
