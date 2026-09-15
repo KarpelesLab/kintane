@@ -710,6 +710,7 @@ mod tests {
             ports: ports(),
             guest_mac: Some(GUEST_MAC),
             ip_id: 1,
+            conns: Vec::new(),
             seen: Seen::default(),
         }
     }

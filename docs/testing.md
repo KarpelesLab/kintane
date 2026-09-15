@@ -1851,24 +1851,62 @@ listener — a TCP endpoint that both accepts and originates.
   loopback sockets QEMU forwards to, and the fragmenting is the downstream relay's; with no NAT
   there is nowhere else for them to live, so the peer sends the two fragments itself — the same
   thing seen from the other side.
+- **Stage three** is a TCP endpoint that accepts, which is what the three rounds need. Where the
+  user-mode network has a relay between the guest and the network to drop and swap segments, here
+  there is no between: every condition the check gates on, the peer produces by choosing what to
+  send.
+  - **Each connection's first in-order data segment is dropped, once.** A lost segment is one
+    that never arrived, so the peer answers it with silence rather than a refusal and the guest
+    must notice by itself. With a one-segment request its retransmission timer does that; with
+    the bulk round's four, the three behind the hole draw three duplicate acknowledgements and
+    its fast retransmit sends the lost one at once — which is the only way that path is reachable
+    in a guest.
+  - **Segments past the hole are held, not discarded**, and each earns an acknowledgement naming
+    what is still missing. Discarding them would cost a window of retransmissions where the
+    protocol costs one.
+  - **The reply goes out as two segments, the half in front sent second**, so the guest holds one
+    out of order and joins it to the stream when the rest arrives. One segment would leave
+    nothing to hold, and the check requires both the holding and the joining.
+  - **A connection is forgotten only once both ends have finished.** Forgetting it when the guest
+    acknowledges the peer's FIN left the guest's own FIN, which follows, arriving for a
+    connection the peer no longer had — unanswered, so the guest stayed in LAST-ACK and its round
+    never reached CLOSED. That is what the `peer-closes` round is there to catch.
 
 A boot of `x86_64-peer` reports it from both ends at once, the guest's check and then the peer's
 own count:
 
 ```
   net        line 17, MSI-X; gateway 52:55:0a:00:02:02; 4 echo replies; udp port 5555,
-             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 57965;
-             THE TCP CONNECTION WAS NEVER ESTABLISHED
-  net peer:  70 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
-             3 acknowledgements, 3 service replies
+             3 round trips; 4 fragments, 2 datagrams reassembled; tcp port 59503,
+             closed by the kernel [syn-sent established fin-wait-1 fin-wait-2 time-wait]
+             and by kbuild [syn-sent established close-wait last-ack],
+             2 data retransmits, 3 segments held out of order, 3 runs joined up,
+             bulk round 1 fast retransmits in 1 resends; 116 frames in, 30 out,
+             64 interrupts, 0 polled, 0 stack buffers held ok
+  net peer:  76 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
+             3 acknowledgements, 3 service replies, 112 rounds of announcements,
+             6 connections, 6 first segments dropped, 3 duplicate acknowledgements,
+             6 replies sent back to front
 ```
 
-That failure is the stage boundary, and it is why **`x86_64-peer` is deliberately absent from
-`scratchpad/verify.sh`'s preset list**. No partial peer passes a check gating on three TCP rounds,
-and the gate enumerates its presets explicitly, so a preset outside the list is a stage rather
-than a regression; it joins the list when the peer can finish a round. **Nothing said above about
-selective acknowledgement or the quiet port changes yet**: both stay host-tested until the peer
-has a TCP endpoint to offer SACK-permitted from, which is stage five.
+Six connections for three rounds, because each round's first segment is dropped and the guest
+opens the round again rather than waiting; six replies sent back to front for the same reason.
+Those four counts, and everything the check gates on, are the same every boot. Four figures in
+that transcript are not, and should not be read as fixed: the guest's ephemeral port, its
+interrupt count, and the peer's frames-in and rounds of announcements, which depend on how long
+the guest takes to reach the check while the peer is announcing into it.
+
+**`x86_64-peer` is still absent from `scratchpad/verify.sh`'s preset list, and a boot of it still
+ends in failure.** The `net` check passes, but `linux net` does not: its `server`, `poll` and
+`peek` modes need kbuild to *originate* a connection into the guest's own listener, having heard
+the `kintane-tcp-listening <tag>` datagram that announces it — an endpoint that connects as well
+as accepts, which is stage four. Without one the guest waits for a connection that never comes and
+the run ends `timed out after 30s with no exit signal from the guest`. The gate
+enumerates its presets explicitly, so a preset outside the list is a stage rather than a
+regression; it joins the list when the whole check passes. **Nothing said above about selective
+acknowledgement or the quiet port changes yet**: both stay host-tested until the peer offers
+SACK-permitted and sends a destination-unreachable, which is stage five and wants a solid endpoint
+beneath it.
 
 ### 2h. Waiting on many things at once
 
