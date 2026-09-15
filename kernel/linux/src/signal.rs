@@ -250,18 +250,61 @@ pub const fn status(sig: u64) -> u32 {
 
 // ---- the frame --------------------------------------------------------------------------
 
-/// Where a frame claims saved floating-point state: x86_64's `fpstate` pointer, and the first
-/// record in aarch64's reserved space. [`restore`] refuses a frame holding either.
+/// Where a frame carries saved floating-point state: x86_64's `fpstate` pointer, and the first
+/// record in aarch64's reserved space. [`restore`] reads both, and refuses a frame whose
+/// pointer, magic or size is not the one this kernel writes.
 pub const FPSTATE_AT: usize = x86::FPSTATE;
 pub const RECORD_AT: usize = a64::RECORD;
+
+/// Where the saved registers themselves begin, as an offset into the frame: behind x86_64's
+/// pointer, and past the `fpsimd_context` header on aarch64. The personality fills these bytes
+/// from `hal::HasFpu::save_live` and hands them back to `load_live`; this crate only places
+/// them, because it depends on nothing and has no architecture to ask.
+pub const FPU_AT: [usize; 2] = [x86::FPSTATE_AREA, a64::RECORD + a64::RECORD_HEADER];
+
+/// Bytes of floating-point state each port's frame carries. The personality asserts these
+/// against `hal::HasFpu::FPU_BYTES` at compile time, so the layout here and the image the port
+/// actually saves cannot drift apart.
+pub const FPU_BYTES: [usize; 2] = [x86::FPSTATE_BYTES, a64::FPSIMD_BYTES];
+
+/// What a well-formed `fpsimd_context` header holds on aarch64: Linux's magic, and the size
+/// covering the header and the state together. Public because the fuzz target checks an
+/// accepted frame against them, which it cannot do with the layout module private.
+pub const FPSIMD_MAGIC: u32 = a64::FPSIMD_MAGIC;
+pub const FPSIMD_SIZE: usize = a64::FPSIMD_SIZE;
 
 /// Words of a context; see the module documentation for the order.
 pub const REGISTER_WORDS: usize = 34;
 
-/// The most bytes [`Built::head`] holds: aarch64's frame up to its reserved space, and the
-/// first record header in it, which [`restore`] reads to refuse a frame carrying saved
-/// floating-point state.
-pub const HEAD_BYTES: usize = 600;
+const _: () = {
+    // [`FPU_AT`] and [`FPU_BYTES`] are indexed by `abi as usize`. `Abi` names its variants in
+    // this order and nothing pins the discriminants, so a reordering would hand each port the
+    // other's offsets — a frame that still builds, still restores, and is wrong.
+    assert!(Abi::X86_64 as usize == 0);
+    assert!(Abi::Aarch64 as usize == 1);
+};
+
+/// The most bytes [`Built::head`] holds: aarch64's frame up to and including its
+/// `fpsimd_context` record and the null record that terminates it, which is the longer of the
+/// two ports' heads.
+pub const HEAD_BYTES: usize = a64::RECORD + a64::RECORD_HEADER + a64::FPSIMD_BYTES + 8;
+
+const _: () = {
+    // Both heads fit, and x86_64's whole frame does: `build` writes into `[u8; HEAD_BYTES]`.
+    assert!(HEAD_BYTES >= x86::FRAME);
+    assert!(HEAD_BYTES == 1128);
+    // The x86_64 area is 16-aligned in user memory. A frame starts at `at ≡ 8 (mod 16)`, so an
+    // area at an offset ≡ 8 (mod 16) lands on a multiple of 16 — which is what `FXRSTOR`
+    // requires of a program that restores the frame itself.
+    assert!((x86::FPSTATE_AREA + 8) % 16 == 0);
+    assert!(x86::FPSTATE_AREA + x86::FPSTATE_BYTES == x86::FRAME);
+    // aarch64's record is `fpsimd_context`: an 8-byte header then the state, and the size the
+    // header declares covers both.
+    assert!(a64::RECORD_HEADER + a64::FPSIMD_BYTES == a64::FPSIMD_SIZE);
+    assert!(a64::FPSIMD_SIZE == 0x210);
+    // The record and its terminator stay inside the 4 KiB of reserved space.
+    assert!(a64::RECORD + a64::FPSIMD_SIZE + 8 <= a64::FRAME);
+};
 
 /// What delivering one signal to a handler needs besides the context.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -320,15 +363,24 @@ pub enum BadFrame {
 
 /// The x86_64 layout: `rt_sigframe` is the return address, a `ucontext` and a `siginfo`.
 mod x86 {
-    pub const FRAME: usize = 440;
+    /// The whole frame: everything up to the floating-point area, then the area itself.
+    pub const FRAME: usize = FPSTATE_AREA + FPSTATE_BYTES;
     pub const UC: usize = 8;
     pub const MCONTEXT: usize = UC + 40;
     /// `uc_sigmask`, after the 256-byte `sigcontext`.
     pub const SIGMASK: usize = MCONTEXT + 256;
-    /// `sigcontext`'s `fpstate` pointer, after `cr2`. Always null here: this kernel saves no
-    /// floating-point state, and a frame that comes back naming some is refused rather than
-    /// ignored, so no program is told its registers were restored when they were not.
+    /// `sigcontext`'s `fpstate` pointer, after `cr2`. [`super::build`] points it at
+    /// [`FPSTATE_AREA`] inside this same frame, and [`super::restore`] accepts that one value
+    /// and nothing else: the area is the kernel's to place, so a frame naming anywhere else is
+    /// a program asking this kernel to read memory of its choosing.
     pub const FPSTATE: usize = MCONTEXT + 23 * 8;
+    /// Where the `FXSAVE` image sits, just past the rest of the frame. Linux puts its
+    /// `_fpstate` above the frame too; what matters here is that it is at a fixed offset, so
+    /// the pointer can be checked rather than followed.
+    pub const FPSTATE_AREA: usize = 440;
+    /// An `FXSAVE` image: x87, MMX and SSE, which is all a program built for
+    /// `targets/x86_64-kintane-hf.json` can name. Mirrors `X86_64::FPU_BYTES`.
+    pub const FPSTATE_BYTES: usize = 512;
     pub const INFO: usize = SIGMASK + 8;
     /// `sigcontext`'s first eighteen words, as indices into the port's register order.
     pub const ORDER: [usize; 18] = [7, 8, 9, 10, 11, 12, 13, 14, 5, 4, 6, 1, 3, 0, 2, 17, 15, 16];
@@ -366,10 +418,20 @@ mod a64 {
     pub const PSTATE: usize = PC + 8;
     /// The reserved space, 4 KiB aligned to 16.
     pub const RESERVED: usize = MCONTEXT + 288;
-    /// The first record in it: a magic and a size. `build` leaves the terminating null record,
-    /// and [`restore`] refuses anything else, `fpsimd_context` above all — this kernel has no
-    /// floating-point state to give back. Linux's own magic, for the record: 0x4650_5342.
+    /// The first record in it: a magic and a size, then the state. [`super::build`] writes a
+    /// `fpsimd_context` here and a terminating null record above it, and [`super::restore`]
+    /// requires exactly that — Linux's own magic and Linux's own size, or the frame is refused.
     pub const RECORD: usize = RESERVED;
+    /// `struct _aarch64_ctx`: a magic word and a size word.
+    pub const RECORD_HEADER: usize = 8;
+    /// `fpsimd_context`'s magic, which is Linux's: "FPSB" little-endian.
+    pub const FPSIMD_MAGIC: u32 = 0x4650_5342;
+    /// The state behind the header: `fpsr` and `fpcr` as 32-bit fields, then the 32 V
+    /// registers. Mirrors `Aarch64::FPU_BYTES`.
+    pub const FPSIMD_BYTES: usize = 8 + 32 * 16;
+    /// What the header's size field declares: the header and the state together, which is what
+    /// Linux writes and what a program walking the records steps over.
+    pub const FPSIMD_SIZE: usize = RECORD_HEADER + FPSIMD_BYTES;
     pub const FRAME: usize = RESERVED + 4096;
     pub const X29: usize = 29;
     pub const X30: usize = 30;
@@ -406,11 +468,28 @@ impl Abi {
     }
 
     /// Bytes of the frame [`restore`] reads.
+    ///
+    /// Both now reach past the registers to the saved floating-point state: x86_64's whole
+    /// frame including the `FXSAVE` area at its end, and aarch64's up to and including the null
+    /// record that terminates the `fpsimd_context`. This length, [`HEAD_BYTES`], the copy
+    /// `build` asks for and the copy `rt_sigreturn` makes all move together — a frame written
+    /// longer than it is read back would hand a program registers the kernel never looks at.
     pub const fn restore_len(self) -> usize {
         match self {
             Abi::X86_64 => x86::FRAME,
-            Abi::Aarch64 => a64::RECORD + 8,
+            Abi::Aarch64 => a64::RECORD + a64::FPSIMD_SIZE + 8,
         }
+    }
+
+    /// Where this port's frame keeps the saved floating-point state, as an offset into it, and
+    /// how many bytes of it there are. The personality fills them before the frame is written
+    /// and hands them back to the port after [`restore`] accepts one.
+    pub const fn fpu_at(self) -> usize {
+        FPU_AT[self as usize]
+    }
+
+    pub const fn fpu_bytes(self) -> usize {
+        FPU_BYTES[self as usize]
     }
 
     /// Where `rt_sigreturn` finds the frame, given the stack pointer it was called with: x86_64's
@@ -500,6 +579,11 @@ pub fn build(
             regs[x86::RDX] = at + x86::UC as u64;
             regs[x86::RAX] = 0;
             regs[x86::RFLAGS] = (ctx[x86::RFLAGS] & x86::USER_FLAGS & !x86::DF) | x86::START_FLAGS;
+            // The floating-point area is part of this frame, so the pointer is the one address
+            // it can be. `restore` accepts that value and no other: a program may write
+            // anything here, and following a pointer of its choosing would be reading memory it
+            // named. The bytes behind it are the personality's to fill; see `Abi::fpu_at`.
+            put(&mut head, x86::FPSTATE, at + x86::FPSTATE_AREA as u64);
             Ok(Built {
                 at,
                 head,
@@ -537,11 +621,21 @@ pub fn build(
             regs[a64::X29] = record_at;
             regs[a64::X30] = d.action.restorer;
             regs[a64::W_PSTATE] = ctx[a64::W_PSTATE] & a64::USER_PSTATE;
+            // `fpsimd_context` at the head of the reserved space, then the null record that
+            // terminates the chain. The size the header declares is the header and the state
+            // together, which is what a program walking these records steps over. The state
+            // itself is the personality's to fill; see `Abi::fpu_at`.
+            put32(&mut head, a64::RECORD, a64::FPSIMD_MAGIC);
+            put32(&mut head, a64::RECORD + 4, a64::FPSIMD_SIZE as u32);
+            let after = a64::RECORD + a64::FPSIMD_SIZE;
+            // The terminating record is a zero magic and a zero size, which `head` already
+            // holds; naming it here is what makes the length below mean what it says.
+            let head_len = after + 8;
             Ok(Built {
                 at,
                 head,
-                head_len: a64::RESERVED,
-                zeros: a64::FRAME - a64::RESERVED,
+                head_len,
+                zeros: a64::FRAME - head_len,
                 record: Some((record_at, record)),
                 regs,
             })
@@ -560,9 +654,16 @@ pub struct Restored {
 /// Read the frame in `bytes`, [`Abi::restore_len`] of them from the address [`Abi::frame_at`]
 /// gave, for a user half of `[user_start, user_end)`. Registers the frame does not hold are
 /// zero.
+///
+/// `at` is where those bytes came from, which the caller knows and the bytes do not say. It is
+/// needed because x86_64's `sigcontext` carries a *pointer* to the saved floating-point state,
+/// and the only pointer this kernel accepts is the one naming the area inside this very frame.
+/// The saved `rsp` in the frame is the interrupted stack pointer, not the frame's address, so
+/// there is nothing in the bytes to check the pointer against.
 pub fn restore(
     abi: Abi,
     bytes: &[u8],
+    at: u64,
     user_start: u64,
     user_end: u64,
 ) -> Result<Restored, BadFrame> {
@@ -577,7 +678,13 @@ pub fn restore(
                 regs[w] = word(x86::MCONTEXT + i * 8);
             }
             regs[x86::RFLAGS] = (regs[x86::RFLAGS] & x86::USER_FLAGS) | x86::START_FLAGS;
-            if word(x86::FPSTATE) != 0 {
+            // The pointer must name the area inside this very frame. `restore` is given the
+            // frame's bytes and not its address, so the check is on the offset the pointer
+            // implies: `at` is the frame's start and the area sits `FPSTATE_AREA` into it, so
+            // a well-formed pointer is exactly that far above the `rsp` the frame restores.
+            // Anything else — null, a byte past, an address elsewhere in the program — is a
+            // program asking this kernel to read memory of its choosing, and is refused.
+            if word(x86::FPSTATE) != at.wrapping_add(x86::FPSTATE_AREA as u64) {
                 return Err(BadFrame::FpState);
             }
             word(x86::SIGMASK)
@@ -593,7 +700,13 @@ pub fn restore(
                 return Err(BadFrame::BadState);
             }
             regs[a64::W_PSTATE] = pstate;
-            if word(a64::RECORD) != 0 {
+            // The record must be the `fpsimd_context` this kernel writes: Linux's magic and
+            // Linux's size, in the first record of the reserved space. A program may write any
+            // bytes here, and a record claiming a different size is one asking the kernel to
+            // walk a chain of its length rather than this one's.
+            let magic = word(a64::RECORD) as u32;
+            let size = (word(a64::RECORD) >> 32) as u32;
+            if magic != a64::FPSIMD_MAGIC || size != a64::FPSIMD_SIZE as u32 {
                 return Err(BadFrame::FpState);
             }
             word(a64::SIGMASK)

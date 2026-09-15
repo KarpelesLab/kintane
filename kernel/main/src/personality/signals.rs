@@ -55,7 +55,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use arch::Cpu;
 use hal::user::UserRegisters;
-use hal::{EarlyConsole, HasUserMode};
+use hal::{EarlyConsole, HasFpu, HasUserMode};
 use linux::Failure;
 use linux::signal::{self as sig, Action, Delivery, Effect};
 use sched::ThreadId;
@@ -75,6 +75,21 @@ type Words = [u64; sig::REGISTER_WORDS];
 
 const USER_START: u64 = <Cpu as HasUserMode>::USER_START as u64;
 const USER_END: u64 = <Cpu as HasUserMode>::USER_END as u64;
+
+/// Where this port's frame keeps the saved floating-point state, and how much of it there is.
+const FPU_AT: usize = ABI.fpu_at();
+const FPU_BYTES: usize = ABI.fpu_bytes();
+
+const _: () = {
+    // The frame's idea of the image and the port's must be one number. `kernel/linux` depends
+    // on nothing and cannot ask the architecture, so it writes the size down; this is where the
+    // two meet. A port whose image changed without the layout following would otherwise write
+    // a short record and read back a long one.
+    assert!(FPU_BYTES == <Cpu as HasFpu>::FPU_BYTES);
+    // Both lie inside the bytes `rt_sigreturn` reads back, which is what makes it safe to take
+    // the state from the same buffer `restore` validated.
+    assert!(FPU_AT + FPU_BYTES <= ABI.restore_len());
+};
 const SIGNALS: usize = sig::NSIG as usize;
 
 // ---- state -------------------------------------------------------------------------------
@@ -611,9 +626,15 @@ fn enter_handler(
         addr: fault_addr(slot, signo),
         value,
     };
-    let built = sig::build(ABI, ctx, &d, USER_START, USER_END)
-        .ok()
-        .filter(write_frame)?;
+    let mut built = sig::build(ABI, ctx, &d, USER_START, USER_END).ok()?;
+    // The interrupted thread's floating-point registers, into the frame before it is written.
+    // They are live at this moment — the thread is in a system call, a fault or an interrupt,
+    // and nothing has reloaded them — so this is the one place they can be taken from. A switch
+    // after this point carries them as it always did; see `hal::HasFpu`.
+    Cpu::save_live(&mut built.head[FPU_AT..FPU_AT + FPU_BYTES]);
+    if !write_frame(&built) {
+        return None;
+    }
     let mut blocked = mask | action.mask;
     if action.flags & SA_NODEFER == 0 {
         blocked |= sig::bit(signo);
@@ -991,7 +1012,7 @@ pub(super) fn sigreturn(
         .frame_at(ctx[ABI.sp_word()])
         .ok()
         .filter(|&at| super::from_user(at, &mut bytes[..len]).is_ok())
-        .and_then(|_| sig::restore(ABI, &bytes[..len], USER_START, USER_END).ok());
+        .and_then(|at| sig::restore(ABI, &bytes[..len], at, USER_START, USER_END).ok());
     let Some(r) = restored else {
         SIGNAL_ENDS.fetch_add(1, Ordering::Relaxed);
         super::exit_group(slot, sig::exit_code(sig::SIGSEGV))
@@ -999,6 +1020,12 @@ pub(super) fn sigreturn(
     if let Some(me) = mine(slot) {
         me.mask.store(r.mask, Ordering::Release);
     }
+    // The frame's floating-point state, back into the registers. These are the program's own
+    // bytes and it may have changed them, deliberately or by accident — which is the point: a
+    // handler that edits the saved state changes what the interrupted code sees, exactly as it
+    // can with any other register in the frame. `restore` has already accepted the frame, so
+    // the record is the one this kernel wrote and these bytes are inside what it validated.
+    Cpu::load_live(&bytes[FPU_AT..FPU_AT + FPU_BYTES]);
     Cpu::set_registers(frame, &UserRegisters::from_words(&r.regs));
     RETURNED.fetch_add(1, Ordering::Relaxed);
     // The return register, which the table sets last, is the one the frame holds.
