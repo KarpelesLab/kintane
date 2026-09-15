@@ -2073,7 +2073,7 @@ own count:
              foreign datagram refused, the quiet port refused ...
   linux net  tcp client ok; server ok; poll ok (two connections, 4 announcements);
              udp ok; peek ok (kbuild told of its listener 1 time); waits woken by the
-             card 35, armed for a TCP timer 13, polled 0; closed in order, every buffer
+             card 32, armed for a TCP timer 15, polled 0; closed in order, every buffer
              back; 0 objects left, 0 frames left ok
   net peer:  100 frames in, 1 ARP requests, 1 answered, 4 echoes answered,
              3 acknowledgements, 12 service replies, 47 rounds of announcements,
