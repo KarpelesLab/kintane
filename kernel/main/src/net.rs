@@ -680,7 +680,9 @@ fn exchange(
     write_usize(c, bulk.fast_retransmits as usize);
     c.write_str(" fast retransmits in ");
     write_usize(c, bulk.retransmits as usize);
-    c.write_str(" resends");
+    c.write_str(" resends, ");
+    write_usize(c, (rounds.sack_retransmits - before.sack_retransmits) as usize);
+    c.write_str(" selective");
 
     let through = |round: &TcpRound, states: &[State]| {
         round.closed && states.iter().all(|s| round.visited & s.bit() != 0)
@@ -700,6 +702,14 @@ fn exchange(
         return Some(
             "THE BULK ROUND'S LOST SEGMENT WAITED FOR THE TIMER RATHER THAN THREE DUPLICATE ACKNOWLEDGEMENTS",
         );
+    }
+    // Selective acknowledgement, where there is a peer that offers it. Only kbuild's own peer
+    // does: QEMU's user-mode network never sends `SACK-permitted`, so under every other preset
+    // the stack has been given no blocks to act on and this would fail for want of a peer
+    // rather than for a fault. A retransmission that stepped over a run is the sending half
+    // proving itself on a wire, which no boot could do before the peer existed.
+    if kconfig::QEMU_NET_PEER && rounds.sack_retransmits == before.sack_retransmits {
+        return Some("NO RETRANSMISSION STEPPED OVER A RUN THE PEER ACKNOWLEDGED SELECTIVELY");
     }
     if rounds.out_of_order_queued == before.out_of_order_queued {
         return Some("NO SEGMENT WAS HELD OUT OF ORDER, THOUGH KBUILD'S RELAY SWAPS A PAIR");

@@ -35,6 +35,10 @@ const SILENCE_NS: u64 = SECOND;
 /// Exit codes. `SUCCESS` is what the kernel requires; the rest say where it stopped, with the
 /// kernel's answer in the byte above (see [`why`]).
 const SUCCESS: u64 = 0x7d;
+/// Everything behaved *and* the quiet port was refused rather than silent, which takes a
+/// network that sends an ICMP destination-unreachable for it. The kernel's check requires this
+/// one where kbuild is the whole network, and accepts either elsewhere.
+const REFUSED: u64 = 0x7e;
 const NO_ADDRESS: u64 = 0x7d01;
 const BIND_FAILED: u64 = 0x7d02;
 const SEND_FAILED: u64 = 0x7d03;
@@ -135,14 +139,19 @@ fn run(console: Handle, service: u64, quiet: u64) -> u64 {
     if let Err(e) = connected.send(REQUEST, ANSWER_NS) {
         return SEND_FAILED | why(e);
     }
-    match connected.recv(&mut buf, SILENCE_NS) {
-        Err(Error::TimedOut) | Err(Error::PeerClosed) => {}
+    // Nothing answers it with a datagram. What may come back instead is a refusal: a network
+    // that sends an ICMP destination-unreachable for the port turns the silence into
+    // `PeerClosed` here. Which of the two happened is not this program's to judge — it depends
+    // on the network it was run against — so it is said in the exit code.
+    let refused = match connected.recv(&mut buf, SILENCE_NS) {
+        Err(Error::TimedOut) => false,
+        Err(Error::PeerClosed) => true,
         _ => return QUIET_PORT_ANSWERED,
-    }
+    };
     if connected.close().is_err() {
         return CLOSE_FAILED;
     }
-    SUCCESS
+    if refused { REFUSED } else { SUCCESS }
 }
 
 #[panic_handler]
