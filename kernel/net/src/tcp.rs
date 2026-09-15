@@ -100,16 +100,40 @@ pub const MSS: u16 = (wire::ETH_MTU - wire::IPV4_HEADER - wire::TCP_HEADER) as u
 const DEFAULT_MSS: u16 = 536;
 /// The largest payload this stack puts in a segment it sends, whatever the peer announces.
 ///
+/// Segments this stack keeps outstanding at once, which is what divides the send ring.
+///
+/// [`DUP_ACK_THRESHOLD`] duplicates need that many segments arriving behind a hole to draw
+/// them, so four — one lost and three behind it — is the least that reaches fast retransmit at
+/// all, and it is exactly [`INITIAL_WINDOW`], which bounds the first flight.
+///
+/// **Both holes of a partial acknowledgement must be outstanding before recovery begins.**
+/// `recover` is the highest byte sent when the loss was found (RFC 6582 §3.2), so an
+/// acknowledgement can at most reach it; a hole in anything sent afterwards leaves the
+/// acknowledgement landing exactly on `recover`, which is full by definition. Measured twice,
+/// not reasoned: losing the first and fifth of six gave `0 partial`, and so did the third and
+/// sixth of eight — the sixth being one of the three arrivals that draw the duplicates.
+///
+/// With a first hole at the *k*th segment the guest gets *k*−1 acknowledgements in order, so
+/// its window reaches 4+(*k*−1) segments and *k*+2 follow the hole before recovery starts.
+/// Three must arrive to draw the duplicates, the second hole takes a fourth, and one more must
+/// lie past it for the peer to name in a block. A first hole at the third segment is the
+/// smallest that satisfies all of it: eight.
+pub const SEGMENTS_IN_FLIGHT: usize = DUP_ACK_THRESHOLD as usize + 5;
+/// The largest payload this stack puts in a segment it sends, whatever the peer announces.
+///
 /// A connection's send ring is one pool buffer, so a ring's worth is all it can ever have
 /// outstanding. Sending [`MSS`] at a time would put one segment in flight, and a peer cannot
 /// send [`DUP_ACK_THRESHOLD`] duplicate acknowledgements for a loss when only one later
 /// segment exists to draw them: the sender's fast retransmit would be unreachable outside a
-/// host test. A quarter of the ring leaves four segments outstanding, which is what it needs.
+/// host test.
 ///
-/// The cost is header overhead per byte, and it is stated rather than tuned. The alternative
-/// is several pool buffers per send ring, which is memory every port carries whether or not
-/// it has a card; see this module's "Memory".
-pub const SEND_SEG: usize = RING / (DUP_ACK_THRESHOLD as usize + 1);
+/// **This costs no memory.** The ring is one pool buffer however it is divided; the divisor
+/// decides only how those bytes are cut up, so eight segments occupy 1512 of the ring's 1514
+/// where four occupied 1512 exactly. What it costs is header overhead on the wire — eight
+/// headers per ring's worth instead of four — and that is stated rather than tuned. The
+/// alternative considered and rejected is several pool buffers per send ring, which *is*
+/// memory every port carries whether or not it has a card; see this module's "Memory".
+pub const SEND_SEG: usize = RING / SEGMENTS_IN_FLIGHT;
 /// The retransmission timeout a connection with no round-trip sample yet uses (RFC 6298 §2.1
 /// asks for a second; this stack's checks and its peers are a virtual machine away, and a
 /// second of silence before the first retransmission is most of a check's patience).
@@ -237,6 +261,11 @@ pub struct Counters {
     /// Retransmissions that stepped over a run the peer selectively acknowledged, rather than
     /// sending it again as go-back-N would.
     pub sack_retransmits: u64,
+    /// Acknowledgements arriving in recovery that covered some but not all of what was
+    /// outstanding when the loss was found: a second hole, still to be sent (RFC 6582 §3.2).
+    /// Counted apart from [`fast_retransmits`](Self::fast_retransmits), which a partial
+    /// acknowledgement also bumps, so a check can ask for one without inferring it from a sum.
+    pub partial_acks: u64,
     /// Round-trip measurements taken (never from a retransmitted segment: Karn's rule).
     pub rtt_samples: u64,
     pub resets_sent: u64,
@@ -824,6 +853,7 @@ impl Tcb {
                 self.cwnd = self.cwnd.saturating_sub(acked).max(self.seg());
                 self.resend = true;
                 counters.fast_retransmits += 1;
+                counters.partial_acks += 1;
                 self.timing = None;
             }
         } else {
@@ -905,6 +935,7 @@ impl Tcp {
                 dup_acks: 0,
                 fast_retransmits: 0,
                 sack_retransmits: 0,
+                partial_acks: 0,
                 rtt_samples: 0,
                 resets_sent: 0,
                 resets_received: 0,

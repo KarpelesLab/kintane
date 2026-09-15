@@ -115,6 +115,9 @@ struct Seen {
     announcements: u64,
     connections: u64,
     dropped_first: u64,
+    /// The bulk round's second withheld segment, so a second hole is open when the first
+    /// retransmission arrives and the acknowledgement for it is partial rather than full.
+    dropped_later: u64,
     duplicate_acks: u64,
     replies_reversed: u64,
     opened: u64,
@@ -137,6 +140,16 @@ struct Seen {
 /// One connection the guest opened to the service, and what this end owes it.
 ///
 /// There is no listen backlog and no reassembly beyond what the rounds need: the guest opens
+/// What the bulk round calls itself, in the first segment of its request.
+///
+/// The round is told apart by its **name**, not by the size of its first segment. A length
+/// threshold was tried and was wrong within the hour: chosen against a segment of 252 bytes,
+/// it stopped matching when the ring was divided differently and the segment became 189, so
+/// the peer went on disturbing every connection identically and the check failed with
+/// `0 later segments dropped`. A rule keyed to a number this work was actively tuning could
+/// only ever have held by luck.
+const BULK_MARK: &[u8] = b"bulk ";
+
 /// one connection at a time, sends one request, and closes in the order its mode names.
 struct Conn {
     guest_port: u16,
@@ -152,12 +165,38 @@ struct Conn {
     /// dropping them is what keeps a lost segment costing one retransmission instead of a
     /// window's worth.
     held: Vec<(u32, Vec<u8>)>,
-    /// The first in-order data segment of every connection is dropped, once. With one segment
-    /// the guest's timer sends it again; with four, the three behind it draw the three
-    /// duplicate acknowledgements its fast retransmit needs. Under `-netdev user` a relay
-    /// between the guest and the network does this; here there is no between, so the peer
-    /// does it by choosing what to answer.
-    dropped: bool,
+    /// New data segments this end has taken from the guest on this connection, retransmissions
+    /// excluded.
+    ///
+    /// A short round loses its **first** segment, as every round always has: with one segment
+    /// the guest's timer sends it again; with several, the ones behind it draw the three
+    /// duplicate acknowledgements its fast retransmit needs.
+    ///
+    /// The bulk round loses its **third and seventh** instead, its first two let through
+    /// deliberately. Three measurements drove that, in this order:
+    ///
+    /// * First and third of five: `0 fast retransmits in 3 resends`. The guest's first flight
+    ///   is its initial window of four, and the three behind the first hole are exactly what
+    ///   draws the duplicates; taking one leaves two, below the threshold.
+    /// * First and fifth of six: `1 fast retransmit ... 0 partial`. With the *first* segment
+    ///   gone nothing is acknowledged before recovery starts, so the window never grows, only
+    ///   four are outstanding, and `recover` is the end of the fourth — the acknowledgement
+    ///   after the retransmission lands exactly on it, which is full by definition. **No ring
+    ///   size fixes that**: while the first segment is the first hole, no acknowledgement can
+    ///   be partial.
+    /// * Third and sixth of eight: `0 fast retransmits in 2 resends`. The sixth was one of the
+    ///   three arrivals behind the hole, so the threshold was never reached. The second hole
+    ///   must fall past the segments that draw the duplicates, not among them.
+    ///
+    /// Retransmissions are excluded so the segment withheld is never the one being resent: a
+    /// connection that lost a segment must be able to make progress once it sends it again, or
+    /// the round could only ever end on the timer.
+    ///
+    /// Under `-netdev user` a relay between the guest and the network does this; here there is
+    /// no between, so the peer does it by choosing what to answer.
+    new_data: u32,
+    /// Whether this is the bulk round, by the name in its first segment.
+    long: bool,
     /// The request line, however many segments carried it.
     request: Vec<u8>,
     replied: bool,
@@ -263,7 +302,8 @@ pub fn serve(ports: NetPorts, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<
         eprintln!(
             "  net peer: {} frames in, {} ARP requests, {} answered, {} echoes answered, \
              {} acknowledgements, {} service replies, {} rounds of announcements, \
-             {} connections, {} first segments dropped, {} duplicate acknowledgements, \
+             {} connections, {} first segments dropped, {} later segments dropped, \
+             {} duplicate acknowledgements, \
              {} replies sent back to front, {} connections opened, {} verdicts sent, \
              {} selective acknowledgements naming {} runs, {} acknowledgements with blocks of \
              the guest's own, {} segments the guest sent again ({} bytes), {} datagrams refused",
@@ -276,6 +316,7 @@ pub fn serve(ports: NetPorts, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<
             s.announcements,
             s.connections,
             s.dropped_first,
+            s.dropped_later,
             s.duplicate_acks,
             s.replies_reversed,
             s.opened,
@@ -521,7 +562,8 @@ impl Peer {
             snd_nxt: isn.wrapping_add(1),
             rcv_nxt: 0,
             held: Vec::new(),
-            dropped: false,
+            new_data: 0,
+            long: false,
             request: Vec::new(),
             replied: false,
             fin_sent: false,
@@ -753,7 +795,8 @@ impl Peer {
             snd_nxt: isn.wrapping_add(1),
             rcv_nxt: seq.wrapping_add(1),
             held: Vec::new(),
-            dropped: false,
+            new_data: 0,
+            long: false,
             request: Vec::new(),
             replied: false,
             fin_sent: false,
@@ -792,12 +835,27 @@ impl Peer {
         // The dropped first segment is the service's disturbance. A connection this end opened
         // carries the guest's reply, and losing that would slow the exchange with no check
         // asking for it.
-        if c.opened.is_none() && seq == c.rcv_nxt && !c.dropped {
-            // The one segment this connection loses. Silence, not a refusal: a lost segment
-            // is one that never arrived, and the guest must notice by itself.
-            c.dropped = true;
-            self.seen.dropped_first += 1;
-            return Vec::new();
+        if c.opened.is_none() && !again {
+            c.new_data += 1;
+            // Silence, not a refusal: a lost segment is one that never arrived, and the guest
+            // must notice by itself.
+            if c.new_data == 1 {
+                c.long = payload
+                    .strip_prefix(NET_TCP_REQUEST)
+                    .is_some_and(|rest| rest.starts_with(BULK_MARK));
+                if !c.long {
+                    self.seen.dropped_first += 1;
+                    return Vec::new();
+                }
+            }
+            // On the bulk round the first two are let through on purpose, so their
+            // acknowledgements grow the guest's window past its initial four before the hole is
+            // found — only then is more outstanding than the first flight when recovery begins,
+            // which is the whole of what makes the next acknowledgement partial.
+            if c.long && (c.new_data == 3 || c.new_data == 7) {
+                self.seen.dropped_later += 1;
+                return Vec::new();
+            }
         }
         if seq == c.rcv_nxt {
             c.rcv_nxt = c.rcv_nxt.wrapping_add(payload.len() as u32);
