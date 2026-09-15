@@ -2154,8 +2154,7 @@ impl Listing {
 
     /// Whether the listing holds `name`, and calls it `kind`.
     fn holds(&self, name: &[u8], kind: u8) -> bool {
-        (0..self.count)
-            .any(|i| &self.names[i][..self.lens[i]] == name && self.kinds[i] == kind)
+        (0..self.count).any(|i| &self.names[i][..self.lens[i]] == name && self.kinds[i] == kind)
     }
 }
 const OUT_LEN: usize = 2000;
@@ -2363,7 +2362,6 @@ fn files() -> ! {
     expect(call1(sys::CLOSE, again as u64) == 0, 94);
     expect(unlink(LONG_NAME, 0) == 0, 94);
 
-
     // 230-239: listing a directory. These make a long name of their own and remove it, so
     // they write, and like steps 94 and 190-192 they come before step 95's `fsync` — which
     // is what makes them durable and leaves nothing in the cache for the check that follows.
@@ -2386,10 +2384,8 @@ fn files() -> ! {
     // does not fit must be carried to the next one rather than dropped or repeated.
     let mut buf = [0u8; 128];
     loop {
-        let n = sys::call(
-            sys::GETDENTS64,
-            [dir, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0],
-        );
+        let n =
+            sys::call(sys::GETDENTS64, [dir, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]);
         expect(n >= 0, 232);
         if n == 0 {
             break;
@@ -2412,14 +2408,28 @@ fn files() -> ! {
     let mut first = [0u8; 128];
     let one = sys::call(
         sys::GETDENTS64,
-        [again, first.as_mut_ptr() as u64, first.len() as u64, 0, 0, 0],
+        [
+            again,
+            first.as_mut_ptr() as u64,
+            first.len() as u64,
+            0,
+            0,
+            0,
+        ],
     );
     expect(one > 0, 238);
     expect(sys::call(sys::LSEEK, [again, 0, SEEK_SET, 0, 0, 0]) == 0, 239);
     let mut twice = [0u8; 128];
     let two = sys::call(
         sys::GETDENTS64,
-        [again, twice.as_mut_ptr() as u64, twice.len() as u64, 0, 0, 0],
+        [
+            again,
+            twice.as_mut_ptr() as u64,
+            twice.len() as u64,
+            0,
+            0,
+            0,
+        ],
     );
     expect(two == one && twice[..two as usize] == first[..one as usize], 239);
     expect(call1(sys::CLOSE, again) == 0, 239);
@@ -2501,10 +2511,8 @@ fn files() -> ! {
     let mut final_seen = Listing::new();
     let mut into = [0u8; 128];
     loop {
-        let n = sys::call(
-            sys::GETDENTS64,
-            [now, into.as_mut_ptr() as u64, into.len() as u64, 0, 0, 0],
-        );
+        let n =
+            sys::call(sys::GETDENTS64, [now, into.as_mut_ptr() as u64, into.len() as u64, 0, 0, 0]);
         expect(n >= 0, 240);
         if n == 0 {
             break;

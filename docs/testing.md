@@ -850,6 +850,7 @@ lists, the nightly job iterates, and the smoke run replays:
 | `virtio-ring` | a used ring, as a hostile device writes it | a device script: heads, lengths, index jumps |
 | `net` | Ethernet frames carrying ARP, IPv4, ICMP, UDP and TCP, and the stack given one with a TCP listener open, then its timers run | seeded: an ARP reply, an echo request, a datagram and a TCP SYN for the listener, with correct checksums; or built with the stack's own writers; then mutated |
 | `syscall` | numbers and argument registers | drawn from `abi::TABLE`, so a new call is fuzzed without a new target |
+| `dirent` | the records `getdents64` packs into a program's buffer | a name of up to 255 bytes, a buffer usually within four bytes of the record's own length, and an offset the input invents |
 
 A target's `run` must answer every input: a value or an error, never a panic, never a
 hang. The driver runs each input on a worker thread under `catch_unwind` and waits for it
@@ -1071,6 +1072,15 @@ pieces and none lost between them; a buffer too small for even one record refuse
 rather than the zero a caller would read as the end of the directory; and a listing rewound with
 `lseek` reproducing its first batch. The steps write, so they run before the step that syncs, and
 they make and remove their own names rather than looking for a name an earlier step removed.
+
+The `dirent` fuzz target reads the packing itself, where the program's buffer length meets the
+volume's name: 200,000 inputs at seed 7, 43.4% of them packing a record rather than being turned
+away, no failures. It asserts that a record never reaches past the buffer it was given, that its
+length leaves the next record aligned and is the `d_reclen` the header claims, that the inode, the
+offset and the name come back as they went in with the name terminated, that the padding is written
+rather than left as whatever the buffer held, and that a name the format cannot carry — an empty
+one, or one holding a NUL — is refused outright rather than packed into something a reader would
+stop early in.
 
 | Mutation | What catches it |
 |---|---|

@@ -34,9 +34,8 @@
 //!   allocation unit, how many units it has, how many are free and the longest name it holds, as
 //!   [`statfs_answer`] encodes them. A read-side request, so a read-only connection may ask.
 //! * `getdents`: `a` is the file number of an open directory and the payload an eight-byte
-//!   little-endian index; the reply's payload is that entry as [`dirent_answer`] encodes it,
-//!   and empty once the directory has no more. A read-side request, so a read-only connection
-//!   may list.
+//!   little-endian index; the reply's payload is that entry as [`dirent_answer`] encodes it, and
+//!   empty once the directory has no more. A read-side request, so a read-only connection may list.
 //! * `sync`: nothing; every write so far reaches the disk before the reply.
 //! * `close`: `a` is the file number.
 //!

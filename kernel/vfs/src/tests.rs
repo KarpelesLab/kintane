@@ -59,10 +59,7 @@ fn listing_needs_a_directory_and_a_live_handle() {
     // Matched rather than unwrapped: an `Entry` carries no `Debug`, so the success side
     // cannot be printed by an assertion that fails.
     let file = vfs.open("/hello.txt").unwrap();
-    assert!(matches!(
-        vfs.readdir_fd(file, 0),
-        Err(Error::NotADirectory)
-    ));
+    assert!(matches!(vfs.readdir_fd(file, 0), Err(Error::NotADirectory)));
     let dir = vfs.open("/sub").unwrap();
     vfs.close(dir).unwrap();
     // A closed handle names nothing, as it does for every other operation.
