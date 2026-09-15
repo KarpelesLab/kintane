@@ -158,8 +158,47 @@ pub trait HasCoherentDma: Arch {}
 /// `Default` must produce a state a restore will accept. That is not the same as zero: an
 /// all-zero x86 `FXSAVE` image has `MXCSR = 0`, which unmasks every floating-point
 /// exception, so the first user multiply that underflows traps. See `X86_64::FpuState`.
+///
+/// # The live registers, which are not the context's
+///
+/// [`save_live`](HasFpu::save_live) and [`load_live`](HasFpu::load_live) move the state of the
+/// *running CPU*, not of a stored [`Context`](crate::HasContextSwitch::Context). A signal frame
+/// needs exactly that and cannot use the switch: at delivery the interrupted thread's registers
+/// are live, and at `rt_sigreturn` the bytes to put back come from the program's own stack.
+///
+/// A switch between the two is harmless in both directions, which is worth spelling out because
+/// it is the reason this is sound at all. After `save_live` the live registers still hold the
+/// interrupted values, so a switch saves and restores them as it always did. After `load_live`
+/// they hold what the frame asked for, and a switch carries *those*. Neither leaves the frame's
+/// copy and the thread's copy disagreeing.
+///
+/// Both work in bytes rather than in `Self::FpuState` because their caller holds the frame's
+/// bytes inside a plain array with no alignment guarantee, while `FXSAVE` and `stp q` fault on
+/// a misaligned address. A port copies through an aligned local of its own, so alignment stays
+/// the architecture's business and never reaches the code that lays frames out.
 pub trait HasFpu: Arch {
     type FpuState: Default;
+
+    /// Bytes of the image the two calls below move. A caller that lays this state out in a
+    /// structure of its own checks its offsets against this at compile time rather than
+    /// writing the number down a second time.
+    const FPU_BYTES: usize;
+
+    /// Write the running CPU's user-visible floating-point state into `out`.
+    ///
+    /// # Panics
+    /// If `out` is shorter than [`FPU_BYTES`](HasFpu::FPU_BYTES).
+    fn save_live(out: &mut [u8]);
+
+    /// Load `bytes` into the running CPU's user-visible floating-point registers.
+    ///
+    /// Every byte is a value some register may legally hold, so there is nothing here to
+    /// validate: the control words this writes are masked by the port to the bits a program
+    /// may set, and a program can reach the same states with its own instructions anyway.
+    ///
+    /// # Panics
+    /// If `bytes` is shorter than [`FPU_BYTES`](HasFpu::FPU_BYTES).
+    fn load_live(bytes: &[u8]);
 }
 
 /// An interrupt number as the interrupt controller numbers them.

@@ -114,6 +114,138 @@ impl Default for FpSimd {
     }
 }
 
+/// Bytes of the state a signal frame carries: the 32 V registers, then `FPSR` and `FPCR` as
+/// two words. Not `size_of::<FpSimd>()`: the frame's order is Linux's, which puts the control
+/// words first, and the two must not be confused.
+pub const FPSIMD_BYTES: usize = 512 + 8;
+
+/// Offsets inside the byte image above.
+const VREGS: usize = 0;
+const FPSR_AT: usize = 512;
+const FPCR_AT: usize = 516;
+
+core::arch::global_asm!(
+    r#"
+.section .text.fpsimd, "ax"
+// aarch64_fpsimd_save(into: *mut u8) / aarch64_fpsimd_load(from: *const u8)
+//
+// The live registers, not a `Context`'s: what a signal frame needs at delivery and at
+// `rt_sigreturn`. `.arch_extension fp` for the same reason the switch needs it — the kernel's
+// target is `-neon`, so without it the assembler rejects these outright.
+//
+// The caller passes a 16-aligned buffer, which `stp q` requires.
+.globl aarch64_fpsimd_save
+aarch64_fpsimd_save:
+    .arch_extension fp
+    stp     q0,  q1,  [x0, #0x000]
+    stp     q2,  q3,  [x0, #0x020]
+    stp     q4,  q5,  [x0, #0x040]
+    stp     q6,  q7,  [x0, #0x060]
+    stp     q8,  q9,  [x0, #0x080]
+    stp     q10, q11, [x0, #0x0a0]
+    stp     q12, q13, [x0, #0x0c0]
+    stp     q14, q15, [x0, #0x0e0]
+    stp     q16, q17, [x0, #0x100]
+    stp     q18, q19, [x0, #0x120]
+    stp     q20, q21, [x0, #0x140]
+    stp     q22, q23, [x0, #0x160]
+    stp     q24, q25, [x0, #0x180]
+    stp     q26, q27, [x0, #0x1a0]
+    stp     q28, q29, [x0, #0x1c0]
+    stp     q30, q31, [x0, #0x1e0]
+    // Linux's `fpsimd_context` carries fpsr then fpcr, each a 32-bit field.
+    mrs     x9,  fpsr
+    mrs     x10, fpcr
+    str     w9,  [x0, #0x200]
+    str     w10, [x0, #0x204]
+    ret
+
+.globl aarch64_fpsimd_load
+aarch64_fpsimd_load:
+    .arch_extension fp
+    ldp     q0,  q1,  [x0, #0x000]
+    ldp     q2,  q3,  [x0, #0x020]
+    ldp     q4,  q5,  [x0, #0x040]
+    ldp     q6,  q7,  [x0, #0x060]
+    ldp     q8,  q9,  [x0, #0x080]
+    ldp     q10, q11, [x0, #0x0a0]
+    ldp     q12, q13, [x0, #0x0c0]
+    ldp     q14, q15, [x0, #0x0e0]
+    ldp     q16, q17, [x0, #0x100]
+    ldp     q18, q19, [x0, #0x120]
+    ldp     q20, q21, [x0, #0x140]
+    ldp     q22, q23, [x0, #0x160]
+    ldp     q24, q25, [x0, #0x180]
+    ldp     q26, q27, [x0, #0x1a0]
+    ldp     q28, q29, [x0, #0x1c0]
+    ldp     q30, q31, [x0, #0x1e0]
+    ldr     w9,  [x0, #0x200]
+    ldr     w10, [x0, #0x204]
+    msr     fpsr, x9
+    msr     fpcr, x10
+    ret
+"#,
+);
+
+unsafe extern "C" {
+    fn aarch64_fpsimd_save(into: *mut u8);
+    fn aarch64_fpsimd_load(from: *const u8);
+}
+
+/// Save the running CPU's V registers and control words into `out`, in Linux's order.
+///
+/// Copies through an aligned local: `stp q` faults on an address that is not 16-aligned, and
+/// `out` is a slice into whatever its caller had.
+///
+/// # Panics
+/// If `out` is shorter than [`FPSIMD_BYTES`].
+pub fn save_live(out: &mut [u8]) {
+    #[repr(C, align(16))]
+    struct Image([u8; FPSIMD_BYTES]);
+    let mut image = Image([0; FPSIMD_BYTES]);
+    // SAFETY: `image` is 16-aligned by `repr(align(16))` and holds the 520 bytes the routine
+    // writes. Boot set `CPACR_EL1.FPEN`, so reaching the registers does not trap.
+    unsafe { aarch64_fpsimd_save(image.0.as_mut_ptr()) };
+    out[..FPSIMD_BYTES].copy_from_slice(&image.0);
+}
+
+/// Load `bytes` into the running CPU's V registers and control words.
+///
+/// `FPCR` is masked to the bits the architecture defines. These bytes come from a program's
+/// own stack, and while writing a reserved `FPCR` bit is not an abort here as a bad `MXCSR` is
+/// on x86, a value the architecture calls reserved is not one to hand the hardware unread.
+/// `FPSR` is all status, which a program may set freely with its own instructions.
+///
+/// # Panics
+/// If `bytes` is shorter than [`FPSIMD_BYTES`].
+pub fn load_live(bytes: &[u8]) {
+    #[repr(C, align(16))]
+    struct Image([u8; FPSIMD_BYTES]);
+    let mut image = Image([0; FPSIMD_BYTES]);
+    image.0.copy_from_slice(&bytes[..FPSIMD_BYTES]);
+    let fpcr = u32::from_le_bytes([
+        image.0[FPCR_AT],
+        image.0[FPCR_AT + 1],
+        image.0[FPCR_AT + 2],
+        image.0[FPCR_AT + 3],
+    ]) & FPCR_MASK;
+    image.0[FPCR_AT..FPCR_AT + 4].copy_from_slice(&fpcr.to_le_bytes());
+    // SAFETY: `image` is 16-aligned and holds the 520 bytes the routine reads, with `FPCR`
+    // masked to defined bits. Every V register byte is a value the register may hold.
+    unsafe { aarch64_fpsimd_load(image.0.as_ptr()) };
+}
+
+/// The `FPCR` bits the architecture defines for the base floating-point set: the exception
+/// traps, rounding mode, flush-to-zero, default NaN and the two AHP/FZ16 controls.
+const FPCR_MASK: u32 = 0x07ff_9f00;
+
+const _: () = {
+    assert!(VREGS == 0);
+    assert!(FPSR_AT == 512);
+    assert!(FPCR_AT == 516);
+    assert!(FPSIMD_BYTES == 520);
+};
+
 /// The callee-saved state of a suspended thread.
 ///
 /// `repr(C)` because `aarch64_context_switch` addresses the fields by offset. The offsets

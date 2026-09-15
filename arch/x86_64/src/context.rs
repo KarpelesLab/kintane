@@ -111,6 +111,65 @@ impl Default for FxSave {
     }
 }
 
+/// Bytes of the `FXSAVE` image, which is what a signal frame carries.
+pub const FXSAVE_BYTES: usize = 512;
+
+/// Save the running CPU's x87, MMX and SSE state into `out`.
+///
+/// Copies through an aligned local because `FXSAVE` faults on an address that is not
+/// 16-aligned and `out` is a slice into whatever its caller had.
+///
+/// # Panics
+/// If `out` is shorter than [`FXSAVE_BYTES`].
+pub fn save_live(out: &mut [u8]) {
+    let mut image = FxSave::new();
+    // SAFETY: `image` is 16-aligned by `repr(align(16))` and 512 bytes, which is what
+    // `fxsave64` writes. Boot set `CR4.OSFXSR`, so the instruction is available; the check
+    // in `arch::init` is what guarantees that.
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{p}]",
+            p = in(reg) core::ptr::from_mut(&mut image).cast::<u8>(),
+            options(nostack),
+        );
+    }
+    out[..FXSAVE_BYTES].copy_from_slice(&image.0);
+}
+
+/// Load `bytes` into the running CPU's x87, MMX and SSE registers.
+///
+/// `MXCSR` is masked to the bits the hardware defines: `FXRSTOR` raises `#GP` for any reserved
+/// bit set, and these bytes come from a program's own stack, so an unmasked write here would
+/// turn a scribbled frame into a kernel fault rather than a program's own problem.
+///
+/// # Panics
+/// If `bytes` is shorter than [`FXSAVE_BYTES`].
+pub fn load_live(bytes: &[u8]) {
+    let mut image = FxSave::new();
+    image.0.copy_from_slice(&bytes[..FXSAVE_BYTES]);
+    let mxcsr = u32::from_le_bytes([
+        image.0[FxSave::MXCSR],
+        image.0[FxSave::MXCSR + 1],
+        image.0[FxSave::MXCSR + 2],
+        image.0[FxSave::MXCSR + 3],
+    ]) & MXCSR_MASK;
+    image.0[FxSave::MXCSR..FxSave::MXCSR + 4].copy_from_slice(&mxcsr.to_le_bytes());
+    // SAFETY: `image` is 16-aligned and 512 bytes, and its `MXCSR` holds only defined bits,
+    // which is the one field `FXRSTOR` faults on. Every other byte is a value some register
+    // may hold.
+    unsafe {
+        core::arch::asm!(
+            "fxrstor64 [{p}]",
+            p = in(reg) core::ptr::from_ref(&image).cast::<u8>(),
+            options(nostack, readonly),
+        );
+    }
+}
+
+/// The bits `MXCSR` defines: the six exception flags, the six masks, rounding, flush-to-zero
+/// and denormals-are-zero. Everything above bit 15 is reserved and faults `FXRSTOR`.
+const MXCSR_MASK: u32 = 0xffff;
+
 /// The saved state of a suspended kernel thread: the SysV callee-saved registers.
 ///
 /// Layout is `repr(C)` because the switch reads and writes it from assembly by

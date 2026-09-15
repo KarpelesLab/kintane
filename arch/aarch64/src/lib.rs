@@ -190,6 +190,18 @@ impl HasFpu for Aarch64 {
     // trap, and the kernel's own target keeps `-neon`, so this state is a user program's
     // alone.
     type FpuState = context::FpSimd;
+
+    // The frame's image is the V registers then `FPSR` and `FPCR` as 32-bit fields, which is
+    // Linux's `fpsimd_context` order and not `FpSimd`'s. 520 bytes against the context's 528.
+    const FPU_BYTES: usize = context::FPSIMD_BYTES;
+
+    fn save_live(out: &mut [u8]) {
+        context::save_live(out);
+    }
+
+    fn load_live(bytes: &[u8]) {
+        context::load_live(bytes);
+    }
 }
 
 /// Terminate QEMU through an ARM semihosting `SYS_EXIT` call.
