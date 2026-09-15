@@ -529,10 +529,29 @@ already holds rather than a second authority:
   eight-and-three is stored as one, keeping the case it was written in; anything longer, or mixed
   in case, is kept in long entries with a short alias of its own, and the file answers to either.
   A name the driver will not write is refused as `ENAMETOOLONG` rather than shortened, so a
-  program is never handed back a name it did not ask for. **There is no `getdents` or
-  `getdents64`**, so a Linux program cannot list a directory at all: it can create, open, rename
-  and unlink a long name, and never enumerate one. A native program reads a directory through the
-  file server instead. A forked child does not inherit an open file.
+  program is never handed back a name it did not ask for. A forked child does not inherit an open
+  file.
+- `getdents64` lists an open directory, packing Linux's own `dirent64` records: an inode, the
+  offset a later call resumes from, the record's length, what the entry is (`d_type`), and the
+  name. **The name is the long one** where a file has one, never the short alias it also answers
+  to. Unlike `stat` and `statfs`, this record has one layout on both architectures — every port
+  here is 64-bit and little-endian, and Linux defined `dirent64` as the record that does not
+  change shape between them.
+
+  **The handle's position is the cursor.** It holds the index of the entry to report next, so a
+  program starts again by seeking to zero and the kernel remembers nothing else. A record that
+  does not fit the buffer is **not** consumed — the cursor moves only once the record is the
+  program's — so the next call reports that same entry, and a buffer too small for even one
+  record is `EINVAL` rather than a zero a caller would read as the end of the directory.
+
+  **What an offset promises, and what it costs.** An offset names a position in the directory as
+  it is *now*, not a name. Nothing here can promise more: a filesystem this kernel mounts has no
+  stable per-entry cookie, and FAT numbers its entries by where they sit, so removing one moves
+  every later entry down. A program that lists a directory while something removes from it may
+  therefore see a name twice or miss one; only a program that does not remove while listing is
+  promised each name once. The cost is that a filesystem finds its *n*th entry by counting from
+  the first, so listing a directory of *n* entries reads *n²/2* of them — directories here hold
+  tens of names, not thousands.
 - `pipe2` makes two ends of one of 4 kernel pipes, each holding 512 bytes. A read of an empty
   pipe blocks on the pipe's wait queue until a writer puts bytes in, or until the last write end
   closes, which is end of file. A write to a full pipe blocks until a reader makes room, and

@@ -149,6 +149,7 @@ pub enum Call {
     Renameat,
     Statfs,
     Fstatfs,
+    Getdents64,
     Poll,
     Ppoll,
     Select,
@@ -164,7 +165,7 @@ pub enum Call {
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 66] = [
+    pub const ALL: [Call; 67] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -231,6 +232,7 @@ impl Call {
         Call::RtSigqueueinfo,
         Call::Statfs,
         Call::Fstatfs,
+        Call::Getdents64,
     ];
 
     /// The name the tables give it.
@@ -302,6 +304,7 @@ impl Call {
             Call::RtSigqueueinfo => "rt_sigqueueinfo",
             Call::Statfs => "statfs",
             Call::Fstatfs => "fstatfs",
+            Call::Getdents64 => "getdents64",
         }
     }
 
@@ -375,6 +378,7 @@ impl Call {
             Call::RtSigqueueinfo => (129, 138),
             Call::Statfs => (137, 43),
             Call::Fstatfs => (138, 44),
+            Call::Getdents64 => (217, 61),
         };
         let n = match abi {
             Abi::X86_64 => x86_64,
@@ -992,6 +996,68 @@ pub fn statfs_bytes(
         }
     }
     s
+}
+
+/// The fixed part of a `struct linux_dirent64`: the inode, the offset a later call resumes
+/// from, this record's length, and what the entry is. The name and a zero byte follow it.
+pub const DIRENT_HEADER: usize = 19;
+
+/// What one `dirent64` takes for a name of `name_len` bytes: the header, the name, its zero
+/// byte, and padding so the record after it starts eight-byte aligned.
+pub const fn dirent64_len(name_len: usize) -> usize {
+    (DIRENT_HEADER + name_len + 1).next_multiple_of(8)
+}
+
+/// What `d_type` calls a node of this kind.
+const fn d_type(kind: FileKind) -> u8 {
+    match kind {
+        FileKind::Fifo => 1,
+        FileKind::CharDevice => 2,
+        FileKind::Directory => 4,
+        FileKind::Regular => 8,
+        FileKind::Socket => 12,
+    }
+}
+
+/// Write one `dirent64` into `out`: `ino` as its inode, `next` as the offset a later call
+/// resumes from, and `name` as the name, which must not hold a zero byte.
+///
+/// Returns how many bytes it took. `None` when `out` is shorter than [`dirent64_len`] says,
+/// so a caller never writes a record it cannot finish, and `None` for a name a directory
+/// entry cannot carry.
+///
+/// **One layout, both architectures.** Unlike `stat` and `statfs`, `dirent64` does not vary
+/// here: every port this kernel has is 64-bit and little-endian, and Linux defined this record
+/// as the one that does not change shape between them.
+pub fn dirent64_bytes(
+    out: &mut [u8],
+    ino: u64,
+    next: u64,
+    kind: FileKind,
+    name: &[u8],
+) -> Option<usize> {
+    if name.is_empty() || name.contains(&0) {
+        return None;
+    }
+    let len = dirent64_len(name.len());
+    let record = out.get_mut(..len)?;
+    for b in record.iter_mut() {
+        *b = 0;
+    }
+    let reclen = u16::try_from(len).ok()?;
+    for (dst, src) in record.iter_mut().zip(
+        ino.to_le_bytes()
+            .iter()
+            .chain(next.to_le_bytes().iter())
+            .chain(reclen.to_le_bytes().iter())
+            .chain(core::iter::once(&d_type(kind))),
+    ) {
+        *dst = *src;
+    }
+    for (dst, src) in record.iter_mut().skip(DIRENT_HEADER).zip(name) {
+        *dst = *src;
+    }
+    Some(len)
 }
 
 /// A `struct stat` in `abi`'s layout for a file of `kind` and `size` bytes, inode `ino`: the

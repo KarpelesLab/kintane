@@ -474,6 +474,26 @@ fn answer(
             Ok(s) => vfsproto::statfs_answer(s.block_size, s.blocks, s.free, s.name_max),
             Err(e) => vfsproto::status(status_of(e), 0),
         },
+        Request::Getdents { file, index } => {
+            let Some(Some(open)) = files.get(usize::from(file)) else {
+                return vfsproto::status(Status::BadFile, file);
+            };
+            // A program's word, so it is bounded here rather than trusted: an index past what
+            // any directory holds reads as the end of one.
+            let at = usize::try_from(index).unwrap_or(usize::MAX);
+            // The server keeps a path and an offset rather than a live handle, so the
+            // directory is opened for this request as `Read` opens a file for its own.
+            let listed = with_file(open, OpenFlags::READ, |ns, fd| ns.readdir_fd(fd, at));
+            match listed {
+                Ok(Some(entry)) => {
+                    vfsproto::dirent_answer(entry.kind == vfs::Kind::Dir, entry.name())
+                        .unwrap_or(vfsproto::status(Status::Io, file))
+                }
+                // No payload: the directory has no entry there, which is how a listing ends.
+                Ok(None) => vfsproto::status(Status::Ok, file),
+                Err(e) => vfsproto::status(status_of(e), file),
+            }
+        }
         Request::Close { file } => {
             match files.get_mut(usize::from(file)).and_then(Option::take) {
                 // What a writer wrote reaches the disk by the time its close is answered.

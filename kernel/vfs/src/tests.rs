@@ -34,6 +34,41 @@ impl Fixture {
     }
 }
 
+#[test]
+fn a_directory_handle_lists_what_the_directory_holds() {
+    let mut f = Fixture::new();
+    let mut fs = f.build();
+    let mut vfs = Vfs::<2, 4>::new();
+    vfs.mount("/", &mut fs).unwrap();
+    let dir = vfs.open("/sub").unwrap();
+    let first = vfs.readdir_fd(dir, 0).unwrap().unwrap();
+    assert_eq!(first.name(), b"nested.txt");
+    assert_eq!(first.kind, Kind::File);
+    // By index, not by a cursor: the same index answers the same entry, and the one past the
+    // end is the end rather than an error.
+    assert_eq!(vfs.readdir_fd(dir, 0).unwrap().unwrap().name(), b"nested.txt");
+    assert!(vfs.readdir_fd(dir, 1).unwrap().is_none());
+}
+
+#[test]
+fn listing_needs_a_directory_and_a_live_handle() {
+    let mut f = Fixture::new();
+    let mut fs = f.build();
+    let mut vfs = Vfs::<2, 4>::new();
+    vfs.mount("/", &mut fs).unwrap();
+    // Matched rather than unwrapped: an `Entry` carries no `Debug`, so the success side
+    // cannot be printed by an assertion that fails.
+    let file = vfs.open("/hello.txt").unwrap();
+    assert!(matches!(
+        vfs.readdir_fd(file, 0),
+        Err(Error::NotADirectory)
+    ));
+    let dir = vfs.open("/sub").unwrap();
+    vfs.close(dir).unwrap();
+    // A closed handle names nothing, as it does for every other operation.
+    assert!(matches!(vfs.readdir_fd(dir, 0), Err(Error::BadHandle)));
+}
+
 fn read_to_end<const M: usize, const O: usize>(vfs: &mut Vfs<'_, M, O>, fd: Fd) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4];
