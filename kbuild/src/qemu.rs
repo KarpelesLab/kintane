@@ -461,8 +461,8 @@ const NET_PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(25
 /// [`tcp_service`]'s protocol, and the datagram that tells the guest its port:
 /// `kernel/main/src/net.rs`'s `TCP_ANNOUNCE`, `TCP_REQUEST` and `TCP_REPLY`.
 pub(crate) const NET_TCP_ANNOUNCE: &[u8] = b"kintane-tcp-port ";
-const NET_TCP_REQUEST: &[u8] = b"kintane-tcp-request ";
-const NET_TCP_REPLY: &[u8] = b"kintane-tcp-reply ";
+pub(crate) const NET_TCP_REQUEST: &[u8] = b"kintane-tcp-request ";
+pub(crate) const NET_TCP_REPLY: &[u8] = b"kintane-tcp-reply ";
 
 /// What the guest sends [`udp_peer`] once a listener is up on [`NET_GUEST_TCP_PORT`], with a
 /// number; and [`tcp_inbound`]'s side of the connection kbuild then makes into the guest. The

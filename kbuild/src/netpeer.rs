@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use crate::qemu::{
     NET_ACK, NET_ECHO, NET_FRAGMENT_PATTERN, NET_GUEST_PORT, NET_PROBE, NET_TCP_ANNOUNCE,
-    NET_UDP_ANNOUNCE, NET_UDP_FRAGMENTED, NET_UDP_QUIET, NET_UDP_REPLY, NET_UDP_REQUEST, NetPorts,
-    fragment_datagram, ipv4_checksum, ipv4_header,
+    NET_TCP_REPLY, NET_TCP_REQUEST, NET_UDP_ANNOUNCE, NET_UDP_FRAGMENTED, NET_UDP_QUIET,
+    NET_UDP_REPLY, NET_UDP_REQUEST, NetPorts, fragment_datagram, ipv4_checksum, ipv4_header,
 };
 
 /// The address the guest is configured to reach, and the hardware address this peer answers
@@ -49,6 +49,21 @@ const ARP_REPLY: u16 = 2;
 
 const PROTO_ICMP: u8 = 1;
 const PROTO_UDP: u8 = 17;
+const PROTO_TCP: u8 = 6;
+
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
+
+/// The segment size this peer offers, which is the guest's own: both sit behind one
+/// 1500-byte Ethernet, so neither has reason to offer less.
+const PEER_MSS: u16 = 1460;
+
+/// What this end advertises it can take. Large enough that the guest is never held back by
+/// the receiver, since what the rounds measure is loss and reordering, not flow control.
+const PEER_WINDOW: u16 = 0xffff;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 
@@ -66,6 +81,40 @@ struct Seen {
     acks_sent: u64,
     service_replies: u64,
     announcements: u64,
+    connections: u64,
+    dropped_first: u64,
+    duplicate_acks: u64,
+    replies_reversed: u64,
+}
+
+/// One connection the guest opened to the service, and what this end owes it.
+///
+/// There is no listen backlog and no reassembly beyond what the rounds need: the guest opens
+/// one connection at a time, sends one request, and closes in the order its mode names.
+struct Conn {
+    guest_port: u16,
+    /// The next sequence number this end will send.
+    snd_nxt: u32,
+    /// Everything below this has arrived in order; what an acknowledgement names.
+    rcv_nxt: u32,
+    /// Segments that arrived past a hole, held until it fills. Holding them rather than
+    /// dropping them is what keeps a lost segment costing one retransmission instead of a
+    /// window's worth.
+    held: Vec<(u32, Vec<u8>)>,
+    /// The first in-order data segment of every connection is dropped, once. With one segment
+    /// the guest's timer sends it again; with four, the three behind it draw the three
+    /// duplicate acknowledgements its fast retransmit needs. Under `-netdev user` a relay
+    /// between the guest and the network does this; here there is no between, so the peer
+    /// does it by choosing what to answer.
+    dropped: bool,
+    /// The request line, however many segments carried it.
+    request: Vec<u8>,
+    replied: bool,
+    fin_sent: bool,
+    /// The guest's own FIN has arrived and been acknowledged. A connection is forgotten only
+    /// once both ends have finished: the guest acknowledges this end's FIN before sending its
+    /// own, and forgetting it in between leaves that FIN unanswered and the guest in LAST-ACK.
+    fin_seen: bool,
 }
 
 /// The network, as far as the guest is concerned.
@@ -77,6 +126,9 @@ struct Peer {
     /// Distinct per datagram, as a sender's ought to be; a fragmented datagram's two frames
     /// share theirs, which is what marks them as one datagram's parts.
     ip_id: u16,
+    /// Open connections, and those in the moments after a close; a connection is forgotten
+    /// once both ends have finished with it.
+    conns: Vec<Conn>,
     seen: Seen,
 }
 
@@ -101,6 +153,7 @@ pub fn serve(ports: NetPorts, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<
             ports,
             guest_mac: None,
             ip_id: 1,
+            conns: Vec::new(),
             seen: Seen::default(),
         };
         let mut last: Option<Instant> = None;
@@ -125,7 +178,9 @@ pub fn serve(ports: NetPorts, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<
         let s = &peer.seen;
         eprintln!(
             "  net peer: {} frames in, {} ARP requests, {} answered, {} echoes answered, \
-             {} acknowledgements, {} service replies, {} rounds of announcements",
+             {} acknowledgements, {} service replies, {} rounds of announcements, \
+             {} connections, {} first segments dropped, {} duplicate acknowledgements, \
+             {} replies sent back to front",
             s.frames,
             s.arp_requests,
             s.arp_answered,
@@ -133,6 +188,10 @@ pub fn serve(ports: NetPorts, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<
             s.acks_sent,
             s.service_replies,
             s.announcements,
+            s.connections,
+            s.dropped_first,
+            s.duplicate_acks,
+            s.replies_reversed,
         );
     })
 }
@@ -160,6 +219,7 @@ impl Peer {
                     reply.into_iter().collect()
                 }
                 Some(&PROTO_UDP) => self.udp(frame).into_iter().collect(),
+                Some(&PROTO_TCP) => self.tcp(frame),
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -325,10 +385,282 @@ impl Peer {
         Some(f)
     }
 
+    /// Drive one connection a step, given a segment addressed to the service.
+    ///
+    /// The guest's check gates on what a lossy network produces, so this end produces it
+    /// deliberately: each connection's first in-order data segment is dropped, later segments
+    /// are held past the hole and answered with a duplicate acknowledgement, and the reply
+    /// goes out back to front so a segment is held out of order and then joined.
+    fn tcp(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
+        let Some(seg) = self.segment(frame) else {
+            return Vec::new();
+        };
+        if seg.flags & TCP_RST != 0 {
+            // Nothing is owed to a connection the guest has torn down, and answering one
+            // would be a segment arriving after the rounds are over.
+            self.conns.retain(|c| c.guest_port != seg.guest_port);
+            return Vec::new();
+        }
+        if seg.flags & TCP_SYN != 0 && seg.flags & TCP_ACK == 0 {
+            return self.accept(seg.guest_port, seg.seq).into_iter().collect();
+        }
+        let Some(i) = self
+            .conns
+            .iter()
+            .position(|c| c.guest_port == seg.guest_port)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if !seg.payload.is_empty() {
+            out.extend(self.data(i, seg.seq, &seg.payload));
+        }
+        if seg.flags & TCP_FIN != 0 {
+            out.extend(self.closing(i, seg.seq, &seg.payload));
+        }
+        if seg.flags & TCP_ACK != 0 {
+            let done = {
+                let c = &self.conns[i];
+                c.fin_sent && seg.ack == c.snd_nxt && c.fin_seen
+            };
+            if done {
+                self.conns.retain(|c| c.guest_port != seg.guest_port);
+            }
+        }
+        out
+    }
+
+    /// Answer a SYN: the handshake, with the segment size this end offers.
+    ///
+    /// A SYN for a connection already open is the guest sending it again, so the same answer
+    /// goes back rather than a second connection appearing.
+    fn accept(&mut self, guest_port: u16, seq: u32) -> Option<Vec<u8>> {
+        if let Some(c) = self.conns.iter().find(|c| c.guest_port == guest_port) {
+            let (snd, rcv) = (c.snd_nxt.wrapping_sub(1), c.rcv_nxt);
+            return self.tcp_frame(guest_port, snd, rcv, TCP_SYN | TCP_ACK, &[]);
+        }
+        // Distinct per connection, so a segment from a previous round cannot be mistaken for
+        // one of this round's.
+        let isn = 0x2000_0000u32.wrapping_add(u32::from(guest_port) << 8);
+        self.conns.push(Conn {
+            guest_port,
+            snd_nxt: isn.wrapping_add(1),
+            rcv_nxt: seq.wrapping_add(1),
+            held: Vec::new(),
+            dropped: false,
+            request: Vec::new(),
+            replied: false,
+            fin_sent: false,
+            fin_seen: false,
+        });
+        self.seen.connections += 1;
+        self.tcp_frame(guest_port, isn, seq.wrapping_add(1), TCP_SYN | TCP_ACK, &[])
+    }
+
+    /// Take one data segment, and answer it.
+    fn data(&mut self, i: usize, seq: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+        let c = &mut self.conns[i];
+        if seq == c.rcv_nxt && !c.dropped {
+            // The one segment this connection loses. Silence, not a refusal: a lost segment
+            // is one that never arrived, and the guest must notice by itself.
+            c.dropped = true;
+            self.seen.dropped_first += 1;
+            return Vec::new();
+        }
+        if seq == c.rcv_nxt {
+            c.rcv_nxt = c.rcv_nxt.wrapping_add(payload.len() as u32);
+            c.request.extend_from_slice(payload);
+            // Whatever was held past the hole now follows on, in order.
+            while let Some(k) = c.held.iter().position(|(at, _)| *at == c.rcv_nxt) {
+                let (_, held) = c.held.remove(k);
+                c.rcv_nxt = c.rcv_nxt.wrapping_add(held.len() as u32);
+                c.request.extend_from_slice(&held);
+            }
+        } else if seq.wrapping_sub(c.rcv_nxt) < u32::MAX / 2 {
+            // Past the hole: held, and acknowledged with what is still missing — which is the
+            // duplicate acknowledgement the guest counts towards its fast retransmit.
+            if !c.held.iter().any(|(at, _)| *at == seq) {
+                c.held.push((seq, payload.to_vec()));
+            }
+            self.seen.duplicate_acks += 1;
+        }
+        let (port, snd, rcv) = (c.guest_port, c.snd_nxt, c.rcv_nxt);
+        let mut out: Vec<Vec<u8>> = self
+            .tcp_frame(port, snd, rcv, TCP_ACK, &[])
+            .into_iter()
+            .collect();
+        out.extend(self.reply(i));
+        out
+    }
+
+    /// The reply, once the request line is whole: two segments, the second sent first.
+    ///
+    /// One segment would leave nothing to hold: the guest's check requires a segment held out
+    /// of order and later joined to the stream, which under `-netdev user` its relay arranges
+    /// by swapping a pair. Here the peer arranges it by choosing the order it sends.
+    fn reply(&mut self, i: usize) -> Vec<Vec<u8>> {
+        let c = &self.conns[i];
+        if c.replied || !c.request.ends_with(b"\n") {
+            return Vec::new();
+        }
+        let Some(rest) = c.request.strip_prefix(NET_TCP_REQUEST) else {
+            return Vec::new();
+        };
+        let reply = [NET_TCP_REPLY, rest].concat();
+        let peer_closes = rest.starts_with(b"peer-closes ");
+        let (port, snd, rcv) = (c.guest_port, c.snd_nxt, c.rcv_nxt);
+        let split = reply.len() / 2;
+        let (first, second) = reply.split_at(split);
+        let (first, second) = (first.to_vec(), second.to_vec());
+        let second_at = snd.wrapping_add(first.len() as u32);
+        let mut out = Vec::new();
+        // The half in front goes second, so the guest holds it and joins it when the rest
+        // arrives.
+        out.extend(self.tcp_frame(port, second_at, rcv, TCP_ACK | TCP_PSH, &second));
+        out.extend(self.tcp_frame(port, snd, rcv, TCP_ACK | TCP_PSH, &first));
+        let c = &mut self.conns[i];
+        c.snd_nxt = c.snd_nxt.wrapping_add(reply.len() as u32);
+        c.replied = true;
+        self.seen.replies_reversed += 1;
+        if peer_closes {
+            c.fin_sent = true;
+            let (port, snd, rcv) = (c.guest_port, c.snd_nxt, c.rcv_nxt);
+            out.extend(self.tcp_frame(port, snd, rcv, TCP_ACK | TCP_FIN, &[]));
+            self.conns[i].snd_nxt = snd.wrapping_add(1);
+        }
+        out
+    }
+
+    /// Acknowledge the guest's FIN, and send this end's if it has not gone already.
+    fn closing(&mut self, i: usize, seq: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+        let c = &mut self.conns[i];
+        let fin_at = seq.wrapping_add(payload.len() as u32);
+        if fin_at != c.rcv_nxt {
+            // A FIN past a hole: acknowledged when the hole fills, not before.
+            return Vec::new();
+        }
+        c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+        c.fin_seen = true;
+        let send_fin = !c.fin_sent;
+        if send_fin {
+            c.fin_sent = true;
+        }
+        let (port, snd, rcv) = (c.guest_port, c.snd_nxt, c.rcv_nxt);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if send_fin {
+            out.extend(self.tcp_frame(port, snd, rcv, TCP_ACK | TCP_FIN, &[]));
+            self.conns[i].snd_nxt = snd.wrapping_add(1);
+        } else {
+            out.extend(self.tcp_frame(port, snd, rcv, TCP_ACK, &[]));
+        }
+        out
+    }
+
+    /// One TCP segment to the guest, from the service's port, with both checksums.
+    fn tcp_frame(
+        &mut self,
+        guest_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let mac = self.guest_mac?;
+        // The segment size option goes on a SYN, by custom and because that is the only
+        // segment the guest reads it from.
+        let options: &[u8] = if flags & TCP_SYN != 0 {
+            &[2, 4, (PEER_MSS >> 8) as u8, PEER_MSS as u8]
+        } else {
+            &[]
+        };
+        let header = 20 + options.len();
+        let total = 20 + header + payload.len();
+        let mut f = Vec::with_capacity(14 + total);
+        f.extend_from_slice(&mac);
+        f.extend_from_slice(&PEER_MAC);
+        f.extend_from_slice(&ETHERTYPE_IPV4);
+        f.push(0x45);
+        f.push(0);
+        f.extend_from_slice(&u16::try_from(total).ok()?.to_be_bytes());
+        f.extend_from_slice(&self.next_id().to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.push(64);
+        f.push(PROTO_TCP);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&GATEWAY);
+        f.extend_from_slice(&GUEST);
+        let sum = ipv4_checksum(f.get(14..34)?);
+        f[24..26].copy_from_slice(&sum.to_be_bytes());
+        f.extend_from_slice(&self.ports.tcp.to_be_bytes());
+        f.extend_from_slice(&guest_port.to_be_bytes());
+        f.extend_from_slice(&seq.to_be_bytes());
+        f.extend_from_slice(&ack.to_be_bytes());
+        f.push(((header / 4) as u8) << 4);
+        f.push(flags);
+        f.extend_from_slice(&PEER_WINDOW.to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(options);
+        f.extend_from_slice(payload);
+        let sum = tcp_checksum(&f);
+        f[50..52].copy_from_slice(&sum.to_be_bytes());
+        Some(f)
+    }
+
+    /// The parts of a segment addressed to the service, or nothing if it is not one.
+    fn segment(&self, frame: &[u8]) -> Option<Segment> {
+        let (ihl, total) = ipv4_header(frame)?;
+        if frame.get(30..34)? != GATEWAY {
+            return None;
+        }
+        let at = 14 + ihl;
+        let guest_port = u16::from_be_bytes([*frame.get(at)?, *frame.get(at + 1)?]);
+        let to = u16::from_be_bytes([*frame.get(at + 2)?, *frame.get(at + 3)?]);
+        if to != self.ports.tcp {
+            return None;
+        }
+        let seq = u32::from_be_bytes(frame.get(at + 4..at + 8)?.try_into().ok()?);
+        let ack = u32::from_be_bytes(frame.get(at + 8..at + 12)?.try_into().ok()?);
+        let header = usize::from(frame.get(at + 12)? >> 4) * 4;
+        let flags = *frame.get(at + 13)?;
+        let payload = frame.get(at + header..14 + total)?.to_vec();
+        Some(Segment {
+            guest_port,
+            seq,
+            ack,
+            flags,
+            payload,
+        })
+    }
+
     fn next_id(&mut self) -> u16 {
         self.ip_id = self.ip_id.wrapping_add(1);
         self.ip_id
     }
+}
+
+/// One segment, parsed far enough to drive a connection.
+struct Segment {
+    guest_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+/// A segment's checksum over the IPv4 pseudo-header, for a frame whose IPv4 header is five
+/// words. Unlike a datagram's, a segment's is mandatory, so a zero sum is sent as it comes.
+fn tcp_checksum(frame: &[u8]) -> u16 {
+    let tcp = 34;
+    let len = frame.len() - tcp;
+    let mut all = Vec::with_capacity(12 + len);
+    all.extend_from_slice(&frame[26..30]);
+    all.extend_from_slice(&frame[30..34]);
+    all.push(0);
+    all.push(PROTO_TCP);
+    all.extend_from_slice(&(len as u16).to_be_bytes());
+    all.extend_from_slice(&frame[tcp..]);
+    ipv4_checksum(&all)
 }
 
 /// A datagram's checksum over the IPv4 pseudo-header, for a frame whose header is five words.
@@ -378,6 +710,7 @@ mod tests {
             ports: ports(),
             guest_mac: Some(GUEST_MAC),
             ip_id: 1,
+            conns: Vec::new(),
             seen: Seen::default(),
         }
     }
