@@ -59,6 +59,11 @@ pub fn block_line(_i: usize) -> Option<u32> {
     None
 }
 
+/// Nor a PCI source id, there being no block device and no IOMMU.
+pub fn block_source_id(_i: usize) -> Option<u16> {
+    None
+}
+
 /// No network card is bound on these ports either.
 pub fn net_line() -> Option<u32> {
     None

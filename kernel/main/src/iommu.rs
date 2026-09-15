@@ -135,6 +135,11 @@ pub fn confine_disk(
         c.write_str("no IOMMU on this machine");
         return false;
     };
+    // The device's own source id, from the slot the kernel drives it through.
+    let Some(source) = platform::block_source_id(DISK_SLOT) else {
+        c.write_str("the disk has no PCI source id for the IOMMU to name it by");
+        return false;
+    };
     let Some(base) = hal::paging::device_virt(facts.register_base) else {
         c.write_str("the IOMMU register window is outside the device window");
         return false;
@@ -165,10 +170,7 @@ pub fn confine_disk(
         c.write_str("the disk's DMA grant could not be mapped into its IOMMU domain");
         return false;
     }
-    if unit
-        .attach(facts.block_source_id, &domain, &mut pool)
-        .is_err()
-    {
+    if unit.attach(source, &domain, &mut pool).is_err() {
         c.write_str("the disk could not be attached to its IOMMU domain");
         return false;
     }
@@ -185,14 +187,14 @@ pub fn confine_disk(
     c.write_str("VT-d on, ");
     write_usize(c, facts.host_address_width as usize);
     c.write_str("-bit; disk ");
-    write_source(c, facts.block_source_id);
+    write_source(c, source);
     c.write_str(" mapped to its grant only, invalidation queued");
     // SAFETY: the one write, on the single-threaded boot path, before anything reads it.
     unsafe {
         *CONFINEMENT.get() = Some(Confinement {
             unit,
             domain,
-            source: facts.block_source_id,
+            source,
             interrupts: None,
         });
     }
@@ -219,6 +221,11 @@ pub fn take_fault() -> Option<(Fault, u16)> {
 
 /// The remapping table entry the disk's MSI-X interrupt is delivered through.
 const DISK_HANDLE: u16 = 0;
+
+/// The slot of the disk this confines. One confinement, so one slot: the unit's translation is
+/// enabled for every device behind it, and a second unconfined function would fault into the
+/// same log the confinement check reads, so the IOMMU presets attach a single drive.
+const DISK_SLOT: usize = 0;
 
 /// How [`tamper_disk_interrupt`] changes the disk's table entry, for the checks that the entry
 /// is what decides whether and where the disk's interrupt is delivered.

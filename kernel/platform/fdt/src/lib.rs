@@ -489,6 +489,12 @@ pub fn block_line(i: usize) -> Option<u32> {
     BLOCK_LINES.get(i)?.get().map(|n| n.0)
 }
 
+/// A memory-mapped virtio slot is not a PCI function and has no source id, and no port using
+/// this platform has an IOMMU to want one.
+pub fn block_source_id(_i: usize) -> Option<u16> {
+    None
+}
+
 /// The network card's interrupt line, once its handler is wired. `None` when the card is
 /// polled.
 pub fn net_line() -> Option<u32> {
