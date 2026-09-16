@@ -3478,6 +3478,62 @@ The configuration space is too large to enumerate, so we sample it deliberately:
 - `int` and `hex` symbols are sampled only when they declare a `range`. The range is the
   only statement of which values are meant to work.
 
+### As measured
+
+The question above — whether the trait approach really removed unbuildable
+configurations — has now been answered by sweeping rather than by argument, and the answer
+is no.
+
+Twelve random samples from seed 5000 built **one**. Both boundary runs, over all
+twenty-one presets, built **seven** of twenty-one. **No** configuration in either run
+failed to resolve, so the generator's promise — that every sample it emits is valid — held
+across all thirty-three, and the failures are the tree's rather than the sampler's.
+
+Twenty-five failures, four causes:
+
+| cause | occurrences | kind |
+|---|---|---|
+| A `CONFIG_USERSPACE`-gated module referenced without a guard | 31 | code |
+| `personality_off.rs` lacks `churn_cycles`, which `model_paged.rs` calls | 4 | code |
+| `KERNEL_THREAD_SLOTS` settable below what the build needs | 2 | language |
+| `DEVICE_WINDOW_BASE` under `MM_FLAT` on x86_64 | masked | undecided |
+
+Three reproduce from a single non-default symbol, with no seed:
+
+```
+kbuild build --preset x86_64-qemu  --set USERSPACE=n        # arch/x86_64/src/context.rs
+kbuild build --preset aarch64-virt --set USERSPACE=n        # arch/aarch64/src/context.rs
+kbuild build --preset i686-qemu    --set WAIT_RACE_TEST=y   # kernel/main/src/waitrace.rs
+```
+
+The first two are the same defect on both MMU ports: `lib.rs` gates `pub mod user` behind
+`CONFIG_USERSPACE`, and `context.rs` names `crate::user` with no guard — three sites on
+each. `exception.rs` and `interrupt.rs` on both ports do this correctly, with paired
+`#[cfg(CONFIG_USERSPACE)]` and `#[cfg(not(...))]` functions; `context.rs` has no `cfg` at
+all. The third is the same class one layer up: `waitrace` is gated on `WAIT_RACE_TEST`
+alone, while it imports `objects`, `readiness` and `wait`, all gated on `USERSPACE`. On
+i686 `USERSPACE` can never be on, so that one symbol is enough.
+
+**Failures mask each other, and the order is the crate order.** `MM_FLAT=y` on an MMU
+target turns off `MM_PAGED`, which drops `USERSPACE` by its own `depends on` — so the
+`arch` failure above fires first and hides whatever `MM_FLAT` does to
+`DEVICE_WINDOW_BASE`, whose value `boot.rs` asserts is `2 << 39`. That one cannot be
+classified until the first is fixed, and is recorded here undecided rather than guessed.
+
+**No preset exercises any of this.** The only presets choosing `MM_FLAT` are
+`armv7m-mps2` and `riscv32-virt`, neither of which has an MMU; all fourteen x86_64 and
+aarch64 presets leave the memory model at its default and `USERSPACE` at `default y`. That
+is how twenty-one green presets coexist with a boundary run that fails two thirds of the
+time: the presets are a curated set, and these combinations are outside it.
+
+The harness was tested in both directions before its numbers were believed. Its
+`did not resolve` arm had never fired — nought of thirty-three — which is the shape of a
+check that cannot fail; forcing an unknown symbol produces
+`DID NOT RESOLVE (a kbuild bug): unknown configuration symbol NOPE`, counted apart from
+build failures and reported with its own reproduction command.
+
+`randconfig-build` builds and does not boot. Every number here is a compile result.
+
 **What the first run found.** 36 of the first 50 random samples, and every `--allyes`
 boundary, failed to build. None of that was a kernel bug. `MOCK_ARCH`, the switch that
 compiles `hal`'s mock architectures for host tests, had a prompt, so the generator
