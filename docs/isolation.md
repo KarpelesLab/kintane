@@ -280,6 +280,80 @@ read. The 4.5 µs is two traps into the emulator and its descriptor processing, 
 asynchronous queue, which drains in its own time; there the bound the driver waits under is what
 matters, and only the host tests exercise it.
 
+## AMD-Vi: what QEMU presents, and what a second unit would cost
+
+The confinement machinery here is proven against Intel's unit. This is what was
+measured when the question was asked of AMD's, so the next attempt starts from
+evidence rather than from the obvious reading of a property list.
+
+**QEMU models AMD-Vi properly, not as a stub.** On QEMU 11.0.3 the `amd-iommu`
+device instantiates on `q35`, and accepts `intremap=on` and `dma-remap=on`
+together under `kernel-irqchip=split`. It carries a full memory-mapped register
+model — a device-table base, a command-buffer base, an event-log base, control and
+status, extended features, and the head and tail pointers for both rings.
+
+**`dma-remap` defaulting to off is a switch, not a wall.** The natural reading —
+that emulated-device DMA simply is not translated, so there is nothing to confine
+— is wrong. QEMU's own diagnostic is `device %02x.%02x.%x requires dma-remap=1`:
+the translation is there and the flag turns it on. What makes the default look
+alarming is that **`intel-iommu` has no such property at all**, so this is not a
+shared knob whose default differs but one unit's switch that the other lacks.
+
+**IVRS replaces DMAR one for one.** With `amd-iommu` substituted for
+`intel-iommu` and nothing else changed, the machine publishes six tables, exactly
+as it does with VT-d, and the kernel reports `no DMAR, so no IOMMU`. A temporary
+probe asking the table walker for `IVRS` directly answered `IVRS PRESENT`. That
+was observed rather than inferred: the unchanged table count and the signature in
+QEMU's binary made it near-certain, and everything else here rested on it, so it
+was worth ten lines to see it rather than deduce it.
+
+### The seam is in the right place; nothing above it transfers
+
+The three traits the driver is written against — a register accessor over
+offsets, a source of 4 KiB frames, and physical-memory access for the entries the
+hardware reads — name nothing about VT-d. An AMD-Vi driver would sit on them
+unchanged, and `drivers/iommu/vtd`'s own manifest already says as much: no unit
+dependencies, host-tested, "plain logic over traits".
+
+Everything above that seam is Intel's, in structure rather than in detail:
+
+| what | why it does not carry over |
+| --- | --- |
+| the capability read and its width derivation | `CAP` at offset `0x08`, guest address width from bits [21:16]; AMD-Vi publishes extended features there |
+| attaching a device | a root entry per bus and a context entry per function, sixteen bytes each; AMD-Vi has one flat device table indexed by device id |
+| invalidation | about five hundred lines encoding VT-d descriptors; AMD-Vi takes commands through a ring buffer |
+| faults | read back from the fault-recording registers the capability register locates; AMD-Vi writes events into a log in memory |
+| interrupt remapping | a 256-entry table in VT-d's entry format, and the message encoding that names an index in it |
+| the DMAR parser | one table's layout; IVRS needs a sibling of comparable size |
+| the facts the platform hands up | a register base, which is common, and a host address width, which is a DMAR field with no IVRS equivalent |
+
+So a second unit is a second driver, not a parameterisation: a crate comparable
+to the existing one, an IVRS parser beside the DMAR one, a generalised facts
+structure, and something — a trait or a second kernel-side module — for the
+kernel to choose between them.
+
+**That is not judged worth it for one more unit.** The estimate is deliberately
+recorded rather than the conclusion alone, so a later round with a different
+reason to want AMD-Vi — real hardware, say — can weigh it again without repeating
+the measurement. The seam needs no moving when that happens.
+
+### A defect found on the way, independent of any of this
+
+`iommu_off.rs` — the module a build *without* an IOMMU compiles — returns
+`vtd::QueueStats`. A configuration that has no IOMMU at all therefore still names
+one vendor's crate in its public surface. That is worth fixing whether or not
+AMD-Vi is ever built.
+
+### A note on method, for whoever tries this next
+
+Six hand-built QEMU command lines were run before one produced an interpretable
+result. The first varied the machine line, the device and its flags at once; the
+next omitted the disk arguments entirely, so a missing device looked like an IOMMU
+symptom until the matched `intel-iommu` control failed in exactly the same way;
+another named a disk image that the build step does not create. The result that
+counted came from changing one term inside the build tool and letting it assemble
+the rest. **Running the control first would have saved four boots.**
+
 ## Discovering an SMMUv3 (aarch64), and why confinement stops there
 
 aarch64 has no IOMMU integration, so a driver domain on that port is confined by nothing — the
