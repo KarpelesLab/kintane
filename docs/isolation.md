@@ -391,12 +391,24 @@ A disk on PCIe, which is where confinement becomes reachable:
 - the block driver binding through PCI on aarch64. **This is what the next stage is actually blocked
   on, and it is not a matching problem.** `virtio-blk` already lists `pci1af4,1042` and `pci1af4,1001`
   among its `compatible` strings, exactly what enumeration synthesises for the function, so the driver
-  would be chosen the moment a node existed for it. The obstacle is *when*: `discover` builds the tree
-  and binds it in one pass, while the walk cannot run until the check phase, because configuration
-  space is unreachable until the kernel's address space maps the ECAM window. By then the
-  `Resources` ledger that `discover` claims through is a local that has been dropped. Binding a PCI
-  function here needs a ledger that outlives discovery — a change to the device model's shape, not an
-  extra call site.
+  would be chosen the moment a node existed for it. This paragraph has now been wrong twice, in the
+  same place, for the same reason: each time someone recorded the obstacle they expected instead of
+  the one they hit. **Two things sit in front of the ledger.** *The function never becomes a node* —
+  a boot attaches `virtio-blk-pci` and the walk finds it, `walked 2 functions, 1 host bridge,
+  1 endpoint`, while the device model lists 57 nodes with no entry for it, so `virtio-blk` is never
+  asked about this function at all. `platform/acpi` synthesises such nodes in `build_tree`, adding
+  each enumerated `Function` with `Origin::Pci(f)`; this platform calls `DeviceTree::build` once,
+  from the blob, and has no second pass. *And binding one means a third disk* — this preset resolves
+  `QEMU_BLOCK_TEST` and `QEMU_PCIE_BLOCK` together and already boots with both memory-mapped slots
+  taken, `virtio_blk`'s probe declines when no slot is free, and `MAX_DISKS` sizes fourteen arrays,
+  with `block.rs` asserting it equals two because `image_of` maps every non-primary slot to the
+  second disk's image. A third disk keyed that way would be the position-versus-identity bug one slot
+  along. The `Resources` ledger being a dropped local is true and still needed, but it is third in
+  order: a second tree pass on this platform adding enumerated functions as nodes, then a ledger and
+  tree that outlive discovery, then a third image before a third disk — the last gating the other
+  two. The mechanisms are already where they are needed: `Builder` is exported, `NODES` is a static
+  the builder can take, `tree.mmio()` resolves a function's base address registers, and the tree uses
+  57 of 256 nodes.
 - an interrupt. **Not the ITS, and not message-signalled at all, necessarily.** `virt`'s bridge node
   carries `interrupt-map` and `interrupt-map-mask` as well as `msi-map`, so a function's legacy INTx
   pin is routed to a GIC SPI the existing driver already handles. The GICv3 driver states it
