@@ -190,6 +190,7 @@ extern "C" fn start(sp: *const u64) -> ! {
         b"rtsig" => rtsig(),
         b"fp" => fp_mode(),
         b"stop" => stop_mode(),
+        b"suspend" => suspend_mode(),
         b"poll" => poll_mode(),
         b"peek" => peek_mode(s.arg),
         _ => hello(&s),
@@ -680,6 +681,107 @@ fn stop_mode() -> ! {
     expect(wait_status(killed, 0, 209) == SIGKILL as u32, 209);
 
     exit(STOP_SUCCESS)
+}
+
+// ---- suspend: rt_sigsuspend, and SIGCHLD when a child stops --------------------------------
+
+const SUSPEND_SUCCESS: u64 = 57;
+const SA_NOCLDSTOP: u64 = 1;
+static SUSP_HITS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn on_susp(_sig: i32) {
+    SUSP_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Say we are about to signal, then signal `parent`.
+fn signal_parent(ready: u64, parent: u64) {
+    let byte = [1u8];
+    sys::call(sys::WRITE, [ready, byte.as_ptr() as u64, 1, 0, 0, 0]);
+    sys::call(sys::KILL, [parent, SIGUSR1, 0, 0, 0, 0]);
+}
+
+fn suspend_mode() -> ! {
+    let mut byte = [0u8; 1];
+
+    // 143: a sigset is eight bytes here as everywhere, and the size is checked before the wait —
+    // a call that waited first and complained later could not be told from one that worked.
+    let held = bit(SIGUSR1);
+    expect(sys::call(sys::RT_SIGSUSPEND, [&raw const held as u64, 4, 0, 0, 0, 0]) == -EINVAL, 143);
+
+    // 144: `SIGUSR1` blocked with a handler installed, and a child that sends it.
+    expect(sigaction(SIGUSR1, on_susp as *const () as u64, 0) == 0, 144);
+    expect(sigprocmask(SIG_BLOCK, bit(SIGUSR1)) == 0, 144);
+    let fds = pipe(144);
+    let parent = sys::call(sys::GETPID, [0; 6]) as u64;
+    let child = sys::fork();
+    expect(child >= 0, 144);
+    if child == 0 {
+        signal_parent(fds[1], parent);
+        exit(0)
+    }
+    expect(sys::call(sys::READ, [fds[0], byte.as_mut_ptr() as u64, 1, 0, 0, 0]) == 1, 144);
+
+    // 145: the mask worn unblocks what is blocked outside, so the signal arrives only because
+    // this call asked for it. There is no success: a return means a signal.
+    let allow = 0u64;
+    expect(sys::call(sys::RT_SIGSUSPEND, [&raw const allow as u64, 8, 0, 0, 0, 0]) == -EINTR, 145);
+    // 146: and it returned because the handler ran, not merely because something woke it.
+    expect(SUSP_HITS.load(Ordering::Relaxed) == 1, 146);
+
+    // 147: the mask worn is gone and the thread's own is back — restored from the signal frame
+    // by `rt_sigreturn`, not by the call. A null set asks without changing anything.
+    let mut old = 0u64;
+    expect(sys::call(sys::RT_SIGPROCMASK, [SIG_BLOCK, 0, &raw mut old as u64, 8, 0, 0]) == 0, 147);
+    expect(old & bit(SIGUSR1) != 0, 147);
+    expect(wait_child(child, 147) == 0, 147);
+    expect(sigaction(SIGUSR1, SIG_DFL, 0) == 0, 147);
+
+    // 148: a parent is told when a child stops, and again when it continues. Only a parent that
+    // installed a handler can see it: `SIGCHLD`'s default disposition is to ignore, and an
+    // ignored signal is discarded where it is sent rather than left pending.
+    expect(sigaction(SIGCHLD, on_chld as *const () as u64, 0) == 0, 148);
+    let before = CHLD_HITS.load(Ordering::Relaxed);
+    let ready = pipe(148);
+    // A child that exits the moment it is continued would send a third `SIGCHLD` of its own,
+    // which could arrive before the count below is read and make an exact expectation flap. It
+    // waits to be let go instead, so every count here is taken at a point the parent chose.
+    let go = pipe(148);
+    let stopper = sys::fork();
+    expect(stopper >= 0, 148);
+    if stopper == 0 {
+        stop_self(ready[1]);
+        let mut wait = [0u8; 1];
+        sys::call(sys::READ, [go[0], wait.as_mut_ptr() as u64, 1, 0, 0, 0]);
+        exit(STOP_CHILD_CODE)
+    }
+    expect(sys::call(sys::READ, [ready[0], byte.as_mut_ptr() as u64, 1, 0, 0, 0]) == 1, 148);
+    expect(wait_status(stopper, WUNTRACED, 148) == stopped_status(SIGSTOP), 148);
+    expect(CHLD_HITS.load(Ordering::Relaxed) == before + 1, 148);
+    expect(sys::call(sys::KILL, [stopper as u64, SIGCONT, 0, 0, 0, 0]) == 0, 148);
+    expect(wait_status(stopper, WCONTINUED, 148) == CONTINUED_STATUS, 148);
+    expect(CHLD_HITS.load(Ordering::Relaxed) == before + 2, 148);
+    let byte1 = [1u8];
+    expect(sys::call(sys::WRITE, [go[1], byte1.as_ptr() as u64, 1, 0, 0, 0]) == 1, 148);
+    expect(wait_status(stopper, 0, 148) == ((STOP_CHILD_CODE as u32) << 8), 148);
+
+    // 149: `SA_NOCLDSTOP` suppresses those two and nothing else — the child's exit still tells.
+    expect(sigaction(SIGCHLD, on_chld as *const () as u64, SA_NOCLDSTOP) == 0, 149);
+    let quiet = CHLD_HITS.load(Ordering::Relaxed);
+    let ready = pipe(149);
+    let hushed = sys::fork();
+    expect(hushed >= 0, 149);
+    if hushed == 0 {
+        stop_self(ready[1]);
+        exit(STOP_CHILD_CODE)
+    }
+    expect(sys::call(sys::READ, [ready[0], byte.as_mut_ptr() as u64, 1, 0, 0, 0]) == 1, 149);
+    expect(wait_status(hushed, WUNTRACED, 149) == stopped_status(SIGSTOP), 149);
+    expect(CHLD_HITS.load(Ordering::Relaxed) == quiet, 149);
+    expect(sys::call(sys::KILL, [hushed as u64, SIGCONT, 0, 0, 0, 0]) == 0, 149);
+    expect(wait_status(hushed, 0, 149) == ((STOP_CHILD_CODE as u32) << 8), 149);
+    expect(CHLD_HITS.load(Ordering::Relaxed) == quiet + 1, 149);
+
+    exit(SUSPEND_SUCCESS)
 }
 
 // ---- signals: handlers, masks, EINTR, SIGCHLD, SIGPIPE and default actions -----------------

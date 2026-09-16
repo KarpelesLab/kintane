@@ -300,6 +300,7 @@ fn dispatch(
         Call::RtSigprocmask => signals::procmask(slot, a0, a1, a2, a3),
         Call::RtSigreturn => signals::sigreturn(slot, frame),
         Call::RtSigpending => signals::pending(slot, a0, a1),
+        Call::RtSigsuspend => signals::suspend(slot, a0, a1),
         Call::Sigaltstack => signals::altstack(a0, a1),
         Call::Kill => signals::kill(slot, a0, a1),
         Call::Tgkill => signals::tgkill(slot, a0, a1, a2),
@@ -2479,6 +2480,7 @@ pub fn scheduled_check(c: &dyn EarlyConsole) -> Check {
         .and(signals::rtsig_check(c))
         .and(signals::fp_check(c))
         .and(signals::stop_check(c))
+        .and(signals::suspend_check(c))
 }
 
 fn free_frames() -> usize {

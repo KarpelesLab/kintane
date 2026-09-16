@@ -519,9 +519,9 @@ process, its descriptors or its mappings, and waits on the kernel's wait queues 
 so that another thread of the process can make the call that ends the wait.
 
 **The numbers and the tables.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 104 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
+`syscall_64.tbl`, in its format: 105 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
 the generic table arm64 numbers its calls by, in the format of Linux's `scripts/syscall.tbl`:
-97 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
+98 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
 each with its number under each `linux::Abi`; a host test pins every number to its name in
 that ABI's table, and the kernel reads a table at run time only to name a call it does not
 implement. The kernel picks the ABI from its port's ELF machine at compile time, and dispatches
@@ -653,7 +653,7 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `rt_sigaction` | any signal but `SIGKILL` and `SIGSTOP`, which are `EINVAL`; `sigsetsize` must be 8. A handler must carry `SA_RESTORER`, since the kernel has no trampoline of its own to return through; one without is `EINVAL`. `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND` are honoured, and `SA_ONSTACK` has no effect, as with no alternate stack set. Setting a signal to be ignored discards it where it is pending |
 | `rt_sigprocmask` | `SIG_BLOCK`, `SIG_UNBLOCK` and `SIG_SETMASK` on the calling thread's mask; `SIGKILL` and `SIGSTOP` are never blocked |
 | `rt_sigpending` | the pending signals the calling thread blocks, its own and its process's |
-| `rt_sigsuspend` | wears the mask given, waits until a signal arrives that is not ignored, and always ends `EINTR`; `sigsetsize` must be 8, and `SIGKILL` and `SIGSTOP` are dropped from the mask as elsewhere. There is no success: a return means a signal. The mask it replaced is restored by `rt_sigreturn` from the frame, so a handler runs under the mask that was asked for, as Linux promises |
+| `rt_sigsuspend` | wears the mask given, waits until a signal arrives that is not ignored, and always ends `EINTR`; `sigsetsize` must be 8, and `SIGKILL` and `SIGSTOP` are dropped from the mask as elsewhere. There is no success: a return means a signal. A handler runs under the mask that was asked for, and the mask it *replaced* is restored afterwards by `rt_sigreturn`, which the call leaves in the frame for it rather than putting back itself — Linux's `saved_sigmask`, and the reason the idiom of blocking a signal, testing a flag and suspending is free of the race it exists to avoid. A signal that needs no handler restarts the call instead of ending it, as Linux's `ERESTARTNOHAND` does |
 | `rt_sigreturn` | resumes from the frame below the stack pointer, validated; a frame it refuses ends the process with `SIGSEGV` |
 | `sigaltstack` | reports that there is no alternate stack; setting one is `ENOSYS`, and logged |
 | `kill` | a signal, or 0 to ask whether the process exists, to a Linux process by pid. A process group and -1 are `EINVAL`. `SIGSTOP` is accepted and stops the process; `SIGCONT` resumes it |

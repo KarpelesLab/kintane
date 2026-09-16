@@ -121,6 +121,7 @@ pub enum Call {
     RtSigprocmask,
     RtSigreturn,
     RtSigpending,
+    RtSigsuspend,
     Sigaltstack,
     Kill,
     Tgkill,
@@ -165,7 +166,7 @@ pub enum Call {
 
 impl Call {
     /// Every call, for the host tests and [`decode`].
-    pub const ALL: [Call; 67] = [
+    pub const ALL: [Call; 68] = [
         Call::Read,
         Call::Write,
         Call::Close,
@@ -193,6 +194,7 @@ impl Call {
         Call::RtSigprocmask,
         Call::RtSigreturn,
         Call::RtSigpending,
+        Call::RtSigsuspend,
         Call::Sigaltstack,
         Call::Kill,
         Call::Tgkill,
@@ -265,6 +267,7 @@ impl Call {
             Call::RtSigprocmask => "rt_sigprocmask",
             Call::RtSigreturn => "rt_sigreturn",
             Call::RtSigpending => "rt_sigpending",
+            Call::RtSigsuspend => "rt_sigsuspend",
             Call::Sigaltstack => "sigaltstack",
             Call::Kill => "kill",
             Call::Tgkill => "tgkill",
@@ -339,6 +342,7 @@ impl Call {
             Call::RtSigprocmask => (14, 135),
             Call::RtSigreturn => (15, 139),
             Call::RtSigpending => (127, 136),
+            Call::RtSigsuspend => (130, 133),
             Call::Sigaltstack => (131, 132),
             Call::Kill => (62, 129),
             Call::Tgkill => (234, 131),

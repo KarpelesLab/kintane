@@ -58,6 +58,7 @@
 130	common	tkill			sys_tkill
 131	common	tgkill			sys_tgkill
 132	common	sigaltstack		sys_sigaltstack
+133	common	rt_sigsuspend		sys_rt_sigsuspend
 134	common	rt_sigaction		sys_rt_sigaction
 135	common	rt_sigprocmask		sys_rt_sigprocmask
 136	common	rt_sigpending		sys_rt_sigpending
