@@ -51,12 +51,29 @@
 //! discards a pending `SIGCONT`, as Linux does. `SIGKILL` ends a stopped process rather than
 //! waiting for it to be continued.
 //!
+//! # Suspending
+//!
+//! [`suspend`] wears a mask, waits for a signal that is not ignored, and always ends `EINTR`.
+//! It never restores the mask it replaced on the path where a signal arrived, and that is
+//! deliberate rather than an omission: [`deliver`] reads the thread's mask *fresh* on the way
+//! out of the call and hands it to [`enter_handler`], which stores it in the frame as
+//! `Delivery::old_mask`, and [`sigreturn`] puts that value back. So the mask the handler runs
+//! under, and the mask restored afterwards, are both decided by what is installed when the call
+//! returns. Restoring here would run the handler under the wrong mask and then restore the
+//! wrong one — Linux restores at `rt_sigreturn`, and this is how that falls out of the existing
+//! frame rather than needing a saved-mask of its own.
+//!
+//! The other path does restore: when the wait ends without a signal — the process is ending —
+//! nothing will be delivered, so nothing would put the old mask back.
+//!
 //! # Not built
 //!
-//! Alternate signal stacks: `sigaltstack` reports none and refuses to set one.
-//! `rt_sigsuspend`, `rt_sigtimedwait` and `signalfd`. `SIGCHLD` is not sent to a parent when a
-//! child stops or continues, so `SA_NOCLDSTOP` has nothing to suppress; a parent learns of a stop
-//! by asking, with `WUNTRACED` or `WCONTINUED`.
+//! Alternate signal stacks: `sigaltstack` reports none and refuses to set one. `signalfd`.
+//! `rt_sigtimedwait`, which is further away than its name suggests: it must take a pending
+//! signal and report its number *without* running a handler, and the only place one is taken
+//! from is [`deliver`]'s own loop, so consuming-without-delivering does not exist here. It also
+//! needs a wait that distinguishes a timeout from nothing-ready, where [`super::poll`]'s answers
+//! both with zero.
 //!
 //! # Queued signals
 //!
