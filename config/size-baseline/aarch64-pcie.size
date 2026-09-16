@@ -26,14 +26,14 @@ crate hal text 632 rodata 0 data 0 bss 0
 crate hwproxy text 384 rodata 0 data 0 bss 0
 crate ipc text 3512 rodata 16 data 0 bss 0
 crate kalloc text 12500 rodata 0 data 0 bss 0
-crate kintane text 431764 rodata 240 data 77728 bss 142992
+crate kintane text 431868 rodata 240 data 77728 bss 142992
 crate kobject text 7528 rodata 16 data 0 bss 0
 crate linux text 10696 rodata 0 data 0 bss 0
 crate map text 400 rodata 0 data 0 bss 0
 crate mm text 30024 rodata 0 data 0 bss 0
 crate net text 43620 rodata 0 data 0 bss 0
 crate pl011 text 1660 rodata 0 data 80 bss 108
-crate platform text 9944 rodata 16 data 89440 bss 1715
+crate platform text 10000 rodata 16 data 89440 bss 1715
 crate rfind text 316 rodata 0 data 0 bss 0
 crate sched text 2796 rodata 0 data 0 bss 0
 crate strip_suffix text 52 rodata 0 data 0 bss 0
