@@ -13,9 +13,74 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 2 — Core kernel | **every item landed**; the stress audit is judged in slices rather than wall-clock windows, and `kbuild soak` runs it unattended; **a two-hour soak at 8 CPUs passed 7,200 audits of 7,200** while five branches shared the host, and the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on a device being on PCIe at all: the bridge is now found from the device tree and the bus behind it walked, at the first moment the device mapping reaches a window the boot tables cannot cover, but nothing is attached to it yet |
+| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on a device being on PCIe at all: the bridge is now found from the device tree and the bus behind it walked, at the first moment the device mapping reaches a window the boot tables cannot cover, and a disk is attached to it; what remains is binding one, which needs a resource ledger outliving discovery, since the walk cannot run until configuration space is mapped and by then the ledger discovery claims through has been dropped |
 | 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Queued real-time signals, `MSG_PEEK`, scattered and gathered messages, and floating-point state carried in a signal frame and validated on return are built too. Stopping signals too: a stop parks a process at its next system call and `SIGCONT` resumes it, reported to a parent by `wait4` with `WUNTRACED` and `WCONTINUED`. What remains unbuilt is alternate signal stacks, `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd`, and `SIGCHLD` on a child's stop |
 | 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, and a disk sharing an interrupt line serviced rather than silently unwired, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end, where a partial acknowledgement is reachable in a guest and the measurement shows the blocks themselves saving nothing; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The seventeenth round of landings
+
+Twenty-one presets build and boot. Four briefs ran, and two of them changed no behaviour at all —
+one produced a paragraph, one produced a single assertion, and both were worth more than the code
+they did not write.
+
+- **Why one line in a verdict chain costs kilobytes on a port that can never run it — measured to the
+  byte.** Two rounds ago a chain entry cost one port 2,837 bytes and another 390, on architectures that
+  compile none of the feature behind it; the cause was attributed by control, but the mechanism was
+  guessed at rather than known, and a proposed remedy turned out to make no difference at all. The
+  chain is inlined into the kernel's entry function at optimisation level one, and the fourteenth link
+  pushes that inlining tree past the compiler's budget: five functions flip from inlined to outlined,
+  and their sizes sum to **exactly** the measured growth, while the entry function shrinks by the same
+  work folding back out of it. Naming those five is what turns a mystery into an attribution.
+- **So the cost belongs to the size of the enclosing function, not to the feature.** Any fourteenth
+  statement of comparable weight would trigger it — which is why changing what the link *dispatched to*
+  measured byte-for-byte identical, and why the ports built for size escape entirely: there, those
+  functions are already outlined and no threshold remains to cross. The practical consequence is
+  written into the testing document rather than left in a report: a per-crate delta on a port that
+  compiles none of a feature is **expected**, must be attributed to named symbols before it is called a
+  regression, and is not proportional to what was added. The next such surprise costs a reader a
+  paragraph instead of a round.
+- **That investigation changed no code, and said so.** It refused the two remedies it had measured to be
+  ineffective, declined to claim figures for a port whose symbols it had not examined, and recorded the
+  274 bytes its own attribution could not account for rather than rounding them into the total.
+- **Two kbuild builds can now share one output directory.** The compiler writes each codegen unit's
+  object beside the path it is told to write, named from the crate and a metadata hash, and deletes it
+  once the archive is built — so two presets built side by side for one architecture race on identical
+  intermediate names. That was established by a probe compile that kept its temporaries, rather than
+  inferred from the error text, and the sibling temporaries turn out to be randomly named and harmless.
+  Each compile now stages into a directory of its own and the finished artifact is renamed into place,
+  which is atomic: a build alongside sees the previous artifact or this one, never a partial write.
+  **Ten rounds of ten failed before; none of nine after** — rates far enough apart to claim, unlike the
+  previous round's four-of-six against six-of-six, which three trials could not separate. Every one of
+  those baseline failures was a failed archive rather than a missing crate, which confirms in
+  retrospect that the earlier fix had already closed the other window.
+- **A disk is attached to the aarch64 PCIe bus, and binding it is refused with the obstacle named.**
+  The check gates on **endpoints** rather than on how many functions the walk found, because a bridge
+  presents its own function whether or not anything is plugged in — so a count can never say a device
+  is there. Binding does not follow, and the document's own prediction about why was wrong: it said the
+  next step needed message-signalled interrupts, and the machine's tree carries the properties that
+  route a legacy pin to an ordinary interrupt the existing driver already handles. Nor was matching the
+  obstacle; the driver already lists exactly what enumeration synthesises. **The blocker is a
+  lifetime**: discovery builds and binds in one pass, while the walk cannot run until configuration
+  space is mapped, by which time the ledger discovery claims through has been dropped. That prediction
+  is retracted in the document it appeared in, and replaced with the constraint someone actually hit.
+- **What the layers key by position, and what they key by identity, is now written down and one of them
+  is asserted.** A slot is where a device sits; an image is what a medium carries; the two agree on PCI
+  and disagree on memory-mapped virtio. Every site was enumerated rather than sampled, and the result
+  is negative — all of them correct — which is exactly the kind of answer worth recording, because it
+  converts "probably fine" into a list. The one mapping that could silently drift, from any non-primary
+  slot to the second disk's image, is exhaustive only while there are two disks; it now fails the build
+  when a third is added, in the same place the existing arrays already complain.
+
+**What the round taught.** Its most valuable output changed no code: an unexplained cost accepted two
+rounds earlier turned out to be an inlining threshold, with five named functions flipping from inlined
+to outlined and summing to the measured growth exactly — so the figure is an artifact of the enclosing
+function's size, not proportional to the feature, and the next such surprise costs a reader a paragraph
+instead of a round. Three briefs reported falsifications that were **void** rather than passing: one
+whose mutation failed in a dependency crate before the guarded code compiled, one whose evidence check
+looked for text the failing path never prints, and one whose restore quietly deleted the guard it had
+just added. Each was caught by reading output rather than by trusting that an edit had worked, and each
+was reported as void rather than counted as a pass. The fourth brief declined to quote a cost across
+twenty-one presets because it had measured one, and said so.
 
 ### The sixteenth round of landings
 
