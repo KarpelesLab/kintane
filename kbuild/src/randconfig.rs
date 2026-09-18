@@ -6,13 +6,22 @@
 //! command that rebuilds it, so a nightly red is something a person can reproduce on
 //! their own machine in one step rather than an anecdote.
 //!
-//! Two kinds of failure are kept apart, because they are different people's bugs:
+//! Three kinds of failure are kept apart, because they are different people's bugs:
 //!
 //! - **The configuration did not resolve.** The generator promises valid configurations, so this is
 //!   a kbuild bug.
 //! - **The configuration resolved and did not build.** An unbuildable combination: a kernel bug, or
 //!   a missing `depends on` in a `.kcfg`. Exactly what the trait approach in `docs/portability.md`
 //!   claims should not exist.
+//! - **The configuration built and did not boot.** A combination that compiles into a kernel that
+//!   does not run, which no amount of building finds.
+//!
+//! # What is booted, and what is not
+//!
+//! Some samples have no success to report, and are counted apart rather than called failures:
+//! see [`not_bootable`] for which and why. A sweep that invents failures is worse than no
+//! sweep, so the rule is that a sample is booted only when a passing run is a thing it could
+//! have produced.
 //!
 //! With `--allyes` or `--allno`, the boundary configurations of every preset are built
 //! instead of random ones.
@@ -109,6 +118,9 @@ pub fn run(root: &Path, opts: &Opts) -> Result<(), String> {
 
     let mut invalid = Vec::new();
     let mut unbuildable = Vec::new();
+    let mut unbootable = Vec::new();
+    let mut booted = 0usize;
+    let mut no_channel = 0usize;
     for (i, sample) in samples.iter().enumerate() {
         let cmd = repro(sample, &opts.sets);
         println!("\n\x1b[36m[{}/{}]\x1b[0m {cmd}", i + 1, samples.len());
@@ -128,11 +140,29 @@ pub fn run(root: &Path, opts: &Opts) -> Result<(), String> {
             continue;
         }
         match crate::do_build(root, &o) {
-            Ok(_) => println!("\x1b[32mbuilt\x1b[0m"),
             Err(e) => {
                 let _ = std::fs::write(&log, &e);
                 eprintln!("\x1b[31mDID NOT BUILD\x1b[0m: {}", first_line(&e));
                 unbuildable.push((cmd, log));
+            }
+            Ok((image, res)) => {
+                println!("\x1b[32mbuilt\x1b[0m");
+                if let Some(why) = not_bootable(&res) {
+                    println!("  not booted: {why}");
+                    no_channel += 1;
+                } else {
+                    match boot_sample(root, &o, &image, &res) {
+                        Ok(code) => {
+                            println!("\x1b[32mbooted\x1b[0m (qemu exit {code})");
+                            booted += 1;
+                        }
+                        Err(e) => {
+                            let _ = std::fs::write(&log, &e);
+                            eprintln!("\x1b[31mDID NOT BOOT\x1b[0m: {}", first_line(&e));
+                            unbootable.push((cmd, log));
+                        }
+                    }
+                }
             }
         }
     }
@@ -144,22 +174,91 @@ pub fn run(root: &Path, opts: &Opts) -> Result<(), String> {
         unbuildable.len(),
         invalid.len()
     );
+    println!(
+        "of those that built: {booted} booted, {} did not boot, {no_channel} not booted (no \
+         verdict to give)",
+        unbootable.len()
+    );
     for (what, list) in [
         ("did not build", &unbuildable),
+        ("did not boot", &unbootable),
         ("did not resolve", &invalid),
     ] {
         for (cmd, log) in list {
             println!("  {what}: {cmd}\n    log: {}", log.display());
         }
     }
-    if invalid.is_empty() && unbuildable.is_empty() {
+    if invalid.is_empty() && unbuildable.is_empty() && unbootable.is_empty() {
         Ok(())
     } else {
         Err(format!(
             "{} of {} configurations failed",
-            invalid.len() + unbuildable.len(),
+            invalid.len() + unbuildable.len() + unbootable.len(),
             samples.len()
         ))
+    }
+}
+
+/// Why this configuration is not booted, or `None` when it can be.
+///
+/// Two kinds of sample have no success to report, and asking them for one would invent a
+/// failure rather than find one:
+///
+/// * **No result channel.** The verdict of a run is the guest's exit status, and `QEMU_EXIT`
+///   is what lets a guest produce one. Without it a boot could end only in a timeout, and
+///   since `QEMU_EXIT` is `default n`, every `--allno` sample is one.
+/// * **A deliberate crash mode.** `CRASH_PANIC` and `CRASH_FAULT` build a kernel that is
+///   *meant* to die after boot. `kbuild run` on one is expected to fail; CI reads the
+///   decoded backtrace out of such a run rather than its exit status.
+fn not_bootable(res: &crate::kcfg::Resolution) -> Option<&'static str> {
+    if !res.is_on("QEMU_EXIT") {
+        return Some("without QEMU_EXIT the guest cannot report a verdict");
+    }
+    if res.is_on("CRASH_PANIC") || res.is_on("CRASH_FAULT") {
+        return Some("a deliberate crash mode is meant to die, not to signal success");
+    }
+    None
+}
+
+/// The least a sampled configuration is given to boot, when it is not a stress run.
+///
+/// CI gives every preset sixty seconds (`kbuild run --preset <name> --timeout 60`), and a
+/// sample is never faster than a preset: it may have more CPUs, a larger heap, or a boot menu
+/// to sit through. `--timeout` raises this and does not lower it, because a sweep that fails a
+/// healthy guest for being slow reports noise, and noise is worse than no sweep at all.
+const BOOT_SECONDS: u64 = 60;
+
+/// Boot a sample that has just built, and return the guest's exit status when it passed.
+///
+/// The caller decides whether a sample is bootable at all; see this module's header for why
+/// a configuration without `QEMU_EXIT` is not one.
+fn boot_sample(
+    root: &Path,
+    opts: &Opts,
+    image: &Path,
+    res: &crate::kcfg::Resolution,
+) -> Result<i32, String> {
+    let log = root.join("build").join(res.str("TARGET")).join("qemu.log");
+    let m = crate::qemu::machine_for(res, image, &log)?;
+    // A sample may have turned the stress run on, and that lasts STRESS_SECONDS of guest time,
+    // far past the thirty seconds `--timeout` defaults to. Give it the allowance `kbuild
+    // stress` gives, so that a long run is not reported as a hang.
+    let timeout = if res.is_on("STRESS_TEST") {
+        crate::stress::timeout(res.int("STRESS_SECONDS").max(0) as u64)
+    } else {
+        opts.timeout.max(BOOT_SECONDS)
+    };
+    let outcome = crate::boot(root, res, &m, timeout, None)?;
+    match outcome.code {
+        Some(c) if outcome.passed => Ok(c),
+        Some(c) => Err(format!(
+            "error: guest exited {c}, expected {} for success",
+            m.success_code
+        )),
+        None if outcome.timed_out => {
+            Err(format!("error: no exit signal from the guest in {timeout}s"))
+        }
+        None => Err("error: QEMU was terminated by a signal".into()),
     }
 }
 
