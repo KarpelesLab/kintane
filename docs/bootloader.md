@@ -588,8 +588,28 @@ the design above is not read as a description of the code.
   enrolled into the variable store, and passing the check needs the image signed with
   Authenticode, a PKCS#7 signature over the PE's hash. Neither exists in the tree, and D8
   rules out taking them from a crate. They are one piece of work, not two.
-- **Measured boot needs a TPM**, which QEMU provides only through `swtpm`. That is not part of
-  the test environment, so no PCR is extended and no event log is passed.
+- **Measured boot needs a TPM, and nothing here can emulate one** — though not for the reason
+  it is tempting to give. Measured against QEMU 11.0.3, the device models are all present:
+  `tpm-tis` and `tpm-crb` on `qemu-system-x86_64`, `tpm-tis-device` and `tpm-tis-i2c` on
+  `qemu-system-aarch64`. What is missing is a backend. `-tpmdev help` lists exactly one on
+  both binaries, `emulator`. `-tpmdev passthrough,id=tpm0` is refused with *"Parameter 'type'
+  expects a TPM backend type"* — text byte-identical to the refusal of a backend name invented
+  as a control — so this QEMU would make no use of a real host TPM either; `swtpm` is not the
+  usual route here, it is the only one. The `emulator` backend is genuinely compiled in,
+  failing a layer later on *"tpm-emulator: parameter 'chardev' is missing"*, and it speaks
+  only to `swtpm`, which is not installed. No device runs bare: `-device tpm-tis` without a
+  backend is *"'tpmdev' property is required"*. Hence no PCR is extended and no event log is
+  passed.
+- **The blocker is the verifier, not the emulator.** Homebrew carries `swtpm` as a bottled
+  formula, so the environment gap is the cheap half of this problem and a weak reason to
+  defer. The expensive half is that nothing would read the result. A PCR extended by a loader
+  that no attestation service, sealed secret, or boot policy ever consults is a record, not a
+  guarantee — and a measurement check with nothing behind it is a check that cannot fail,
+  which is the shape this project keeps having to dig out. Under QEMU it is weaker still: the
+  emulated TPM's state is a file on the same host as the images it measures, so whoever can
+  change the kernel can change the measurement of it. QEMU's TPM is not a threat model. Take
+  this up when something exists that refuses to proceed on a wrong value — the threat model
+  first, then the device in `kbuild/src/qemu.rs`, then the loader's hash, in that order.
 - **Modules are not signed**, for the same missing primitive. A module carries a build
   identity and an interface hash, which refuse one built for another configuration. That
   guards against a mistake, not an adversary.
