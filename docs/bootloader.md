@@ -593,16 +593,18 @@ the design above is not read as a description of the code.
   `tpm-tis` and `tpm-crb` on `qemu-system-x86_64`, `tpm-tis-device` and `tpm-tis-i2c` on
   `qemu-system-aarch64`. What is missing is a backend. `-tpmdev help` lists exactly one on
   both binaries, `emulator`. `-tpmdev passthrough,id=tpm0` is refused with *"Parameter 'type'
-  expects a TPM backend type"* — text byte-identical to the refusal of a backend name invented
-  as a control — so this QEMU would make no use of a real host TPM either; `swtpm` is not the
-  usual route here, it is the only one. The `emulator` backend is genuinely compiled in,
+  expects a TPM backend type"* — the same diagnostic QEMU gives for a backend name invented as
+  a control, the two messages differing only where QEMU echoes back the argument it was handed
+  — so this QEMU would make no use of a real host TPM either; `swtpm` is not the usual route
+  here, it is the only one. The `emulator` backend is genuinely compiled in,
   failing a layer later on *"tpm-emulator: parameter 'chardev' is missing"*, and it speaks
   only to `swtpm`, which is not installed. No device runs bare: `-device tpm-tis` without a
   backend is *"'tpmdev' property is required"*. Hence no PCR is extended and no event log is
   passed.
-- **The blocker is the verifier, not the emulator.** Homebrew carries `swtpm` as a bottled
-  formula, so the environment gap is the cheap half of this problem and a weak reason to
-  defer. The expensive half is that nothing would read the result. A PCR extended by a loader
+- **The blocker is the verifier, not the emulator.** Homebrew carries `swtpm` 0.10.2 as a
+  formula bottled for `arm64_tahoe` — this machine, and only this one; anywhere else it is a
+  source build behind seven dependencies. So the environment gap is the cheap half *here*, and
+  a weak reason to defer. The expensive half is that nothing would read the result. A PCR extended by a loader
   that no attestation service, sealed secret, or boot policy ever consults is a record, not a
   guarantee — and a measurement check with nothing behind it is a check that cannot fail,
   which is the shape this project keeps having to dig out. Under QEMU it is weaker still: the
