@@ -14,8 +14,75 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
 | 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
 | 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on a device being on PCIe at all: the bridge is now found from the device tree and the bus behind it walked, at the first moment the device mapping reaches a window the boot tables cannot cover, and a disk is attached to it; what remains is binding one, which needs a resource ledger outliving discovery, since the walk cannot run until configuration space is mapped and by then the ledger discovery claims through has been dropped |
-| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Queued real-time signals, `MSG_PEEK`, scattered and gathered messages, and floating-point state carried in a signal frame and validated on return are built too. Stopping signals too: a stop parks a process at its next system call and `SIGCONT` resumes it, reported to a parent by `wait4` with `WUNTRACED` and `WCONTINUED`. What remains unbuilt is alternate signal stacks, `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd`, and `SIGCHLD` on a child's stop |
+| 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Queued real-time signals, `MSG_PEEK`, scattered and gathered messages, and floating-point state carried in a signal frame and validated on return are built too. Stopping signals too: a stop parks a process at its next system call and `SIGCONT` resumes it, reported to a parent by `wait4` with `WUNTRACED` and `WCONTINUED`. `rt_sigsuspend` waits under a replacement mask and always ends interrupted, and a parent is told when a child stops or continues, with `SA_NOCLDSTOP` honoured through its own action rather than left a constant nothing reads. What remains unbuilt is alternate signal stacks, `signalfd`, and `rt_sigtimedwait` — the last of which is not `rt_sigsuspend`'s sibling despite the pairing: it must take a signal from the queue and report its number without running a handler, and the only place a signal is taken sits inside the delivery path |
 | 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, and a disk sharing an interrupt line serviced rather than silently unwired, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end, where a partial acknowledgement is reachable in a guest and the measurement shows the blocks themselves saving nothing; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The eighteenth round of landings
+
+Twenty-one presets build and boot. Four briefs ran and **three of them wrote no implementation at
+all** — which is the round, rather than a shortfall in it.
+
+- **Two of the five signal calls the personality still listed as unbuilt are now built**, and the other
+  three are refused with reasons rather than deferred. A waiting call that blocks under a replacement
+  mask and always ends interrupted fits what already exists — the polling path performs its exact
+  shape, and the wake predicate already excludes signals whose disposition is to ignore, which is the
+  kernel's own rule. The subtlety is the mask: the system Linux implements restores the pre-suspend
+  mask when a handler *returns*, not when the call does, and because delivery here reads the thread's
+  mask fresh and stores it in the frame, the call leaves its own mask installed on the interrupted
+  path and restores it only when no signal arrived. **The timed variant is not that call's sibling**,
+  despite the two being listed together: it must take a signal from the queue and report its number
+  *without* running a handler, and the only place a signal is taken sits inside the delivery path.
+  Two new mechanisms rather than one call.
+- **A parent is now told when a child stops or continues**, which completes the previous stopping-signal
+  work rather than extending it — the stop path already recorded its event and woke waiters before
+  parking, so the notification belongs on that line. The promise this changes was written in **three**
+  places and all three change together: the documentation had said no such signal is sent, so the flag
+  that suppresses it had nothing to suppress. That flag is now honoured through the parent's action
+  rather than remaining a constant the code parsed nowhere. And a pending notification under the
+  default disposition is discarded — which is the real system's behaviour and not a defect to repair,
+  so the check installs a handler in the parent, without which it would pass while proving nothing.
+- **Binding a disk on the other architecture's PCIe bus was refused, and the obstacle moved again.**
+  The document had said the blocker was a resource ledger that does not outlive discovery. That is
+  true and is not the binding constraint: the enumerated function **never becomes a node**, because
+  this platform builds its device tree once from the firmware blob and has no second pass, where the
+  other platform synthesises a node per function — and a driver binds to a node, so the driver is
+  never asked. Binding one would also mean a **third** disk, which the compile-time assertion added
+  the round before refuses, because the mapping from slot to disk image is exhaustive only while there
+  are two. **That assertion fired in the first round after it landed, in a different brief, on the
+  first attempt to do the thing it forbids** — and the brief declined to widen it, because doing so to
+  make a boot line appear would have reintroduced, one slot along, the bug two rounds were spent
+  removing.
+- **The other x86_64 unit was measured and then declined, with the estimate recorded rather than the
+  conclusion alone.** The emulator models it properly rather than as a stub; its translation flag
+  defaulting off is a switch rather than a wall, and the asymmetry only looks alarming because the
+  first unit has no such flag at all; and its firmware table replaces the other's one for one, which
+  was observed with a ten-line probe rather than inferred from an unchanged table count. The judgement
+  is that **the seam is in the right place and nothing above it transfers**: the three traits the
+  driver is written against name nothing vendor-specific, while the capability read, the table shape,
+  five hundred lines of invalidation, the fault path and the interrupt format are all the first
+  unit's. So a second unit is a second driver, not a parameterisation — and that is not judged worth
+  it for one more unit, with the cost written down so a later round with a different reason can weigh
+  it again.
+- **Thirty-three random configurations found four bugs that twenty-one curated presets cannot.** One of
+  twelve random samples built; seven of twenty-one minimal ones; **none failed to resolve**, so the
+  generator's promise held and every failure belongs to the tree. Three reproduce from a **single**
+  non-default symbol with no seed at all: a module gated on userspace being enabled is named from the
+  context switch with no guard whatsoever, on both architectures with memory management — while the
+  neighbouring files do it correctly with paired functions, which is exactly why it survived. A fourth
+  is the configuration language rather than the code: a symbol carries a static range while the build
+  requires a sum computed from four others. **The reason no preset finds these is structural**: the
+  only presets choosing the flat memory model have no memory management unit, and all fourteen that do
+  leave the model at its default with userspace on.
+
+**What the round taught.** Three briefs produced findings instead of code, and each refusal was worth
+more than the work it declined — one prevented reintroducing a bug two rounds had removed, one costed
+a second driver at some two and a half thousand lines and said so rather than starting it, and one
+found four real defects and declined to fix them from a sweep, because each needs its own falsification
+and they span two architectures, the kernel and the configuration language. Two of the four also lost
+their worktrees: one because it produced no code and the tooling reclaims an unchanged tree, and one to
+an interruption mid-task. **The first lost nothing but a pair of hands to apply text it supplied
+verbatim; the second lost nothing at all, because it had committed before gating** — a rule added one
+round earlier precisely for that window.
 
 ### The seventeenth round of landings
 
