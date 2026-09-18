@@ -706,7 +706,10 @@ fn suspend_mode() -> ! {
     // 143: a sigset is eight bytes here as everywhere, and the size is checked before the wait —
     // a call that waited first and complained later could not be told from one that worked.
     let held = bit(SIGUSR1);
-    expect(sys::call(sys::RT_SIGSUSPEND, [&raw const held as u64, 4, 0, 0, 0, 0]) == -EINVAL, 143);
+    expect(
+        sys::call(sys::RT_SIGSUSPEND, [&raw const held as u64, 4, 0, 0, 0, 0]) == -EINVAL,
+        143,
+    );
 
     // 144: `SIGUSR1` blocked with a handler installed, and a child that sends it.
     expect(sigaction(SIGUSR1, on_susp as *const () as u64, 0) == 0, 144);
@@ -724,14 +727,20 @@ fn suspend_mode() -> ! {
     // 145: the mask worn unblocks what is blocked outside, so the signal arrives only because
     // this call asked for it. There is no success: a return means a signal.
     let allow = 0u64;
-    expect(sys::call(sys::RT_SIGSUSPEND, [&raw const allow as u64, 8, 0, 0, 0, 0]) == -EINTR, 145);
+    expect(
+        sys::call(sys::RT_SIGSUSPEND, [&raw const allow as u64, 8, 0, 0, 0, 0]) == -EINTR,
+        145,
+    );
     // 146: and it returned because the handler ran, not merely because something woke it.
     expect(SUSP_HITS.load(Ordering::Relaxed) == 1, 146);
 
     // 147: the mask worn is gone and the thread's own is back — restored from the signal frame
     // by `rt_sigreturn`, not by the call. A null set asks without changing anything.
     let mut old = 0u64;
-    expect(sys::call(sys::RT_SIGPROCMASK, [SIG_BLOCK, 0, &raw mut old as u64, 8, 0, 0]) == 0, 147);
+    expect(
+        sys::call(sys::RT_SIGPROCMASK, [SIG_BLOCK, 0, &raw mut old as u64, 8, 0, 0]) == 0,
+        147,
+    );
     expect(old & bit(SIGUSR1) != 0, 147);
     expect(wait_child(child, 147) == 0, 147);
     expect(sigaction(SIGUSR1, SIG_DFL, 0) == 0, 147);
