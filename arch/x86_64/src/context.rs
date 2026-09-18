@@ -255,21 +255,12 @@ impl HasContextSwitch for X86_64 {
     }
 
     unsafe fn switch(from: *mut Context, to: *const Context) {
-        // The thread pointer of a thread that runs user code. `FS` base is one register per
-        // CPU, and a program changes it only through the kernel, so it is read back when the
-        // thread leaves and written when it arrives. Kernel threads neither read it nor
-        // change it, and a switch between two of them costs nothing here.
+        // The thread pointer of a thread that runs user code, carried by the paired
+        // functions below: with userspace, read back when the thread leaves and written
+        // when it arrives; without it, a kernel with no `crate::user` to call.
         // SAFETY: the caller's contract makes `from` the running thread's context, `to` a
-        // suspended one, and the switch masked on this CPU; `IA32_FS_BASE` is defined at
-        // CPL 0, and the kernel addresses nothing through `FS`.
-        unsafe {
-            if (*from).user_kernel_stack != 0 {
-                (*from).user_tls = crate::paging::read_msr(crate::user::MSR_FS_BASE);
-            }
-            if (*to).user_kernel_stack != 0 {
-                crate::paging::write_msr(crate::user::MSR_FS_BASE, (*to).user_tls);
-            }
-        }
+        // suspended one, and the switch masked on this CPU.
+        unsafe { switch_user_tls(from, to) };
         // A thread that runs user code takes its kernel stack to whichever CPU it resumes
         // on: that CPU's `TSS.rsp0` and `syscall` stack are what a trap from its user code
         // will land on. Kernel-only threads leave both alone; nothing enters ring 0 from a
@@ -282,16 +273,64 @@ impl HasContextSwitch for X86_64 {
             // to, which `bind` recorded.
             unsafe { crate::smp::install_kernel_stack(user_stack) };
         }
-        // And its address space. A thread that runs user code carries its own root; a
-        // kernel thread carries none and runs on the kernel's, so no kernel thread ever
-        // runs on tables a process might free.
+        // And its address space, by the same pairing. A thread that runs user code carries
+        // its own root; a kernel thread carries none and runs on the kernel's, so no kernel
+        // thread ever runs on tables a process might free.
         // SAFETY: as above; `user_root` is what `bind` recorded, or zero.
-        unsafe { crate::user::load_space((*to).user_root) };
+        unsafe { load_user_space(to) };
         // SAFETY: forwarded verbatim; the caller upholds `switch_raw`'s contract, which
         // is this function's own.
         unsafe { switch_raw(from, to) }
     }
 }
+
+/// Carry the thread pointer of a thread that runs user code across a switch.
+///
+/// `FS` base is one register per CPU, and a program changes it only through the kernel, so
+/// it is read back when the thread leaves and written when it arrives. Kernel threads
+/// neither read it nor change it, and a switch between two of them costs nothing here.
+///
+/// # Safety
+/// `from` is the running thread's context, `to` a suspended one, and the switch masked on
+/// this CPU.
+#[cfg(CONFIG_USERSPACE)]
+unsafe fn switch_user_tls(from: *mut Context, to: *const Context) {
+    // SAFETY: forwarded from the caller's contract; `IA32_FS_BASE` is defined at CPL 0,
+    // and the kernel addresses nothing through `FS`.
+    unsafe {
+        if (*from).user_kernel_stack != 0 {
+            (*from).user_tls = crate::paging::read_msr(crate::user::MSR_FS_BASE);
+        }
+        if (*to).user_kernel_stack != 0 {
+            crate::paging::write_msr(crate::user::MSR_FS_BASE, (*to).user_tls);
+        }
+    }
+}
+
+/// No userspace port: no thread has a user thread pointer to carry.
+///
+/// # Safety
+/// None; matches the userspace form's signature.
+#[cfg(not(CONFIG_USERSPACE))]
+unsafe fn switch_user_tls(_from: *mut Context, _to: *const Context) {}
+
+/// Install the address space the thread `to` describes is to run on.
+///
+/// # Safety
+/// `to` is a valid suspended context and the switch is masked, on the CPU `to` is about to
+/// run on; `user_root` is what `bind` recorded, or zero.
+#[cfg(CONFIG_USERSPACE)]
+unsafe fn load_user_space(to: *const Context) {
+    // SAFETY: forwarded verbatim from this function's own contract.
+    unsafe { crate::user::load_space((*to).user_root) };
+}
+
+/// No userspace port: every thread runs on the kernel's tables, already installed.
+///
+/// # Safety
+/// None; matches the userspace form's signature.
+#[cfg(not(CONFIG_USERSPACE))]
+unsafe fn load_user_space(_to: *const Context) {}
 
 /// Save the callee-saved registers into `from`, load them from `to`, and return into
 /// whichever thread `to` describes.

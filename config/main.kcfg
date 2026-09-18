@@ -42,9 +42,14 @@ choice MM_MODEL
 
     config MM_FLAT
         bool "Flat physical memory"
+        depends on ARCH_HAS_FLAT
         help
             No address translation. Required on targets without an MMU;
-            selectable on MMU targets for minimal-overhead builds.
+            selectable on an MMU target whose port has a flat path, which
+            ARCH_HAS_FLAT records. i686 has one; x86_64 and AArch64 do not,
+            and asking them for MM_FLAT used to resolve and then fail to
+            compile -- DEVICE_WINDOW_BASE falls to zero, which x86_64's
+            boot tables and AArch64's root-entry assert both reject.
 endchoice
 
 # --- memory the image reserves -----------------------------------------------
@@ -169,7 +174,14 @@ config NR_CPUS
 
 config KERNEL_THREAD_SLOTS
     int "Guarded stack slots for kernel threads"
-    range 2 256
+    range 19 256 if STRESS_TEST && BLOCK_DOMAIN
+    range 17 256 if STRESS_TEST && DRIVER_ISOLATION
+    range 16 256 if STRESS_TEST
+    range 8 256 if BLOCK_DOMAIN && DRIVER_ISOLATION
+    range 7 256 if BLOCK_DOMAIN
+    range 6 256 if DRIVER_ISOLATION
+    range 5 256 if USERSPACE
+    range 4 256
     default 19 if STRESS_TEST && BLOCK_DOMAIN
     default 17 if STRESS_TEST && DRIVER_ISOLATION
     default 16 if STRESS_TEST
@@ -181,6 +193,17 @@ config KERNEL_THREAD_SLOTS
         eight is the floor for a test build; with userspace the standing
         file server holds one more. A build that asks for fewer than its
         threads need fails to compile, in kernel/main/src/preempt.rs.
+
+        The ranges above are that same requirement said in this language,
+        so a configuration that resolves also builds: each line is the
+        worst case for its guard -- the scheduler's four, the stress run's
+        extra stacks, one for an isolated driver domain, two for the block
+        domain, one for the file server -- which is why a stress build with
+        a block domain asks for nineteen. preempt.rs keeps the exact sum;
+        a range cannot compute one, and duplicating it per disk and network
+        test would be eight more lines to keep in step. Before these lines
+        the range was `2 256` and the sum was stated only in Rust, so
+        randconfig could resolve a build that then failed to compile.
 
         The port's linker script reserves this many slots plus one per
         secondary CPU, so the array grows with NR_CPUS without anyone
@@ -563,7 +586,7 @@ config NULL_DEREF_TEST
 
 config WAIT_RACE_TEST
     bool "Stall a wait between its first look and registering, on purpose"
-    depends on QEMU_EXIT && MM_PAGED
+    depends on QEMU_EXIT && USERSPACE
     default n
     help
         Compile a stall point into WaitQueue::wait_once, between the look

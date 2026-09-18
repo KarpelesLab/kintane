@@ -15,6 +15,21 @@ config ARCH_HAS_MMU
         The target has a hardware MMU with page tables.
         Corresponds to the HasMmu trait.
 
+config ARCH_HAS_FLAT
+    bool
+    readonly
+    help
+        The port can run with address translation off, so MM_FLAT is a
+        memory model it offers. Every target without an MMU has this and
+        nothing else; an MMU target has it only if its port carries a path
+        that never builds page tables.
+
+        x86_64 and AArch64 do not. Long mode cannot run with paging off at
+        all, and the AArch64 port maps its UART and every device window
+        through DEVICE_WINDOW_BASE from code that is not conditional on the
+        memory model. i686 does: it builds flat today, which is why this is
+        a property of the port rather than of having an MMU.
+
 config ARCH_HAS_MPU
     bool
     readonly
@@ -85,6 +100,7 @@ choice ARCH
     config ARCH_I686
         bool "32-bit x86"
         select ARCH_HAS_MMU
+        select ARCH_HAS_FLAT
         select ARCH_HAS_SMP
         select ARCH_HAS_CAS
         select ARCH_HAS_COHERENT_DMA
@@ -92,6 +108,7 @@ choice ARCH
 
     config ARCH_ARMV7M
         bool "ARMv7-M (Cortex-M, no MMU)"
+        select ARCH_HAS_FLAT
         select ARCH_HAS_MPU
         # LDREX/STREX. ARMv6-M (Cortex-M0) has no exclusive access and
         # would be a separate choice without this select.
@@ -99,6 +116,7 @@ choice ARCH
 
     config ARCH_RISCV32
         bool "RISC-V 32-bit (no MMU)"
+        select ARCH_HAS_FLAT
         # The A extension's LR/SC, unless the base-ISA variant below says
         # this core has none.
         select ARCH_HAS_CAS if !RISCV32_NO_ATOMICS

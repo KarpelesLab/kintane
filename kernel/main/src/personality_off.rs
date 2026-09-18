@@ -125,3 +125,15 @@ pub fn stress_cycle(_round: u64) -> Result<(), &'static str> {
 pub fn stress_cycles() -> u64 {
     0
 }
+
+/// No Linux processes to churn, so none ever completed a cycle.
+#[cfg_attr(
+    not(CONFIG_USERSPACE),
+    expect(
+        dead_code,
+        reason = "only userspace drives processes in the stress run"
+    )
+)]
+pub fn churn_cycles() -> u64 {
+    0
+}

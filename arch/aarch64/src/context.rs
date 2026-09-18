@@ -510,22 +510,16 @@ impl HasContextSwitch for Aarch64 {
         // carries none and runs on the kernel's, so no kernel thread ever runs on tables a
         // process might free. On this port `SP_EL1` is the thread's own kernel stack, so
         // there is nothing else to install for a trap from EL0 to land on.
+        // Both of these are paired functions below: with userspace they do the work, and
+        // without it there is no `crate::user` to call and nothing to carry.
         // SAFETY: the caller's contract makes `to` a valid suspended context and the
         // switch masked, on the CPU `to` is about to run on; `user_root` is what `bind`
         // recorded, or zero.
-        unsafe { crate::user::load_space((*to).user_root) };
+        unsafe { load_user_space(to) };
         // The thread pointer of a thread that runs user code, which its program may have
         // changed at EL0 since it last arrived. Kernel threads neither read nor write it.
-        // SAFETY: as above; `from` is the running thread's context. `TPIDR_EL0` is EL0's
-        // register, read and written at EL1, and nothing in the kernel uses it.
-        unsafe {
-            if (*from).user_kernel_stack != 0 {
-                (*from).user_tls = crate::user::read_tpidr_el0();
-            }
-            if (*to).user_kernel_stack != 0 {
-                crate::user::write_tpidr_el0((*to).user_tls);
-            }
-        }
+        // SAFETY: as above; `from` is the running thread's context.
+        unsafe { switch_user_tls(from, to) };
         // SAFETY: the caller upholds the contract — interrupts masked, `from` writable
         // and distinct from `to`, `to` a suspended context with a live stack. The call
         // is an ordinary AAPCS64 call, so the compiler already treats every caller-saved
@@ -534,6 +528,53 @@ impl HasContextSwitch for Aarch64 {
         unsafe { aarch64_context_switch(from, to) }
     }
 }
+
+/// Install the address space the thread `to` describes is to run on.
+///
+/// A thread that runs user code carries its own address space; a kernel thread carries none
+/// and runs on the kernel's, so no kernel thread ever runs on tables a process might free.
+///
+/// # Safety
+/// `to` is a valid suspended context and the switch is masked, on the CPU `to` is about to
+/// run on; `user_root` is what `bind` recorded, or zero.
+#[cfg(CONFIG_USERSPACE)]
+unsafe fn load_user_space(to: *const Context) {
+    // SAFETY: forwarded verbatim from this function's own contract.
+    unsafe { crate::user::load_space((*to).user_root) };
+}
+
+/// No userspace port: every thread runs on the kernel's tables, already installed.
+///
+/// # Safety
+/// None; matches the userspace form's signature.
+#[cfg(not(CONFIG_USERSPACE))]
+unsafe fn load_user_space(_to: *const Context) {}
+
+/// Carry the thread pointer of a thread that runs user code across a switch.
+///
+/// # Safety
+/// `from` is the running thread's context, `to` a suspended one, and the switch masked on
+/// this CPU. `TPIDR_EL0` is EL0's register, read and written at EL1, and nothing in the
+/// kernel uses it.
+#[cfg(CONFIG_USERSPACE)]
+unsafe fn switch_user_tls(from: *mut Context, to: *const Context) {
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        if (*from).user_kernel_stack != 0 {
+            (*from).user_tls = crate::user::read_tpidr_el0();
+        }
+        if (*to).user_kernel_stack != 0 {
+            crate::user::write_tpidr_el0((*to).user_tls);
+        }
+    }
+}
+
+/// No userspace port: no thread has a user thread pointer to carry.
+///
+/// # Safety
+/// None; matches the userspace form's signature.
+#[cfg(not(CONFIG_USERSPACE))]
+unsafe fn switch_user_tls(_from: *mut Context, _to: *const Context) {}
 
 // --- selftest ---------------------------------------------------------------------------
 
