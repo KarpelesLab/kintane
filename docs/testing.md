@@ -3535,7 +3535,87 @@ check that cannot fail; forcing an unknown symbol produces
 `DID NOT RESOLVE (a kbuild bug): unknown configuration symbol NOPE`, counted apart from
 build failures and reported with its own reproduction command.
 
-`randconfig-build` builds and does not boot. Every number here is a compile result.
+Every number above is a compile result: `randconfig-build` built and did not boot. That is
+no longer true, and what changed is below.
+
+### After the fixes, and with booting
+
+All four causes above are fixed (commit `fd0db49`), the undecided one decided. Each was
+falsified by a command that failed before the change and passes after:
+
+```
+kbuild build --preset x86_64-qemu  --set USERSPACE=n     # 1 -> 0
+kbuild build --preset aarch64-virt --set USERSPACE=n     # 1 -> 0
+kbuild build --preset x86_64-qemu  --set ABI_LINUX=n     # 1 -> 0, the churn_cycles one
+kbuild build --preset i686-qemu    --set WAIT_RACE_TEST=y  # refused, not built
+```
+
+The last does not build and is not meant to. `WAIT_RACE_TEST` now depends on `USERSPACE`
+rather than `MM_PAGED`, so asking for it on i686 is refused at resolution by name. Making it
+*build* would have meant gating the module on `all(WAIT_RACE_TEST, USERSPACE)`, which lets
+the symbol be set and silently compiles `waitrace_off` — a check that cannot fail, which is
+the defect this tree has been bitten by most.
+
+**`MM_FLAT` on x86_64 and aarch64 is decided: forbidden, and was not.** Under `MM_FLAT`,
+`DEVICE_WINDOW_BASE` falls to zero, which x86_64's boot tables reject and which aarch64's
+root-entry assert rejects independently. Long mode cannot run with paging off at all. That
+this is a property of the port and not of having an MMU is settled by i686, which has an MMU
+and builds flat today — so `ARCH_HAS_FLAT` joins the readonly capability symbols, selected by
+the three ports that have a flat path.
+
+**`KERNEL_THREAD_SLOTS` was fixed in the configuration language, not in Rust.** `preempt.rs`
+already asserted the exact sum and is right; what was missing was any statement of it where
+the generator reads. Eight `range` lines now bound the symbol.
+
+#### What the sweep says now
+
+| run | round 18 | round 19 |
+|---|---|---|
+| `--allno`, 21 presets | 7 built | **16 built**, and 16 of 16 booted |
+| 12 random, seed 5000 | 1 built | **6 built**, 0 of 6 judged |
+
+No configuration in either run failed to resolve, so the generator's promise held again.
+
+#### What booting found that building did not
+
+Nothing, in the end, that the boundary runs reached: all sixteen `--allno` samples that built
+also booted. Everything below was found by booting random samples **before** the crash-mode
+rule was added, and each was reproduced by hand rather than counted:
+
+| what | seed | kind |
+|---|---|---|
+| Boot stack overflows in the heap selftest: `armv7m-tiny` pins `BOOT_STACK_KIB=14`, `INKERNEL_TESTS` wants the `default 32` a preset overrides | 5011 | language |
+| A guest given `QEMU_MEMORY_MB=8` — the floor — with EFI firmware, an IOMMU, two disks and a NIC never prints a byte | 5008 | language |
+| `BOOT_MENU_TIMEOUT=600` in a `QEMU_EXIT` build, whose own help says test builds use 0 | 5000 | language |
+
+They share one shape with `KERNEL_THREAD_SLOTS`, and it is the lesson of this round:
+**`default … if X` states a requirement that `range` does not enforce**, so any preset or
+sample that names the symbol explicitly escapes it. Five symbols carry a requirement only in
+a `default`.
+
+Building alone found three more, all new since round 18:
+
+| what | occurrences | kind |
+|---|---|---|
+| `DRIVERS` and `started_chip` absent when `GIC_V2` and `GIC_V3` are both off — the whole of the `--allno` aarch64 column | 6 | code |
+| `THREAD_STACK_KIB` below the 8 KiB its linker script asserts (2), or not a power of two, which `hal::StackArray` requires (1) | 3 | language |
+| aarch64 inline assembly rejects a sampled value | 2 | code |
+
+The `THREAD_STACK_KIB` pair is worth separating, because only one of the two is the shape
+this round is about. The 8 KiB floor is a missing `range` like the others, and it is
+architecture-conditional: armv7m's linker script asserts only 1 KiB, and `armv7m-tiny` ships
+`THREAD_STACK_KIB=4` legitimately, so a flat floor would be wrong. The power-of-two
+requirement is not that shape at all — this language has no way to say "a power of two", so
+nothing but the linker can ever catch it.
+
+#### A limit, stated rather than hidden
+
+All six random samples that built drew a deliberate crash mode, so the random half now judges
+nothing. That is the generator rather than chance: it proposes symbols one at a time and keeps
+what still resolves, so a choice's non-default members get proposed and accepted while
+`CRASH_NONE` is only ever the default and is never proposed. The fix is to judge a crash-mode
+sample by the crash harness's criterion — a decoded backtrace, as CI does — instead of
+skipping it. Until then the boot coverage is the boundary runs.
 
 **What the first run found.** 36 of the first 50 random samples, and every `--allyes`
 boundary, failed to build. None of that was a kernel bug. `MOCK_ARCH`, the switch that
