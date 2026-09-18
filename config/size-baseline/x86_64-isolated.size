@@ -1,12 +1,12 @@
 # kbuild size report for preset x86_64-isolated. Rewrite with `kbuild size --preset x86_64-isolated --update-baseline`.
 section .bss 274432
-section .data 280952
+section .data 281240
 section .note.kintane 36
 section .rodata 245720
 section .stack 32768
-section .text 983040
+section .text 987136
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 57094 data 0 bss 0
+crate (anonymous) text 0 rodata 57435 data 0 bss 0
 crate (unmangled) text 10590 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 6835 rodata 0 data 0 bss 0
@@ -26,9 +26,9 @@ crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
 crate ipc text 4698 rodata 16 data 0 bss 0
 crate kalloc text 13891 rodata 0 data 0 bss 0
-crate kintane text 475293 rodata 256 data 94560 bss 141942
+crate kintane text 476228 rodata 256 data 94848 bss 141958
 crate kobject text 4907 rodata 16 data 0 bss 0
-crate linux text 11893 rodata 0 data 0 bss 0
+crate linux text 11908 rodata 0 data 0 bss 0
 crate map text 348 rodata 0 data 0 bss 0
 crate mm text 36363 rodata 0 data 0 bss 0
 crate module text 18869 rodata 0 data 0 bss 0
@@ -39,7 +39,7 @@ crate rfind text 296 rodata 0 data 0 bss 0
 crate sched text 3385 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
 crate sync text 21602 rodata 32 data 1088 bss 272
-crate thread text 9100 rodata 0 data 0 bss 0
+crate thread text 9113 rodata 0 data 0 bss 0
 crate time text 3222 rodata 0 data 0 bss 0
 crate trim_matches text 903 rodata 0 data 0 bss 0
 crate uart16550 text 2152 rodata 0 data 256 bss 88
@@ -51,5 +51,5 @@ crate virtio_bind text 2014 rodata 0 data 0 bss 0
 crate virtio_blk text 3877 rodata 32 data 384 bss 0
 crate virtio_blk_core text 4992 rodata 0 data 0 bss 0
 crate virtio_net text 4393 rodata 16 data 176 bss 8
-crate vtd text 7404 rodata 0 data 0 bss 0
-total 2079092
+crate vtd text 7462 rodata 0 data 0 bss 0
+total 2083476

@@ -1,15 +1,15 @@
 # kbuild size report for preset x86_64-qemu. Rewrite with `kbuild size --preset x86_64-qemu --update-baseline`.
 section .bss 274432
-section .data 280504
+section .data 280792
 section .note.kintane 36
 section .rodata 196568
 section .stack 32768
-section .text 933888
+section .text 937984
 section .thread_stacks 262144
-crate (anonymous) text 0 rodata 58297 data 0 bss 0
-crate (unmangled) text 9022 rodata 0 data 1024 bss 0
+crate (anonymous) text 0 rodata 57432 data 0 bss 0
+crate (unmangled) text 9127 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
-crate abi text 6810 rodata 0 data 0 bss 0
+crate abi text 6835 rodata 0 data 0 bss 0
 crate acpi text 56552 rodata 0 data 0 bss 0
 crate apic text 6406 rodata 0 data 304 bss 232
 crate arch text 39780 rodata 0 data 2145 bss 90905
@@ -18,17 +18,18 @@ crate block text 2658 rodata 0 data 0 bss 0
 crate bootinfo text 2574 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
-crate core text 20905 rodata 3002 data 0 bss 0
+crate core text 20996 rodata 3002 data 0 bss 0
 crate device text 27696 rodata 0 data 0 bss 0
 crate elf text 3249 rodata 0 data 0 bss 0
 crate fat text 35787 rodata 0 data 0 bss 0
 crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
-crate ipc text 3007 rodata 16 data 0 bss 0
+crate ipc text 4698 rodata 16 data 0 bss 0
 crate kalloc text 13961 rodata 0 data 0 bss 0
-crate kintane text 442272 rodata 240 data 94104 bss 141832
+crate kintane text 446052 rodata 240 data 94392 bss 141848
 crate kobject text 6354 rodata 16 data 0 bss 0
-crate linux text 11893 rodata 0 data 0 bss 0
+crate linux text 11908 rodata 0 data 0 bss 0
+crate map text 348 rodata 0 data 0 bss 0
 crate mm text 36372 rodata 0 data 0 bss 0
 crate module text 18869 rodata 0 data 0 bss 0
 crate multiboot text 604 rodata 0 data 0 bss 0
@@ -37,7 +38,7 @@ crate platform text 33501 rodata 80 data 180962 bss 2858
 crate rfind text 296 rodata 0 data 0 bss 0
 crate sched text 3385 rodata 0 data 0 bss 0
 crate strip_suffix text 38 rodata 0 data 0 bss 0
-crate sync text 20731 rodata 32 data 1088 bss 272
+crate sync text 15326 rodata 32 data 1088 bss 272
 crate thread text 9441 rodata 0 data 0 bss 0
 crate time text 3222 rodata 0 data 0 bss 0
 crate trim_matches text 903 rodata 0 data 0 bss 0
@@ -47,7 +48,7 @@ crate vfs text 18440 rodata 0 data 0 bss 0
 crate vfsproto text 3172 rodata 0 data 0 bss 0
 crate virtio text 6217 rodata 0 data 0 bss 0
 crate virtio_bind text 2014 rodata 0 data 0 bss 0
-crate virtio_blk text 3564 rodata 32 data 384 bss 0
+crate virtio_blk text 6316 rodata 32 data 384 bss 0
 crate virtio_blk_core text 2702 rodata 0 data 0 bss 0
 crate virtio_net text 4393 rodata 16 data 176 bss 8
-total 1980340
+total 1984724
