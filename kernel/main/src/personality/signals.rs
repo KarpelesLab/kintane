@@ -51,12 +51,34 @@
 //! discards a pending `SIGCONT`, as Linux does. `SIGKILL` ends a stopped process rather than
 //! waiting for it to be continued.
 //!
+//! # Suspending
+//!
+//! [`suspend`] wears a mask, waits for a signal that is not ignored, and always ends `EINTR`.
+//! Two masks matter on the way out, and that is the whole difficulty: the handler must run under
+//! the mask the call *asked for*, and the mask it *replaced* must be back once that handler
+//! returns. [`deliver`] reads the thread's mask fresh, so the first comes for free. The second
+//! cannot, because by then the replaced mask is gone. So [`suspend`] leaves it in
+//! [`ThreadSignals::saved`], [`enter_handler`] writes that into the frame as `Delivery::old_mask`
+//! in place of the mask in force, and [`sigreturn`] puts it back. Linux needs the same extra
+//! state for the same reason and calls it `saved_sigmask`.
+//!
+//! Restoring inside [`suspend`] instead would run the handler under the very mask the caller was
+//! replacing, and leave the program racing exactly where `sigsuspend` exists to stop it racing:
+//! block a signal, test a flag, suspend, and find the signal unblocked on the next turn.
+//!
+//! Two paths put the mask back with no frame to carry it. When the wait ends without a signal the
+//! process is ending and nothing will be delivered. And when the signal that woke it needs no
+//! handler, [`deliver`] restores the mask and the call runs again — Linux's `ERESTARTNOHAND`: a
+//! suspend a handler ends reports `EINTR`, and one nothing handles waits again.
+//!
 //! # Not built
 //!
-//! Alternate signal stacks: `sigaltstack` reports none and refuses to set one.
-//! `rt_sigsuspend`, `rt_sigtimedwait` and `signalfd`. `SIGCHLD` is not sent to a parent when a
-//! child stops or continues, so `SA_NOCLDSTOP` has nothing to suppress; a parent learns of a stop
-//! by asking, with `WUNTRACED` or `WCONTINUED`.
+//! Alternate signal stacks: `sigaltstack` reports none and refuses to set one. `signalfd`.
+//! `rt_sigtimedwait`, which is further away than its name suggests: it must take a pending
+//! signal and report its number *without* running a handler, and the only place one is taken
+//! from is [`deliver`]'s own loop, so consuming-without-delivering does not exist here. It also
+//! needs a wait that distinguishes a timeout from nothing-ready, where [`super::poll`]'s answers
+//! both with zero.
 //!
 //! # Queued signals
 //!
@@ -134,7 +156,16 @@ struct ThreadSignals {
     /// instruction, which faults again at once; see [`REFAULTS`].
     fault_pc: AtomicU64,
     refaults: AtomicU32,
+    /// The mask the next delivery on this thread must put back, or [`NO_SAVED`]: what
+    /// [`suspend`] replaced. `rt_sigreturn` restores this rather than the mask the call wore
+    /// while it waited. Linux keeps the same thing, and calls it `saved_sigmask`.
+    saved: AtomicU64,
 }
+
+/// No mask saved for the next delivery, in [`ThreadSignals::saved`]. It can never be mistaken
+/// for a real one: every store to a mask clears the two unblockable signals, so a value with
+/// every bit set is not a mask any thread can be wearing.
+const NO_SAVED: u64 = u64::MAX;
 
 static THREAD_SIGNALS: [ThreadSignals; THREADS] = [const {
     ThreadSignals {
@@ -146,6 +177,7 @@ static THREAD_SIGNALS: [ThreadSignals; THREADS] = [const {
         fault: AtomicU64::new(0),
         fault_pc: AtomicU64::new(0),
         refaults: AtomicU32::new(0),
+        saved: AtomicU64::new(NO_SAVED),
     }
 }; THREADS];
 
@@ -189,14 +221,47 @@ const STOP_SIGNALS: u64 = sig::bit(sig::SIGSTOP)
 /// a stopped process instead of waiting for it to be continued.
 static STOP_WAIT: WaitQueue = WaitQueue::new();
 
+/// Where [`suspend`] waits. Woken by every signal send, through [`wake_stopped`], and by a
+/// process ending, so a suspended thread of it does not wait for a signal that is never coming.
+static SUSPEND_WAIT: WaitQueue = WaitQueue::new();
+
 /// Threads parked by a stop, and continues that resumed one: what the check counts.
 static STOPS: AtomicU64 = AtomicU64::new(0);
 static CONTINUES: AtomicU64 = AtomicU64::new(0);
 
-/// Wake every thread a stop has parked. Called where a process starts to end, so a stopped one
-/// can be killed.
+/// Calls to [`suspend`] that a signal ended, and stop or continue notifications sent to a
+/// parent: what the check counts.
+static SUSPENDS: AtomicU64 = AtomicU64::new(0);
+static CHILD_NOTES: AtomicU64 = AtomicU64::new(0);
+
+/// Wake every thread a stop has parked, and every thread suspended in [`suspend`]. Called where
+/// a process starts to end, so a stopped one can be killed, and from every signal send, so a
+/// suspended thread looks again at what is deliverable.
 pub(super) fn wake_stopped() {
     STOP_WAIT.wake_all();
+    SUSPEND_WAIT.wake_all();
+}
+
+/// Tell `slot`'s parent, if it has one, that the child has stopped or continued.
+///
+/// `SA_NOCLDSTOP` on the parent's action for `SIGCHLD` suppresses both, and nothing else: it is
+/// read here rather than left as a constant the tree never consults, because a flag that is
+/// documented and unparsed is a promise the code cannot keep.
+///
+/// Whether the parent ever observes this is its own business. `SIGCHLD`'s default disposition is
+/// to ignore, and [`send_process`] discards an ignored signal where it is sent rather than
+/// leaving it pending — so a parent that installed no handler sees exactly what it saw before.
+/// That is Linux's behaviour, and it is why a check of this must install one.
+fn note_parent(slot: usize) {
+    let parent = PARENT[slot].load(Ordering::Acquire);
+    if parent == 0 {
+        return;
+    }
+    if action_of(parent - 1, sig::SIGCHLD).flags & sig::flags::SA_NOCLDSTOP != 0 {
+        return;
+    }
+    CHILD_NOTES.fetch_add(1, Ordering::Relaxed);
+    let _ = send_process(parent - 1, sig::SIGCHLD, super::pid(slot) as u32);
 }
 
 /// Clear `bits` wherever they are pending in `slot`: the process's own set and every thread's.
@@ -218,6 +283,9 @@ fn continue_process(slot: usize) {
     if STOPPED[slot].swap(0, Ordering::AcqRel) != 0 {
         CONTINUES.fetch_add(1, Ordering::Relaxed);
         STOP_EVENT[slot].store(EVENT_CONTINUED, Ordering::Release);
+        // Inside the arm that saw a stop to undo, so a `SIGCONT` sent to a process that was not
+        // stopped tells the parent nothing: there was no continue to report.
+        note_parent(slot);
         STOP_WAIT.wake_all();
     }
 }
@@ -257,6 +325,9 @@ fn stop_here(slot: usize, signo: u64) {
     STOPPED[slot].store(signo, Ordering::Release);
     STOP_EVENT[slot].store(EVENT_STOPPED | (signo & 0xff), Ordering::Release);
     STOPS.fetch_add(1, Ordering::Relaxed);
+    // Before the park, beside the wake, for the same reason the wake is here: a parent must not
+    // be able to see the stop and find no signal, nor be told of a stop that has not happened.
+    note_parent(slot);
     super::wake_all_waiters();
     let _ = STOP_WAIT.wait_until(None, || {
         (STOPPED[slot].load(Ordering::Acquire) == 0 || userproc::exiting(slot)).then_some(())
@@ -392,6 +463,7 @@ fn claim(key: u32, slot: usize, tid: u64, mask: u64) -> Option<&'static ThreadSi
     t.tid.store(tid, Ordering::Release);
     t.mask.store(mask & !sig::UNBLOCKABLE, Ordering::Release);
     t.pending.store(0, Ordering::Release);
+    t.saved.store(NO_SAVED, Ordering::Release);
     // Last, so no one looking for the key finds the entry half made.
     t.key.store(key, Ordering::Release);
     Some(t)
@@ -542,6 +614,30 @@ pub(super) fn restore_mask(slot: usize, old: u64) {
     }
 }
 
+/// Leave `old` for the next delivery on this thread to restore in place of the mask in force:
+/// what [`suspend`] replaced. See the module documentation for why it cannot simply be put back.
+fn save_mask(slot: usize, old: u64) {
+    if let Some(t) = mine(slot) {
+        t.saved.store(old, Ordering::Release);
+    }
+}
+
+/// Forget a saved mask, for a path that puts it back itself.
+fn clear_saved(slot: usize) {
+    if let Some(t) = mine(slot) {
+        t.saved.store(NO_SAVED, Ordering::Release);
+    }
+}
+
+/// Take the saved mask if there is one, leaving none behind. One swap, so it is restored once
+/// however many deliveries follow.
+fn take_saved(t: &ThreadSignals) -> Option<u64> {
+    match t.saved.swap(NO_SAVED, Ordering::AcqRel) {
+        NO_SAVED => None,
+        old => Some(old),
+    }
+}
+
 /// Whether every thread of `slot` masks `bit`, so a process-wide signal must wait.
 fn masked_everywhere(slot: usize, bit: u64) -> bool {
     let mut any = false;
@@ -689,6 +785,13 @@ pub(super) fn deliver(
                 }
             }
         }
+        // Nothing was delivered, so no frame will carry a saved mask back and this must. This is
+        // the path an `rt_sigsuspend` takes when the signal that woke it turns out to need no
+        // handler: the mask goes back and the call below runs again, which is what Linux's
+        // `ERESTARTNOHAND` does with it.
+        if let Some(old) = take_saved(me) {
+            me.mask.store(old & !sig::UNBLOCKABLE, Ordering::Release);
+        }
     }
     // No handler ran, so a call a signal interrupted runs again.
     if interrupted {
@@ -762,10 +865,15 @@ fn enter_handler(
     } else {
         sig::SI_KERNEL
     };
+    // What `rt_sigreturn` will put back: the mask a call like `rt_sigsuspend` replaced when one
+    // is waiting to be restored, and otherwise the mask in force. The handler still runs under
+    // `mask` below — the mask that was asked for — which is the split Linux makes with
+    // `saved_sigmask`, and the reason the two cannot be the same value.
+    let restore = take_saved(me).unwrap_or(mask);
     let d = Delivery {
         sig: signo,
         action,
-        old_mask: mask,
+        old_mask: restore,
         code,
         pid: from,
         addr: fault_addr(slot, signo),
@@ -1021,6 +1129,43 @@ pub(super) fn procmask(
         super::to_user(old, &before.to_le_bytes())?;
     }
     Ok(0)
+}
+
+/// `rt_sigsuspend`: wear `mask` and wait until a signal arrives that is not ignored. There is no
+/// success — a return means a signal — so this always ends `EINTR`.
+///
+/// The mask is **not** put back on that path: it is left for the delivery instead. The handler
+/// runs under the mask this call asked for, and [`sigreturn`] restores the one it replaced out of
+/// the frame — the split Linux makes with `saved_sigmask`. Putting it back here would run the
+/// handler under the very mask the caller was trying to replace.
+pub(super) fn suspend(slot: usize, set: u64, size: u64) -> Result<u64, Failure> {
+    if size != sig::SIGSET_BYTES {
+        return Err(Failure::InvalidArgument);
+    }
+    let mut bytes = [0u8; 8];
+    super::from_user(set, &mut bytes)?;
+    let wanted = u64::from_le_bytes(bytes);
+    let Some(old) = wear_mask(slot, wanted) else {
+        return Err(Failure::TryAgain);
+    };
+    // Hand the replaced mask to the delivery that is about to happen rather than putting it back
+    // here: the handler must run under the mask this call asked for, and `rt_sigreturn` must put
+    // this one back afterwards. Linux keeps it the same way, as `saved_sigmask`.
+    save_mask(slot, old);
+    let woken = SUSPEND_WAIT.wait_until(None, || {
+        (interrupting(slot) || userproc::exiting(slot)).then_some(interrupting(slot))
+    });
+    // Anything but a signal — the process is ending, or the scheduler cannot block — leaves
+    // nothing to deliver, so no frame will carry the mask back and this must.
+    if woken == Ok(true) {
+        SUSPENDS.fetch_add(1, Ordering::Relaxed);
+        blocked_call_interrupted();
+    } else {
+        clear_saved(slot);
+        restore_mask(slot, old);
+    }
+    userproc::end_if_exiting(slot);
+    Err(Failure::Interrupted)
 }
 
 pub(super) fn pending(slot: usize, set: u64, size: u64) -> Result<u64, Failure> {
@@ -1369,6 +1514,64 @@ pub(super) fn stop_check(c: &dyn EarlyConsole) -> Check {
     }
     let clean = super::report_run(c, &run);
     Check::from_ok(run.code == Some(STOP_SUCCESS) && counted && clean)
+}
+
+/// `argv` for the program's suspending mode, and its exit code when every step behaved; mirror
+/// `user/linux-hello/src/main.rs`.
+const SUSPEND_ARGV: [&[u8]; 2] = [b"hello", b"suspend"];
+const SUSPEND_SUCCESS: u64 = 57;
+/// What that mode does at least: one `rt_sigsuspend` that a signal ended. The notices to a parent
+/// are counted *exactly* rather than at least, because the point of the second half is that two
+/// of the four stops and continues must send nothing at all: the child whose parent asked for
+/// `SA_NOCLDSTOP` is silent, and a count of four would mean the flag was read and ignored.
+const SUSPENDS_EXPECTED: u64 = 1;
+const NOTES_EXPECTED: u64 = 2;
+
+/// Run the program in its suspending mode and grade it: `rt_sigsuspend` wears the mask it is
+/// given, ends only for a signal, runs the handler under that mask and leaves the mask it
+/// replaced behind it; and a parent that installed a handler is told when a child stops and when
+/// it continues, unless it asked not to be. On the boot thread, after the stopping run, whose
+/// slot and stacks it reuses.
+///
+/// As with [`stop_check`], the counters are what separate a kernel that does this from one that
+/// merely lets the program reach its exit: a parent cannot see the difference between a notice
+/// that was suppressed and one that was never sent, so the kernel's own count of what it sent is
+/// the half the program cannot check.
+pub(super) fn suspend_check(c: &dyn EarlyConsole) -> Check {
+    c.write_str("\n  linux suspend ");
+    let before = [&SUSPENDS, &CHILD_NOTES].map(|n| n.load(Ordering::Relaxed));
+    let run = match super::run_mode(&SUSPEND_ARGV) {
+        Ok(run) => run,
+        Err((check, why)) => {
+            c.write_str(why);
+            return check;
+        }
+    };
+    let after = [&SUSPENDS, &CHILD_NOTES].map(|n| n.load(Ordering::Relaxed));
+    let [suspends, notes] = [0, 1].map(|i| after[i] - before[i]);
+    match (run.started, run.code) {
+        (false, _) => c.write_str("the program NEVER STARTED"),
+        (true, None) => c.write_str("the program NEVER EXITED"),
+        (true, Some(SUSPEND_SUCCESS)) => c.write_str(
+            "rt_sigsuspend waited under the mask it was given and ended EINTR, the mask it replaced came back, a parent was told of a stop and of a continue, SA_NOCLDSTOP silenced both",
+        ),
+        (true, Some(code)) => {
+            c.write_str("the program exited ");
+            write_hex(c, code);
+            c.write_str(", WRONG");
+        }
+    }
+    c.write_str("; ");
+    write_usize(c, suspends as usize);
+    c.write_str(" suspended, ");
+    write_usize(c, notes as usize);
+    c.write_str(" told");
+    let counted = suspends >= SUSPENDS_EXPECTED && notes == NOTES_EXPECTED;
+    if !counted {
+        c.write_str("; NOT WHAT THE MODE DOES");
+    }
+    let clean = super::report_run(c, &run);
+    Check::from_ok(run.code == Some(SUSPEND_SUCCESS) && counted && clean)
 }
 
 /// Run the program in its faults mode and grade it: a handler entered for a thread that makes

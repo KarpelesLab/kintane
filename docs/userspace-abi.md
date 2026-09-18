@@ -519,9 +519,9 @@ process, its descriptors or its mappings, and waits on the kernel's wait queues 
 so that another thread of the process can make the call that ends the wait.
 
 **The numbers and the tables.** `kernel/linux/syscalls_x86_64.tbl` is a subset of Linux's
-`syscall_64.tbl`, in its format: 104 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
+`syscall_64.tbl`, in its format: 105 calls. `kernel/linux/syscalls_aarch64.tbl` is a subset of
 the generic table arm64 numbers its calls by, in the format of Linux's `scripts/syscall.tbl`:
-97 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
+98 calls. Neither is turned into code. The calls the personality answers are `linux::Call`s,
 each with its number under each `linux::Abi`; a host test pins every number to its name in
 that ABI's table, and the kernel reads a table at run time only to name a call it does not
 implement. The kernel picks the ABI from its port's ELF machine at compile time, and dispatches
@@ -653,6 +653,7 @@ A wait ends when the process does. Signals will end one with `EINTR`; `interrupt
 | `rt_sigaction` | any signal but `SIGKILL` and `SIGSTOP`, which are `EINVAL`; `sigsetsize` must be 8. A handler must carry `SA_RESTORER`, since the kernel has no trampoline of its own to return through; one without is `EINVAL`. `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND` are honoured, and `SA_ONSTACK` has no effect, as with no alternate stack set. Setting a signal to be ignored discards it where it is pending |
 | `rt_sigprocmask` | `SIG_BLOCK`, `SIG_UNBLOCK` and `SIG_SETMASK` on the calling thread's mask; `SIGKILL` and `SIGSTOP` are never blocked |
 | `rt_sigpending` | the pending signals the calling thread blocks, its own and its process's |
+| `rt_sigsuspend` | wears the mask given, waits until a signal arrives that is not ignored, and always ends `EINTR`; `sigsetsize` must be 8, and `SIGKILL` and `SIGSTOP` are dropped from the mask as elsewhere. There is no success: a return means a signal. A handler runs under the mask that was asked for, and the mask it *replaced* is restored afterwards by `rt_sigreturn`, which the call leaves in the frame for it rather than putting back itself — Linux's `saved_sigmask`, and the reason the idiom of blocking a signal, testing a flag and suspending is free of the race it exists to avoid. A signal that needs no handler restarts the call instead of ending it, as Linux's `ERESTARTNOHAND` does |
 | `rt_sigreturn` | resumes from the frame below the stack pointer, validated; a frame it refuses ends the process with `SIGSEGV` |
 | `sigaltstack` | reports that there is no alternate stack; setting one is `ENOSYS`, and logged |
 | `kill` | a signal, or 0 to ask whether the process exists, to a Linux process by pid. A process group and -1 are `EINVAL`. `SIGSTOP` is accepted and stops the process; `SIGCONT` resumes it |
@@ -692,10 +693,20 @@ an undelivered `SIGCONT`: the later of the two decides, as Linux promises.
 it is given, so blocking it does not stop it from stopping the process. `SIGKILL` ends a stopped
 process rather than waiting for it to be continued.
 
-*What a parent sees.* Only by asking. `wait4` reports a stop with `WUNTRACED` and a continue with
-`WCONTINUED`, each **once**, and neither reaps the child. **No `SIGCHLD` is sent when a child
-stops or continues**, so `SA_NOCLDSTOP` has nothing to suppress. A parent that asks for neither
-option never learns the child stopped, and waits on.
+*What a parent sees.* Two ways, and they are independent. `wait4` reports a stop with `WUNTRACED`
+and a continue with `WCONTINUED`, each **once**, and neither reaps the child. Separately, the
+parent is sent `SIGCHLD` when a child stops and again when one continues, unless its action for
+`SIGCHLD` carries `SA_NOCLDSTOP`, which suppresses both and nothing else.
+
+That signal is only observable to a parent that installed a handler. `SIGCHLD`'s default
+disposition is to ignore, and an ignored signal is discarded where it is sent rather than left
+pending — so a parent using the default sees exactly what it saw before, and one asking `wait4`
+with neither option still never learns the child stopped, and waits on. This is Linux's behaviour
+rather than an economy: there, too, the notification exists for handlers.
+
+The signal is sent *before* the stopping thread parks, on the same line that wakes a parent
+already blocked in `wait4`. A parent therefore cannot be woken by the child's stop and find no
+signal waiting, nor be sent a signal about a stop that has not happened yet.
 
 *Not built at all:* process groups and job control — there are none, so nothing sends `SIGTTIN`
 or `SIGTTOU` of its own accord and the terminal signals only arrive if a program sends them;
@@ -805,7 +816,8 @@ handler to the default while an ignored signal stays ignored.
   `SA_RESTART`, or no handler runs after all, the call returns to its own system call instruction
   with its arguments, and runs again.
 - **Generated by the kernel:** `SIGCHLD` to a parent when a child's last thread has gone, and
-  `SIGPIPE` to a thread whose write found no reader. A trap ends a Linux process as `SIGSEGV`
+  again when a child stops or continues unless the parent's action for it carries `SA_NOCLDSTOP`;
+  and `SIGPIPE` to a thread whose write found no reader. A trap ends a Linux process as `SIGSEGV`
   would, but runs no handler, since the trap hook has no registers either.
 
 **Limits, all of them fixed sizes:** 4 process slots, and a pool of 3 process threads at once per
@@ -833,10 +845,13 @@ no corpus yet for a gap to fail.
 
 **What it does not do yet:**
 
-- **Signals are not complete.** There is no alternate signal stack, `rt_sigsuspend`,
-  `rt_sigtimedwait` or `signalfd`, and no `SIGCHLD` is sent to a parent when a child stops or
-  continues — so `SA_NOCLDSTOP` has nothing to suppress, and a parent learns of a stop by asking
-  with `WUNTRACED` or `WCONTINUED` rather than by being told.
+- **Signals are not complete.** There is no alternate signal stack, no `rt_sigtimedwait` and no
+  `signalfd`. The two are grouped by name and are not the same distance away: `rt_sigtimedwait`
+  must *dequeue* a signal and report its number **without running a handler**, and the only
+  place a pending signal is taken from is inside delivery, so consuming-without-delivering does
+  not exist here; it also needs a wait that tells "timed out" from "nothing ready", where the
+  present one answers both with zero. That is two new mechanisms rather than one more call,
+  which is why it did not land beside `rt_sigsuspend`.
 - **Real-time signals queue; the rest coalesce.** A signal of 32 or above sent with
   `rt_sigqueueinfo` is kept whole — three sent are three delivered, oldest first, each with its
   own `si_value` — up to eight entries per process, after which a send is `EAGAIN` rather than a

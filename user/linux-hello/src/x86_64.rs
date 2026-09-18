@@ -37,6 +37,7 @@ pub const GETRANDOM: u64 = 318;
 pub const RT_SIGACTION: u64 = 13;
 pub const RT_SIGPROCMASK: u64 = 14;
 pub const RT_SIGPENDING: u64 = 127;
+pub const RT_SIGSUSPEND: u64 = 130;
 pub const RT_SIGQUEUEINFO: u64 = 129;
 pub const KILL: u64 = 62;
 pub const TGKILL: u64 = 234;
