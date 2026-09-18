@@ -65,6 +65,32 @@ pub const SECTORS2: u64 = FS_START;
 /// wrong ones on the other.
 pub const DISK2: usize = 1;
 
+/// Sectors in the third disk's image.
+///
+/// The third disk carries no volume either, and unlike the second it is never written: it is
+/// attached read-only, so it has no scratch area and ends where one would begin. That is also
+/// what gives it a length of its own, which is what lets a header tell it from the second disk.
+pub const SECTORS3: u64 = SCRATCH_START;
+
+/// The third disk's index in [`pattern_on`]'s hash; mirrors `kbuild/src/testdisk.rs`'s `DISK3`.
+pub const DISK3: usize = 2;
+
+/// Each image's length in sectors, indexed by image.
+///
+/// A disk's header names its own length, so this table is what turns what a disk *says* it is
+/// into which image it carries ([`image_named`]) — identity read off the medium rather than
+/// inferred from the slot it was bound in. The lengths must stay pairwise distinct: two images
+/// of one length would be two disks no header could tell apart.
+pub const IMAGE_SECTORS: [u64; 3] = [SECTORS, SECTORS2, SECTORS3];
+
+/// Which image a disk whose header names `sectors` carries, if it is one of this format's.
+///
+/// `None` for a disk carrying something else, which is a disk to report rather than one to
+/// check against another image's bytes.
+pub fn image_named(sectors: u64) -> Option<usize> {
+    IMAGE_SECTORS.iter().position(|&n| n == sectors)
+}
+
 /// `/HELLO.TXT`'s content.
 pub const HELLO: &[u8] = b"hello from the KinTane test disk\n";
 /// `/SUB/NESTED.TXT`'s content.
@@ -188,8 +214,7 @@ pub fn fill_sector_on(disk: usize, sector: u64, into: &mut [u8]) {
     if sector == 0 && into.len() >= HEADER_BYTES {
         into[..8].copy_from_slice(MAGIC);
         into[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        let sectors = if disk == 0 { SECTORS } else { SECTORS2 };
-        into[12..16].copy_from_slice(&(sectors as u32).to_le_bytes());
+        into[12..16].copy_from_slice(&(IMAGE_SECTORS[disk] as u32).to_le_bytes());
     }
 }
 
@@ -283,17 +308,28 @@ mod tests {
 
     #[test]
     fn a_sector_from_the_wrong_disk_matches_nothing() {
-        // What the wrong-binding check rests on: the same sector on the two disks shares
-        // almost no byte, so a read served by the other device is caught by content.
+        // What the wrong-binding check rests on: the same sector on any two of the disks
+        // shares almost no byte, so a read served by another device is caught by content.
+        // Every sector compared is below the shortest image, so all three disks have it.
         let mut a = [0u8; SECTOR];
         let mut b = [0u8; SECTOR];
-        for sector in [1, 7, 1000, FS_START - 1] {
-            fill_sector_on(0, sector, &mut a);
-            fill_sector_on(1, sector, &mut b);
-            let same = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
-            assert!(same < SECTOR / 16, "sector {sector}: {same} of {SECTOR} bytes equal");
-            assert_eq!(first_mismatch_on(1, sector, &a), Some(0), "disk 0 passes as disk 1");
-            assert_eq!(first_mismatch_on(0, sector, &b), Some(0), "disk 1 passes as disk 0");
+        for sector in [1, 7, 1000, SECTORS3 - 1] {
+            for i in 0..IMAGE_SECTORS.len() {
+                for j in 0..IMAGE_SECTORS.len() {
+                    if i == j {
+                        continue;
+                    }
+                    fill_sector_on(i, sector, &mut a);
+                    fill_sector_on(j, sector, &mut b);
+                    let same = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+                    assert!(same < SECTOR / 16, "sector {sector}, images {i}/{j}: {same} equal");
+                    assert_eq!(
+                        first_mismatch_on(j, sector, &a),
+                        Some(0),
+                        "image {i} passes as {j}"
+                    );
+                }
+            }
         }
     }
 
@@ -302,10 +338,31 @@ mod tests {
         let mut s0 = [0u8; SECTOR];
         fill_sector_on(0, 0, &mut s0);
         assert_eq!(header(&s0), Some(SECTORS));
-        fill_sector_on(1, 0, &mut s0);
+        fill_sector_on(DISK2, 0, &mut s0);
         assert_eq!(header(&s0), Some(SECTORS2), "the second disk names its own length");
-        assert_ne!(SECTORS, SECTORS2, "the two lengths must differ to tell them apart");
+        fill_sector_on(DISK3, 0, &mut s0);
+        assert_eq!(header(&s0), Some(SECTORS3), "and the third names its own");
         assert_eq!(SECTORS2, FS_START, "the second disk is pattern only");
+        assert_eq!(SECTORS3, SCRATCH_START, "and the third is pattern that is never written");
+    }
+
+    #[test]
+    fn a_header_says_which_image_the_disk_carries() {
+        // The identity key: what a disk carries is read off the disk rather than inferred from
+        // the slot it was bound in. Two images of one length would be two disks no header could
+        // tell apart, so the lengths are pairwise distinct and `image_named` is their inverse.
+        for (image, &sectors) in IMAGE_SECTORS.iter().enumerate() {
+            let mut s0 = [0u8; SECTOR];
+            fill_sector_on(image, 0, &mut s0);
+            assert_eq!(header(&s0), Some(sectors), "image {image} names its own length");
+            assert_eq!(image_named(sectors), Some(image), "and that length names it back");
+        }
+        for i in 0..IMAGE_SECTORS.len() {
+            for j in 0..i {
+                assert_ne!(IMAGE_SECTORS[i], IMAGE_SECTORS[j], "images {i} and {j} share a length");
+            }
+        }
+        assert_eq!(image_named(SECTORS + 1), None, "a length no image has names none");
     }
 
     #[test]

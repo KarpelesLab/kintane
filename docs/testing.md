@@ -532,9 +532,12 @@ still serves its own data afterwards. Without an IOMMU only the first of the thr
 What a disk holds follows the **image** it was attached from, not the slot it was bound in. The
 two agree on PCI, where enumeration follows the order the drives were given, and differ on
 virtio-mmio, where QEMU fills `virt`'s slots downwards so the volume's disk arrives in the higher
-one. The check asks `image_of`, which reuses what `choose_primary` already established by reading
-each disk's header, rather than trusting a slot number — the same rule `kbuild/src/qemu.rs`
-states for the drives it attaches.
+one. The check asks `image_of`, which reads back what `choose_primary` recorded for that slot when
+it read the disk's header — every image names its own length, so `testdisk::image_named` turns the
+length a header names into the image that named it, and nothing infers an image from a slot number.
+That is the same rule `kbuild/src/qemu.rs` states for the drives it attaches, and it is why the
+`virtio-blk-pci` function `QEMU_PCIE_BLOCK` attaches has `testdisk3.img` of its own rather than the
+second disk's file: two disks sharing an image are two disks no header could tell apart.
 
 Each was falsified. Keying the expected contents by slot index rather than by image — the bug
 this check shipped with — fails on `aarch64-virt` with `DISK 1 DID NOT READ BACK ITS OWN

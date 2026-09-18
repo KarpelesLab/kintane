@@ -49,6 +49,13 @@ pub const SECTORS: u64 = FS32_START + FS32_SECTORS;
 /// disk's volume would begin.
 pub const SECTORS2: u64 = FS_START;
 
+/// Sectors in the third disk's image; mirrors the kernel's `SECTORS3`.
+///
+/// The third disk carries no volume either, and unlike the second it is never written: it is
+/// attached read-only, so it has no scratch area and ends where one would begin. That is also
+/// what gives it a length of its own, which is what lets a header tell it from the second disk.
+pub const SECTORS3: u64 = SCRATCH_START;
+
 /// The config symbol that attaches the disk.
 pub const SYMBOL: &str = "QEMU_BLOCK_TEST";
 
@@ -58,6 +65,12 @@ pub const FILE: &str = "testdisk.img";
 /// The second disk's file name. Its own file, not a second attachment of the first: two
 /// `-drive`s on one image make QEMU refuse the run with `Failed to get shared "write" lock`.
 pub const FILE2: &str = "testdisk2.img";
+
+/// The third disk's file name, for the function on the PCIe bus. Its own image rather than a
+/// second attachment of the second disk's: a disk is told from another by the length its header
+/// names, so a function sharing an image with a memory-mapped slot would be a disk no header
+/// could tell from it.
+pub const FILE3: &str = "testdisk3.img";
 
 /// `/HELLO.TXT`: one cluster.
 const HELLO: &[u8] = b"hello from the KinTane test disk\n";
@@ -216,34 +229,60 @@ pub fn image(program: Option<&[u8]>, linux: Option<&[u8]>) -> Result<Vec<u8>, St
     Ok(disk)
 }
 
-/// The second disk's image: header and pattern, no volume.
+/// A pattern-only image of `sectors` sectors, carrying image `disk`'s bytes: header and
+/// pattern, no volume.
 ///
-/// A pure function of its constants like [`image`], so it is byte-identical on every build.
-pub fn image2() -> Vec<u8> {
-    let mut disk = vec![0u8; SECTORS2 as usize * SECTOR];
-    for (sector, bytes) in disk.chunks_exact_mut(SECTOR).enumerate() {
+/// A pure function of its arguments like [`image`], so it is byte-identical on every build.
+/// The header names this image's own length, which is how the kernel tells one pattern-only
+/// disk from another without trusting the slot it was bound in.
+fn pattern_image(disk: usize, sectors: u64) -> Vec<u8> {
+    let mut image = vec![0u8; sectors as usize * SECTOR];
+    for (sector, bytes) in image.chunks_exact_mut(SECTOR).enumerate() {
         for (i, b) in bytes.iter_mut().enumerate() {
-            *b = pattern_on(DISK2, sector as u64, i);
+            *b = pattern_on(disk, sector as u64, i);
         }
     }
-    disk[..8].copy_from_slice(MAGIC);
-    disk[8..12].copy_from_slice(&VERSION.to_le_bytes());
-    disk[12..HEADER_BYTES].copy_from_slice(&(SECTORS2 as u32).to_le_bytes());
-    disk
+    image[..8].copy_from_slice(MAGIC);
+    image[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    image[12..HEADER_BYTES].copy_from_slice(&(sectors as u32).to_le_bytes());
+    image
+}
+
+/// The second disk's image: header and pattern, no volume.
+pub fn image2() -> Vec<u8> {
+    pattern_image(DISK2, SECTORS2)
+}
+
+/// The third disk's image, for the function on the PCIe bus: header and pattern, no volume and
+/// no scratch area, since nothing writes it.
+pub fn image3() -> Vec<u8> {
+    pattern_image(DISK3, SECTORS3)
 }
 
 /// The second disk's index, in [`pattern_on`]'s terms.
 pub const DISK2: usize = 1;
 
-/// Write the second disk's image into `out`, unless the file already holds these bytes.
-pub fn write2(out: &Path) -> Result<PathBuf, String> {
-    let path = out.join(FILE2);
-    let bytes = image2();
+/// The third disk's index, in [`pattern_on`]'s terms; mirrors the kernel's `DISK3`.
+pub const DISK3: usize = 2;
+
+/// Write `bytes` into `out/name`, unless the file already holds exactly them.
+fn write_bytes(out: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = out.join(name);
     if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
         return Ok(path);
     }
-    std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Write the second disk's image into `out`, unless the file already holds these bytes.
+pub fn write2(out: &Path) -> Result<PathBuf, String> {
+    write_bytes(out, FILE2, &image2())
+}
+
+/// Write the third disk's image into `out`, unless the file already holds these bytes.
+pub fn write3(out: &Path) -> Result<PathBuf, String> {
+    write_bytes(out, FILE3, &image3())
 }
 
 /// Write the image into `out`, unless the file already holds exactly these bytes. With
@@ -349,6 +388,42 @@ mod tests {
     #[test]
     fn the_second_disks_image_is_the_same_on_every_build() {
         assert_eq!(image2(), image2());
+    }
+
+    #[test]
+    fn the_third_disk_shares_no_sector_with_the_others_and_names_its_own_length() {
+        let first = image(None, None).unwrap();
+        let second = image2();
+        let third = image3();
+        assert_eq!(third.len(), SECTORS3 as usize * SECTOR);
+        assert_eq!(&third[..8], MAGIC, "the third disk carries the same format");
+        assert_eq!(
+            u32::from_le_bytes(third[12..16].try_into().unwrap()),
+            SECTORS3 as u32,
+            "and names its own length, which is how a header tells it from the second disk"
+        );
+        // Pairwise distinct lengths. Two images of one length would be two disks no header
+        // could tell apart — which is what the PCIe function was, while it shared FILE2.
+        assert_ne!(SECTORS, SECTORS2);
+        assert_ne!(SECTORS, SECTORS3);
+        assert_ne!(SECTORS2, SECTORS3);
+        // Past the header, no two of the three share a sector.
+        for sector in [1usize, 7, 1000, SECTORS3 as usize - 1] {
+            for (what, a, b) in [
+                ("first/third", &first, &third),
+                ("second/third", &second, &third),
+            ] {
+                let a = &a[sector * SECTOR..][..SECTOR];
+                let b = &b[sector * SECTOR..][..SECTOR];
+                let same = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+                assert!(same < SECTOR / 16, "{what} sector {sector}: {same} of {SECTOR} equal");
+            }
+        }
+    }
+
+    #[test]
+    fn the_third_disks_image_is_the_same_on_every_build() {
+        assert_eq!(image3(), image3());
     }
 
     #[test]

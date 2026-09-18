@@ -881,9 +881,12 @@ config QEMU_PCIE_BLOCK
         rather than part of QEMU_BLOCK_TEST, whose contract is that a driver
         binds the disk and the boot gates on reading it -- true of the
         memory-mapped disks this port already has, and not of a PCI function
-        here. The drive is read-only and points at the second disk's pristine
-        image, because nothing writes what nothing drives, and because both run
-        copies are already attached to the memory-mapped devices.
+        here. The drive is read-only and points at a third image of its own,
+        testdisk3.img, because nothing writes what nothing drives and because
+        both run copies are already attached to the memory-mapped devices. Its
+        own image rather than the second disk's: what a disk carries is read
+        from the length its header names, so two disks sharing an image are two
+        disks no header could tell apart.
 
         A PCI function cannot be bound on this port today. The walk happens in
         the check phase, because configuration space is out of reach until the

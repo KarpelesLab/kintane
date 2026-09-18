@@ -1196,8 +1196,9 @@ correctly keyed by index. An *image* is what a medium carries, and bytes are its
 disk holds the volume, and which pattern a sector should match. The two agree on PCI, where
 enumeration follows the order the drives were attached, and disagree on memory-mapped virtio, where
 QEMU fills `virt`'s slots downwards while enumeration walks upwards. So the kernel reads each disk's
-header to decide which slot carries the volume (`block::choose_primary`), `block::image_of` turns a
-slot into the image it holds, and `virtio_blk::slot` turns a device's node back into its slot, which
+header to decide what each disk carries (`block::choose_primary`, which records the image whose
+length each header names), `block::image_of` reads that record back rather than inferring it from
+the slot, and `virtio_blk::slot` turns a device's node back into its slot, which
 is how a platform wires the right line to the right disk. Keying an identity by position yields a
 check that passes where it is written and fails where it is needed: one did, for two rounds, because
 every gate that ran it used PCI -- where the two numberings happen to agree.
@@ -1693,6 +1694,15 @@ the same hash before its shift, so disk 0 adds zero and is byte for byte the ima
 while disk 1 shares almost no byte of any sector with it. Each disk's header names its own
 length. That is what lets a read served through the wrong device's binding be caught by content,
 rather than by trusting the binding that served it.
+
+**A third image, before a third disk.** `QEMU_PCIE_BLOCK` attaches a `virtio-blk-pci` function to
+the PCIe bus, and until it had an image of its own it pointed at the second disk's file — which
+would have been a disk no header could tell from the second the moment anything bound it.
+`testdisk3.img` of `SECTORS3` sectors is that image: pattern all the way down like the second, and
+never written, so it has no scratch area and ends where one would begin. The three lengths are
+pairwise distinct, and `testdisk::image_named` turns the length a header names back into the image
+that named it, which is how `block::choose_primary` records what every bound slot carries. The
+image comes first: nothing binds that function yet.
 
 **Which disk carries the volume is read, not assumed.** A slot's number is the order the
 platform enumerated the devices in, which need not be the order the run gave the drives: QEMU

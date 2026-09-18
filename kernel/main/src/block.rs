@@ -68,6 +68,20 @@ static STARTED: [AtomicBool; virtio_blk::MAX_DISKS] =
 /// image's length.
 static PRIMARY: AtomicUsize = AtomicUsize::new(0);
 
+/// What a slot's entry in [`IMAGES`] holds until a header has said what its disk carries.
+const NO_IMAGE: usize = usize::MAX;
+
+/// Which *image* each slot's disk carries, as that disk's own header named it.
+///
+/// Filled by [`choose_primary`], which reads sector 0 of every bound slot and turns the length
+/// the header names into an image through [`testdisk::image_named`]. This is the identity half
+/// of the position-or-identity split: a slot is where a device sits, an image is what the medium
+/// carries, and the two disagree wherever enumeration order is not the order the drives were
+/// attached. Keying bytes by slot reads the right ones on one port and the wrong ones on
+/// another; keying them by what the disk says it carries reads the right ones on both.
+static IMAGES: [AtomicUsize; virtio_blk::MAX_DISKS] =
+    [const { AtomicUsize::new(NO_IMAGE) }; virtio_blk::MAX_DISKS];
+
 /// The disk carrying the volumes: what the filesystem, the stress workload and the driver
 /// domain all mean by "the disk".
 pub fn disk() -> Option<&'static VirtioBlk<Locks>> {
@@ -387,27 +401,30 @@ const PROBE_LBA: u64 = 7;
 
 /// Which *image* the disk in slot `i` carries, which is what its bytes are keyed by.
 ///
-/// Not the slot number. `choose_primary` has already read each disk's header and recorded which
-/// slot holds the volumes, so the volume's disk is image 0 and the only other bound disk is
-/// image [`testdisk::DISK2`]. On PCI the two numberings agree, because enumeration follows the
-/// order the drives were attached; on virtio-mmio they do not, because QEMU fills the slots
-/// downwards and the volume's disk lands in the higher one. Keying by slot reads the right bytes
-/// on one port and the wrong ones on the other, which is a check that passes where it is written
-/// and fails where it is needed.
-/// `image_of`'s mapping is exhaustive only while there are two disks: every slot that is not the
-/// primary's is taken to carry [`testdisk::DISK2`]. A third disk would key to the second one's
-/// image and be checked against bytes that are not its own -- this very bug, one slot further
-/// along, and visible only on a port that attached three disks.
+/// Not the slot number, and no longer inferred from it either: [`choose_primary`] has read every
+/// bound disk's header and recorded in [`IMAGES`] the image whose length that header named. On
+/// PCI the two numberings agree, because enumeration follows the order the drives were attached;
+/// on virtio-mmio they do not, because QEMU fills the slots downwards and the volume's disk lands
+/// in the higher one. Keying by slot reads the right bytes on one port and the wrong ones on the
+/// other, which is a check that passes where it is written and fails where it is needed.
+///
+/// `None` for a slot whose disk carries no image this kernel knows — a disk to report, rather
+/// than one to check against some other image's bytes.
+///
+/// Every slot a boot can bind needs an image of its own for a header to name. While there were
+/// two of each, sending every non-primary slot to `DISK2` was exhaustive by accident; a third
+/// disk would have keyed to the second one's image and been checked against bytes that are not
+/// its own. Reading the image off the header instead leaves the count as the only thing that has
+/// to hold.
 const _: () = assert!(
-    virtio_blk::MAX_DISKS == 2,
-    "image_of maps every non-primary slot to DISK2; a third disk needs an image of its own"
+    testdisk::IMAGE_SECTORS.len() >= virtio_blk::MAX_DISKS,
+    "a slot this kernel can bind has no image of its own for a header to name"
 );
 
-fn image_of(slot: usize) -> usize {
-    if slot == primary() {
-        0
-    } else {
-        testdisk::DISK2
+fn image_of(slot: usize) -> Option<usize> {
+    match IMAGES.get(slot)?.load(Ordering::Acquire) {
+        NO_IMAGE => None,
+        image => Some(image),
     }
 }
 
@@ -452,7 +469,13 @@ fn two_device_checks(
             c.write_str("A DISK WOULD NOT SERVE THE READ");
             return false;
         }
-        if let Some(at) = testdisk::first_mismatch_on(image_of(i), PROBE_LBA, sector) {
+        let Some(image) = image_of(i) else {
+            c.write_str("DISK ");
+            write_usize(c, i);
+            c.write_str(" CARRIES NO IMAGE THIS KERNEL KNOWS");
+            return false;
+        };
+        if let Some(at) = testdisk::first_mismatch_on(image, PROBE_LBA, sector) {
             c.write_str("DISK ");
             write_usize(c, i);
             c.write_str(" DID NOT READ BACK ITS OWN PATTERN, FIRST AT BYTE ");
@@ -462,7 +485,9 @@ fn two_device_checks(
         // And it is not the *other* disk's bytes: the two images must actually differ here, or
         // reading through the wrong binding would have passed the check above.
         let twin = if i == primary() { other } else { primary() };
-        if testdisk::first_mismatch_on(image_of(twin), PROBE_LBA, sector).is_none() {
+        let reads_as_twin = image_of(twin)
+            .is_some_and(|t| testdisk::first_mismatch_on(t, PROBE_LBA, sector).is_none());
+        if reads_as_twin {
             c.write_str("THE TWO DISKS' SECTORS ARE INDISTINGUISHABLE");
             return false;
         }
@@ -577,7 +602,8 @@ fn second_disk_confined(
     };
     let sector = &mut buf[..testdisk::SECTOR];
     if blk.read_blocks(PROBE_LBA, sector).is_err()
-        || testdisk::first_mismatch_on(image_of(primary()), PROBE_LBA, sector).is_some()
+        || image_of(primary())
+            .is_none_or(|im| testdisk::first_mismatch_on(im, PROBE_LBA, sector).is_some())
     {
         c.write_str("; THE OTHER DISK STOPPED SERVING AFTER ITS NEIGHBOUR FAULTED");
         return false;
@@ -586,13 +612,14 @@ fn second_disk_confined(
     stopped && untouched
 }
 
-/// Record which bound disk carries the volumes, by reading each one's header, and set
-/// `primary_grant` to that disk's grant.
+/// Record what each bound disk carries, by reading its header, and set `primary_grant` to the
+/// grant of the one carrying the volumes.
 ///
-/// The volume-carrying image's header names [`testdisk::SECTORS`]; the second disk's names
-/// its own, shorter length. So the disks identify themselves and nothing here trusts a slot
-/// number. With one disk this chooses it and says nothing, leaving the single-drive path
-/// exactly as it was.
+/// Every image's header names its own length, so a disk says which image it carries and nothing
+/// here trusts a slot number. Every bound slot is read, not only the slots before the volume's:
+/// [`image_of`] answers for all of them, and a slot left unrecorded would be one whose bytes
+/// nothing could be keyed by. With one disk this chooses it and says nothing, leaving the
+/// single-drive path exactly as it was.
 fn choose_primary(c: &dyn EarlyConsole, primary_grant: &mut Option<(usize, u64, usize)>) -> bool {
     let mut sector = [0u8; testdisk::SECTOR];
     let mut found = None;
@@ -601,9 +628,17 @@ fn choose_primary(c: &dyn EarlyConsole, primary_grant: &mut Option<(usize, u64, 
         if blk.read_blocks(0, &mut sector).is_err() {
             continue;
         }
-        if testdisk::header(&sector) == Some(testdisk::SECTORS) {
-            found = Some(i);
-            break;
+        // What this disk carries, from the length its own header names. A disk carrying
+        // something else records nothing, and `image_of` reports it rather than keying its
+        // bytes to an image that is not its own.
+        let Some(image) = testdisk::header(&sector).and_then(testdisk::image_named) else {
+            continue;
+        };
+        IMAGES[i].store(image, Ordering::Release);
+        // The volume's image, in the first slot carrying it. The loop runs on rather than
+        // breaking, so that every slot's image is recorded and not only those before this one.
+        if image == 0 {
+            found = found.or(Some(i));
         }
     }
     match found {

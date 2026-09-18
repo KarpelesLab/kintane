@@ -1278,6 +1278,11 @@ fn do_build(root: &Path, opts: &Opts) -> Result<(PathBuf, kcfg::Resolution), Str
         // The second disk, beside the first. It carries no volume and no program: it exists so
         // the machine has two block devices to tell apart.
         testdisk::write2(image.parent().unwrap_or(Path::new(".")))?;
+        // And the third, for the function `QEMU_PCIE_BLOCK` puts on the PCIe bus. Its own image
+        // rather than a second attachment of the second disk's, for the reason `pcie_endpoint`
+        // gives: what a disk carries is read from the length its header names, so two disks
+        // sharing an image are two disks no header could tell apart.
+        testdisk::write3(image.parent().unwrap_or(Path::new(".")))?;
     }
     // A module asking for another configuration gets this one with its overrides on top.
     // A `--set` the overridden configuration cannot honour is dropped for that build only:

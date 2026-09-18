@@ -354,13 +354,16 @@ fn pcie_endpoint(res: &Resolution, image: &Path) -> Vec<String> {
     // Its own file, and read-only. Two `-drive`s on one image make QEMU refuse the run with
     // `Failed to get "write" lock`, and on this port the memory-mapped disks already hold both
     // run copies — `QEMU_BLOCK_TEST` defaults on for aarch64, so a preset that never names it
-    // still attaches them. This one points at the second disk's *pristine* image, which nothing
-    // else attaches, and takes no write lock at all: nothing binds this function, so nothing
-    // writes it, and saying so on the command line keeps it that way.
+    // still attaches them. This one points at the *third* disk's image, which nothing else
+    // attaches: a disk is told from another by the length its header names, so a function
+    // sharing the second disk's image would be a disk no header could tell from it — the check
+    // that each binding reaches its own disk could not be made of them. It takes no write lock
+    // at all: nothing binds this function yet, so nothing writes it, and saying so on the
+    // command line keeps it that way.
     let pristine = image
         .parent()
         .unwrap_or(Path::new("."))
-        .join(crate::testdisk::FILE2);
+        .join(crate::testdisk::FILE3);
     vec![
         "-drive".to_string(),
         format!("file={},if=none,id=kt_pcie,format=raw,readonly=on", pristine.display()),

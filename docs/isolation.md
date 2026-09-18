@@ -496,8 +496,8 @@ A disk on PCIe, which is where confinement becomes reachable:
 - `virtio-blk-pci` on the QEMU command line for this port. **Built**, with `QEMU_PCIE_BLOCK`: the
   function is attached and the `pcie` check gates on the walk finding it, because a bridge presents
   its own function whether or not anything is plugged in. Nothing binds the function and nothing
-  reads it: its drive is read-only and points at the second disk's pristine image, because both run
-  copies are already attached to the memory-mapped devices. The `block` check is untouched and still
+  reads it: its drive is read-only and points at `testdisk3.img`, an image of its own, because both
+  run copies are already attached to the memory-mapped devices. The `block` check is untouched and still
   passes — this port's disks are the memory-mapped ones, which `QEMU_BLOCK_TEST` attaches by default
   on aarch64 whether or not a preset names the symbol.
 - the block driver binding through PCI on aarch64. **This is what the next stage is actually blocked
@@ -512,14 +512,17 @@ A disk on PCIe, which is where confinement becomes reachable:
   each enumerated `Function` with `Origin::Pci(f)`; this platform calls `DeviceTree::build` once,
   from the blob, and has no second pass. *And binding one means a third disk* — this preset resolves
   `QEMU_BLOCK_TEST` and `QEMU_PCIE_BLOCK` together and already boots with both memory-mapped slots
-  taken, `virtio_blk`'s probe declines when no slot is free, and `MAX_DISKS` sizes fourteen arrays,
-  with `block.rs` asserting it equals two because `image_of` maps every non-primary slot to the
-  second disk's image. A third disk keyed that way would be the position-versus-identity bug one slot
-  along. The `Resources` ledger being a dropped local is true and still needed, but it is third in
-  order: a second tree pass on this platform adding enumerated functions as nodes, then a ledger and
-  tree that outlive discovery, then a third image before a third disk — the last gating the other
-  two. The mechanisms are already where they are needed: `Builder` is exported, `NODES` is a static
-  the builder can take, `tree.mmio()` resolves a function's base address registers, and the tree uses
+  taken, `virtio_blk`'s probe declines when no slot is free, and `MAX_DISKS` sizes fourteen arrays.
+  **The image half of that is now done.** `block.rs` no longer asserts `MAX_DISKS == 2`: the function
+  has `testdisk3.img`, of a third length of its own, and `image_of` reads each slot's image out of
+  what `choose_primary` recorded from that disk's header rather than sending every non-primary slot
+  to the second disk's image. Raising `MAX_DISKS` is now a one-line change, deliberately left to
+  whoever binds the function, since a third slot costs every preset a `VirtioBlk` in `.bss` for a
+  slot only `aarch64-pcie` can fill. What remains in front of the ledger is the first item above.
+  The `Resources` ledger being a dropped local is true and still needed: a second tree pass on this
+  platform adding enumerated functions as nodes, then a ledger and tree that outlive discovery. The
+  mechanisms are already where they are needed: `Builder` is exported, `NODES` is a static the
+  builder can take, `tree.mmio()` resolves a function's base address registers, and the tree uses
   57 of 256 nodes.
 - an interrupt. **Not the ITS, and not message-signalled at all, necessarily.** `virt`'s bridge node
   carries `interrupt-map` and `interrupt-map-mask` as well as `msi-map`, so a function's legacy INTx
