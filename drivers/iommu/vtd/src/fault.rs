@@ -9,37 +9,17 @@
 //! and clears it. A machine with a deeper log would iterate `CAP.NFR + 1` of them; one is what
 //! the demonstration needs and what is host-tested.
 
+use iommu::Fault;
+
 use crate::{Regs, reg};
 
-/// One recorded fault: a DMA the device's domain does not allow, or an interrupt the
-/// remapping table does not.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Fault {
-    /// The device address the device tried to reach. For an interrupt-remapping fault, the
-    /// fault information field instead, whose top 16 bits are the table index the blocked
-    /// message named; see [`Fault::interrupt_index`].
-    pub address: u64,
-    /// The faulting device's source id (`bus << 8 | dev << 3 | fn`).
-    pub source_id: u16,
-    /// The fault reason (VT-d §7.1, Table 7-1): e.g. 5 is "write to a non-writable page", 6 is
-    /// "read from a page with no read permission".
-    pub reason: u8,
-    /// Whether the access was a write.
-    pub write: bool,
-}
-
-impl Fault {
-    /// Whether this is an interrupt-remapping fault (VT-d §7.1, reasons 0x20 to 0x26): a
-    /// message blocked by the remapping table rather than a DMA blocked by a domain.
-    pub fn is_interrupt(&self) -> bool {
-        (0x20..=0x26).contains(&self.reason)
-    }
-
-    /// For an interrupt-remapping fault, the table index the blocked message named: bits
-    /// 63:48 of the fault information field (VT-d §10.4.14).
-    pub fn interrupt_index(&self) -> Option<u16> {
-        self.is_interrupt().then_some((self.address >> 48) as u16)
-    }
+/// Whether a reason code is an interrupt-remapping fault (VT-d §7.1, reasons 0x20 to 0x26): a
+/// message blocked by the remapping table rather than a DMA blocked by a domain.
+///
+/// This range is VT-d's, so it stays here: what leaves this crate is the decoded index, not a
+/// number a caller would have to look up in Intel's table to understand.
+fn is_interrupt(reason: u8) -> bool {
+    (0x20..=0x26).contains(&reason)
 }
 
 /// The fault-recording register block's offset: CAP.FRO (bits [33:24], in 16-byte units).
@@ -65,13 +45,20 @@ pub fn take(regs: &impl Regs) -> Option<Fault> {
         return None;
     }
     let low = regs.read64(base);
+    let reason = ((high >> 32) & 0xff) as u8;
+    // For a DMA fault this is the address the device named. For an interrupt-remapping fault it
+    // is the fault information field instead, whose bits 63:48 are the table index the blocked
+    // message named (VT-d §10.4.14) — decoded here, so that nothing above has to know which
+    // reason codes mean which.
+    let address = low & !0xfff;
     let fault = Fault {
-        address: low & !0xfff,
+        address,
         source_id: (high & 0xffff) as u16,
-        reason: ((high >> 32) & 0xff) as u8,
+        reason,
         // The Type bit is bit 126 of the record, i.e. bit 62 of the high qword: 0 is a write
         // request, 1 is a read (VT-d §10.4.14).
         write: (high >> 62) & 1 == 0,
+        interrupt_index: is_interrupt(reason).then_some((address >> 48) as u16),
     };
     // Clear the record by writing 1 to its F bit, then clear the pending-fault status.
     regs.write64(base + 8, 1 << 63);

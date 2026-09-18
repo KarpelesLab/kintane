@@ -337,12 +337,50 @@ recorded rather than the conclusion alone, so a later round with a different
 reason to want AMD-Vi — real hardware, say — can weigh it again without repeating
 the measurement. The seam needs no moving when that happens.
 
-### A defect found on the way, independent of any of this
+### A defect found on the way, and what it turned out to be an instance of
 
-`iommu_off.rs` — the module a build *without* an IOMMU compiles — returns
-`vtd::QueueStats`. A configuration that has no IOMMU at all therefore still names
-one vendor's crate in its public surface. That is worth fixing whether or not
-AMD-Vi is ever built.
+`iommu_off.rs` — the module a build *without* an IOMMU compiles — returned
+`vtd::QueueStats`, and imported `vtd::Fault` besides. Two types, not one: a
+configuration with no IOMMU at all still named one vendor's crate in its own
+public surface.
+
+Both now live in `kernel/iommu`, a unit that holds the vocabulary and no
+hardware — a fault a unit recorded, and what its invalidation queue has
+completed — as `block` holds the storage vocabulary and `virtio-blk` the device.
+`vtd` depends on it and re-exports both, so its own surface is unchanged.
+`iommu_off.rs` now names `::iommu` and no driver at all; `iommu.rs` still names
+`vtd`, as the module that programs the hardware has to. The twelve public
+signatures of the pair stay identical, which is the property that matters: they
+are chosen by `#[cfg]`, so a drift between them breaks the builds that take one
+and no others.
+
+Moving the types verbatim would have renamed the leak rather than closed it.
+`Fault::interrupt_index` extracted bits 63:48 of a VT-d fault-information field
+and `is_interrupt` compared against VT-d reason codes 0x20–0x26; carrying those
+into a crate called neutral would have carried Intel's encoding with them. They
+stay in `vtd`, which hands up a decoded `interrupt_index: Option<u16>`. What
+crosses the boundary is a fact, not an encoding — `reason` survives only as an
+opaque code a caller prints and never interprets.
+
+**The other `_off` modules are clean.** All fourteen were checked, for any path
+naming a driver crate rather than only for `use` lines: `block`, `blockdomain`,
+`fs`, `intx`, `isolation`, `net`, `pcie`, `personality`, `smmu`, `stress`,
+`waitrace`, and `fdt`'s `pcie_off` and `smmuv3_off` import nothing but `hal`,
+`mm`, `device` and `crate`. `iommu_off.rs` was the only one. `smmu.rs` is the
+contrast worth keeping in view: the same problem, solved from the start by
+`platform` owning `SmmuFacts`, so the kernel-side module never names a driver.
+
+**What it is an instance of is in the build graph, not in the modules.** No
+driver unit in the tree declares `config.requires`, and `deps.units` has no
+conditional form, so every driver is planned in every configuration. Building
+`x86_64-qemu`, which sets no `IOMMU`, compiles `libvtd.rlib` — and `gic`,
+`pl011` and `fdt`: an interrupt controller, a UART and a device-tree parser for
+a machine this kernel is not. None of them is linked, so this costs image bytes
+nowhere: `vtd` appears in exactly three size baselines, the three presets with
+`IOMMU=y`, and contributes nothing to the other eighteen. Dropping the compile
+as well needs either a conditional dependency in `kmod.toml` or a provider pair,
+and `boot/uefi/kmod.toml` already records the same hazard from the other side —
+a unit planned everywhere, compiled for a target that cannot use it.
 
 ### A note on method, for whoever tries this next
 

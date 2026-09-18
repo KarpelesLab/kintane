@@ -1198,7 +1198,7 @@ fn blocked_and_logged(c: &dyn EarlyConsole, blk: &VirtioBlk<Locks>, how: iommu::
     }
     let source = iommu::source_of(i);
     match fault {
-        Some(f) if Some(f.source_id) == source && f.interrupt_index() == Some(i as u16) => {
+        Some(f) if Some(f.source_id) == source && f.interrupt_index == Some(i as u16) => {
             c.write_str(", fault ");
             write_hex(c, u64::from(f.reason));
             c.write_str(" from ");

@@ -30,6 +30,8 @@
 //! kernel knows its domains and flushes them by domain or by page. Device-TLB (ATS) invalidation
 //! is not built, because nothing here enables ATS.
 
+use iommu::QueueStats;
+
 use crate::pagetable::{Domain, Perm};
 use crate::{Error, Frames, PAGE_SIZE, PhysMem, Regs, SPIN_LIMIT, Unit, reg, zero_frame};
 
@@ -109,17 +111,6 @@ impl Invalidation {
 /// The invalidation wait descriptor that ends a batch: write `cookie` to `status` when reached.
 fn wait(status: u64, cookie: u32) -> (u64, u64) {
     (TYPE_WAIT | WAIT_STATUS_WRITE | (u64::from(cookie) << 32), status)
-}
-
-/// What the queue has done, for a report.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct QueueStats {
-    /// Invalidation descriptors the hardware completed, waits not counted.
-    pub invalidations: u64,
-    /// Batches submitted and seen complete: one wait each.
-    pub waits: u64,
-    /// The most status reads one wait needed before it saw its cookie.
-    pub longest_wait: u32,
 }
 
 impl<R: Regs, M: PhysMem> Unit<R, M> {

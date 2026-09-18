@@ -16,9 +16,9 @@
     )
 )]
 
+use ::iommu::{Fault, QueueStats};
 use hal::EarlyConsole;
 use mm::DirectMap;
-use vtd::Fault;
 
 /// Nothing to confine.
 pub fn confine_disk(
@@ -102,6 +102,6 @@ pub fn route_disk_interrupt(_i: usize, _line: u32, _cpu: usize) -> Result<(), &'
 }
 
 /// No invalidation queue.
-pub fn invalidation_stats() -> Option<vtd::QueueStats> {
+pub fn invalidation_stats() -> Option<QueueStats> {
     None
 }

@@ -22,11 +22,12 @@
 
 use core::cell::SyncUnsafeCell;
 
+use ::iommu::{Fault, QueueStats};
 use arch::Cpu;
 use hal::{EarlyConsole, PhysAddr};
 use mm::DirectMap;
 use mm::phys::FrameAllocator;
-use vtd::{Domain, Fault, Frames, InterruptTable, Irte, Perm, PhysMem, QueueStats, Regs, Unit};
+use vtd::{Domain, Frames, InterruptTable, Irte, Perm, PhysMem, Regs, Unit};
 
 use crate::write_usize;
 

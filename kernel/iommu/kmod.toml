@@ -1,0 +1,17 @@
+# What an IOMMU reports, independent of whose IOMMU it is.
+#
+# The vocabulary only: a fault a unit recorded, and what its invalidation queue has
+# completed. No registers, no vendor, no architecture — a driver decodes its own hardware
+# and hands these on, exactly as a storage driver implements `block`'s trait.
+#
+# It exists so that a build with no IOMMU has something to name. `kernel/main/src/iommu_off.rs`
+# is compiled when `IOMMU` is off, and until this unit it returned `vtd`'s types: a
+# configuration with no IOMMU named one vendor's crate in its own public surface.
+[unit]
+name = "iommu"
+kind = "lib"
+root = "src/lib.rs"
+layer = "device"
+
+[deps]
+units = []

@@ -368,13 +368,13 @@ mod tests {
         unit.regs_for_test()
             .plant_fault(5 << 48, 0x0019, 0x26, true);
         let fault = unit.take_fault().unwrap();
-        assert!(fault.is_interrupt());
-        assert_eq!(fault.interrupt_index(), Some(5));
+        // Which reason codes mean "interrupt" is this driver's to know: what it hands up is the
+        // decoded index, so `Some` is itself the claim that this was an interrupt fault.
+        assert_eq!(fault.interrupt_index, Some(5));
         assert_eq!(fault.source_id, 0x0019);
-        // A DMA fault is not an interrupt fault.
+        // A DMA fault is not an interrupt fault, so it carries no index.
         unit.regs_for_test().plant_fault(0x5000, DISK, 5, true);
         let fault = unit.take_fault().unwrap();
-        assert!(!fault.is_interrupt());
-        assert_eq!(fault.interrupt_index(), None);
+        assert_eq!(fault.interrupt_index, None);
     }
 }

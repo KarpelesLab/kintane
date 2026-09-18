@@ -49,9 +49,11 @@ mod harness;
 #[cfg(test)]
 mod tests;
 
-pub use fault::Fault;
+// The vocabulary a caller gets back is the kernel's, not this driver's: see `kernel/iommu`.
+// Re-exported so that this crate's own surface still reads as a whole.
+pub use iommu::{Fault, QueueStats};
 pub use pagetable::{Domain, Perm};
-pub use qi::{Invalidation, QUEUE_ENTRIES, QueueStats};
+pub use qi::{Invalidation, QUEUE_ENTRIES};
 pub use regs::reg;
 pub use remap::{IRT_ENTRIES, InterruptTable, Irte, message_handle, remappable_message};
 
