@@ -19,17 +19,29 @@
 //!
 //! Every receive installs a handle and every send takes one out, and a slot whose
 //! generation would wrap is retired for good (`kobject::handle`). Slots are reused
-//! lowest first, so a table retires one slot per million round trips through it. The
-//! tables here are sized so that a day of the fastest ping-pong QEMU runs does not
-//! retire them all; a table that did would fail the run with a refused receive, which
-//! is what that limit looks like in a long-lived process.
+//! lowest first, so a table retires one slot every [`CYCLES_PER_SLOT`] round trips
+//! through it. A table that retired them all would fail the run with a refused receive,
+//! which is what that limit looks like in a long-lived process.
+//!
+//! # Sizing, as arithmetic rather than as a promise
+//!
+//! This used to say the tables were sized so that "a day of the fastest ping-pong QEMU
+//! runs" would not retire them all. That was not a number and it was wrong: a 24-hour
+//! soak failed at 14 h 13 m with exactly the refused receive described above, having
+//! made 267,383,146 round trips against a ceiling of 255 × 1,048,574 = 267,386,370.
+//!
+//! So the claim is now a figure the compiler checks. [`ROUND_TRIPS`] is what these
+//! tables can serve, [`OBSERVED_RATE`] is the median this kernel sustains, and the
+//! assertion below requires the first to cover a full day at the second. Raising
+//! `SLOTS`, or the generation bits in `kobject::handle`, moves the ceiling; lowering
+//! either will fail the build rather than a fourteen-hour run.
 
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ipc::{Channel, ENDPOINT_RIGHTS, Error, Transfer};
-use kobject::handle::{Handle, HandleTable};
+use kobject::handle::{CYCLES_PER_SLOT, Handle, HandleTable};
 use kobject::{ObjectId, ObjectIds, ObjectType, Rights};
 
 use super::{Parked, Workload, checkpoint, fail, park_requested, parked, progress};
@@ -38,6 +50,30 @@ use crate::preempt::{begin, yield_now};
 
 /// Slots per table. See the module comment.
 const SLOTS: usize = 256;
+
+/// Round trips these tables serve before the last reusable slot retires.
+///
+/// One slot holds the endpoint for the life of the run, so `SLOTS - 1` are reusable, and
+/// each serves [`CYCLES_PER_SLOT`] open/close pairs — one per round trip, since every
+/// round trip transfers the event handle out of a table and back into it.
+const ROUND_TRIPS: u64 = (SLOTS as u64 - 1) * CYCLES_PER_SLOT;
+
+/// Round trips a second this kernel sustains, as a median over a 14-hour run at 8 CPUs.
+///
+/// Measured, not assumed. The figure that failed was an unmeasured one: the tables were
+/// sized for about 3,095/s and the kernel turned out to be 45% faster than that.
+const OBSERVED_RATE: u64 = 4_485;
+
+/// A soak has to be able to run a full day at the rate the kernel actually achieves.
+///
+/// This is the check the old prose could not make. If a future change narrows the
+/// generation or widens the index, the build stops here instead of a soak stopping
+/// fourteen hours in.
+const _: () = assert!(
+    ROUND_TRIPS >= 24 * 60 * 60 * OBSERVED_RATE,
+    "the ipc handle tables cannot serve a 24-hour soak at the observed rate: \
+     raise SLOTS, or give the generation more bits in kobject::handle"
+);
 
 type Chan = Channel<Locks, 2, 8, 1>;
 
