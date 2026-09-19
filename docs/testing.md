@@ -2839,7 +2839,7 @@ stress heartbeat 30/30 s: heap 2506153 (refused 157179), ipc 2223464, sleeps 113
 
 | Mutation | Result |
 |---|---|
-| No reschedule IPI for a wake placed on another CPU | "a workload did not reach a checkpoint: ping" at 3 s |
+| No reschedule IPI for a wake placed on another CPU | "a workload did not reach a checkpoint: net" at 1 s, and the audit now adds *"net ran 0 slices and was passed over for 0 since the park was asked: no timer interrupt on its CPU ever saw it ready, so that CPU was not ticking"* |
 | Balancing disabled | "both never-blocking heap workloads ran on one CPU for a whole interval" at 1 s |
 | The scheduler lock removed | "a workload did not reach a checkpoint: heap B" at 1 s |
 
@@ -2847,6 +2847,34 @@ The first works because an idle secondary no longer wakes for every timer in the
 kernel (see [architecture.md](architecture.md#the-smp-scheduler)). A woken thread
 placed on it without an IPI waits for a full arming of its timer, seconds, instead of
 milliseconds.
+
+That row read *"ping at 3 s"* until it was re-run: it was recorded when the seven original
+workloads were all there were, and `net`, `tcp`, `block`, `block B` and `fs` have been added
+since. `net` sleeps between polls and so is the first to notice a wake that never arrives,
+which is why it now fails first and sooner. **`ping` can no longer be the victim of a lost
+wake at all** — it never blocks on the channel, an empty or full endpoint being a yield, so
+nothing about it is ever waiting to be woken. A stale expected-result is worse than none: it
+sent a search after the wrong mechanism.
+
+### What the 24-hour soak's failure is not
+
+The run that failed at 14 h 13 m with `a workload did not reach a checkpoint: ping` left a
+41.9 MB trail and a 50 MB console, and they rule out more than they confirm.
+
+- **Not a stalled host.** 40,766 samples from 1 s to 51,180 s, guest time tracking wall-clock
+  to 0.11%, and exactly one gap over 5 s in the whole run — 6 s, at 2,123 s, fourteen hours
+  earlier. Slices are charged per timer interrupt rather than as a duration precisely so this
+  reading does not measure the host.
+- **Not a CPU that stopped ticking.** The per-CPU tick counts in the final twenty heartbeats
+  never flatten: the smallest one-second delta on any of the eight CPUs is 63.
+- **Not a slow decline.** `ipc` — ping/pong round trips — was still running at ~4,400 a second
+  in the last sample before the audit asked. The workload went from thousands of round trips a
+  second to under two slices in three seconds.
+- **Not a lost wake**, for the structural reason above: `ping` never blocks.
+
+What remains is a thread that stopped abruptly while every CPU kept taking interrupts, and the
+message named only the workload. That is why the audit now reports the slices it ran and the
+slices it was passed over for: the next occurrence says which of those it was.
 
 **Not falsified:** the reschedule IPI a secondary sends the boot CPU when it arms a timer
 earlier than the boot CPU's next wake-up. Removing it still passed a 20-second run. The
