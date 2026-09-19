@@ -14,22 +14,50 @@
 //! Generations are finite, so a slot could in principle wrap around to a generation
 //! some ancient handle still names. Rather than make that vanishingly unlikely and
 //! hope, a slot whose generation would wrap is **retired** and never reused. The
-//! cost is one table entry after 2^20 open/close cycles; the benefit is that the ABA
-//! case does not exist rather than being improbable.
+//! cost is one table entry after [`CYCLES_PER_SLOT`] open/close cycles; the benefit is
+//! that the ABA case does not exist rather than being improbable.
+//!
+//! # How the 32 bits are split, and why here
+//!
+//! A handle is one `u32`: the low [`INDEX_BITS`] name the slot, the rest counts the
+//! generation. The split is a direct trade — every bit given to the index is one the
+//! generation does not have, so a wider table retires its slots sooner.
+//!
+//! It is set by what the tree actually builds. The largest `HandleTable` anywhere is
+//! the ipc stress workload's 256 slots; every other is eight or fewer. A 10-bit index
+//! addresses 1024, four times the largest and the same per-process ceiling Linux
+//! defaults to for file descriptors, and leaves 22 bits of generation.
+//!
+//! This was 12 bits until a 24-hour soak died at 14 h 13 m with its handle table
+//! exhausted, having addressed 4096 slots for tables that never exceeded 256 while the
+//! generation ran out. See `kernel/main/src/stress/ipc.rs` for the arithmetic that
+//! sizing now has to satisfy.
 
 use core::fmt;
 
 use crate::rights::Rights;
 use crate::{ObjectId, ObjectType};
 
-/// Bits of the handle value used for the slot index.
-const INDEX_BITS: u32 = 12;
+/// Bits of the handle value used for the slot index. See the module comment: this is
+/// a trade against the generation, not a free choice.
+pub const INDEX_BITS: u32 = 10;
 const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
 /// The rest is the generation.
 const MAX_GENERATION: u32 = (1 << (32 - INDEX_BITS)) - 1;
 
 /// The largest table this encoding can address.
 pub const MAX_SLOTS: usize = 1 << INDEX_BITS;
+
+/// Open/close cycles one slot serves before it is retired.
+///
+/// A slot starts at generation 1 and [`HandleTable::close`] advances it; the close whose
+/// next generation would reach [`MAX_GENERATION`] retires the slot instead. So the cycle
+/// that retires a slot is the `MAX_GENERATION - 1`th, and that many succeed.
+///
+/// Exported because sizing a long-lived table is arithmetic, not a guess: a workload that
+/// opens and closes a handle per iteration gets `CYCLES_PER_SLOT` iterations per reusable
+/// slot and no more. `a_slot_serves_exactly_cycles_per_slot_open_close_pairs` pins it.
+pub const CYCLES_PER_SLOT: u64 = (MAX_GENERATION - 1) as u64;
 
 /// What a program holds. Opaque: the split into index and generation is ours.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -586,6 +614,29 @@ mod tests {
         }
         assert_eq!(t.insert(obj(99), ObjectType::Channel, Rights::READ), Err(Error::TableFull));
         assert_eq!(t.len(), 8);
+    }
+
+    #[test]
+    fn a_slot_serves_exactly_cycles_per_slot_open_close_pairs() {
+        // The whole of table sizing rests on this number, so count it rather than derive
+        // it. A 24-hour soak died because a table's capacity was described as "a day of
+        // the fastest runs" instead of as a figure anything could check.
+        let mut t: HandleTable<1> = HandleTable::new();
+        let mut cycles: u64 = 0;
+        loop {
+            match t.insert(obj(1), ObjectType::Channel, Rights::READ) {
+                Ok(h) => {
+                    t.close(h).unwrap();
+                    cycles += 1;
+                }
+                Err(Error::TableFull) => break,
+                Err(e) => panic!("unexpected {e:?}"),
+            }
+        }
+        assert_eq!(
+            cycles, CYCLES_PER_SLOT,
+            "a slot served {cycles} cycles, not the {CYCLES_PER_SLOT} its constant promises"
+        );
     }
 
     #[test]
