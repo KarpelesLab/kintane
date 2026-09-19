@@ -56,6 +56,17 @@ pub struct PcieFacts {
     /// requester ids are mapped. `None` where the tree maps none, which would mean a device
     /// here could raise no message-signalled interrupt.
     pub msi: Option<(u32, u32)>,
+    /// Where base address registers are placed, for the machine whose firmware placed none.
+    ///
+    /// A slice off the front of [`mem32`](Self::mem32): CPU physical, so the kernel maps it
+    /// as a device window and a register placed inside it is reachable. Taken here, during
+    /// discovery, and that is the whole reason it exists as a field — the windows the
+    /// address space maps are fixed when discovery ends, and the walk that learns how much
+    /// room the registers actually need cannot run until that space exists. So the room is
+    /// reserved from what the tree says the bridge forwards, before anything is enumerated.
+    ///
+    /// `None` where the bridge forwards no 32-bit memory window.
+    pub bar_arena: Option<(u64, u64)>,
 }
 
 impl PcieFacts {
@@ -75,6 +86,15 @@ impl PcieFacts {
         u64::from(self.bus_end).saturating_sub(u64::from(self.bus_start)) + 1
     }
 }
+
+/// How much of the bridge's forwarded 32-bit window is reserved for base address registers.
+///
+/// The kernel maps this whole slice as a device window, so it is a page-table cost paid on
+/// every boot of a build with `PCIE`, whether or not anything is behind the bridge. A
+/// megabyte is 256 pages, enough for far more registers than `virt` can present — the one
+/// function this machine attaches wants 4 KiB and 16 KiB — and small enough that reserving
+/// it before knowing what is there costs nothing worth measuring.
+const BAR_ARENA_BYTES: u64 = 1 << 20;
 
 /// The facts, once [`discover`] has found a bridge.
 ///
@@ -134,6 +154,7 @@ pub fn discover(c: &dyn EarlyConsole, tree: &DeviceTree<'_, '_>) {
         mem32,
         mem64,
         msi: msi_map(tree, id),
+        bar_arena: mem32.map(|(base, len)| (base, len.min(BAR_ARENA_BYTES))),
     };
     // SAFETY: once, on the boot path, before anything reads it.
     let _ = unsafe { FACTS.set(facts) };
@@ -293,7 +314,31 @@ pub struct PcieScan {
     /// The buffer filled before the walk finished, so there may be more.
     pub truncated: bool,
     /// Every base address register read back as enumeration left it.
+    ///
+    /// Read before assignment, which deliberately changes them: this says sizing put back
+    /// what it found, and nothing else.
     pub restored: bool,
+    /// Registers [`assign`](pci::assign_memory_bars) placed, because they decoded nowhere.
+    ///
+    /// Zero on a machine whose firmware assigned them all, which is every machine with
+    /// firmware.
+    pub placed: usize,
+    /// A register could not be placed: the arena was too small, or the address did not fit
+    /// the register's width.
+    pub unplaced: bool,
+    /// What the endpoint answered when its own registers were read at the address just
+    /// assigned to them: virtio's second feature word.
+    ///
+    /// This is the difference between a placement that looks right and one that is. A BAR
+    /// holds whatever was written to it, so reading the register back through configuration
+    /// space proves only that the register works. Reading the *device* at the address that
+    /// register now names proves the decoder moved with it. Bit 0 of word 1 is
+    /// `VIRTIO_F_VERSION_1`, which every modern virtio device sets, so the answer is both
+    /// non-zero and specific — an unmapped or wrongly-placed window reads as all ones.
+    ///
+    /// `None` when nothing behind the bridge is a virtio block device, or when its
+    /// capabilities do not describe a modern layout.
+    pub answered: Option<u32>,
 }
 
 /// Room for what `virt` can present: the bridge's own function and whatever the command line
@@ -326,12 +371,67 @@ pub fn enumerate(c: &dyn EarlyConsole) -> Option<PcieScan> {
             return None;
         }
     };
+    // Before anything is deliberately changed: this says sizing put back what it found.
+    // Assignment below writes these registers on purpose, so asking afterwards would be
+    // asking whether the assignment happened, which is a different question.
+    let restored = pci::verify_restored(&cfg, out.get(..n).unwrap_or(&[])).is_ok();
+    // Then place whatever decodes nowhere. On a machine with firmware this places nothing,
+    // because firmware already did; on this one it is the difference between a function a
+    // driver could bind and one whose registers are at address zero.
+    let (placed, unplaced) = match f.bar_arena {
+        Some((base, len)) => {
+            match pci::assign_memory_bars(&cfg, out.get_mut(..n).unwrap_or(&mut []), base, len) {
+                Ok(placed) => (placed, false),
+                Err(_) => (0, true),
+            }
+        }
+        None => (0, false),
+    };
     let found = out.get(..n).unwrap_or(&[]);
     Some(PcieScan {
         functions: n,
         bridges: found.iter().filter(|f| f.is_host_bridge()).count(),
         endpoints: found.iter().filter(|f| !f.is_host_bridge()).count(),
         truncated,
-        restored: pci::verify_restored(&cfg, found).is_ok(),
+        restored,
+        placed,
+        unplaced,
+        answered: found.iter().find_map(virtio_answers),
     })
+}
+
+/// Read a virtio block function's second feature word at the address its registers were
+/// just assigned.
+///
+/// The placement is otherwise unfalsifiable from configuration space alone: a base address
+/// register holds whatever was written to it, so reading it back says the register works and
+/// nothing about where the device now decodes. This reads the device itself, through the
+/// kernel's mapping of the arena, and what comes back is specific enough to tell a working
+/// window from a silent one — an unmapped or misplaced window reads as all ones.
+#[allow(unsafe_code)]
+fn virtio_answers(f: &Function) -> Option<u32> {
+    if !virtio_blk::pci::is_block_device(f) {
+        return None;
+    }
+    let layout = virtio_blk::pci::layout_of(f).ok()?;
+    let common = layout.common;
+    let base = match f.bars.get(usize::from(common.bar))? {
+        pci::Bar::Memory { base, .. } if *base != 0 => *base,
+        _ => return None,
+    };
+    let at = base.checked_add(u64::from(common.offset))?;
+    let virt = hal::paging::device_virt(at)?;
+    // Virtio's common configuration structure: select the upper feature word, then read it.
+    // The select register exists to be written and choosing a word has no other effect; the
+    // device has not been reset or initialised, and nothing here claims it.
+    let select: *mut u32 = core::ptr::with_exposed_provenance_mut(virt);
+    let feature: *const u32 = core::ptr::with_exposed_provenance(virt + 4);
+    // SAFETY: `at` is inside the arena the bridge forwards, which discovery claimed and the
+    // kernel's address space maps at `DEVICE_WINDOW_BASE` above its physical address, and
+    // the function's decoder was turned on with the assignment. The offsets are the first
+    // two words of a structure the capability says is at least `COMMON_BYTES` long.
+    unsafe {
+        core::ptr::write_volatile(select, 1);
+        Some(core::ptr::read_volatile(feature))
+    }
 }

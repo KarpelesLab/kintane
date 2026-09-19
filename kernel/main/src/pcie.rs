@@ -118,6 +118,14 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         c.write_str(", AND A BASE ADDRESS REGISTER DID NOT READ BACK AS ENUMERATION LEFT IT");
         return Check::Failed;
     }
+    // A register the arena could not hold is a device a driver could not map, and silence
+    // here would be a function that enumerates and then answers reads at address zero.
+    if scan.unplaced {
+        c.write_str(
+            ", AND A BASE ADDRESS REGISTER COULD NOT BE PLACED IN THE ARENA RESERVED FOR IT",
+        );
+        return Check::Failed;
+    }
     c.write_str("; walked ");
     write_usize(c, scan.functions);
     c.write_str(" functions, ");
@@ -136,5 +144,33 @@ pub fn check(c: &dyn EarlyConsole) -> Check {
         c.write_str(", the buffer filled before the walk finished");
     }
     c.write_str(", every register restored");
+    // What firmware would have done, on a machine that has none. Zero on a machine that
+    // does, and saying so is worth a few bytes: it is the difference between a function a
+    // driver can map and one decoding at address zero.
+    if scan.placed > 0 {
+        c.write_str("; ");
+        write_usize(c, scan.placed);
+        c.write_str(" base address register");
+        if scan.placed != 1 {
+            c.write_str("s");
+        }
+        c.write_str(" placed, which no firmware here had");
+    }
+    // Whether the placement worked is a question configuration space cannot answer: a base
+    // address register holds whatever was written to it. This is the device answering at the
+    // address that register names, which is the only thing that says the decoder moved.
+    if let Some(features) = scan.answered {
+        // Bit 0 of the second word is VIRTIO_F_VERSION_1. An unmapped or misplaced window
+        // reads as all ones, and a silent one as zero, so neither can be mistaken for this.
+        const VERSION_1: u32 = 1;
+        if features == u32::MAX || features & VERSION_1 == 0 {
+            c.write_str(", AND THE DEVICE DID NOT ANSWER AS A MODERN VIRTIO DEVICE THERE");
+            return Check::Failed;
+        }
+        c.write_str("; the endpoint answers virtio 1.0 at the address it was given");
+    } else if kconfig::QEMU_PCIE_BLOCK {
+        c.write_str(", AND THE ATTACHED BLOCK FUNCTION'S REGISTERS COULD NOT BE READ");
+        return Check::Failed;
+    }
     Check::Passed
 }

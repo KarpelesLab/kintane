@@ -421,6 +421,24 @@ pub unsafe fn discover(c: &dyn EarlyConsole, boot_arg: u64) -> Option<bool> {
                 count += 1;
             }
         }
+        // Room for the base address registers of whatever is behind the PCIe bridge, taken
+        // from the window the tree says it forwards. Claimed here because this is the last
+        // moment anything can be: the address space is built from this list, and the walk
+        // that would learn what the registers actually need cannot run until that space
+        // exists — configuration space is a quarter of a terabyte above what the boot
+        // tables map. So the room is reserved from the tree's word, and the walk fills it.
+        // Nothing is read from it here; on a machine whose firmware assigned the registers
+        // it is reserved and never used.
+        if let Some((phys, len)) = pcie::facts().and_then(|f| f.bar_arena) {
+            if let Some(slot) = windows.get_mut(count) {
+                *slot = DeviceWindow {
+                    phys,
+                    len,
+                    what: "PCI Express base address registers",
+                };
+                count += 1;
+            }
+        }
         // SAFETY: once, on the boot path, before anything reads the windows.
         let _ = unsafe { WINDOWS.set((windows, count)) };
         c.write_str("; ");

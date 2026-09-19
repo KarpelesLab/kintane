@@ -358,8 +358,14 @@ pub enum Unplaced {
 ///
 /// On success the function's recorded [`Bar`] and its `original_bars` both hold the
 /// assigned value, so [`verify_restored`] called afterwards agrees with the hardware.
-/// Memory decoding is left **off**: enabling it belongs to the driver that claims the
-/// window, and a device decoding before anything owns it answers reads nobody expects.
+///
+/// Memory decoding is turned **on** for a function whose registers were placed, and that is
+/// part of assigning rather than a separate courtesy: a register with an address and its
+/// decoder off answers nothing, so leaving it off would place addresses no read could ever
+/// reach and there would be no way to tell a correct assignment from a wrong one. It is
+/// what firmware does after assigning, and it is safe for the same reason firmware's is —
+/// the arena belongs to these registers and nothing else decodes there. The command
+/// register's other bits, bus mastering included, stay the driver's.
 pub fn assign_memory_bars(
     cfg: &impl ConfigSpace,
     functions: &mut [Function],
@@ -376,6 +382,8 @@ pub fn assign_memory_bars(
         let at = f.address;
         let count = bar_count(f.header_type);
         let mut i = 0;
+        // Registers placed on this function, which decides whether its decoder is turned on.
+        let mut here = 0;
         // Bounded: advances by one or two registers a pass, as `size_bars` does.
         while i < count {
             let (size, wide) = match f.bars.get(i) {
@@ -425,7 +433,18 @@ pub fn assign_memory_bars(
             }
             cursor = aligned.saturating_add(size);
             placed += 1;
+            here += 1;
             i += if wide { 2 } else { 1 };
+        }
+        // A register with an address and its decoder off answers nothing. Turning it on is
+        // the last step of placing it, not a separate favour to the driver.
+        if here > 0 {
+            let command = cfg.read(at, reg::COMMAND);
+            // Status is the upper half and its bits clear when written with ones, so the
+            // write carries only the command half.
+            let with_memory = (command & 0xffff) | reg::COMMAND_MEMORY;
+            cfg.write(at, reg::COMMAND, with_memory);
+            f.original_command = with_memory as u16;
         }
     }
     Ok(placed)

@@ -24,6 +24,8 @@ pub struct PcieFacts {
     pub mem32: Option<(u64, u64)>,
     pub mem64: Option<(u64, u64)>,
     pub msi: Option<(u32, u32)>,
+    /// Where base address registers would be placed. No bridge, so nowhere.
+    pub bar_arena: Option<(u64, u64)>,
 }
 
 impl PcieFacts {
@@ -88,6 +90,12 @@ pub struct PcieScan {
     pub endpoints: usize,
     pub truncated: bool,
     pub restored: bool,
+    /// Registers assignment placed. Nothing is walked here, so none.
+    pub placed: usize,
+    /// A register that could not be placed. None are placed, so none fail to be.
+    pub unplaced: bool,
+    /// What an endpoint would have answered. Nothing is walked here, so nothing answers.
+    pub answered: Option<u32>,
 }
 
 /// No bridge, so no bus to walk.

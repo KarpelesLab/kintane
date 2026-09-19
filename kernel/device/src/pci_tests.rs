@@ -1025,6 +1025,31 @@ fn an_unassigned_bar_is_placed_and_reads_back() {
     // The record of what the registers held is updated with them, so a restore check run
     // afterwards compares against what is really there.
     assert_eq!(pci::verify_restored(&m, &fns), Ok(()));
+    // And the decoder is on, because a register with an address and its decoder off answers
+    // nothing: the assignment would be unverifiable and the device unusable.
+    assert_eq!(m.read(at, 0x04) & 0x2, 0x2, "memory decoding is enabled");
+}
+
+#[test]
+fn a_function_nothing_was_placed_on_keeps_its_command_register() {
+    // Turning on a decoder for a function this did not place anything for would be
+    // changing something it has no business changing.
+    let m = Model::default();
+    m.add(Address::new(0, 0, 0), (0x1b36, 0x0008), HOST, 0, &[]);
+    m.endpoint(
+        Address::new(0, 1, 0),
+        (0x1af4, 0x1042),
+        ETHERNET,
+        &[Spec::Mem32 {
+            base: 0xc000_0000,
+            size: 0x1000,
+            prefetch: false,
+        }],
+    );
+    let before = m.read(Address::new(0, 1, 0), 0x04);
+    let mut fns = enumerate(&m);
+    assert_eq!(pci::assign_memory_bars(&m, &mut fns, 0x1000_0000, 0x10_0000), Ok(0));
+    assert_eq!(m.read(Address::new(0, 1, 0), 0x04), before);
 }
 
 #[test]
