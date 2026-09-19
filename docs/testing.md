@@ -3724,10 +3724,11 @@ demonstrably pass at 70% of a 14 KiB stack — costing `armv7m-tiny` 18 KiB agai
 budget to forbid something that works. The guard that caught it already exists and is a
 runtime one, which is the right instrument for a depth no configuration language can compute.
 
-A separate conflict found on the way, not fixed here: `INKERNEL_TESTS=y` with
-`LOCKDEP_ABBA_TEST=y` fails `lock order: nothing reported since boot`, because the ABBA test
-deliberately reports an inversion that the in-kernel check then asserts never happened. Two
-switches that cannot both be on, with nothing saying so.
+A separate conflict was found on the way and left unfixed that round: `INKERNEL_TESTS=y` with
+`LOCKDEP_ABBA_TEST=y` failed `lock order: nothing reported since boot`, because the ABBA test
+deliberately reports an inversion that the in-kernel check then asserted never happened. It has
+since been resolved in the check rather than in the configuration language — see *The ABBA
+conflict, resolved in the check rather than the language* below.
 
 #### The combination, found: two symbols, and why the sweep could not reach it
 
