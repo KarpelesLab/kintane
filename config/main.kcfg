@@ -211,7 +211,8 @@ config KERNEL_THREAD_SLOTS
 
 config THREAD_STACK_KIB
     int "Bytes in a kernel thread's stack slot (KiB)"
-    range 1 1024
+    range 1 1024 if ARCH_ARMV7M
+    range 8 1024
     default 32
     help
         One slot: the guard at its bottom and the stack above it. A power
@@ -219,6 +220,20 @@ config THREAD_STACK_KIB
         to its slot with a shift. Every slot costs this much RAM whether a
         thread uses it or not, which is what makes it worth turning down on
         a machine with kilobytes rather than gigabytes.
+
+        The ranges above are the floor every port's link.ld asserts, said
+        in this language. It is 8 KiB on x86_64, AArch64, i686 and riscv32,
+        where the guard is a whole page and a slot must leave stack above
+        it; ARMv7-M asserts 1 KiB instead, because there the guard is a
+        quarter of the slot rather than a page. armv7m-tiny ships 4, which
+        is why a flat floor of 8 would be wrong. Below the floor the build
+        resolved and then died at link with "THREAD_STACK_KIB leaves no
+        stack above the guard page", which is late and far from the cause.
+
+        The power-of-two requirement is deliberately not said here, because
+        this language cannot say it: a range is a floor and a ceiling, and
+        kcfg has no way to express "a power of two". The linker assert is
+        the only instrument that catches it, and every port carries one.
 
 config USERSPACE
     bool "Native userspace"
@@ -714,8 +729,25 @@ config FRAME_BITMAP_KIB
 config QEMU_MEMORY_MB
     int "Guest memory under QEMU (MiB)"
     depends on QEMU_EXIT
+    range 56 65536 if KINBOOT_EFI || KINBOOT_STUB
     range 8 65536
     default 128
+    help
+        A configuration that boots through firmware needs far more of this
+        than one QEMU loads directly, and the floor is the firmware's
+        appetite rather than the kernel's. Measured on both firmware
+        presets, which take the OVMF path in kbuild/src/qemu.rs whenever
+        KINBOOT_EFI or KINBOOT_STUB is on: x86_64-efi and x86_64-efistub
+        both fail at 52 MiB and both pass at 56. A direct-boot preset is
+        unaffected -- x86_64-qemu boots at the old floor of 8.
+
+        Below it the guest prints nothing at all and exits 0 rather than
+        33, which reads as a hang rather than as too little memory; a
+        random sample at 8 MiB with EFI firmware, an IOMMU, two disks and
+        a NIC is what found it. The floor is the lowest value measured to
+        work rather than the next round number above it, because a floor
+        that refuses configurations which demonstrably pass costs more
+        than it saves.
 
 config QEMU_CPU
     string "CPU model under QEMU"
