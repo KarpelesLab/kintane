@@ -365,10 +365,12 @@ pub fn region() -> (u64, u64) {
 /// These tell apart the only two ways a workload can miss [`PARK_WITHIN`], which the name in
 /// the failure message cannot. **Passed over** means timer interrupts did find it ready and a
 /// peer won every time: the queue reached it, and the scheduler shared badly. **Neither ran
-/// nor passed** means no timer interrupt on its CPU ever saw it ready at all, so that CPU was
-/// not ticking -- halted with work queued, or a host not running it -- which is not the
-/// scheduler starving it. Slices are counted per timer interrupt and not as a duration, so
-/// neither reading measures the host (see [`Slices`]).
+/// nor passed** means no timer interrupt on its CPU charged it at all, which is ambiguous and
+/// says so: either the thread is the only runnable one on its CPU and that CPU, being
+/// uncontended, arms no timer while it runs it, or that CPU was not ticking at all -- halted
+/// with work queued, or a host not running it. Both are distinguishable from the scheduler
+/// starving it, which is what `passed` shows. Slices are counted per timer interrupt and not as a
+/// duration, so neither reading measures the host (see [`Slices`]).
 ///
 /// The process checks already draw this distinction for the process the auditor drives
 /// (`none charged`); the workloads had no way to state it, so a 24-hour soak that failed here
@@ -394,7 +396,7 @@ fn park_diagnosis(c: &dyn EarlyConsole, name: &str, d: ParkDiag) {
     } else if d.ran > 0 {
         "it ran, but never reached a checkpoint"
     } else {
-        "no timer interrupt on its CPU ever saw it ready, so that CPU was not ticking"
+        "no timer interrupt on its CPU charged it at all, so either it is the only runnable\n         thread there and that CPU is running it tickless, or that CPU was not ticking --\n         halted with work queued, or a host not running it"
     });
     c.write_str("\n");
 }
