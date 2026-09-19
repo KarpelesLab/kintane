@@ -1,6 +1,6 @@
 # kbuild size report for preset x86_64-isolated. Rewrite with `kbuild size --preset x86_64-isolated --update-baseline`.
 section .bss 274432
-section .data 281240
+section .data 281256
 section .note.kintane 36
 section .rodata 245720
 section .stack 32768
@@ -14,7 +14,7 @@ crate acpi text 57173 rodata 0 data 0 bss 0
 crate apic text 6406 rodata 0 data 304 bss 232
 crate arch text 39780 rodata 0 data 2145 bss 90905
 crate bcache text 5555 rodata 0 data 0 bss 0
-crate block text 2658 rodata 0 data 0 bss 0
+crate block text 2742 rodata 0 data 0 bss 0
 crate bootinfo text 2574 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
@@ -26,7 +26,7 @@ crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
 crate ipc text 4698 rodata 16 data 0 bss 0
 crate kalloc text 13891 rodata 0 data 0 bss 0
-crate kintane text 476228 rodata 256 data 94848 bss 141958
+crate kintane text 476925 rodata 256 data 94864 bss 141958
 crate kobject text 4907 rodata 16 data 0 bss 0
 crate linux text 11908 rodata 0 data 0 bss 0
 crate map text 348 rodata 0 data 0 bss 0
@@ -51,5 +51,5 @@ crate virtio_bind text 2014 rodata 0 data 0 bss 0
 crate virtio_blk text 3877 rodata 32 data 384 bss 0
 crate virtio_blk_core text 4992 rodata 0 data 0 bss 0
 crate virtio_net text 4393 rodata 16 data 176 bss 8
-crate vtd text 7462 rodata 0 data 0 bss 0
-total 2083476
+crate vtd text 7541 rodata 0 data 0 bss 0
+total 2083492

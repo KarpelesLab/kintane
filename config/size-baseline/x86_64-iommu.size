@@ -1,20 +1,20 @@
 # kbuild size report for preset x86_64-iommu. Rewrite with `kbuild size --preset x86_64-iommu --update-baseline`.
 section .bss 274432
-section .data 280984
+section .data 281000
 section .note.kintane 36
 section .rodata 200664
 section .stack 32768
 section .text 958464
 section .thread_stacks 262144
 crate (anonymous) text 0 rodata 56928 data 0 bss 0
-crate (unmangled) text 11870 rodata 0 data 1024 bss 0
+crate (unmangled) text 11872 rodata 0 data 1024 bss 0
 crate __rustc text 139 rodata 0 data 0 bss 0
 crate abi text 6835 rodata 0 data 0 bss 0
 crate acpi text 57173 rodata 0 data 0 bss 0
 crate apic text 6406 rodata 0 data 304 bss 232
 crate arch text 39780 rodata 0 data 2145 bss 90905
 crate bcache text 5555 rodata 0 data 0 bss 0
-crate block text 2658 rodata 0 data 0 bss 0
+crate block text 2742 rodata 0 data 0 bss 0
 crate bootinfo text 2574 rodata 0 data 0 bss 0
 crate buildid text 288 rodata 32 data 0 bss 0
 crate cmdline text 1411 rodata 0 data 0 bss 0
@@ -26,7 +26,7 @@ crate hal text 558 rodata 0 data 0 bss 0
 crate hwproxy text 306 rodata 0 data 0 bss 0
 crate ipc text 3007 rodata 16 data 0 bss 0
 crate kalloc text 13896 rodata 0 data 0 bss 0
-crate kintane text 454592 rodata 240 data 94584 bss 141848
+crate kintane text 455485 rodata 240 data 94600 bss 141848
 crate kobject text 6350 rodata 16 data 0 bss 0
 crate linux text 11908 rodata 0 data 0 bss 0
 crate map text 348 rodata 0 data 0 bss 0
@@ -51,5 +51,5 @@ crate virtio_bind text 2014 rodata 0 data 0 bss 0
 crate virtio_blk text 3771 rodata 32 data 384 bss 0
 crate virtio_blk_core text 2651 rodata 0 data 0 bss 0
 crate virtio_net text 4393 rodata 16 data 176 bss 8
-crate vtd text 7044 rodata 0 data 0 bss 0
-total 2009492
+crate vtd text 7036 rodata 0 data 0 bss 0
+total 2009508
