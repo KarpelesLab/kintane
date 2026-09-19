@@ -3678,6 +3678,57 @@ architecture-conditional: armv7m's linker script asserts only 1 KiB, and `armv7m
 requirement is not that shape at all — this language has no way to say "a power of two", so
 nothing but the linker can ever catch it.
 
+#### The shape, enumerated rather than counted (round 20)
+
+The claim above that five symbols carry a requirement only in a `default` was a count of
+symbols needing a constraint, across two different shapes. Parsing all 87 `config` blocks in
+`config/` — `main.kcfg`, `arch.kcfg`, `board.kcfg` and `boards/` — makes the set exact.
+Only **four** int symbols have a conditional `default` at all, and before this round three of
+them had no conditional `range`:
+
+| symbol | conditional defaults | conditional ranges before | after |
+|---|---|---|---|
+| `KERNEL_THREAD_SLOTS` | 3 | 7 | fixed in round 19 |
+| `BOOT_STACK_KIB` | 7 | 0 | **deliberately still 0** — see below |
+| `BOOT_MENU_TIMEOUT` | 1 | 0 | `range 0 30 if QEMU_EXIT` |
+| `QEMU_CPUS` | 1 | 0 | `range 2 255 if ARCH_X86_64 \|\| ARCH_I686` |
+
+`QEMU_CPUS` was not among the three the sweep reported; the enumeration found it. It is the
+familiar defect in a new place: the PC ports describe two CPUs so that a MADT walk stopping
+after its first entry cannot pass, and at `QEMU_CPUS=1` that walk passes regardless, so the
+check stops being able to fail. `QEMU_CPUS=1` on x86 resolved cleanly before this round.
+
+`QEMU_MEMORY_MB` and `THREAD_STACK_KIB` are a neighbouring shape, not this one: neither has a
+conditional default, so their requirements are stated nowhere at all rather than stated in the
+wrong place. Twenty other symbols carry conditional defaults that are identities or
+preferences — `TARGET`, `LINKER_SCRIPT`, `IMAGE_FORMAT` — which is why a blanket rule turning
+every conditional default into a bound would be wrong. `BOOT_MENU_TIMEOUT`'s requirement is a
+**ceiling** while `BOOT_STACK_KIB`'s would be a floor, so even among the int symbols the
+direction is not uniform.
+
+#### `BOOT_STACK_KIB` keeps no floor, and why
+
+The boot-stack overflow was attributed to `armv7m-tiny` pinning `BOOT_STACK_KIB=14` while
+`INKERNEL_TESTS` wants the `default 32` the preset overrides. That combination does not fail:
+`kbuild run --preset armv7m-tiny --set INKERNEL_TESTS=y` passes, and the tree's own guard
+reports `deepest 10120 of 14336 bytes (70%, limit 75%) ok`. Adding each of
+`SERIAL_IRQ_TEST`, `QEMU_PCI_TEST_DEVICE`, `BOOT_MODE_RECOVERY`, `KALLOC_FAULT_INJECT`,
+`DEBUG_LOCKDEP` or `QEMU_MEMORY_MB=8` on top moves that number not at all — every one measures
+10120 bytes.
+
+The whole of seed 5011 does overflow: `stack overflow: the address is in the guard below the
+boot stack`, guest exit 1, and it happens *during* the in-kernel tests, past the checkpoint
+where the depth is sampled. So the requirement is real but it belongs to a combination no
+single symbol names, and a `range 32 256 if INKERNEL_TESTS` would refuse configurations that
+demonstrably pass at 70% of a 14 KiB stack — costing `armv7m-tiny` 18 KiB against a 160 KiB
+budget to forbid something that works. The guard that caught it already exists and is a
+runtime one, which is the right instrument for a depth no configuration language can compute.
+
+A separate conflict found on the way, not fixed here: `INKERNEL_TESTS=y` with
+`LOCKDEP_ABBA_TEST=y` fails `lock order: nothing reported since boot`, because the ABBA test
+deliberately reports an inversion that the in-kernel check then asserts never happened. Two
+switches that cannot both be on, with nothing saying so.
+
 #### Why nearly every random sample is a crash sample
 
 All six random samples that built at seed 5000 drew a deliberate crash mode. This section used
