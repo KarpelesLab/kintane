@@ -382,6 +382,11 @@ as well needs either a conditional dependency in `kmod.toml` or a provider pair,
 and `boot/uefi/kmod.toml` already records the same hazard from the other side —
 a unit planned everywhere, compiled for a target that cannot use it.
 
+That has since been measured and declined: it costs 10.4 s of a 232 s sweep, and
+gating these units would stop their host tests running, because `hosttest.rs`
+selects from the planned units. See *Every driver is compiled for every
+configuration, and that is deliberate* in [build-system.md](build-system.md).
+
 ### A note on method, for whoever tries this next
 
 Six hand-built QEMU command lines were run before one produced an interpretable

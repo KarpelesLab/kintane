@@ -338,6 +338,59 @@ vector, hashes of all dependency outputs). A cache hit is a hardlink. This makes
 "rebuild all six tier-1 targets" cheap in CI, which is what makes the
 every-target-every-merge rule in [testing.md](testing.md) affordable.
 
+### Every driver is compiled for every configuration, and that is deliberate
+
+Forty-one units declare `config.requires` — every `arch`, the boot units, the `platform`
+and `lastgood` providers, the user programs, `selftest`, the test modules. **No unit under
+`drivers/` declares one.** So `x86_64-qemu` compiles `gic` and `pl011`, an Arm interrupt
+controller and an Arm UART, and `aarch64-virt` compiles `apic` and `uart16550`. None of
+them is linked: `vtd` appears in three of the twenty-one size baselines, `gic` and `pl011`
+in five, and they contribute nothing to the rest.
+
+**The cost, measured** with one rustc invocation timed per unit across a 21-preset sweep.
+Each of the seven machine-specific units is compiled exactly 21 times:
+
+| unit | ms over 21 compiles | linked into | wasted ms |
+|---|---|---|---|
+| `acpi` | 6,742 | 12 | 2,889 |
+| `fdt` | 3,372 | 7 | 2,240 |
+| `apic` | 2,395 | 9 | 1,368 |
+| `uart16550` | 1,688 | 12 | 720 |
+| `pl011` | 1,399 | 5 | 1,056 |
+| `gic` | 1,367 | 5 | 1,040 |
+| `vtd` | 1,327 | 3 | 1,134 |
+
+**10.4 s of a 232 s sweep — 4.5%**, and the sweep runs once a round. The developer's inner
+loop builds one preset, where it is about 0.4 s of 11 s. For comparison `core`, which the
+cache does handle well, is 32.8 s of the same sweep over seven compiles.
+
+**What it buys is test coverage, and gating would spend it.** Every one of these units sets
+`host-tests = true`, and each manifest says why in its own words: the GIC's "specifier
+translation and the GICv2 driver are plain register arithmetic and are host-tested under
+every preset"; the PL011 is "plain MMIO, so it is host-tested under every preset and not
+gated on an architecture"; VT-d's register layout "is the same wherever VT-d exists". The
+same sentence appears in `boot/acpi`, `boot/fdt`, `kernel/device` and `boot/kinboot-bios`.
+`hosttest.rs` selects from the *planned* units, so a unit the configuration excludes is a
+unit whose tests stop running. Gating `gic` on `ARCH_AARCH64` takes the `x86_64-qemu` host
+suite from 41 units and 1,214 cases to 40 and 1,206 — while the build still exits 0, which
+is why "it still builds" cannot detect this. Both host stages in the gate report 41 units,
+the `x86_64-qemu` figure; `aarch64-virt` reports 39. So the gate's host suite is x86_64
+only, and gating the Arm drivers would stop their tests running in CI at all.
+
+**And only four of the seven could be gated anyway.** `gic` and `pl011` are depended on
+solely by `kernel/platform/fdt`, `apic` and `uart16550` solely by `kernel/platform/acpi`,
+and both of those are already gated on their architectures — so gating them is consistent.
+`vtd`, `fdt` and `acpi` have ungated dependents (`kernel/main`, `kernel/device`), and
+`plan` refuses: `unit 'kintane' depends on 'vtd', which is not in this configuration`.
+Reaching them needs a provider pair with a `-none` counterpart, the pattern `blkdomain`
+and `lastgood` already use.
+
+**So nothing changes here.** The trade is 4.5% of a once-a-round sweep against deleting
+eight test cases per driver from the only host suite CI runs. If the cost ever becomes
+material, the prerequisite is to decouple host-test selection from the plan — have
+`hosttest.rs` choose from discovered units rather than planned ones — and only then gate
+the four that can be gated. Doing it in the other order buys seconds and pays in coverage.
+
 ## Commands
 
 ```
