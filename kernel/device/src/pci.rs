@@ -32,9 +32,20 @@
 //! checks that configuration space still holds them. The kernel runs that check once
 //! enumeration is done, because a BAR left at all ones works until a driver maps it.
 //!
+//! # Resource assignment
+//!
+//! BARs are read as firmware assigned them, and on a machine whose firmware did assign them
+//! that is the whole story. Not every machine has firmware: QEMU's `virt` booted with
+//! `-kernel` runs none, so every BAR is implemented, sizes correctly, and decodes nowhere —
+//! a driver bound to such a function would map address zero. [`assign_memory_bars`] places
+//! the registers that read zero, from an arena the caller takes out of the window its bridge
+//! forwards, and leaves every register firmware did assign exactly as it was.
+//!
 //! # What is not here
 //!
-//! Resource assignment: BARs are read as firmware assigned them. MSI, and hot-plug.
+//! MSI, and hot-plug. I/O-space assignment: nothing on the ports this kernel runs on needs
+//! a device behind an I/O BAR, and a window that is 64 KiB for a whole machine is worth
+//! handing out only when something asks.
 //!
 //! # Capabilities
 //!
@@ -308,6 +319,116 @@ pub enum Disturbed {
         was: u32,
         now: u32,
     },
+}
+
+/// Why [`assign_memory_bars`] could not place a register.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unplaced {
+    /// The arena ran out: `need` bytes, aligned to `align`, did not fit what was left.
+    NoRoom {
+        at: Address,
+        index: usize,
+        need: u64,
+        left: u64,
+    },
+    /// A 64-bit register whose upper half would be non-zero cannot be placed from a
+    /// 32-bit arena, and this assigns only from the bridge's 32-bit window.
+    TooHigh { at: Address, index: usize },
+}
+
+/// Assign addresses to the memory BARs that have none, from `arena`.
+///
+/// This is the job firmware does on a machine that has any. QEMU's `virt` booted with
+/// `-kernel` runs none, so every BAR reads back zero: the register is implemented, sizing
+/// reports its width, and nothing has ever told the device where to decode. A driver bound
+/// to such a function would map address zero.
+///
+/// Only registers reading zero are placed, so a machine whose firmware did assign them is
+/// left exactly as it was — the assignment is a repair for the case where nobody did it,
+/// not a policy this kernel imposes over one that exists.
+///
+/// Host bridges are skipped, as they are in [`size_bars`]: a bridge's own BARs are not
+/// device registers to place, and touching its decoding can take the path to everything
+/// behind it.
+///
+/// `arena` is CPU physical, must lie inside the window the bridge forwards, and must be
+/// mapped by the caller's address space before any driver reads a register. Each register
+/// is placed at its natural alignment, which is what the decoder requires: a BAR of size
+/// `n` ignores the low `log2(n)` bits of the address written to it.
+///
+/// On success the function's recorded [`Bar`] and its `original_bars` both hold the
+/// assigned value, so [`verify_restored`] called afterwards agrees with the hardware.
+/// Memory decoding is left **off**: enabling it belongs to the driver that claims the
+/// window, and a device decoding before anything owns it answers reads nobody expects.
+pub fn assign_memory_bars(
+    cfg: &impl ConfigSpace,
+    functions: &mut [Function],
+    arena_base: u64,
+    arena_len: u64,
+) -> Result<usize, Unplaced> {
+    let mut cursor = arena_base;
+    let end = arena_base.saturating_add(arena_len);
+    let mut placed = 0;
+    for f in functions.iter_mut() {
+        if f.is_host_bridge() {
+            continue;
+        }
+        let at = f.address;
+        let count = bar_count(f.header_type);
+        let mut i = 0;
+        // Bounded: advances by one or two registers a pass, as `size_bars` does.
+        while i < count {
+            let (size, wide) = match f.bars.get(i) {
+                Some(&Bar::Memory {
+                    base, size, wide, ..
+                }) if base == 0 && size != 0 => (size, wide),
+                Some(&Bar::Memory { wide, .. }) => {
+                    i += if wide { 2 } else { 1 };
+                    continue;
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            // Natural alignment: the decoder ignores the low bits, so an address that is
+            // not a multiple of the size decodes somewhere else.
+            let aligned = cursor.next_multiple_of(size);
+            if aligned.saturating_add(size) > end {
+                return Err(Unplaced::NoRoom {
+                    at,
+                    index: i,
+                    need: size,
+                    left: end.saturating_sub(cursor),
+                });
+            }
+            if !wide && aligned > u64::from(u32::MAX) {
+                return Err(Unplaced::TooHigh { at, index: i });
+            }
+            let offset = reg::BAR0 + 4 * i as u16;
+            let low_was = f.original_bars.get(i).copied().unwrap_or(0);
+            // The low four bits are the register's type, not address, and are read-only.
+            let low = (aligned as u32 & !0xf) | (low_was & 0xf);
+            cfg.write(at, offset, low);
+            if let Some(slot) = f.original_bars.get_mut(i) {
+                *slot = low;
+            }
+            if wide {
+                let high = (aligned >> 32) as u32;
+                cfg.write(at, offset + 4, high);
+                if let Some(slot) = f.original_bars.get_mut(i + 1) {
+                    *slot = high;
+                }
+            }
+            if let Some(Bar::Memory { base, .. }) = f.bars.get_mut(i) {
+                *base = aligned;
+            }
+            cursor = aligned.saturating_add(size);
+            placed += 1;
+            i += if wide { 2 } else { 1 };
+        }
+    }
+    Ok(placed)
 }
 
 /// How many BARs a header layout has.

@@ -952,3 +952,141 @@ fn a_function_reports_its_msix_table_through_enumeration() {
     assert!(cap.enabled && cap.function_masked);
     assert_eq!(msi::msi(&fns[0]), None);
 }
+
+/// A machine whose firmware assigned nothing: every BAR reads zero, which is what QEMU's
+/// `virt` presents when it is booted with `-kernel` and no firmware runs at all.
+fn unassigned() -> Model {
+    let m = Model::default();
+    m.add(Address::new(0, 0, 0), (0x1b36, 0x0008), HOST, 0, &[]);
+    m.endpoint(
+        Address::new(0, 1, 0),
+        (0x1af4, 0x1042),
+        ETHERNET,
+        &[
+            Spec::Mem32 {
+                base: 0,
+                size: 0x1000,
+                prefetch: false,
+            },
+            Spec::Mem64 {
+                base: 0,
+                size: 0x4000,
+                prefetch: false,
+            },
+        ],
+    );
+    m
+}
+
+#[test]
+fn an_unassigned_bar_is_placed_and_reads_back() {
+    let m = unassigned();
+    let mut fns = enumerate(&m);
+    let at = Address::new(0, 1, 0);
+    // Before: the registers are implemented, sized, and decode nowhere.
+    assert!(matches!(
+        find(&fns, at).bars[0],
+        Bar::Memory {
+            base: 0,
+            size: 0x1000,
+            ..
+        }
+    ));
+    let placed = pci::assign_memory_bars(&m, &mut fns, 0x1000_0000, 0x10_0000).unwrap();
+    assert_eq!(placed, 2, "both memory registers are placed");
+
+    let f = find(&fns, at);
+    let (b0, b1) = (f.bars[0], f.bars[1]);
+    let base0 = match b0 {
+        Bar::Memory { base, .. } => base,
+        _ => panic!("bar 0 is memory"),
+    };
+    let base1 = match b1 {
+        Bar::Memory {
+            base, size, wide, ..
+        } => {
+            assert!(wide && size == 0x4000);
+            base
+        }
+        _ => panic!("bar 1 is a 64-bit memory register"),
+    };
+    assert_ne!(base0, 0);
+    assert_ne!(base1, 0);
+    // Natural alignment: the decoder ignores the low bits of the address it is given, so a
+    // register placed off its own size would answer somewhere else.
+    assert_eq!(base0 % 0x1000, 0);
+    assert_eq!(base1 % 0x4000, 0);
+    // They do not overlap.
+    assert!(base0 + 0x1000 <= base1 || base1 + 0x4000 <= base0);
+    // And the hardware holds what the record claims, which is the point of assigning.
+    assert_eq!(m.read(at, 0x10) & !0xf, base0 as u32);
+    assert_eq!(m.read(at, 0x14) & !0xf, base1 as u32 & !0xf);
+    assert_eq!(m.read(at, 0x18), (base1 >> 32) as u32);
+    // The record of what the registers held is updated with them, so a restore check run
+    // afterwards compares against what is really there.
+    assert_eq!(pci::verify_restored(&m, &fns), Ok(()));
+}
+
+#[test]
+fn a_bar_firmware_already_assigned_is_left_alone() {
+    // The repair is for the machine nobody assigned. One that was assigned keeps what it
+    // was given, because moving a decoder under a driver would be worse than doing nothing.
+    let m = Model::default();
+    m.add(Address::new(0, 0, 0), (0x1b36, 0x0008), HOST, 0, &[]);
+    m.endpoint(
+        Address::new(0, 1, 0),
+        (0x1af4, 0x1042),
+        ETHERNET,
+        &[Spec::Mem32 {
+            base: 0xc000_0000,
+            size: 0x1000,
+            prefetch: false,
+        }],
+    );
+    let mut fns = enumerate(&m);
+    let placed = pci::assign_memory_bars(&m, &mut fns, 0x1000_0000, 0x10_0000).unwrap();
+    assert_eq!(placed, 0, "nothing was unassigned, so nothing moved");
+    assert!(matches!(
+        find(&fns, Address::new(0, 1, 0)).bars[0],
+        Bar::Memory {
+            base: 0xc000_0000,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_host_bridges_own_registers_are_not_placed() {
+    // As in sizing: a bridge's BARs are not device registers to hand out, and disturbing
+    // its decoding can take the path to everything behind it with it.
+    let m = Model::default();
+    m.add(
+        Address::new(0, 0, 0),
+        (0x1b36, 0x0008),
+        HOST,
+        0,
+        &[Spec::Mem32 {
+            base: 0,
+            size: 0x1000,
+            prefetch: false,
+        }],
+    );
+    let mut fns = enumerate(&m);
+    assert_eq!(pci::assign_memory_bars(&m, &mut fns, 0x1000_0000, 0x10_0000), Ok(0));
+    assert_eq!(m.read(Address::new(0, 0, 0), 0x10) & !0xf, 0);
+}
+
+#[test]
+fn an_arena_too_small_says_which_register_did_not_fit() {
+    let m = unassigned();
+    let mut fns = enumerate(&m);
+    // Room for the 4 KiB register and not for the 16 KiB one behind it.
+    let err = pci::assign_memory_bars(&m, &mut fns, 0x1000_0000, 0x2000).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            pci::Unplaced::NoRoom { at, index: 1, need: 0x4000, .. } if at == Address::new(0, 1, 0)
+        ),
+        "{err:?}"
+    );
+}
