@@ -12,10 +12,50 @@ demonstrable — something boots, something passes, something fits in a budget �
 | 1 — The portability spine | **done**, including `kinboot-bios` |
 | 2 — Core kernel | **every item landed**; the stress audit is judged in slices rather than wall-clock windows, and `kbuild soak` runs it unattended; **a two-hour soak at 8 CPUs passed 7,200 audits of 7,200** while five branches shared the host, and the 24-hour run is not yet done |
 | 3 — SMP and the device model | **exit criterion met**: 8 CPUs boot and stress clean on both ports; devices, interrupts and consoles through one device model from FDT and from ACPI/PCIe |
-| 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. Real hardware and a thousand random configs remain |
-| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on a device being on PCIe at all: the bridge is now found from the device tree and the bus behind it walked, at the first moment the device mapping reaches a window the boot tables cannot cover, and a disk is attached to it; what remains is binding one, which needs a resource ledger outliving discovery, since the walk cannot run until configuration space is mapped and by then the ledger discovery claims through has been dropped |
+| 4 — Configurability, scaling down | riscv32 (with and without atomics), ARMv7-M at 56 KiB of RAM, `mm::flat`, modules, the full config language, random configs, size budgets. The random sweep now **boots what it builds**: sixteen of the twenty-one boundary configurations build and all sixteen boot, against seven building and none booted a round earlier, once four defects it had found were fixed — three in code and one in the configuration language, where a `preempt.rs` assert was the requirement and nothing stated it where the generator reads. Booting then found three more that building alone could not, sharing one shape: `default … if X` states a requirement `range` does not enforce, so any preset or sample naming the symbol escapes it. Real hardware and a thousand random configs remain |
+| 5 — Driver isolation | **exit criterion met** on x86_64, and past it: the same virtio-blk core runs in the kernel and in a ring-3 domain, its interrupt delivered as a message, its DMA confined by VT-d with remapped interrupts and queued invalidation; on `x86_64-isolated-smp` the client, the interrupt and the domain each run on a different CPU; a faulting domain dies alone and restarts; the cost is measured. AMD-Vi and per-domain quotas remain; on aarch64 the SMMUv3 is found and reported — its stream-id width, its granules and its output size — but nothing on that port is behind it, because the machine maps stream ids only from the PCIe root complex while this port's disk sits in a memory-mapped virtio slot, so confinement there waits on a device being on PCIe at all: the bridge is now found from the device tree and the bus behind it walked, at the first moment the device mapping reaches a window the boot tables cannot cover, and a disk is attached to it; what remains is binding one. The ledger is no longer the obstacle: `pcie.rs` already keeps its enumerated functions in a `static`, so they outlive discovery. What blocks a driver binding to one is that a driver binds to a *node*, and FDT's tree is built from the blob, where `Builder::add` carries only name, compatible and origin — so a second pass must build a separate bridge-plus-functions tree in the check phase rather than rebuild the blob's nodes, which would drop their `reg` and `interrupts`. A third disk image now exists and each disk's bytes are keyed by what it carries rather than the slot it sits in, so a third slot no longer routes to the second disk's image; `MAX_DISKS` stays 2 until the binding lands, since a third slot costs every preset a `VirtioBlk` in `.bss` for a slot only `aarch64-pcie` could fill |
 | 6 — Userspace and the Linux personality | 6a closed, including channels as counted objects and a standing file server. 6b on x86_64 and aarch64: threads, pipes, futexes, copy-on-write `fork`, `execve`, `wait4`, signals delivered from interrupts and faults, TCP and datagram sockets, `poll`/`select`/`epoll`, and file writes. Queued real-time signals, `MSG_PEEK`, scattered and gathered messages, and floating-point state carried in a signal frame and validated on return are built too. Stopping signals too: a stop parks a process at its next system call and `SIGCONT` resumes it, reported to a parent by `wait4` with `WUNTRACED` and `WCONTINUED`. `rt_sigsuspend` waits under a replacement mask and always ends interrupted, and a parent is told when a child stops or continues, with `SA_NOCLDSTOP` honoured through its own action rather than left a constant nothing reads. What remains unbuilt is alternate signal stacks, `signalfd`, and `rt_sigtimedwait` — the last of which is not `rt_sigsuspend`'s sibling despite the pairing: it must take a signal from the queue and report its number without running a handler, and the only place a signal is taken sits inside the delivery path |
 | 7 — Real hardware and real work | started early: disks with MSI-X and INTx through `_PRT`, an interrupt that belongs to its device rather than its driver, and a disk sharing an interrupt line serviced rather than silently unwired, FAT16 and FAT32 written as well as read and both crash-tested and fuzzed, and directories a program can list; virtio-net with IPv4 reassembly, TCP with congestion control, out-of-order delivery and selective acknowledgement on both sides, exercised against a peer kbuild controls end to end, where a partial acknowledgement is reachable in a guest and the measurement shows the blocks themselves saving nothing; datagram and stream sockets over handles and through Linux calls; an EFI stub, image formats, reproducible releases, a last-known-good boot counter |
+
+### The nineteenth round of landings
+
+Four briefs, three of them written by the previous round's refusals rather than chosen.
+
+- **A build with no IOMMU names no vendor.** `iommu_off.rs` — the module a build *without* an
+  IOMMU compiles — returned `vtd::QueueStats` and imported `vtd::Fault`: two types, not the one
+  the brief described. Both now live in `kernel/iommu`, a unit holding the vocabulary and no
+  hardware, which `vtd` depends on and re-exports, so the vendor's own surface is unchanged.
+  Moving them verbatim would have renamed the leak rather than closed it — `Fault::interrupt_index`
+  extracted bits 63:48 of a VT-d fault field and `is_interrupt` compared VT-d reason codes
+  `0x20..=0x26`, so a crate called neutral would have carried Intel's encoding. The decode stays in
+  `vtd`, which hands up a decoded `interrupt_index`; `reason` survives only as an opaque code a
+  caller prints. All fourteen `_off` modules were enumerated, not sampled: this was the only one.
+  The general shape is in the build graph, not the modules — no driver unit declares
+  `config.requires` and `deps.units` has no conditional form, so `x86_64-qemu` compiles `gic`,
+  `pl011` and `fdt` into an x86_64 kernel. None is linked, so it costs image bytes nowhere.
+- **Four configuration defects, and a sweep that boots.** Three reproduced from a single
+  non-default symbol with no seed: `crate::user` named with no `cfg` on both MMU ports, `waitrace`
+  gated on its own symbol while importing three that need `USERSPACE`, and `personality_off`
+  missing `churn_cycles`. The fourth was fixed in the configuration language, not in Rust: a
+  `preempt.rs` assert was the requirement and nothing stated it where the generator reads.
+  `MM_FLAT` on x86_64 and aarch64 is now forbidden through `ARCH_HAS_FLAT` — decisively a port
+  property and not an MMU one, since i686 has an MMU and builds flat. One repro deliberately does
+  *not* pass afterwards: making `WAIT_RACE_TEST=y` build on i686 required gating the module so the
+  symbol could be set while `waitrace_off` silently compiled, which is a check that cannot fail, so
+  it is refused by name at resolution instead.
+- **A third disk image, keyed by what a disk carries.** `QEMU_PCIE_BLOCK` pointed its
+  `virtio-blk-pci` function at the *second* disk's image while `block.rs` asserted `MAX_DISKS == 2`
+  because `image_of` sent every non-primary slot to `DISK2` — one bug from two sides. Each slot now
+  records its image from the disk's own header. Falsified twice, and a third falsification was
+  declined as void because nothing binds the function it would have altered.
+- **Measured boot, measured and declined.** The device models are all present, but `-tpmdev help`
+  lists exactly one backend on both binaries, `emulator`, and `passthrough` draws the same
+  diagnostic QEMU gives a backend name invented as a control. The real blocker is not the emulator:
+  nothing in this tree would *read* a measurement, and a PCR extended by a loader no attestation
+  service, sealed secret or boot policy consults is a record, not a guarantee.
+
+What this round did not do: the disk on the aarch64 PCIe bus is still not bound, and the 24-hour
+soak still has not run.
 
 ### The eighteenth round of landings
 
