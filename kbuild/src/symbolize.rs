@@ -235,14 +235,36 @@ pub fn entries(log: &str) -> Vec<Entry> {
     log.lines().filter_map(parse_line).collect()
 }
 
-/// Print a decoded backtrace for every entry in `log`. Returns how many there were.
-pub fn report(log: &str, bundle: &Path, nm: &Path) -> Result<usize, String> {
+/// The symbols and entries a decode needs, or `None` when the log holds no backtrace at all.
+///
+/// The one place a bundle is loaded and its build ID checked, so [`report`] and [`decode`]
+/// cannot drift over which logs they refuse.
+fn load_for(log: &str, bundle: &Path, nm: &Path) -> Result<Option<(Symbols, Vec<Entry>)>, String> {
     let found = entries(log);
     if found.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
     let syms = Symbols::load(bundle, nm)?;
     check_build(&buildid::in_log(log), syms.build_id.as_deref(), bundle)?;
+    Ok(Some((syms, found)))
+}
+
+/// What [`report`] prints, as data: each entry's decoded description, in order.
+///
+/// Empty means the log held no `bt` lines, which is a log that decoded fine and had nothing
+/// in it — not a failure. A caller that requires a backtrace has to say so itself.
+pub fn decode(log: &str, bundle: &Path, nm: &Path) -> Result<Vec<String>, String> {
+    let Some((syms, found)) = load_for(log, bundle, nm)? else {
+        return Ok(Vec::new());
+    };
+    Ok(found.iter().map(|e| syms.describe(e)).collect())
+}
+
+/// Print a decoded backtrace for every entry in `log`. Returns how many there were.
+pub fn report(log: &str, bundle: &Path, nm: &Path) -> Result<usize, String> {
+    let Some((syms, found)) = load_for(log, bundle, nm)? else {
+        return Ok(0);
+    };
     println!("\n\x1b[36msymbolized backtrace\x1b[0m ({})", bundle.display());
     for e in &found {
         let label = match e.frame {
