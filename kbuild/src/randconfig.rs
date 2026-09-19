@@ -251,10 +251,7 @@ fn boot_sample(
     let outcome = crate::boot(root, res, &m, timeout, None)?;
     match outcome.code {
         Some(c) if outcome.passed => Ok(c),
-        Some(c) => Err(format!(
-            "error: guest exited {c}, expected {} for success",
-            m.success_code
-        )),
+        Some(c) => Err(format!("error: guest exited {c}, expected {} for success", m.success_code)),
         None if outcome.timed_out => {
             Err(format!("error: no exit signal from the guest in {timeout}s"))
         }
