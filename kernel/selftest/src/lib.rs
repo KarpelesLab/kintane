@@ -403,8 +403,17 @@ fn lock_order<A: Arch>(r: &mut Report) {
 
     // Nothing in the image takes classed locks in a bad order before the tests run, and
     // in a build without checking this is zero by construction.
-    r.check(
-        "lock order: nothing reported since boot",
-        sync::lockdep::report::<A>().count == 0,
-    );
+    //
+    // LOCKDEP_ABBA_TEST is the one configuration where that is false on purpose: two
+    // kernel threads take two locks in opposite orders, and by the time this runs the
+    // inversion is already recorded, so the count is 1 rather than 0. Skipping the check
+    // there costs no coverage, because `lockcheck::verdict` asserts something strictly
+    // stronger in that build -- exactly one violation, and that it is the test's own,
+    // named pair. Asserting zero here would only be able to fail.
+    if !kconfig::LOCKDEP_ABBA_TEST {
+        r.check(
+            "lock order: nothing reported since boot",
+            sync::lockdep::report::<A>().count == 0,
+        );
+    }
 }
