@@ -505,6 +505,23 @@ A disk on PCIe, which is where confinement becomes reachable:
   run copies are already attached to the memory-mapped devices. The `block` check is untouched and still
   passes — this port's disks are the memory-mapped ones, which `QEMU_BLOCK_TEST` attaches by default
   on aarch64 whether or not a preset names the symbol.
+- **base address registers with addresses in them.** Found this round, and it was in front of
+  everything below. The `virtio-blk-pci` function enumerates, sizes correctly — 4 KiB and 16 KiB —
+  and every one of its registers read **zero**: implemented, and decoding nowhere. `pci.rs` said so
+  in as many words under *What is not here*: "resource assignment: BARs are read as firmware
+  assigned them". There is no firmware here to have assigned them. QEMU's `virt` booted with
+  `-kernel` runs none, and a driver bound to such a function would have mapped address zero. **Now
+  done.** `pci::assign_memory_bars` places the registers that read zero at their natural alignment,
+  leaves alone every register firmware did assign, skips host bridges, and turns on memory decoding
+  with the placement — a register with an address and its decoder off answers nothing, so leaving it
+  off would place addresses no read could reach. The room comes from a megabyte reserved off the
+  front of the bridge's forwarded 32-bit window **during discovery**, which is the only moment it
+  can be reserved: the windows the address space maps are fixed when discovery ends, and the walk
+  that would learn what the registers need cannot run until that space exists. The boot proves the
+  placement by reading the *device* at the address its register now names — configuration space
+  cannot answer this, since a BAR holds whatever was written to it — and the endpoint answers
+  virtio's `VIRTIO_F_VERSION_1`, which an unmapped window (all ones) and a silent one (zero) are
+  both distinguishable from.
 - the block driver binding through PCI on aarch64. **This is what the next stage is actually blocked
   on, and it is not a matching problem.** `virtio-blk` already lists `pci1af4,1042` and `pci1af4,1001`
   among its `compatible` strings, exactly what enumeration synthesises for the function, so the driver
@@ -536,9 +553,34 @@ A disk on PCIe, which is where confinement becomes reachable:
   change for a first interrupt to arrive. Which of the two paths is right is a decision for whoever
   binds the device, not a prerequisite for binding it.
 
+**Where the next attempt starts, in order, with what was measured this round.** The registers now
+have addresses and the device answers at them, so what is left is the node, the ledger, the slot and
+the line:
+
+1. **A second tree pass.** `Builder` takes `&'s mut [Node<'a>]` and `add(parent, name, compatible,
+   origin)`; the functions live in a `'static` array already, so their `name()` and `compatible()`
+   outlive the tree that borrows them, which is what `platform/acpi`'s `build_tree` relies on. The
+   tree needs storage of its own — root plus `MAX_FUNCTIONS` — rather than reusing `NODES`, whose
+   nodes borrow the blob.
+2. **A `Resources` that outlives discovery**, over its own claim storage. `MMIO` and `IRQS` are
+   already `'static`; what ends at `discover`'s last line is the borrow, not the storage.
+3. **A third disk slot.** `virtio_blk::MAX_DISKS` is a plain `pub const usize = 2` sizing fourteen
+   arrays and a trampoline table, and on this preset both memory-mapped slots are already taken. A
+   third costs **every** preset a `VirtioBlk` in `.bss` for a slot only `aarch64-pcie` can fill, so
+   it should become a configuration symbol before it becomes a three — the cost belongs to the
+   builds that use it.
+4. **The line.** This is the one the record has been wrong about twice, so: the bridge does carry
+   `interrupt-map` and `interrupt-map-mask`, and a legacy pin does route to a GIC SPI the existing
+   driver handles — but **`device::tree` does not interpret a nexus**. `tree.rs` says so at the
+   `interrupt` accessor: an interrupt parent carrying `interrupt-map` "is not interpreted yet". So
+   the translation from a function's pin to a GIC input is unbuilt, and binding either waits for it
+   or drives the disk polled, which the block path already supports.
+
 Once a disk is a PCI function, it is behind the root complex the SMMU translates for, and the
 coverage assertion in the `smmu` check — that no `virtio,mmio` slot sits behind the unit — stops
-being the thing that blocks confinement.
+being the thing that blocks confinement. That assertion keys on `mmio_behind`, so binding on PCIe
+leaves it correctly passing rather than blocking the path; and no preset holds both `SMMUV3` and
+`QEMU_PCIE_BLOCK` today, so confinement will need one that does.
 
 ## Running the driver in a domain (x86_64)
 
