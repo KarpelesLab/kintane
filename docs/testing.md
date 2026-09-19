@@ -3729,6 +3729,63 @@ A separate conflict found on the way, not fixed here: `INKERNEL_TESTS=y` with
 deliberately reports an inversion that the in-kernel check then asserts never happened. Two
 switches that cannot both be on, with nothing saying so.
 
+#### The combination, found: two symbols, and why the sweep could not reach it
+
+Seed 5011's overflow reduces to **two** symbols, not twelve:
+`INKERNEL_TESTS=y` with `BOOT_ARGS_CHECK=n`. Each alone is comfortable; together they
+overflow. Measured with the tree's own guard, at a stack raised enough to report:
+
+| configuration | deepest |
+|---|---|
+| neither (the shipped preset) | 9,568 |
+| `BOOT_ARGS_CHECK=n` alone | 9,592 |
+| `INKERNEL_TESTS=y` alone | 10,120 |
+| **both** | **14,896** |
+
+Additive would predict 10,144. The real figure is **4,752 bytes higher**, so this is an
+interaction and not a sum. It is real rather than an artefact of the painting heuristic: at
+14,336 the CPU takes a MemManage fault with `mmfar` in the guard page, which the MMU decides
+and the paint never touches.
+
+**Why the earlier single-symbol sweep could not find it.** That sweep added one symbol at a
+time as `SYMBOL=y`. `BOOT_ARGS_CHECK` is `default y if QEMU_EXIT`, so reaching this needs a
+default-on symbol turned **off** — a move an add-`=y`-only sweep cannot make. The blind spot
+is structural, not bad luck, and it applies to every default-on symbol in the language.
+
+**The guard is not sampled too early**, which was the obvious suspicion and is wrong:
+`bootstack::check` is `main.rs:265` and `selftest::run_all` is `main.rs:252`, so the
+measurement window contains the whole suite. The comment there says as much. The guard cannot
+report this configuration for a simpler reason — the fault happens first, so the check never
+runs.
+
+It is not a fat stack frame either. Disassembling both builds, the largest frame in either is
+480 bytes, the failing build has *fewer* functions (441 against 448) and *less* stack summed
+across them (14,968 against 15,452), and the biggest single frame growth is 20 bytes. The
+depth comes from the call chain, not from one local. What makes the same log path — 99 lines
+in both, the heap test present in both — run 4,776 bytes deeper is not established here.
+
+#### `BOOT_STACK_KIB=16` on `armv7m-tiny`, and what the 2 KiB buys
+
+The preset moves from 14 to 16. Not to 20, which would make the failing configuration *pass*
+at 72%, and not to 32: the point is not to accommodate a 14,896-byte boot stack but to be able
+to **report** one.
+
+| stack | the failing combination |
+|---|---|
+| 14 KiB | faults mid-suite, no `bootstack` line at all |
+| **16 KiB** | **`deepest 14896 of 16384 bytes (90%, limit 75%) TOO DEEP`** |
+| 20 KiB | passes at 72%, saying nothing |
+
+The guard's own contract is to fail "while there is still room to fix it". At 14 KiB there is
+not: it faults before it can speak. 2,048 bytes restores that, costing 76% → 78% of a 160 KiB
+budget, and it leaves the shipped preset at 58% and an `INKERNEL_TESTS` build at 61% — where
+before it sat at **70% against a 75% limit, 632 bytes of headroom**, thin enough that any
+future change adding ~700 bytes to the boot path would have broken it.
+
+A configuration constraint was rejected again, on new grounds. The pairing is a codegen
+coincidence: `BOOT_ARGS_CHECK` has nothing to do with stack depth, and writing
+`INKERNEL_TESTS && !BOOT_ARGS_CHECK` into the language would record an accident as a rule.
+
 #### Why nearly every random sample is a crash sample
 
 All six random samples that built at seed 5000 drew a deliberate crash mode. This section used

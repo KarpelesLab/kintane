@@ -15,7 +15,13 @@ OPTIMIZE_FOR_SIZE=y
 QEMU_EXIT=y
 KERNEL_THREAD_SLOTS=6
 THREAD_STACK_KIB=4
-BOOT_STACK_KIB=14
+# 16, not 14: the boot-stack guard has to be able to trip before the guard page does.
+# At 14 KiB an INKERNEL_TESTS build measured 10,120 of 14,336 — 70% against a 75% limit,
+# 632 bytes of headroom — and a configuration that adds ~4.8 KiB to the boot path faulted
+# in the middle of the in-kernel suite instead of being reported. 16 KiB costs 2,048 bytes
+# of a 160 KiB budget (76% -> 78%) and restores the guard's contract: that configuration
+# now fails with "TOO DEEP" naming the remedy, and the shipped preset sits at 58%.
+BOOT_STACK_KIB=16
 HANDLER_STACK_KIB=2
 FRAME_BITMAP_KIB=2
 SIZE_BUDGET_KIB=160
