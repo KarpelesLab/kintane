@@ -3569,12 +3569,54 @@ the generator reads. Eight `range` lines now bound the symbol.
 
 #### What the sweep says now
 
-| run | round 18 | round 19 |
-|---|---|---|
-| `--allno`, 21 presets | 7 built | **16 built**, and 16 of 16 booted |
-| 12 random, seed 5000 | 1 built | **6 built**, 0 of 6 judged |
+| run | round 18 | round 19 | round 20 |
+|---|---|---|---|
+| `--allno`, 21 presets | 7 built | **16 built**, and 16 of 16 booted | unchanged |
+| 12 random, seed 5000 | 1 built | 6 built, 0 of 6 judged | 6 built, **6 of 6 judged** |
 
-No configuration in either run failed to resolve, so the generator's promise held again.
+No configuration in any run failed to resolve, so the generator's promise held again.
+
+#### What a sample built to die has to show
+
+A deliberate crash mode is *meant* to bring the guest down, so a crash sample is judged by the
+report it leaves rather than by an exit status — the criterion CI already applies to its seven
+curated crash runs. Four conditions, all of them:
+
+1. **Something decoded at all.** A guest that never reached its crash lands here instead of
+   passing for having died in some other way.
+2. **The crash's own frame is named**: `kintane::crash::nested_panic` for a panic;
+   `arch::backtrace::undefined_instruction` for a fault, which traps into the architecture's
+   entry rather than staying in `nested_fault`.
+3. **Its caller `kintane::crash::outer` is named too.** A report holding only the faulting pc
+   satisfies (2) and proves nothing about unwinding, which is the whole point of a backtrace.
+4. **A frame carries a `kernel/main/src/crash.rs:` line.** Names come from the symbol table
+   and files and lines from `.debug_line`, so without this a bundle whose line table did not
+   decode would pass on names alone.
+
+A crash sample is judged whether or not it has `QEMU_EXIT`, because it reports through its
+backtrace and not through a result channel.
+
+**All six of seed 5000's crash samples fail these conditions, and that is the finding rather
+than a regression.** Five never print a backtrace at all: they carry `QEMU_MEMORY_MB=8`,
+`BOOT_STACK_KIB=1`, `HANDLER_STACK_KIB=1`, `FRAME_BITMAP_KIB=1` or `BOOT_MENU_TIMEOUT=600`,
+and the deliberate crash fires from `main` at line 267 — after the banner, the in-kernel suite
+and the boot-stack check — so these guests die or stall long before reaching it. Two of those
+are already recorded above as round 19 findings, now reached from a second direction.
+
+The sixth is the instructive one. At seed 5011, `armv7m-tiny` **does** crash and **does**
+decode, but at `kernel/main/src/main.rs:252` inside `selftest::heap::exhaust_and_return`, with
+*"stack overflow: the address is in the guard below the boot stack"* — the `BOOT_STACK_KIB=14`
+against `INKERNEL_TESTS` finding from round 19, rediscovered independently. It is what
+condition (2) exists for: a weaker check asking only whether the guest died, or whether any
+backtrace appeared, would have passed this and hidden a real bug.
+
+The criterion was falsified in both directions against a real kernel. `#[inline(always)]` on
+`nested_panic` folds it into `outer`, and the sweep then reports `no decoded frame names
+kintane::crash::nested_panic` and exits 1 — while the guest still crashes, still prints a
+backtrace and still decodes file and line, so conditions 1, 3 and 4 pass and only the targeted
+one fails. Restored, the same command decodes six frames and exits 0. (Merely *removing*
+`#[inline(never)]` is not enough: `nested_panic` diverges and panics, so LLVM outlines it
+anyway.)
 
 #### What booting found that building did not
 
@@ -3608,14 +3650,34 @@ architecture-conditional: armv7m's linker script asserts only 1 KiB, and `armv7m
 requirement is not that shape at all — this language has no way to say "a power of two", so
 nothing but the linker can ever catch it.
 
-#### A limit, stated rather than hidden
+#### Why nearly every random sample is a crash sample
 
-All six random samples that built drew a deliberate crash mode, so the random half now judges
-nothing. That is the generator rather than chance: it proposes symbols one at a time and keeps
-what still resolves, so a choice's non-default members get proposed and accepted while
-`CRASH_NONE` is only ever the default and is never proposed. The fix is to judge a crash-mode
-sample by the crash harness's criterion — a decoded backtrace, as CI does — instead of
-skipping it. Until then the boot coverage is the boundary runs.
+All six random samples that built at seed 5000 drew a deliberate crash mode. This section used
+to explain that as the generator proposing "symbols one at a time", with `CRASH_NONE` "only
+ever the default and never proposed". That is not the mechanism, and the real one is worth
+stating because it applies to **every** choice in the language rather than to this one symbol.
+
+`kcfg::random` picks uniformly among a choice's usable members, `CRASH_NONE` included — it *is*
+proposed, about a third of the time. But the generator runs **two passes**, `choices_seen`
+resets between them, and picking the member that is already on emits no request at all
+("already the member; a request would say nothing"). A choice is skipped in the second pass
+only when the first pass recorded a request for one of its members. So the default member
+survives only if it is drawn *twice*:
+
+> P(default) = (1/k)² rather than 1/k, for a choice with k usable members.
+
+For `CRASH_TEST`, k = 3, so 1/9 ≈ 11% rather than 33%. Measured over 180 seeds on
+`x86_64-qemu`: **18 of 180, 10.0%**, against 11.1% predicted by the two passes and 33.3% for a
+single uniform draw. So about 89% of random samples carry a crash mode, and six of six at seed
+5000 has probability 0.50 — unremarkable, where a single uniform draw would have made it 0.09
+and "unlucky" a fair description.
+
+**Left alone, deliberately.** The bias is unintentional, but its direction suits a sweep: the
+default member is what every preset already builds, and the sweep exists to reach what they do
+not. Changing it would also renumber every recorded seed — seed 5000 would stop reproducing
+the results above — so it belongs to a change that owns the generator, not to one that owns
+the judging. The measurement is here so that decision can start from a number instead of an
+impression.
 
 **What the first run found.** 36 of the first 50 random samples, and every `--allyes`
 boundary, failed to build. None of that was a kernel bug. `MOCK_ARCH`, the switch that
@@ -3626,9 +3688,10 @@ overflow on i686. The fix was to the declaration, not the kernel. `MOCK_ARCH` no
 has a prompt, which in this language means "derived, not chosen"; `kbuild test` still
 sets it. After that, all 50 samples (seed 1000) and all 14 boundary builds passed.
 
-**What "builds" does not yet cover.** A sample is built, not booted. Several of the
-symbols it varies select test modes that crash on purpose. `MM_FLAT` changes no unit on
-the paged ports today, so a sample that picks it proves less than it seems to.
+**What the sweep does not yet cover.** A sample is now built *and* judged — booted for its
+exit status, or read for its crash report when it was built to die — so neither of the two
+gaps this paragraph used to name is still open. `MM_FLAT` changes no unit on the paged ports
+today, so a sample that picks it proves less than it seems to.
 - **Pairwise coverage** over symbols known to interact (SMP × memory model × isolation
   × modules × `ABI_LINUX`), once exhaustive becomes impractical.
 
