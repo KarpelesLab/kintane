@@ -447,7 +447,10 @@ carrying a device.
 **An earlier draft of this document named message-signalled interrupts through the ITS as the
 third requirement. That was a prediction, and it was wrong.** `virt`'s bridge node carries
 `interrupt-map` and `interrupt-map-mask` as well as `msi-map`, so a function's legacy INTx pin
-routes to a GIC SPI the existing driver already handles; no ITS is needed for a first interrupt.
+*is described as* routing to a GIC SPI the existing driver already handles, and no ITS is needed
+for a first interrupt. What the blob describes and what the kernel reads are different questions:
+`device::tree` does not interpret a nexus, so that translation is unbuilt — see step 1 of "What the
+next stage needs".
 What the third requirement actually is appears under "What the next stage needs" below.
 
 ### What runs
@@ -548,7 +551,8 @@ A disk on PCIe, which is where confinement becomes reachable:
   57 of 256 nodes.
 - an interrupt. **Not the ITS, and not message-signalled at all, necessarily.** `virt`'s bridge node
   carries `interrupt-map` and `interrupt-map-mask` as well as `msi-map`, so a function's legacy INTx
-  pin is routed to a GIC SPI the existing driver already handles. The GICv3 driver states it
+  pin is *described* as routing to a GIC SPI the existing driver already handles — though
+  `device::tree` does not yet interpret a nexus, so nothing performs that translation. The GICv3 driver states it
   implements no LPIs or ITS, and `platform::delivers_msi()` answers `false` here; neither has to
   change for a first interrupt to arrive. Which of the two paths is right is a decision for whoever
   binds the device, not a prerequisite for binding it.
