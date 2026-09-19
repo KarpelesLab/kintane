@@ -359,6 +359,46 @@ pub fn region() -> (u64, u64) {
     }
 }
 
+/// What the auditor saw of a workload that missed its deadline: the slices it ran and the
+/// slices it was passed over for, both since the park was asked.
+///
+/// These tell apart the only two ways a workload can miss [`PARK_WITHIN`], which the name in
+/// the failure message cannot. **Passed over** means timer interrupts did find it ready and a
+/// peer won every time: the queue reached it, and the scheduler shared badly. **Neither ran
+/// nor passed** means no timer interrupt on its CPU ever saw it ready at all, so that CPU was
+/// not ticking -- halted with work queued, or a host not running it -- which is not the
+/// scheduler starving it. Slices are counted per timer interrupt and not as a duration, so
+/// neither reading measures the host (see [`Slices`]).
+///
+/// The process checks already draw this distinction for the process the auditor drives
+/// (`none charged`); the workloads had no way to state it, so a 24-hour soak that failed here
+/// named only the workload and left the cause to a rerun.
+#[derive(Clone, Copy, Default)]
+struct ParkDiag {
+    ran: u64,
+    passed: u64,
+}
+
+/// Print what the auditor saw of the workload that missed its deadline, so the failure
+/// carries its own cause.
+fn park_diagnosis(c: &dyn EarlyConsole, name: &str, d: ParkDiag) {
+    c.write_str("\n  ");
+    c.write_str(name);
+    c.write_str(" ran ");
+    write_usize(c, d.ran as usize);
+    c.write_str(" slices and was passed over for ");
+    write_usize(c, d.passed as usize);
+    c.write_str(" since the park was asked: ");
+    c.write_str(if d.passed > 0 {
+        "a timer interrupt found it ready and a peer won each time, so the queue reached it"
+    } else if d.ran > 0 {
+        "it ran, but never reached a checkpoint"
+    } else {
+        "no timer interrupt on its CPU ever saw it ready, so that CPU was not ticking"
+    });
+    c.write_str("\n");
+}
+
 /// Wait for every workload to reach a checkpoint, and say which one did not, and why.
 ///
 /// A running workload answers within an iteration, so what bounds this wait is what the
@@ -366,9 +406,13 @@ pub fn region() -> (u64, u64) {
 /// workload running and never stopping, however long the host took over it. A workload that
 /// is not running earns no slices, and only [`PARK_WITHIN`] tells a sleeper mid-nap from one
 /// that will never park.
-fn park_everything(asked: Instant) -> Option<(usize, &'static str)> {
-    let start: [u64; WORKLOADS] = core::array::from_fn(|w| slices(w).map_or(0, |s| s.ran));
+fn park_everything(asked: Instant) -> Option<(usize, &'static str, ParkDiag)> {
+    let start: [Slices; WORKLOADS] = core::array::from_fn(|w| slices(w).unwrap_or_default());
     let deadline = asked.saturating_add(PARK_WITHIN);
+    let since = |w: usize, now: Slices| ParkDiag {
+        ran: now.ran.wrapping_sub(start[w].ran),
+        passed: now.passed.wrapping_sub(start[w].passed),
+    };
     loop {
         let mut waiting = false;
         for w in 0..WORKLOADS {
@@ -379,10 +423,10 @@ fn park_everything(asked: Instant) -> Option<(usize, &'static str)> {
             let Some(now) = slices(w) else {
                 continue;
             };
-            let ran = now.ran.wrapping_sub(start[w]);
-            PARK_WORST.fetch_max(ran, Ordering::Relaxed);
-            if ran >= PARK_SLICES {
-                return Some((w, "a workload ran its slices without reaching a checkpoint"));
+            let d = since(w, now);
+            PARK_WORST.fetch_max(d.ran, Ordering::Relaxed);
+            if d.ran >= PARK_SLICES {
+                return Some((w, "a workload ran its slices without reaching a checkpoint", d));
             }
         }
         if !waiting {
@@ -394,10 +438,12 @@ fn park_everything(asked: Instant) -> Option<(usize, &'static str)> {
         if timekeeping::now() >= deadline {
             let idle = (0..WORKLOADS).find(|&w| {
                 PARKED[w].load(Ordering::Acquire) == Parked::Running as u8
-                    && slices(w).is_none_or(|now| now.ran.wrapping_sub(start[w]) < RUNNING_SLICES)
+                    && slices(w)
+                        .is_none_or(|now| now.ran.wrapping_sub(start[w].ran) < RUNNING_SLICES)
             });
             if let Some(w) = idle {
-                return Some((w, "a workload did not reach a checkpoint"));
+                let d = slices(w).map_or(ParkDiag::default(), |now| since(w, now));
+                return Some((w, "a workload did not reach a checkpoint", d));
             }
         }
         sleep_until(timekeeping::now().saturating_add(PARKED_NAP));
@@ -493,7 +539,8 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;
 
         PARK.store(true, Ordering::Release);
-        if let Some((w, why)) = park_everything(now) {
+        if let Some((w, why, d)) = park_everything(now) {
+            park_diagnosis(c, NAMES[w], d);
             audit_failed(c, seconds, why, NAMES[w]);
         }
         audit(c, seconds, &mut last, &mut stall);
