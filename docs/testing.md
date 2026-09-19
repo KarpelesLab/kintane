@@ -3785,6 +3785,63 @@ future change adding ~700 bytes to the boot path would have broken it.
 A configuration constraint was rejected again, on new grounds. The pairing is a codegen
 coincidence: `BOOT_ARGS_CHECK` has nothing to do with stack depth, and writing
 `INKERNEL_TESTS && !BOOT_ARGS_CHECK` into the language would record an accident as a rule.
+#### The neighbouring shape, and the limit of what kcfg can say (round 21)
+
+`THREAD_STACK_KIB` and `QEMU_MEMORY_MB` were the pair the enumeration set aside: not a
+requirement stated in the wrong place, but one stated where a generated configuration never
+reads it. Both had a flat `range`; both now carry a conditional one.
+
+| symbol | asserted where | was | now |
+|---|---|---|---|
+| `THREAD_STACK_KIB` | every port's `link.ld` | `range 1 1024` | `range 1 1024 if ARCH_ARMV7M`, else `range 8 1024` |
+| `QEMU_MEMORY_MB` | the firmware, empirically | `range 8 65536` | `range 56 65536 if KINBOOT_EFI \|\| KINBOOT_STUB` |
+
+The floors are architecture- and firmware-conditional, and a flat one would be wrong in both
+cases. x86_64, AArch64, i686 and riscv32 assert `THREAD_STACK_SLOT >= 8K`, because the guard
+is a whole page and a slot must leave stack above it; ARMv7-M asserts `>= 1K`, because there
+the guard is a quarter of the slot. `armv7m-tiny` ships 4 and is the only preset that pins the
+symbol. Below the floor the build resolved and then died at link —
+`THREAD_STACK_KIB=4` on `x86_64-qemu` gives *"THREAD_STACK_KIB leaves no stack above the guard
+page"* — which is late, and far from the symbol that caused it.
+
+`QEMU_MEMORY_MB`'s floor belongs to the firmware rather than the kernel: a guest QEMU loads
+directly boots at 8 MiB, while one that takes the OVMF path — `KINBOOT_EFI` or `KINBOOT_STUB`,
+the condition in `kbuild/src/qemu.rs` — does not. Measured on both firmware presets rather
+than guessed: `x86_64-efi` and `x86_64-efistub` each fail at 52 MiB and each pass at 56, while
+`x86_64-qemu` and `i686-qemu` still boot at 8. Below it the guest prints nothing at all and
+exits 0 rather than 33, which reads as a hang rather than as too little memory — which is why
+the random sample at 8 MiB with EFI firmware, an IOMMU, two disks and a NIC looked like one.
+
+The floor is 56, the lowest value measured to work, not 64, the next round number above it. A
+floor that refuses configurations which demonstrably pass costs more than it saves, which is
+the same reasoning that kept `BOOT_STACK_KIB` without one.
+
+**What this language cannot say.** `hal::StackArray` requires `THREAD_STACK_KIB` to be a power
+of two, and kcfg has no way to express that: a `range` is a floor and a ceiling. The linker
+assert every port carries is the only instrument that can catch it, and the help text now says
+so rather than leaving a reader to wonder why half the requirement is stated and half is not.
+Naming the limit is the honest outcome; inventing a mechanism for one symbol would not be.
+
+#### The ABBA conflict, resolved in the check rather than the language
+
+`INKERNEL_TESTS=y` with `LOCKDEP_ABBA_TEST=y` failed because the in-kernel suite asserts the
+global lockdep report is empty, on the premise its own comment states — nothing in the image
+takes classed locks in a bad order before the tests run. `LOCKDEP_ABBA_TEST` exists to make
+that false, and by the time the suite runs the inversion is already recorded.
+
+The check was the right layer, not the configuration language, and the reason is that the
+stronger assertion already exists one file away: `lockcheck::verdict` is ABBA-aware, requiring
+*exactly one* violation and requiring it to be the test's own named pair, where the in-kernel
+check only ever asked for zero. Skipping it in that build costs no coverage; forbidding the
+combination in kcfg would cost some, since the in-kernel suite could then never run on a build
+that validates lockdep.
+
+Falsified both ways. With ABBA off the check still runs and passes — 35 passed, including
+`lock order: nothing reported since boot`. With ABBA on it is skipped — 34 passed, 0 failed,
+while the lockdep verdict still reports *"expected the test's inversion ok"*. Inverting the
+guard so the check runs in exactly the configuration where its premise is untrue brings the
+failure straight back: 34 passed, 1 failed, `rc=1`. The check keeps its power to fail, and the
+guard's direction is load-bearing rather than cosmetic.
 
 #### Why nearly every random sample is a crash sample
 
