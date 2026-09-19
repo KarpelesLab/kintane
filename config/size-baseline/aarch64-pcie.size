@@ -1,10 +1,10 @@
 # kbuild size report for preset aarch64-pcie. Rewrite with `kbuild size --preset aarch64-pcie --update-baseline`.
 section .bss 229376
-section .data 170240
-section .rodata 548864
+section .data 170264
+section .rodata 552960
 section .stack 32768
 section .stack_guard 4096
-section .text 761856
+section .text 765952
 section .thread_stacks 262144
 crate (anonymous) text 0 rodata 112918 data 0 bss 0
 crate (unmangled) text 11468 rodata 0 data 0 bss 0
@@ -17,7 +17,7 @@ crate bootinfo text 1544 rodata 0 data 0 bss 0
 crate buildid text 252 rodata 32 data 0 bss 0
 crate cmdline text 1448 rodata 0 data 0 bss 0
 crate core text 15596 rodata 3002 data 0 bss 0
-crate device text 23832 rodata 0 data 0 bss 0
+crate device text 25004 rodata 0 data 0 bss 0
 crate elf text 3776 rodata 0 data 0 bss 0
 crate fat text 32296 rodata 0 data 0 bss 0
 crate fdt text 7076 rodata 0 data 0 bss 0
@@ -26,17 +26,17 @@ crate hal text 632 rodata 0 data 0 bss 0
 crate hwproxy text 384 rodata 0 data 0 bss 0
 crate ipc text 3512 rodata 16 data 0 bss 0
 crate kalloc text 12488 rodata 0 data 0 bss 0
-crate kintane text 432420 rodata 240 data 78032 bss 143008
+crate kintane text 432632 rodata 240 data 78032 bss 143008
 crate kobject text 7528 rodata 16 data 0 bss 0
 crate linux text 10708 rodata 0 data 0 bss 0
 crate mm text 29756 rodata 0 data 0 bss 0
 crate net text 43620 rodata 0 data 0 bss 0
 crate pl011 text 1660 rodata 0 data 80 bss 108
-crate platform text 10000 rodata 16 data 89440 bss 1715
+crate platform text 10488 rodata 16 data 89464 bss 1715
 crate rfind text 316 rodata 0 data 0 bss 0
 crate sched text 2796 rodata 0 data 0 bss 0
 crate strip_suffix text 52 rodata 0 data 0 bss 0
-crate sync text 19852 rodata 32 data 1088 bss 272
+crate sync text 19876 rodata 32 data 1088 bss 272
 crate thread text 9012 rodata 0 data 0 bss 0
 crate time text 3324 rodata 0 data 0 bss 0
 crate trim_matches text 820 rodata 0 data 0 bss 0
@@ -44,9 +44,9 @@ crate unwind text 2500 rodata 0 data 0 bss 0
 crate vfs text 18212 rodata 0 data 0 bss 0
 crate vfsproto text 2720 rodata 0 data 0 bss 0
 crate virtio text 6036 rodata 0 data 0 bss 0
-crate virtio_bind text 1604 rodata 0 data 0 bss 0
+crate virtio_bind text 1648 rodata 0 data 0 bss 0
 crate virtio_blk text 3100 rodata 32 data 384 bss 0
 crate virtio_blk_core text 2480 rodata 0 data 0 bss 0
 crate virtio_net text 3716 rodata 16 data 176 bss 8
 crate virtio_probe text 464 rodata 0 data 0 bss 0
-total 2009344
+total 2017560

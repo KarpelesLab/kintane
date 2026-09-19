@@ -3,7 +3,7 @@ section .bss 11328
 section .data 3288
 section .handler_stack 2048
 section .rodata 11680
-section .stack 14336
+section .stack 16384
 section .stack_guard 4096
 section .text 54576
 section .thread_stacks 24576
@@ -33,4 +33,4 @@ crate thread text 2450 rodata 0 data 0 bss 0
 crate time text 2694 rodata 0 data 0 bss 0
 crate trim_matches text 250 rodata 0 data 0 bss 0
 crate unwind text 1432 rodata 0 data 0 bss 0
-total 125928
+total 127976
