@@ -239,6 +239,23 @@ fn failure(w: usize) -> Option<&'static str> {
     core::str::from_utf8(bytes).ok()
 }
 
+/// The first workload holding a recorded failure, if any.
+///
+/// A workload calls [`fail`] where it detects the problem, so what it recorded is the
+/// cause. A park timeout is what that cause looks like from the auditor's clock — a
+/// workload that has recorded a failure and then stops answering park requests is
+/// *explained* by what it recorded, and reporting the timeout instead throws the
+/// explanation away.
+///
+/// That is not hypothetical. A 24-hour soak ended with `a workload did not reach a
+/// checkpoint: ping` while `ping` had already recorded `a receive was refused`: its
+/// handle table had filled, `receive` checks for room before dequeuing, and the retry
+/// loop never returned to the park check. The message that survived was the one that
+/// explained least.
+fn recorded_failure() -> Option<(usize, &'static str)> {
+    (0..WORKLOADS).find_map(|w| failure(w).map(|what| (w, what)))
+}
+
 /// Iterations completed on each CPU, all workloads together.
 static ON_CPU: [AtomicU64; mp::CPUS] = [const { AtomicU64::new(0) }; mp::CPUS];
 
@@ -541,6 +558,15 @@ pub fn run(c: &dyn EarlyConsole) -> ! {
         let seconds = now.saturating_duration_since(start).as_nanos() / 1_000_000_000;
 
         PARK.store(true, Ordering::Release);
+        // Before waiting for the park: a workload that has already said what is wrong
+        // gets to say it. See `recorded_failure` — the recorded string is the cause and
+        // the park timeout is its symptom, and this ordering is the only thing that
+        // decides which one a run reports.
+        if let Some((w, what)) = recorded_failure() {
+            c.write_str("\nstress: ");
+            c.write_str(NAMES[w]);
+            audit_failed(c, seconds, "a workload found something wrong", what);
+        }
         if let Some((w, why, d)) = park_everything(now) {
             park_diagnosis(c, NAMES[w], d);
             audit_failed(c, seconds, why, NAMES[w]);
