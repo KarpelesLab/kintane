@@ -447,6 +447,7 @@ endchoice
 
 config BOOT_MENU_TIMEOUT
     int "Seconds the boot menu waits"
+    range 0 30 if QEMU_EXIT
     range 0 600
     default 0 if QEMU_EXIT
     default 5
@@ -455,6 +456,17 @@ config BOOT_MENU_TIMEOUT
         default. Test builds use 0, which still prints the menu but never
         waits on it: a harness that has to sit through a countdown is a slow
         harness.
+
+        The range above is that same requirement said in this language. A
+        QEMU_EXIT build reports its verdict through the guest's exit status,
+        and randconfig gives such a guest BOOT_SECONDS -- sixty -- to produce
+        one. A countdown longer than that consumes the whole allowance and the
+        run is reported as a hang, which is noise rather than a finding: a
+        sample with BOOT_MENU_TIMEOUT=207 did exactly that. Thirty is the
+        ceiling because it is what the menu check itself uses, so the bound
+        forbids the runaway values without forbidding the one test that needs
+        a countdown at all. Outside QEMU_EXIT nothing waits on the guest, so
+        the original 600 stands.
 
 config BOOT_ARGS_CHECK
     bool "Require the command line the build wrote"
@@ -731,6 +743,7 @@ config SIZE_BUDGET_KIB
 config QEMU_CPUS
     int "CPUs under QEMU"
     depends on QEMU_EXIT
+    range 2 255 if ARCH_X86_64 || ARCH_I686
     range 1 255
     default 2 if ARCH_X86_64 || ARCH_I686
     default 1
@@ -741,6 +754,13 @@ config QEMU_CPUS
         CPU. On aarch64 an SMP build starts every one of them. On x86 only
         the boot CPU runs today; two are described on the PC ports, so a MADT
         walk that stopped after its first entry cannot pass.
+
+        The range above is that same requirement said in this language. The
+        two on the PC ports is not a preference: with one described CPU a MADT
+        walk that stops after its first entry passes anyway, so the check
+        stops being able to fail. The default said so and nothing enforced it,
+        which left QEMU_CPUS=1 on x86 resolvable -- a configuration that
+        builds, boots, and quietly proves nothing.
 
 config QEMU_PCI_TEST_DEVICE
     bool "A PCI test device behind a bridge under QEMU"
